@@ -1,7 +1,7 @@
 import hashlib, json, tarfile
 from pathlib import Path
 from .config import BuildConfig
-from .oci import OCILayer, build_config_json, build_manifest_json
+from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths
 from .fs_utils import ensure_dir, iter_files
 
@@ -12,6 +12,7 @@ class ImageBuilder:
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
+        refs_dir=ensure_dir(output/'refs'/'tags')
 
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
         include = self.config.include_paths or default_include_paths(self.config.context_dir)
@@ -25,7 +26,19 @@ class ImageBuilder:
         cfg_path.write_bytes(cfg_bytes)
 
         manifest=build_manifest_json(cfg_digest,len(cfg_bytes),[layer])
-        (output/'manifest.json').write_bytes(json.dumps(manifest,separators=(',',':')).encode())
+        manifest_bytes=json.dumps(manifest,separators=(',',':')).encode()
+        manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
+        manifest_path=layers_dir/manifest_digest.split(":",1)[1]
+        manifest_path.write_bytes(manifest_bytes)
+
+        oci_layout=build_oci_layout()
+        (output/'oci-layout').write_bytes(json.dumps(oci_layout,separators=(',',':')).encode())
+
+        index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag)
+        (output/'index.json').write_bytes(json.dumps(index,separators=(',',':')).encode())
+
+        tag_name=self.config.tag.split(":",1)[-1] if ":" in self.config.tag else self.config.tag
+        (refs_dir/tag_name).write_text(manifest_digest)
 
         return self.config.tag
 

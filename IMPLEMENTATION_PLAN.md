@@ -41,17 +41,17 @@ src/pycontainer/
 
 #### 1.1: Complete OCI Image Layout
 
-**Status**: Not Started  
+**Status**: ✅ **COMPLETE**  
 **Est. Effort**: 2-3 days  
 **Priority**: High
 
 **Tasks**:
 
-- [ ] Create `index.json` at image layout root (OCI image-layout spec)
-- [ ] Implement `refs/` directory structure for tag references
-- [ ] Add `oci-layout` file with proper version (`{"imageLayoutVersion": "1.0.0"}`)
-- [ ] Update builder to write complete layout, not just manifest + blobs
-- [ ] Validate against OCI Image Layout Specification v1
+- [x] Create `index.json` at image layout root (OCI image-layout spec)
+- [x] Implement `refs/` directory structure for tag references
+- [x] Add `oci-layout` file with proper version (`{"imageLayoutVersion": "1.0.0"}`)
+- [x] Update builder to write complete layout, not just manifest + blobs
+- [x] Validate against OCI Image Layout Specification v1
 
 **Technical Details**:
 
