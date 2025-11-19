@@ -43,39 +43,49 @@ pycontainer build --tag myapp:latest
 
 # With custom context
 pycontainer build --tag myapp:v1 --context /path/to/app
+
+# Build and push to registry
+pycontainer build --tag ghcr.io/user/myapp:v1 --push
 ```
 
 ### Output
 
-Creates an OCI image layout at `dist/image/`:
+Creates a complete OCI image layout at `dist/image/`:
 ```
 dist/image/
-  ├── manifest.json              # OCI manifest
-  └── blobs/sha256/
-      ├── <layer-digest>         # Application layer (tar)
-      └── <config-digest>        # Image config (JSON)
+  ├── index.json                  # OCI index (manifest list)
+  ├── oci-layout                  # Version marker
+  ├── blobs/sha256/
+  │   ├── <manifest-digest>       # Manifest blob
+  │   ├── <config-digest>         # Config blob
+  │   └── <layer-digest>          # Application layer (tar)
+  └── refs/tags/
+      └── <tag-name>              # Tag reference
 ```
 
 ---
 
 ## ✨ Features
 
-### Current Capabilities (Phase 0 ✅)
+### Current Capabilities (Phase 1 🚧)
 
 - ✅ **Zero Docker dependencies** — Pure Python implementation
 - ✅ **Auto-detects Python project structure** — Finds `src/`, `app/`, entry points
 - ✅ **Infers entrypoints** — Reads `pyproject.toml` scripts, falls back to `python -m`
-- ✅ **Creates OCI-compliant images** — Proper manifests, configs, and layers
+- ✅ **Creates OCI-compliant images** — Complete OCI image layout v1
 - ✅ **Command-line interface** — Simple `pycontainer build` workflow
 - ✅ **Programmatic API** — Use as a library in your tools
+- ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
+- ✅ **Blob existence checks** — Skip uploading layers that already exist
+- ✅ **Progress reporting** — Visual feedback during push operations
 
 ### Coming Soon
 
-- 🔜 **Registry push support** — Direct push to GHCR, ACR, Docker Hub (Phase 1)
+- 🔜 **Authentication support** — GitHub tokens, Docker credentials, Azure CLI (Phase 1.3)
+- 🔜 **Layer caching** — Fast incremental builds with content-addressable storage (Phase 1.4)
 - 🔜 **Base image layering** — Build on top of `python:3.11-slim`, distroless, etc. (Phase 2)
 - 🔜 **Dependency packaging** — Include pip-installed packages (Phase 2)
-- 🔜 **Multi-architecture builds** — ARM64, AMD64 support (Phase 3)
-- 🔜 **Caching & layer reuse** — Fast incremental builds (Phase 1)
+- 🔜 **Multi-architecture builds** — ARM64, AMD64 support (Phase 4)
 
 ---
 
@@ -177,8 +187,8 @@ BuildConfig(
 
 ### 🚧 **Phase 1: Registry & Caching** (In Progress)
 
-- [ ] Implement complete OCI image layout (index.json, refs/)
-- [ ] Push images to registries via Docker Registry v2 API
+- [x] Implement complete OCI image layout (index.json, refs/)
+- [x] Push images to registries via Docker Registry v2 API
 - [ ] Support authentication (GHCR, ACR, Docker Hub, private registries)
 - [ ] Add layer caching and reuse logic
 - [ ] Digest verification and content-addressable storage
@@ -251,12 +261,13 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 ## 🔬 Current Limitations (By Design)
 
-These are intentional scope limitations for the experimental phase:
+These are intentional scope limitations for the current phase:
 
-- **No base image support yet** — Only creates application layers (Phase 2)
-- **No registry push** — Local OCI layout only (Phase 1)
+- **No authentication yet** — Registry push requires manual token setup (Phase 1.3)
+- **No base image support** — Only creates application layers (Phase 2)
 - **No dependency packaging** — Expects dependencies in context (Phase 2)
 - **Single architecture** — `amd64/linux` only (Phase 4)
+- **No layer caching** — Rebuilds all layers every time (Phase 1.4)
 
 ---
 

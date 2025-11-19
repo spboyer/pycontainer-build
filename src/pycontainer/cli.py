@@ -1,4 +1,4 @@
-import argparse
+import argparse, os
 from pathlib import Path
 import tomllib
 from .config import BuildConfig
@@ -8,7 +8,11 @@ def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
-    b.add_argument("--tag"); b.add_argument("--context",default=".")
+    b.add_argument("--tag")
+    b.add_argument("--context",default=".")
+    b.add_argument("--push",action="store_true",help="Push image to registry after build")
+    b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
+    b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     args=parser.parse_args()
 
     tag=args.tag or "local/test:latest"
@@ -16,6 +20,10 @@ def main():
     builder=ImageBuilder(cfg)
     out=builder.build()
     print("Built:", out)
+    
+    if args.push:
+        auth_token=os.getenv('GITHUB_TOKEN') or os.getenv('REGISTRY_TOKEN')
+        builder.push(registry_url=args.registry, auth_token=auth_token, show_progress=not args.no_progress)
 
 if __name__=="__main__":
     main()

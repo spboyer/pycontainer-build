@@ -1,9 +1,11 @@
 import hashlib, json, tarfile
 from pathlib import Path
+from typing import Optional
 from .config import BuildConfig
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths
 from .fs_utils import ensure_dir, iter_files
+from .registry_client import RegistryClient, parse_image_reference
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): self.config=config
@@ -40,7 +42,43 @@ class ImageBuilder:
         tag_name=self.config.tag.split(":",1)[-1] if ":" in self.config.tag else self.config.tag
         (refs_dir/tag_name).write_text(manifest_digest)
 
+        self.manifest_digest=manifest_digest
+        self.config_digest=cfg_digest
+        self.layers=[layer]
+        
         return self.config.tag
+    
+    def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, show_progress: bool=True):
+        """Push built image to registry."""
+        if not hasattr(self, 'manifest_digest'):
+            raise RuntimeError("Must call build() before push()")
+        
+        target=registry_url or self.config.tag
+        registry, repo, tag=parse_image_reference(target)
+        
+        client=RegistryClient(registry, repo, auth_token)
+        output=Path(self.config.output_dir)
+        layers_dir=output/'blobs'/'sha256'
+        
+        if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
+        
+        for i, layer in enumerate(self.layers, 1):
+            if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
+            blob_path=layers_dir/layer.digest.split(":",1)[1]
+            skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
+            if show_progress and skipped: print(f"    Layer exists, skipped")
+        
+        if show_progress: print(f"  Pushing config ({self.config_digest[:19]}...)")
+        cfg_path=layers_dir/self.config_digest.split(":",1)[1]
+        client.push_blob(self.config_digest, cfg_path, check_exists=True)
+        
+        if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
+        manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
+        manifest_data=manifest_path.read_bytes()
+        client.push_manifest(tag, manifest_data)
+        
+        if show_progress: print(f"✓ Pushed {registry}/{repo}:{tag}")
+        return f"{registry}/{repo}:{tag}"
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
