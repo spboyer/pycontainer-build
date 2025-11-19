@@ -1,24 +1,78 @@
 """Docker Registry v2 API client implementation."""
-import urllib.request, urllib.parse, urllib.error, json
+import urllib.request, urllib.parse, urllib.error, json, re, base64
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 
 class RegistryClient:
-    def __init__(self, registry: str, repository: str, auth_token: Optional[str]=None):
+    def __init__(self, registry: str, repository: str, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None):
         self.registry=registry.rstrip('/')
         self.repository=repository
         self.auth_token=auth_token
+        self.username=username
+        self.password=password
         self.base_url=f"https://{self.registry}/v2"
+        self._bearer_token=None
     
-    def _make_request(self, method: str, url: str, data: Optional[bytes]=None, headers: Optional[Dict]=None) -> Tuple[int, bytes, Dict]:
+    def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
+        """Parse Www-Authenticate header for OAuth2 challenge."""
+        if not header or not header.startswith('Bearer '): return None
+        params={}
+        pattern=r'(\w+)="([^"]+)"'
+        for match in re.finditer(pattern, header):
+            params[match.group(1)]=match.group(2)
+        return params if params else None
+    
+    def _get_bearer_token(self, auth_params: Dict[str, str]) -> Optional[str]:
+        """Exchange credentials for bearer token via OAuth2."""
+        realm=auth_params.get('realm')
+        service=auth_params.get('service')
+        scope=auth_params.get('scope')
+        
+        if not realm: return None
+        
+        params=[]
+        if service: params.append(f'service={service}')
+        if scope: params.append(f'scope={scope}')
+        
+        url=f"{realm}?{'&'.join(params)}"
+        headers={}
+        
+        if self.username and self.password:
+            creds=base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
+            headers['Authorization']=f'Basic {creds}'
+        elif self.password:
+            headers['Authorization']=f'Bearer {self.password}'
+        
+        try:
+            req=urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req) as resp:
+                data=json.loads(resp.read())
+                return data.get('token') or data.get('access_token')
+        except: return None
+    
+    def _make_request(self, method: str, url: str, data: Optional[bytes]=None, headers: Optional[Dict]=None, retry_auth: bool=True) -> Tuple[int, bytes, Dict]:
         h=headers or {}
-        if self.auth_token:
-            h['Authorization']=f'Bearer {self.auth_token}'
+        
+        token=self._bearer_token or self.auth_token
+        if token:
+            h['Authorization']=f'Bearer {token}'
+        elif self.username and self.password:
+            creds=base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
+            h['Authorization']=f'Basic {creds}'
+        
         req=urllib.request.Request(url, data=data, headers=h, method=method)
         try:
             with urllib.request.urlopen(req) as resp:
                 return resp.status, resp.read(), dict(resp.headers)
         except urllib.error.HTTPError as e:
+            if e.code==401 and retry_auth and not self._bearer_token:
+                www_auth=e.headers.get('Www-Authenticate')
+                if www_auth:
+                    auth_params=self._parse_www_authenticate(www_auth)
+                    if auth_params:
+                        self._bearer_token=self._get_bearer_token(auth_params)
+                        if self._bearer_token:
+                            return self._make_request(method, url, data, headers, retry_auth=False)
             return e.code, e.read(), dict(e.headers)
     
     def blob_exists(self, digest: str) -> bool:

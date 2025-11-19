@@ -6,6 +6,7 @@ from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_lay
 from .project import detect_entrypoint, default_include_paths
 from .fs_utils import ensure_dir, iter_files
 from .registry_client import RegistryClient, parse_image_reference
+from .auth import get_auth_for_registry
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): self.config=config
@@ -39,7 +40,7 @@ class ImageBuilder:
         index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag)
         (output/'index.json').write_bytes(json.dumps(index,separators=(',',':')).encode())
 
-        tag_name=self.config.tag.split(":",1)[-1] if ":" in self.config.tag else self.config.tag
+        _, _, tag_name=parse_image_reference(self.config.tag)
         (refs_dir/tag_name).write_text(manifest_digest)
 
         self.manifest_digest=manifest_digest
@@ -48,7 +49,7 @@ class ImageBuilder:
         
         return self.config.tag
     
-    def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, show_progress: bool=True):
+    def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
@@ -56,7 +57,10 @@ class ImageBuilder:
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         
-        client=RegistryClient(registry, repo, auth_token)
+        if not auth_token and not password:
+            auth_token=get_auth_for_registry(registry, username, password)
+        
+        client=RegistryClient(registry, repo, auth_token=auth_token, username=username, password=password)
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         

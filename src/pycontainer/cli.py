@@ -12,6 +12,8 @@ def main():
     b.add_argument("--context",default=".")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
+    b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
+    b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     args=parser.parse_args()
 
@@ -22,8 +24,9 @@ def main():
     print("Built:", out)
     
     if args.push:
-        auth_token=os.getenv('GITHUB_TOKEN') or os.getenv('REGISTRY_TOKEN')
-        builder.push(registry_url=args.registry, auth_token=auth_token, show_progress=not args.no_progress)
+        auth_token=args.password or os.getenv('GITHUB_TOKEN') or os.getenv('REGISTRY_TOKEN')
+        username=args.username or os.getenv('REGISTRY_USERNAME')
+        builder.push(registry_url=args.registry, auth_token=auth_token, username=username, show_progress=not args.no_progress)
 
 if __name__=="__main__":
     main()

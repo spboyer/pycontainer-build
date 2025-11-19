@@ -17,54 +17,80 @@ Generate a token with `write:packages` scope.
 
 ### 2. Build and Push
 
+**Option 1: Environment Variable (Automatic)**
+
 ```bash
-# Set token
+# Set token - automatically detected
 export GITHUB_TOKEN="ghp_your_token_here"
 
-# Build and push
+# Build and push - no auth flags needed!
 pycontainer build \
   --tag ghcr.io/your-username/myapp:v1.0.0 \
   --push
+```
 
-# Or use --registry to override
+**Option 2: Command Line Flags**
+
+```bash
+# Pass credentials directly
 pycontainer build \
-  --tag myapp:v1.0.0 \
-  --registry ghcr.io/your-username/myapp:v1.0.0 \
+  --tag ghcr.io/your-username/myapp:v1.0.0 \
+  --password "ghp_your_token_here" \
   --push
+```
+
+**Option 3: Use Docker Login**
+
+```bash
+# Login with docker first
+echo "ghp_your_token_here" | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+
+# pycontainer will automatically read ~/.docker/config.json
+pycontainer build --tag ghcr.io/your-username/myapp:v1.0.0 --push
 ```
 
 ## Docker Hub
 
-### Using Environment Variables
+### Automatic via Docker Login (Recommended)
 
 ```bash
-export REGISTRY_TOKEN="your_dockerhub_token"
+# Login with docker (credentials saved to ~/.docker/config.json)
+docker login
+
+# pycontainer automatically reads the credentials
+pycontainer build --tag your-username/myapp:latest --push
+```
+
+### Environment Variables
+
+```bash
+export REGISTRY_USERNAME="your_dockerhub_username"
+export REGISTRY_PASSWORD="your_dockerhub_token"
 
 pycontainer build \
   --tag docker.io/your-username/myapp:latest \
   --push
 ```
 
-### Using Docker Login Credentials
+### Command Line Flags
 
 ```bash
-# Login with docker first
-docker login
-
-# pycontainer will read ~/.docker/config.json
-pycontainer build --tag your-username/myapp:latest --push
+pycontainer build \
+  --tag your-username/myapp:latest \
+  --username your_dockerhub_username \
+  --password your_dockerhub_token \
+  --push
 ```
 
 ## Azure Container Registry (ACR)
 
-### Using Azure CLI
+### Automatic via Azure CLI (Recommended)
 
 ```bash
 # Login to Azure
 az login
-az acr login --name myregistry
 
-# Build and push
+# pycontainer automatically gets tokens via 'az acr login --expose-token'
 pycontainer build \
   --tag myregistry.azurecr.io/myapp:v1 \
   --push
@@ -73,10 +99,22 @@ pycontainer build \
 ### Using Service Principal
 
 ```bash
-export REGISTRY_TOKEN="your_service_principal_password"
+export REGISTRY_USERNAME="your_service_principal_id"
+export REGISTRY_PASSWORD="your_service_principal_password"
 
 pycontainer build \
   --tag myregistry.azurecr.io/myapp:v1 \
+  --push
+```
+
+### Using Admin Credentials
+
+```bash
+# Get admin password from Azure portal or CLI
+pycontainer build \
+  --tag myregistry.azurecr.io/myapp:v1 \
+  --username myregistry \
+  --password "admin_password_from_portal" \
   --push
 ```
 
@@ -174,9 +212,23 @@ This is normal! pycontainer checks if blobs exist before uploading:
 
 This makes subsequent pushes much faster.
 
-## Coming Soon (Phase 1.3)
+## Authentication Priority
 
-- Automatic Docker config.json credential reading
-- Azure CLI integration for ACR
-- Multiple authentication provider support
-- Token refresh for long-running operations
+pycontainer tries authentication methods in this order:
+
+1. **Command line flags** (`--username`, `--password`)
+2. **Environment variables** (`GITHUB_TOKEN`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`)
+3. **Docker config** (`~/.docker/config.json`)
+4. **Azure CLI** (for ACR registries via `az acr login --expose-token`)
+
+This means you can:
+- Override any auto-detected credentials with CLI flags
+- Set environment variables for CI/CD
+- Use `docker login` for local development
+- Seamlessly integrate with Azure CLI
+
+## Coming Soon (Phase 1.4)
+
+- Layer caching for faster incremental builds
+- Content-addressable storage with cache eviction
+- `--no-cache` flag to force full rebuild

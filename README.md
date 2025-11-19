@@ -78,10 +78,12 @@ dist/image/
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
+- ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
+- ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 
 ### Coming Soon
 
-- 🔜 **Authentication support** — GitHub tokens, Docker credentials, Azure CLI (Phase 1.3)
 - 🔜 **Layer caching** — Fast incremental builds with content-addressable storage (Phase 1.4)
 - 🔜 **Base image layering** — Build on top of `python:3.11-slim`, distroless, etc. (Phase 2)
 - 🔜 **Dependency packaging** — Include pip-installed packages (Phase 2)
@@ -189,7 +191,7 @@ BuildConfig(
 
 - [x] Implement complete OCI image layout (index.json, refs/)
 - [x] Push images to registries via Docker Registry v2 API
-- [ ] Support authentication (GHCR, ACR, Docker Hub, private registries)
+- [x] Support authentication (GHCR, ACR, Docker Hub, private registries)
 - [ ] Add layer caching and reuse logic
 - [ ] Digest verification and content-addressable storage
 
@@ -263,11 +265,10 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 These are intentional scope limitations for the current phase:
 
-- **No authentication yet** — Registry push requires manual token setup (Phase 1.3)
+- **No layer caching yet** — Rebuilds all layers every time (Phase 1.4)
 - **No base image support** — Only creates application layers (Phase 2)
 - **No dependency packaging** — Expects dependencies in context (Phase 2)
 - **Single architecture** — `amd64/linux` only (Phase 4)
-- **No layer caching** — Rebuilds all layers every time (Phase 1.4)
 
 ---
 
