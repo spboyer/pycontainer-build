@@ -174,18 +174,18 @@ dist/image/
 
 #### 1.4: Layer Caching & Content-Addressable Storage
 
-**Status**: Not Started  
+**Status**: ✅ **COMPLETE**  
 **Est. Effort**: 4-5 days  
 **Priority**: Medium
 
 **Tasks**:
 
-- [ ] Implement local blob cache (`~/.pycontainer/cache/blobs/`)
-- [ ] Check blob existence before upload (`HEAD /v2/<name>/blobs/<digest>`)
-- [ ] Skip upload if blob exists in registry
-- [ ] Implement cache eviction policy (LRU, max size)
-- [ ] Add `--no-cache` flag to force rebuild
-- [ ] Cache index by content digest (detect unchanged files)
+- [x] Implement local blob cache (`~/.pycontainer/cache/blobs/`)
+- [x] Check blob existence before upload (`HEAD /v2/<name>/blobs/<digest>`)
+- [x] Skip upload if blob exists in registry
+- [x] Implement cache eviction policy (LRU, max size)
+- [x] Add `--no-cache` flag to force rebuild
+- [x] Cache index by content digest (detect unchanged files)
 
 **Technical Details**:
 
@@ -196,22 +196,29 @@ dist/image/
       └── <digest>
   ```
 - Use mtime + file size for fast "is file unchanged?" checks
-- Implement layer splitting: base deps layer + app code layer
+- Content-addressable storage with SHA256 digests
+- LRU eviction when cache exceeds configurable size limit
 
-**Files to Create**:
+**Files Created**:
 
-- `src/pycontainer/cache.py`
+- ✅ `src/pycontainer/cache.py` - LayerCache class with LRU eviction
+- ✅ `tests/test_cache.py` - Comprehensive cache tests (5/5 passing)
 
-**Files to Modify**:
+**Files Modified**:
 
-- `builder.py`: Check cache before creating layers
-- `registry_client.py`: Query blob existence before upload
+- ✅ `builder.py`: Integrated cache lookup/store in _create_app_layer()
+- ✅ `config.py`: Added use_cache, cache_dir, max_cache_size_mb fields
+- ✅ `cli.py`: Added --no-cache and --cache-dir flags
+- ✅ `registry_client.py`: Query blob existence before upload (already implemented)
 
 **Acceptance Criteria**:
 
-- Second build with unchanged files skips layer creation
-- Registry push skips blobs that already exist
-- `--no-cache` forces full rebuild
+- ✅ Second build with unchanged files skips layer creation
+- ✅ Registry push skips blobs that already exist
+- ✅ `--no-cache` forces full rebuild
+- ✅ Cache invalidation on file content changes (mtime + size)
+- ✅ LRU eviction maintains cache size limits
+- ✅ Disabled cache support (cache_dir=None)
 
 ---
 

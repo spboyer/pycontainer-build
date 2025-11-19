@@ -62,7 +62,19 @@ class DockerConfigAuthProvider(AuthProvider):
         
         auths=cfg.get('auths', {})
         
-        for reg_key in [f'https://{registry}', registry, f'https://{registry}/v2/', f'{registry}/v2/']:
+        # Docker Hub special cases
+        docker_hub_keys=['https://index.docker.io/v1/', 'index.docker.io', 'docker.io']
+        if registry in docker_hub_keys or registry=='docker.io':
+            for key in docker_hub_keys:
+                if key in auths:
+                    auth_data=auths[key]
+                    if 'auth' in auth_data:
+                        return self._decode_auth(auth_data['auth'])
+                    if 'username' in auth_data and 'password' in auth_data:
+                        return (auth_data['username'], auth_data['password'])
+        
+        # Try various registry URL formats
+        for reg_key in [registry, f'https://{registry}', f'https://{registry}/v2/', f'{registry}/v2/']:
             if reg_key in auths:
                 auth_data=auths[reg_key]
                 if 'auth' in auth_data:

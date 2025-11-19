@@ -67,7 +67,7 @@ dist/image/
 
 ## ✨ Features
 
-### Current Capabilities (Phase 1 🚧)
+### Current Capabilities (Phase 1 ✅)
 
 - ✅ **Zero Docker dependencies** — Pure Python implementation
 - ✅ **Auto-detects Python project structure** — Finds `src/`, `app/`, entry points
@@ -81,10 +81,12 @@ dist/image/
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
+- ✅ **Layer caching** — Content-addressable storage with LRU eviction
+- ✅ **Cache invalidation** — Detects file changes via mtime + size checks
+- ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 ### Coming Soon
 
-- 🔜 **Layer caching** — Fast incremental builds with content-addressable storage (Phase 1.4)
 - 🔜 **Base image layering** — Build on top of `python:3.11-slim`, distroless, etc. (Phase 2)
 - 🔜 **Dependency packaging** — Include pip-installed packages (Phase 2)
 - 🔜 **Multi-architecture builds** — ARM64, AMD64 support (Phase 4)
@@ -160,8 +162,20 @@ pycontainer build \
   --context /my/project \
   --workdir /app \
   --env KEY=value \
-  --env ANOTHER=value
+  --env ANOTHER=value \
+  --push \
+  --no-cache \
+  --cache-dir ~/.mycache
 ```
+
+**Caching Options**:
+- `--no-cache` — Disable layer caching, force full rebuild
+- `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
+
+The cache automatically:
+- Reuses unchanged layers across builds (content-addressable by SHA256)
+- Invalidates on file content changes (mtime + size checks)
+- Evicts old entries using LRU when size limit reached (default: 5GB)
 
 ### Python API
 
@@ -187,13 +201,13 @@ BuildConfig(
 - Project introspection and auto-detection
 - File packing and layer creation
 
-### 🚧 **Phase 1: Registry & Caching** (In Progress)
+### ✅ **Phase 1: Registry & Caching** (COMPLETE)
 
 - [x] Implement complete OCI image layout (index.json, refs/)
 - [x] Push images to registries via Docker Registry v2 API
 - [x] Support authentication (GHCR, ACR, Docker Hub, private registries)
-- [ ] Add layer caching and reuse logic
-- [ ] Digest verification and content-addressable storage
+- [x] Add layer caching and reuse logic
+- [x] Digest verification and content-addressable storage
 
 ### 📋 **Phase 2: Base Images & Dependencies**
 
@@ -265,7 +279,6 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 These are intentional scope limitations for the current phase:
 
-- **No layer caching yet** — Rebuilds all layers every time (Phase 1.4)
 - **No base image support** — Only creates application layers (Phase 2)
 - **No dependency packaging** — Expects dependencies in context (Phase 2)
 - **Single architecture** — `amd64/linux` only (Phase 4)

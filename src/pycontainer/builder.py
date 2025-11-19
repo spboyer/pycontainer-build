@@ -1,4 +1,4 @@
-import hashlib, json, tarfile
+import hashlib, json, tarfile, shutil
 from pathlib import Path
 from typing import Optional
 from .config import BuildConfig
@@ -7,9 +7,15 @@ from .project import detect_entrypoint, default_include_paths
 from .fs_utils import ensure_dir, iter_files
 from .registry_client import RegistryClient, parse_image_reference
 from .auth import get_auth_for_registry
+from .cache import LayerCache
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): self.config=config
+    def __init__(self, config: BuildConfig): 
+        self.config=config
+        self.cache=LayerCache(
+            cache_dir=Path(config.cache_dir) if config.cache_dir else None,
+            max_size_mb=config.max_cache_size_mb
+        ) if config.use_cache else None
 
     def build(self):
         output=ensure_dir(self.config.output_dir)
@@ -86,13 +92,28 @@ class ImageBuilder:
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
+        files=list(iter_files(ctx, include_paths))
+        
+        if self.cache:
+            cached=self.cache.get_layer(files)
+            if cached:
+                digest, cache_path=cached
+                final=layers_dir/digest.split(":",1)[1]
+                if not final.exists():
+                    shutil.copy2(cache_path, final)
+                return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,cache_path.stat().st_size,str(final))
+        
         tmp=layers_dir/'app-layer.tar'
         with tarfile.open(tmp,'w') as tar:
-            for abs_path, rel in iter_files(ctx, include_paths):
+            for abs_path, rel in files:
                 arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
                 tar.add(abs_path,arcname=arc)
         data=tmp.read_bytes()
         digest="sha256:"+hashlib.sha256(data).hexdigest()
         final=layers_dir/digest.split(":",1)[1]
         tmp.rename(final)
+        
+        if self.cache:
+            self.cache.store_layer(files, digest, final)
+        
         return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,len(data),str(final))

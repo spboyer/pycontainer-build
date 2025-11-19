@@ -15,10 +15,17 @@ def main():
     b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
     b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
+    b.add_argument("--no-cache",action="store_true",help="Disable layer caching, force full rebuild")
+    b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
     args=parser.parse_args()
 
     tag=args.tag or "local/test:latest"
-    cfg=BuildConfig(tag=tag, context_dir=args.context)
+    cfg=BuildConfig(
+        tag=tag, 
+        context_dir=args.context,
+        use_cache=not args.no_cache,
+        cache_dir=args.cache_dir
+    )
     builder=ImageBuilder(cfg)
     out=builder.build()
     print("Built:", out)
