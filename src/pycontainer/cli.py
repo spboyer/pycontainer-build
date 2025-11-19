@@ -9,6 +9,7 @@ def main():
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
     b.add_argument("--tag")
+    b.add_argument("--base-image",help="Base image to layer on (e.g., python:3.11-slim)")
     b.add_argument("--context",default=".")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
@@ -17,14 +18,19 @@ def main():
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",action="store_true",help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
+    b.add_argument("--include-deps",action="store_true",help="Include dependencies from venv or requirements.txt")
+    b.add_argument("--requirements",default="requirements.txt",help="Requirements file for dependency layer")
     args=parser.parse_args()
 
     tag=args.tag or "local/test:latest"
     cfg=BuildConfig(
         tag=tag, 
+        base_image=args.base_image,
         context_dir=args.context,
         use_cache=not args.no_cache,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
+        include_deps=args.include_deps,
+        requirements_file=args.requirements
     )
     builder=ImageBuilder(cfg)
     out=builder.build()

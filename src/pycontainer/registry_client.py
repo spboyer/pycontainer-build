@@ -129,6 +129,25 @@ class RegistryClient:
         if status not in (200, 201):
             raise RuntimeError(f"Index push failed: {status} {body.decode()}")
         return True
+    
+    def pull_manifest(self, reference: str) -> Tuple[Dict, str]:
+        """Pull manifest from registry, returns (manifest_dict, digest)."""
+        url=f"{self.base_url}/{self.repository}/manifests/{reference}"
+        headers={'Accept':'application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json'}
+        status, body, resp_headers=self._make_request('GET', url, headers=headers)
+        if status!=200:
+            raise RuntimeError(f"Failed to pull manifest: {status} {body.decode()}")
+        digest=resp_headers.get('Docker-Content-Digest') or resp_headers.get('docker-content-digest')
+        return json.loads(body), digest
+    
+    def pull_blob(self, digest: str, dest_path: Path) -> bool:
+        """Download blob from registry to local path."""
+        url=f"{self.base_url}/{self.repository}/blobs/{digest}"
+        status, body, _=self._make_request('GET', url)
+        if status!=200:
+            raise RuntimeError(f"Failed to pull blob {digest}: {status}")
+        dest_path.write_bytes(body)
+        return True
 
 def parse_image_reference(ref: str) -> Tuple[str, str, str]:
     """Parse image reference into (registry, repository, tag).
