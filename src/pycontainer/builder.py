@@ -1,23 +1,34 @@
-import hashlib, json, tarfile, shutil, tempfile
+import hashlib, json, tarfile, shutil, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
+from .framework import apply_framework_defaults
 from .fs_utils import ensure_dir, iter_files
 from .registry_client import RegistryClient, parse_image_reference
 from .auth import get_auth_for_registry
 from .cache import LayerCache
+from .sbom import generate_sbom
+
+logger=logging.getLogger(__name__)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
-        self.config=config
+        self.config=apply_framework_defaults(config, Path(config.context_dir))
         self.cache=LayerCache(
             cache_dir=Path(config.cache_dir) if config.cache_dir else None,
             max_size_mb=config.max_cache_size_mb
         ) if config.use_cache else None
+        self.verbose=getattr(config, 'verbose', False)
+        self.dry_run=getattr(config, 'dry_run', False)
 
     def build(self):
+        if self.dry_run:
+            logger.info("DRY RUN: Would build image %s", self.config.tag)
+            self._show_build_plan()
+            return self.config.tag
+        
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -63,6 +74,12 @@ class ImageBuilder:
         self.manifest_digest=manifest_digest
         self.config_digest=cfg_digest
         self.layers=all_layers
+        
+        if getattr(self.config, 'generate_sbom', False):
+            sbom_path=output/'sbom.json'
+            logger.info("Generating SBOM...")
+            generate_sbom(Path(self.config.context_dir), sbom_path)
+            logger.info(f"✓ SBOM saved to {sbom_path}")
         
         return self.config.tag
     
@@ -136,6 +153,22 @@ class ImageBuilder:
         
         if show_progress: print(f"✓ Pushed {registry}/{repo}:{tag}")
         return f"{registry}/{repo}:{tag}"
+    
+    def _show_build_plan(self):
+        """Display build plan for dry-run mode."""
+        print(f"Build Plan for {self.config.tag}:")
+        print(f"  Base Image: {self.config.base_image or 'scratch'}")
+        print(f"  Context: {self.config.context_dir}")
+        print(f"  Working Dir: {self.config.workdir}")
+        print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
+        if self.config.exposed_ports:
+            print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
+        if self.config.env:
+            print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
+        if self.config.labels:
+            print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        print(f"  Include Dependencies: {self.config.include_deps}")
+        print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(self, layers_dir: Path) -> Optional[OCILayer]:
         """Create dependency layer from venv or requirements.txt."""
@@ -171,10 +204,25 @@ class ImageBuilder:
                 return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,cache_path.stat().st_size,str(final))
         
         tmp=layers_dir/'app-layer.tar'
+        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        
         with tarfile.open(tmp,'w') as tar:
-            for abs_path, rel in files:
+            for abs_path, rel in files_sorted:
                 arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
-                tar.add(abs_path,arcname=arc)
+                if self.config.reproducible:
+                    tarinfo=tar.gettarinfo(abs_path, arcname=arc)
+                    tarinfo.mtime=0
+                    tarinfo.uid=0
+                    tarinfo.gid=0
+                    tarinfo.uname="root"
+                    tarinfo.gname="root"
+                    if tarinfo.isfile():
+                        with open(abs_path, 'rb') as f:
+                            tar.addfile(tarinfo, f)
+                    else:
+                        tar.addfile(tarinfo)
+                else:
+                    tar.add(abs_path,arcname=arc)
         data=tmp.read_bytes()
         digest="sha256:"+hashlib.sha256(data).hexdigest()
         final=layers_dir/digest.split(":",1)[1]

@@ -20,3 +20,8 @@ class BuildConfig:
     cmd: Optional[List[str]] = None
     include_deps: bool = False
     requirements_file: str = "requirements.txt"
+    verbose: bool = False
+    dry_run: bool = False
+    platform: str = "linux/amd64"
+    reproducible: bool = True
+    generate_sbom: bool = False
