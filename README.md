@@ -38,14 +38,29 @@ pip install -e .
 ### Build Your First Image
 
 ```bash
-# From your Python project root
+# Simple build (auto-detects everything)
 pycontainer build --tag myapp:latest
 
-# With custom context
-pycontainer build --tag myapp:v1 --context /path/to/app
+# Build on a base image with dependencies
+pycontainer build \
+  --tag myapp:v1 \
+  --base-image python:3.11-slim \
+  --include-deps
+
+# Build FastAPI app (auto-detected, entrypoint configured)
+pycontainer build --tag api:latest --context ./my-fastapi-app
+
+# Build with SBOM for security compliance
+pycontainer build \
+  --tag myapp:v1 \
+  --sbom spdx \
+  --config pycontainer.toml
 
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
+
+# Dry-run to preview (verbose mode)
+pycontainer build --tag test:latest --dry-run --verbose
 ```
 
 ### Output
@@ -67,8 +82,9 @@ dist/image/
 
 ## ✨ Features
 
-### Current Capabilities (Phase 1 ✅)
+### Current Capabilities (Phases 0-2, 4 ✅)
 
+**Foundation & Registry** (Phases 0-1):
 - ✅ **Zero Docker dependencies** — Pure Python implementation
 - ✅ **Auto-detects Python project structure** — Finds `src/`, `app/`, entry points
 - ✅ **Infers entrypoints** — Reads `pyproject.toml` scripts, falls back to `python -m`
@@ -85,11 +101,26 @@ dist/image/
 - ✅ **Cache invalidation** — Detects file changes via mtime + size checks
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
+**Base Images & Dependencies** (Phase 2):
+- ✅ **Base image support** — Build on top of `python:3.11-slim`, distroless, etc.
+- ✅ **Layer merging** — Combines base image layers with application layers
+- ✅ **Config inheritance** — Merges env vars, labels, working dir from base images
+- ✅ **Dependency packaging** — Include pip packages from venv or requirements.txt
+- ✅ **Distroless detection** — Auto-handles shell-less base images
+
+**Production Features** (Phase 4):
+- ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
+- ✅ **Configuration files** — Load settings from `pycontainer.toml`
+- ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
+- ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
+- ✅ **Platform configuration** — Target different architectures with `--platform`
+- ✅ **Verbose logging** — Detailed build progress with `--verbose`
+- ✅ **Dry-run mode** — Preview builds with `--dry-run`
+
 ### Coming Soon
 
-- 🔜 **Base image layering** — Build on top of `python:3.11-slim`, distroless, etc. (Phase 2)
-- 🔜 **Dependency packaging** — Include pip-installed packages (Phase 2)
-- 🔜 **Multi-architecture builds** — ARM64, AMD64 support (Phase 4)
+- 🔜 **Toolchain integrations** — Poetry, Hatch, Azure Developer CLI (Phase 3)
+- 🔜 **Full multi-arch builds** — Actual cross-compilation for ARM64, AMD64 (Phase 4+)
 
 ---
 
@@ -157,20 +188,38 @@ By default, `pycontainer` auto-detects:
 ### Explicit Configuration
 
 ```bash
+# Full configuration with all options
 pycontainer build \
   --tag myapp:v1.2.3 \
   --context /my/project \
+  --base-image python:3.11-slim \
+  --include-deps \
   --workdir /app \
   --env KEY=value \
   --env ANOTHER=value \
+  --platform linux/amd64 \
+  --sbom cyclonedx \
+  --config pycontainer.toml \
+  --verbose \
   --push \
-  --no-cache \
-  --cache-dir ~/.mycache
+  --no-cache
 ```
+
+**Base Image & Dependencies**:
+- `--base-image IMAGE` — Base image to build on (e.g., `python:3.11-slim`)
+- `--include-deps` — Package dependencies from venv or requirements.txt
 
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
+
+**Production Features**:
+- `--config FILE` — Load settings from `pycontainer.toml`
+- `--sbom FORMAT` — Generate SBOM (`spdx` or `cyclonedx`)
+- `--platform PLATFORM` — Target platform (e.g., `linux/arm64`)
+- `--verbose` / `-v` — Detailed build progress
+- `--dry-run` — Preview build without creating artifacts
+- `--no-reproducible` — Disable deterministic builds
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
@@ -180,14 +229,48 @@ The cache automatically:
 ### Python API
 
 ```python
-BuildConfig(
+from pycontainer.config import BuildConfig
+from pycontainer.builder import ImageBuilder
+
+config = BuildConfig(
     tag="myapp:latest",
     context_path=".",
+    base_image="python:3.11-slim",
+    include_deps=True,
     workdir="/app",
-    env={"DEBUG": "false"},
+    env={"DEBUG": "false", "ENV": "production"},
+    labels={"version": "1.0", "maintainer": "team@example.com"},
     include_paths=["src/", "lib/", "pyproject.toml"],
-    entrypoint=["python", "-m", "myapp"]
+    entrypoint=["python", "-m", "myapp"],
+    generate_sbom="spdx",
+    reproducible=True,
+    verbose=True
 )
+
+builder = ImageBuilder(config)
+builder.build()
+```
+
+### Configuration File (`pycontainer.toml`)
+
+```toml
+[build]
+base_image = "python:3.11-slim"
+workdir = "/app"
+include_deps = true
+reproducible = true
+
+[build.labels]
+maintainer = "team@example.com"
+version = "1.0.0"
+
+[build.env]
+PORT = "8080"
+ENV = "production"
+DEBUG = "false"
+
+[registry]
+url = "ghcr.io/myorg/myapp"
 ```
 
 ---
@@ -209,15 +292,15 @@ BuildConfig(
 - [x] Add layer caching and reuse logic
 - [x] Digest verification and content-addressable storage
 
-### 📋 **Phase 2: Base Images & Dependencies**
+### ✅ **Phase 2: Base Images & Dependencies** (COMPLETE)
 
-- [ ] Pull and parse base image manifests
-- [ ] Layer Python app files on top of base images
-- [ ] Support slim, distroless, and custom base images
-- [ ] Package pip-installed dependencies into layers
-- [ ] Respect base image configuration (env, labels, user)
+- [x] Pull and parse base image manifests
+- [x] Layer Python app files on top of base images
+- [x] Support slim, distroless, and custom base images
+- [x] Package pip-installed dependencies into layers
+- [x] Respect base image configuration (env, labels, user)
 
-### 📋 **Phase 3: Toolchain Integrations**
+### 📋 **Phase 3: Toolchain Integrations** (Planned)
 
 - [ ] Poetry plugin (`poetry build --container`)
 - [ ] Hatch build hook
@@ -225,14 +308,14 @@ BuildConfig(
 - [ ] GitHub Actions reusable workflow
 - [ ] VS Code extension / Copilot templates
 
-### 📋 **Phase 4: Polish & Production Readiness**
+### ✅ **Phase 4: Polish & Production Readiness** (COMPLETE)
 
-- [ ] Framework auto-detection (FastAPI, Flask, Django)
-- [ ] `pycontainer.toml` configuration schema
-- [ ] SBOM (Software Bill of Materials) generation
-- [ ] Reproducible builds (deterministic layer creation)
-- [ ] Multi-architecture support (ARM64)
-- [ ] Verbose logging and diagnostics
+- [x] Framework auto-detection (FastAPI, Flask, Django)
+- [x] `pycontainer.toml` configuration schema
+- [x] SBOM (Software Bill of Materials) generation
+- [x] Reproducible builds (deterministic layer creation)
+- [x] Platform configuration (metadata for multi-arch)
+- [x] Verbose logging and diagnostics
 
 ---
 
@@ -275,13 +358,14 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 ---
 
-## 🔬 Current Limitations (By Design)
+## 🔬 Current Limitations
 
-These are intentional scope limitations for the current phase:
+Known limitations and future enhancements:
 
-- **No base image support** — Only creates application layers (Phase 2)
-- **No dependency packaging** — Expects dependencies in context (Phase 2)
-- **Single architecture** — `amd64/linux` only (Phase 4)
+- **Multi-arch builds** — Platform flag sets metadata only; no actual cross-compilation yet
+- **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
+- **SBOM scope** — Python packages only; doesn't parse OS packages from base images
+- **Toolchain integrations** — Poetry, Hatch, azd plugins planned for Phase 3
 
 ---
 
