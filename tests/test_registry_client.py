@@ -22,6 +22,11 @@ def test_registry_client_construction():
     
     client_auth=RegistryClient("localhost:5000","test","token123")
     assert client_auth.auth_token=="token123"
+    
+    # Test docker.io translation to registry-1.docker.io
+    client_dockerhub=RegistryClient("docker.io","library/python")
+    assert client_dockerhub.registry=="registry-1.docker.io"
+    assert client_dockerhub.base_url=="https://registry-1.docker.io/v2"
 
 def test_registry_url_construction():
     """Test URL construction for registry operations."""

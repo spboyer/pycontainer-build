@@ -1,11 +1,18 @@
 """Docker Registry v2 API client implementation."""
-import urllib.request, urllib.parse, urllib.error, json, re, base64
+import urllib.request, urllib.parse, urllib.error, http.client, json, re, base64
 from pathlib import Path
 from typing import Optional, Dict, Tuple
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """HTTP handler that doesn't follow redirects."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 class RegistryClient:
     def __init__(self, registry: str, repository: str, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None):
         self.registry=registry.rstrip('/')
+        if self.registry=='docker.io':
+            self.registry='registry-1.docker.io'
         self.repository=repository
         self.auth_token=auth_token
         self.username=username
@@ -73,7 +80,13 @@ class RegistryClient:
                         self._bearer_token=self._get_bearer_token(auth_params)
                         if self._bearer_token:
                             return self._make_request(method, url, data, headers, retry_auth=False)
-            return e.code, e.read(), dict(e.headers)
+            body=b''
+            try:
+                body=e.read()
+            except: pass
+            return e.code, body, dict(e.headers)
+        except Exception as ex:
+            raise RuntimeError(f"Request failed for {url}: {ex}")
     
     def blob_exists(self, digest: str) -> bool:
         """Check if blob exists in registry via HEAD request."""
@@ -136,18 +149,61 @@ class RegistryClient:
         headers={'Accept':'application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json'}
         status, body, resp_headers=self._make_request('GET', url, headers=headers)
         if status!=200:
-            raise RuntimeError(f"Failed to pull manifest: {status} {body.decode()}")
+            body_text=body.decode() if body else '(empty response)'
+            raise RuntimeError(f"Failed to pull manifest: {status} {body_text}")
+        if not body:
+            raise RuntimeError(f"Empty response body from registry for {reference}")
+        try:
+            manifest=json.loads(body)
+        except json.JSONDecodeError as e:
+            body_preview=body[:500].decode('utf-8', errors='replace')
+            raise RuntimeError(f"Invalid JSON in manifest response: {e}\nBody preview: {body_preview}")
         digest=resp_headers.get('Docker-Content-Digest') or resp_headers.get('docker-content-digest')
-        return json.loads(body), digest
+        return manifest, digest
     
     def pull_blob(self, digest: str, dest_path: Path) -> bool:
         """Download blob from registry to local path."""
         url=f"{self.base_url}/{self.repository}/blobs/{digest}"
-        status, body, _=self._make_request('GET', url)
-        if status!=200:
-            raise RuntimeError(f"Failed to pull blob {digest}: {status}")
-        dest_path.write_bytes(body)
-        return True
+        
+        req=urllib.request.Request(url)
+        token=self._bearer_token or self.auth_token
+        if token:
+            req.add_header('Authorization', f'Bearer {token}')
+        elif self.username and self.password:
+            creds=base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
+            req.add_header('Authorization', f'Basic {creds}')
+        
+        opener=urllib.request.build_opener(NoRedirect)
+        try:
+            with opener.open(req) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    redirect_url=resp.headers.get('Location')
+                    if redirect_url:
+                        redirect_req=urllib.request.Request(redirect_url)
+                        with urllib.request.urlopen(redirect_req) as redirect_resp:
+                            body=redirect_resp.read()
+                            dest_path.write_bytes(body)
+                            return True
+                elif resp.status==200:
+                    body=resp.read()
+                    dest_path.write_bytes(body)
+                    return True
+                else:
+                    body=resp.read()
+                    error_msg=body.decode('utf-8', errors='replace') if body else '(empty)'
+                    raise RuntimeError(f"Failed to pull blob {digest}: {resp.status} - {error_msg}")
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                redirect_url=e.headers.get('Location')
+                if redirect_url:
+                    redirect_req=urllib.request.Request(redirect_url)
+                    with urllib.request.urlopen(redirect_req) as redirect_resp:
+                        body=redirect_resp.read()
+                        dest_path.write_bytes(body)
+                        return True
+            body=e.read() if hasattr(e, 'read') else b''
+            error_msg=body.decode('utf-8', errors='replace') if body else '(empty)'
+            raise RuntimeError(f"Failed to pull blob {digest}: {e.code} - {error_msg}")
 
 def parse_image_reference(ref: str) -> Tuple[str, str, str]:
     """Parse image reference into (registry, repository, tag).
