@@ -50,7 +50,6 @@ class ContainerBuildHook:
                 tag = f"app:{version}"
 
         base_image = self.config.get("base-image", "python:3.11-slim")
-        registry = self.config.get("registry")
         push = self.config["push"] if "push" in self.config else False
         include_deps = self.config["include-deps"] if "include-deps" in self.config else True
         sbom = self.config.get("sbom")
