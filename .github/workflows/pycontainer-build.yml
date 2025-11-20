@@ -1,0 +1,115 @@
+name: Build Container with pycontainer
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+      tag:
+        description: 'Container image tag'
+        required: true
+        type: string
+      base-image:
+        description: 'Base image for container'
+        required: false
+        default: 'python:3.11-slim'
+        type: string
+      context:
+        description: 'Build context directory'
+        required: false
+        default: '.'
+        type: string
+      push:
+        description: 'Push image to registry'
+        required: false
+        default: true
+        type: boolean
+      include-deps:
+        description: 'Include dependencies from venv/requirements.txt'
+        required: false
+        default: true
+        type: boolean
+      sbom:
+        description: 'Generate SBOM (spdx or cyclonedx)'
+        required: false
+        default: ''
+        type: string
+      registry:
+        description: 'Container registry (default: ghcr.io)'
+        required: false
+        default: 'ghcr.io'
+        type: string
+    secrets:
+      REGISTRY_USERNAME:
+        description: 'Registry username (optional if using GITHUB_TOKEN)'
+        required: false
+      REGISTRY_PASSWORD:
+        description: 'Registry password (optional if using GITHUB_TOKEN)'
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build Container
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      
+      - name: Install pycontainer-build
+        run: |
+          python -m pip install --upgrade pip
+          pip install pycontainer-build || pip install git+https://github.com/spboyer/pycontainer-build.git
+      
+      - name: Build container image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          # Build command with all options
+          CMD="pycontainer build --tag ${{ inputs.tag }} --context ${{ inputs.context }} --base-image ${{ inputs.base-image }}"
+          
+          # Add optional flags
+          if [ "${{ inputs.include-deps }}" = "true" ]; then
+            CMD="$CMD --include-deps"
+          fi
+          
+          if [ -n "${{ inputs.sbom }}" ]; then
+            CMD="$CMD --sbom ${{ inputs.sbom }}"
+          fi
+          
+          if [ "${{ inputs.push }}" = "true" ]; then
+            CMD="$CMD --push"
+          fi
+          
+          CMD="$CMD --verbose"
+          
+          echo "Executing: $CMD"
+          $CMD
+      
+      - name: Generate build summary
+        if: always()
+        run: |
+          echo "## Container Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base Image**: \`${{ inputs.base-image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python Version**: \`${{ inputs.python-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Context**: \`${{ inputs.context }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pushed**: ${{ inputs.push }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.sbom }}" ]; then
+            echo "- **SBOM**: \`${{ inputs.sbom }}\`" >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,45 @@
+[project]
+name = "poetry-pycontainer"
+version = "0.1.0"
+description = "Poetry plugin for building OCI container images with pycontainer-build"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "pycontainer contributors" }
+]
+keywords = ["poetry", "plugin", "container", "oci", "docker"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
+
+dependencies = [
+    "poetry>=1.2.0",
+    "cleo>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/spboyer/pycontainer-build"
+Repository = "https://github.com/spboyer/pycontainer-build"
+Issues = "https://github.com/spboyer/pycontainer-build/issues"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.poetry.plugins."poetry.application.plugin"]
+pycontainer = "poetry_pycontainer.plugin:PycontainerPlugin"
