@@ -38,13 +38,13 @@ pip install -e .
 ### Build Your First Image
 
 ```bash
-# Simple build (auto-detects everything)
+# Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
 
-# Build on a base image with dependencies
+# Build with custom base image and dependencies
 pycontainer build \
   --tag myapp:v1 \
-  --base-image python:3.11-slim \
+  --base-image python:3.12-slim \
   --include-deps
 
 # Build FastAPI app (auto-detected, entrypoint configured)
@@ -102,7 +102,8 @@ dist/image/
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
-- ✅ **Base image support** — Build on top of `python:3.11-slim`, distroless, etc.
+- ✅ **Smart base image detection** — Auto-selects Python base image from `requires-python` in pyproject.toml
+- ✅ **Base image support** — Build on top of `python:3.11-slim`, `python:3.12-slim`, distroless, etc.
 - ✅ **Layer merging** — Combines base image layers with application layers
 - ✅ **Config inheritance** — Merges env vars, labels, working dir from base images
 - ✅ **Dependency packaging** — Include pip packages from venv or requirements.txt
@@ -235,6 +236,7 @@ Install from VS Code Marketplace or command palette:
 
 By default, `pycontainer` auto-detects:
 
+- **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
 - **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
 - **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
 - **Working directory**: `/app/`
@@ -261,7 +263,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
 - `--include-deps` — Package dependencies from venv or requirements.txt
 
 **Caching Options**:
@@ -290,7 +292,7 @@ from pycontainer.builder import ImageBuilder
 config = BuildConfig(
     tag="myapp:latest",
     context_path=".",
-    base_image="python:3.11-slim",
+    base_image="python:3.11-slim",  # Optional: auto-detected if omitted
     include_deps=True,
     workdir="/app",
     env={"DEBUG": "false", "ENV": "production"},

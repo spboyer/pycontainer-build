@@ -8,7 +8,11 @@ This is a sample FastAPI application demonstrating all pycontainer-build integra
 
 ```bash
 cd examples/fastapi-app
+# Base image auto-detected from pyproject.toml (requires-python: ">=3.11")
 pycontainer build --tag fastapi-demo:latest --include-deps
+
+# Or with custom base image
+pycontainer build --tag fastapi-demo:latest --base-image python:3.12-slim --include-deps
 ```
 
 ### Build with Poetry Plugin
@@ -124,12 +128,13 @@ This example includes configuration for all integrations:
 
 ## Features Demonstrated
 
-- ✅ Framework auto-detection (FastAPI automatically configured)
-- ✅ Entry point auto-detection from pyproject.toml
-- ✅ Dependency packaging with `--include-deps`
-- ✅ Environment variable configuration
-- ✅ OCI label metadata
-- ✅ Multiple integration methods
+- ✅ **Base image auto-detection** - Python version detected from `requires-python` in pyproject.toml
+- ✅ **Framework auto-detection** - FastAPI automatically configured with proper entrypoint
+- ✅ **Entry point auto-detection** - Reads `[project.scripts]` from pyproject.toml
+- ✅ **Dependency packaging** - Include pip packages with `--include-deps`
+- ✅ **Environment variable configuration** - Custom env vars for production
+- ✅ **OCI label metadata** - Maintainer, description, and custom labels
+- ✅ **Multiple integration methods** - CLI, Poetry, Hatch, VS Code, GitHub Actions, azd
 
 ## Learn More
 

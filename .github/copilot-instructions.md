@@ -20,9 +20,9 @@ cli.py (entry point)
 
 ### Key Architectural Decisions
 
-1. **No Base Image Layering (Yet)**: Currently only creates application layers, doesn't pull/layer base images like `python:3.11-slim`. The `base_image` field in `BuildConfig` is defined but not used—this is a known limitation.
+1. **Smart Base Image Selection**: Auto-detects Python version from `requires-python` in `pyproject.toml` and constructs base image name (e.g., `>=3.11` → `python:3.11-slim`). Users can override with `--base-image` flag. Base images are always required—every build pulls and layers on a Python runtime.
 
-2. **Single Layer Output**: Creates one tar layer with all app files, writes to `dist/image/blobs/sha256/<digest>`. The OCI manifest + config are written to `dist/image/`.
+2. **Multi-Layer Output**: Creates base image layers + optional dependency layer + application layer. All layers are written to `dist/image/blobs/sha256/<digest>`. The OCI manifest + config are written to `dist/image/`.
 
 3. **Entrypoint Auto-Detection**: `project.py` reads `pyproject.toml` → looks for `[project.scripts]` → converts first script to Python module invocation. Falls back to `python -m app` if nothing found.
 
@@ -117,12 +117,11 @@ if child.is_file() and not any(child.match(p) for p in exclude):
 
 ## Known Limitations (Do Not "Fix" Without Discussion)
 
-1. **No base image support**: Doesn't download/layer Python runtime. Output is app-only.
-2. **No registry push**: No code to push to Docker Hub/GitHub Container Registry.
-3. **No dependency installation**: Doesn't run `pip install`. Expects dependencies already in context.
-4. **Single architecture**: Hard-coded to `amd64`/`linux` in `builder.py`.
+1. **Single architecture support**: Metadata supports multi-arch but no actual cross-compilation yet.
+2. **Limited framework detection**: Supports FastAPI, Flask, Django only (easy to extend).
+3. **SBOM scope**: Python packages only; doesn't parse OS packages from base images.
 
-These are intentional scope limitations for the experiment phase.
+These are intentional scope limitations for the current phase.
 
 ## Dependencies
 

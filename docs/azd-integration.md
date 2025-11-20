@@ -55,11 +55,12 @@ services:
         run: |
           pycontainer build \
             --tag ${SERVICE_IMAGE_NAME}:${SERVICE_IMAGE_TAG} \
-            --base-image python:3.11-slim \
             --include-deps \
             --context ${SERVICE_PATH} \
             --push
 ```
+
+> **Note**: The `--base-image` flag is optional. pycontainer-build will auto-detect the Python version from your `pyproject.toml` (`requires-python` field) and use the appropriate base image (e.g., `python:3.11-slim`). You can override this by explicitly setting `--base-image python:3.12-slim` or any custom base image.
 
 ### 3. Deploy
 

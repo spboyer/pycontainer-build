@@ -3,6 +3,7 @@ from pathlib import Path
 from .config import BuildConfig
 from .builder import ImageBuilder
 from .config_loader import config_from_file
+from .project import detect_python_version
 
 def main():
     parser=argparse.ArgumentParser()
@@ -10,7 +11,7 @@ def main():
     b=sub.add_parser("build")
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
     b.add_argument("--tag")
-    b.add_argument("--base-image",help="Base image to layer on (e.g., python:3.11-slim)")
+    b.add_argument("--base-image",help="Base image to layer on (auto-detected from requires-python if not specified)")
     b.add_argument("--context",default=".")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
@@ -52,9 +53,13 @@ def main():
         cfg=config_from_file(Path(args.config), cli_overrides)
     else:
         tag=args.tag or "local/test:latest"
+        base_img=args.base_image
+        if not base_img:
+            py_ver=detect_python_version(args.context)
+            base_img=f"python:{py_ver}-slim"
         cfg=BuildConfig(
             tag=tag, 
-            base_image=args.base_image,
+            base_image=base_img,
             context_dir=args.context,
             use_cache=not args.no_cache,
             cache_dir=args.cache_dir,

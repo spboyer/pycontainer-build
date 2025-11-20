@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 @dataclass
 class BuildConfig:
     tag: str = "local/test:latest"
-    base_image: Optional[str] = None
+    base_image: str = "python:3.11-slim"
     context_dir: str = "."
     workdir: str = "/app"
     entrypoint: Optional[List[str]] = None

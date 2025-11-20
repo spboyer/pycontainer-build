@@ -72,10 +72,15 @@ By default, images are created at:
 ### With Base Image & Dependencies
 
 ```bash
-# Build on a Python base image
+# Build with auto-detected Python base image
 pycontainer build \
   --tag myapp:latest \
-  --base-image python:3.11-slim \
+  --include-deps
+
+# Or explicitly specify a base image
+pycontainer build \
+  --tag myapp:latest \
+  --base-image python:3.12-slim \
   --include-deps
 
 # This will:

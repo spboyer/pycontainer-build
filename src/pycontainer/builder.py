@@ -34,7 +34,7 @@ class ImageBuilder:
         layers_dir=ensure_dir(blobs/'sha256')
         refs_dir=ensure_dir(output/'refs'/'tags')
 
-        base_layers, base_config = self._pull_base_image(layers_dir) if self.config.base_image else ([], None)
+        base_layers, base_config = self._pull_base_image(layers_dir)
         
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
         include = self.config.include_paths or default_include_paths(self.config.context_dir)
@@ -157,7 +157,7 @@ class ImageBuilder:
     def _show_build_plan(self):
         """Display build plan for dry-run mode."""
         print(f"Build Plan for {self.config.tag}:")
-        print(f"  Base Image: {self.config.base_image or 'scratch'}")
+        print(f"  Base Image: {self.config.base_image}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
         print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")

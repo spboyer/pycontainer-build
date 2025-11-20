@@ -1,6 +1,17 @@
-import tomllib
+import tomllib, re
 from pathlib import Path
 from typing import List, Tuple
+
+def detect_python_version(context_dir):
+    """Detect Python version from pyproject.toml requires-python field."""
+    ctx=Path(context_dir); py=ctx/'pyproject.toml'
+    if py.exists():
+        data=tomllib.loads(py.read_text())
+        proj=data.get("project",{}); requires_py=proj.get("requires-python")
+        if requires_py:
+            match=re.search(r'(\d+\.\d+)', requires_py)
+            if match: return match.group(1)
+    return "3.11"
 
 def detect_entrypoint(context_dir):
     ctx=Path(context_dir); py=ctx/'pyproject.toml'

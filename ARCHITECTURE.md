@@ -166,11 +166,31 @@ class ImageBuilder:
 
 ### 3. Project Layer (`project.py`)
 
-**Purpose**: Introspect Python projects to extract metadata, entry points, and structure.
+**Purpose**: Introspect Python projects to extract metadata, entry points, structure, and Python version.
 
 **Key Functions**:
 
 ```python
+def detect_python_version(context_dir) -> str:
+    """
+    Detect Python version from pyproject.toml requires-python field.
+    
+    Extracts version from patterns like:
+    - ">=3.11" → "3.11"
+    - "^3.12" → "3.12"
+    - "~=3.10" → "3.10"
+    
+    Returns:
+        Python version string (e.g., "3.11"), defaults to "3.11" if not found
+    """
+    pyproject = parse_pyproject_toml(context_dir / "pyproject.toml")
+    requires_py = pyproject.get("project", {}).get("requires-python")
+    if requires_py:
+        match = re.search(r'(\d+\.\d+)', requires_py)
+        if match:
+            return match.group(1)
+    return "3.11"
+
 def discover_project(context_path: Path) -> ProjectMetadata:
     """
     Discover Python project structure and metadata.
@@ -484,7 +504,7 @@ class BuildConfig:
     workdir: str = "/app"
     env: dict[str, str] = field(default_factory=dict)
     include_paths: list[str] = field(default_factory=list)
-    base_image: str | None = None  # Phase 2
+    base_image: str = "python:3.11-slim"  # Auto-detected from requires-python
     registry: str | None = None
     use_cache: bool = True
     
@@ -659,11 +679,17 @@ def discover_project(context_path: Path,
 
 **Approach**: Implement OCI spec directly using Python stdlib + HTTP requests.
 
-### Why Single Layer (Phase 0)?
+### Why Smart Base Image Detection?
 
-**Rationale**: Simplify initial implementation, prove feasibility.
+**Rationale**: Simplify user experience by automatically selecting the correct Python base image from project metadata.
 
-**Future**: Phase 2 adds multi-layer support (base + deps + app).
+**Approach**: Parse `requires-python` from `pyproject.toml` and construct base image name (e.g., `>=3.11` → `python:3.11-slim`).
+
+**Benefits**:
+- Zero configuration for common cases
+- Always includes Python runtime (no invalid app-only images)
+- Respects project's Python version requirements
+- Users can still override with `--base-image` flag
 
 ### Why Dataclasses Over Dicts?
 
