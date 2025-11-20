@@ -224,13 +224,7 @@ function installPycontainer(pythonPath: string) {
                 }
             );
 
-            proc.stdout?.on('data', (data) => {
-                outputChannel.append(data.toString());
-            });
-
-            proc.stderr?.on('data', (data) => {
-                outputChannel.append(data.toString());
-            });
+            // Removed duplicate stream handlers for stdout and stderr
         });
     });
 }
