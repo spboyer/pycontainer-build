@@ -71,7 +71,8 @@ jobs:
       - name: Install pycontainer-build
         run: |
           python -m pip install --upgrade pip
-          pip install pycontainer-build || pip install git+https://github.com/spboyer/pycontainer-build.git
+          # Install from PyPI only; fallback to GitHub removed for reproducibility and clarity.
+          pip install pycontainer-build
       
       - name: Build container image
         env:
