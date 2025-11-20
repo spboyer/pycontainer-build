@@ -148,4 +148,4 @@ class PycontainerPlugin(ApplicationPlugin):
 
     def activate(self, application):
         """Activate the plugin by registering commands."""
-        application.command_loader.register_factory("build-container", lambda: ContainerBuildCommand())
+        application.command_loader.register_factory("build-container", ContainerBuildCommand)
