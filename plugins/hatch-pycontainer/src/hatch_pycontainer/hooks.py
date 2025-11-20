@@ -51,13 +51,13 @@ class ContainerBuildHook:
 
         base_image = self.config.get("base-image", "python:3.11-slim")
         registry = self.config.get("registry")
-        push = self.config.get("push", False)
-        include_deps = self.config.get("include-deps", True)
+        push = self.config["push"] if "push" in self.config else False
+        include_deps = self.config["include-deps"] if "include-deps" in self.config else True
         sbom = self.config.get("sbom")
-        verbose = self.config.get("verbose", False)
+        verbose = self.config["verbose"] if "verbose" in self.config else False
         env = self.config.get("env", {})
         labels = self.config.get("labels", {})
-        use_cache = not self.config.get("no-cache", False)
+        use_cache = not self.config["no-cache"] if "no-cache" in self.config else True
 
         # Add build metadata to labels
         labels["org.opencontainers.image.version"] = version
