@@ -56,7 +56,7 @@ class ContainerBuildCommand(Command):
         # Build configuration
         base_image = self.option("base-image") or tool_config.get("base_image", "python:3.11-slim")
         registry = self.option("registry") or tool_config.get("registry")
-        push = self.option("push") or tool_config.get("push", False)
+        push = self.option("push") if self.option("push") is not None else tool_config.get("push", False)
         include_deps = self.option("include-deps") or tool_config.get("include_deps", True)
         sbom = self.option("sbom") or tool_config.get("sbom")
         verbose = self.option("verbose") or tool_config.get("verbose", False)
