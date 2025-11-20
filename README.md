@@ -59,6 +59,9 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Build for different platform (e.g., amd64 from ARM Mac)
+pycontainer build --tag myapp:latest --platform linux/amd64
+
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
 ```
@@ -114,7 +117,8 @@ dist/image/
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
 - ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
-- ✅ **Platform configuration** — Target different architectures with `--platform`
+- ✅ **Cross-platform builds** — Build linux/amd64 from ARM, linux/arm64 from x86, etc.
+- ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
 
@@ -260,6 +264,12 @@ pycontainer build \
   --verbose \
   --push \
   --no-cache
+
+# Build for ARM64 (e.g., for AWS Graviton, Apple Silicon containers)
+pycontainer build \
+  --tag myapp:arm64 \
+  --platform linux/arm64 \
+  --push
 ```
 
 **Base Image & Dependencies**:
@@ -419,10 +429,10 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 Known limitations and future enhancements:
 
-- **Multi-arch builds** — Platform flag sets metadata only; no actual cross-compilation yet
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python packages only; doesn't parse OS packages from base images
-- **Toolchain integrations** — Poetry, Hatch, azd plugins planned for Phase 3
+
+**Note**: Cross-platform builds pull the correct architecture variant from multi-platform base images and generate proper OCI metadata. For Python applications (interpreted language), no actual cross-compilation is needed.
 
 ---
 

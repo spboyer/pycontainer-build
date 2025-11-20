@@ -2,6 +2,13 @@ import hashlib, json, tarfile, shutil, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+
+def parse_platform(platform: str) -> Tuple[str, str]:
+    """Parse platform string (e.g., 'linux/amd64') into (os, arch)."""
+    parts=platform.split('/')
+    if len(parts)!=2:
+        raise ValueError(f"Invalid platform format: {platform}. Expected 'os/arch' (e.g., 'linux/amd64')")
+    return parts[0], parts[1]
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
 from .framework import apply_framework_defaults
@@ -34,7 +41,8 @@ class ImageBuilder:
         layers_dir=ensure_dir(blobs/'sha256')
         refs_dir=ensure_dir(output/'refs'/'tags')
 
-        base_layers, base_config = self._pull_base_image(layers_dir)
+        os_name, arch = parse_platform(self.config.platform)
+        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
         include = self.config.include_paths or default_include_paths(self.config.context_dir)
@@ -49,7 +57,7 @@ class ImageBuilder:
         
         all_layers=base_layers+app_layers
 
-        cfg = build_config_json("amd64","linux",self.config.env,self.config.workdir,entry,self.config.exposed_ports,
+        cfg = build_config_json(arch,os_name,self.config.env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
@@ -65,7 +73,7 @@ class ImageBuilder:
         oci_layout=build_oci_layout()
         (output/'oci-layout').write_bytes(json.dumps(oci_layout,separators=(',',':')).encode())
 
-        index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag)
+        index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag,arch,os_name)
         (output/'index.json').write_bytes(json.dumps(index,separators=(',',':')).encode())
 
         _, _, tag_name=parse_image_reference(self.config.tag)
@@ -83,19 +91,19 @@ class ImageBuilder:
         
         return self.config.tag
     
-    def _pull_base_image(self, layers_dir: Path) -> Tuple[List[OCILayer], Optional[Dict]]:
+    def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull base image from registry, return (base_layers, base_config)."""
         registry, repo, tag=parse_image_reference(self.config.base_image)
         auth_token=get_auth_for_registry(registry)
         client=RegistryClient(registry, repo, auth_token=auth_token)
         
-        print(f"Pulling base image {self.config.base_image}...")
+        print(f"Pulling base image {self.config.base_image} for {os_name}/{arch}...")
         manifest, _=client.pull_manifest(tag)
         
         if manifest.get('mediaType')=='application/vnd.oci.image.index.v1+json':
             for m in manifest.get('manifests',[]):
                 plat=m.get('platform',{})
-                if plat.get('architecture')=='amd64' and plat.get('os')=='linux':
+                if plat.get('architecture')==arch and plat.get('os')==os_name:
                     manifest, _=client.pull_manifest(m['digest'])
                     break
         

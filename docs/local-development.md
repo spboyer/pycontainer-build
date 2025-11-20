@@ -83,6 +83,20 @@ pycontainer build \
   --base-image python:3.12-slim \
   --include-deps
 
+# Build for different platform (e.g., amd64 from ARM Mac)
+pycontainer build \
+  --tag myapp:amd64 \
+  --base-image python:3.11-slim \
+  --platform linux/amd64 \
+  --include-deps
+
+# Build for ARM64 (e.g., for AWS Graviton instances)
+pycontainer build \
+  --tag myapp:arm64 \
+  --base-image python:3.11-slim \
+  --platform linux/arm64 \
+  --include-deps
+
 # This will:
 # 1. Pull python:3.11-slim layers from registry
 # 2. Package your app files
@@ -308,6 +322,40 @@ ls -lh ~/.pycontainer/cache/layers/
 
 # Force rebuild without cache
 pycontainer build --tag myapp:v3 --base-image python:3.11-slim --include-deps --no-cache
+```
+
+### Use Case 6: Cross-Platform Builds
+
+```bash
+# Build for AMD64 from your ARM Mac
+pycontainer build \
+  --tag myapp:amd64 \
+  --platform linux/amd64 \
+  --base-image python:3.11-slim \
+  --include-deps \
+  --verbose
+
+# Verify the platform in the image config
+MANIFEST_DIGEST=$(jq -r '.manifests[0].digest' dist/image/index.json | cut -d: -f2)
+CONFIG_DIGEST=$(jq -r '.config.digest' dist/image/blobs/sha256/$MANIFEST_DIGEST | cut -d: -f2)
+jq '.architecture, .os' dist/image/blobs/sha256/$CONFIG_DIGEST
+# Output: "amd64" "linux"
+
+# Build for ARM64 (AWS Graviton, Raspberry Pi, etc.)
+pycontainer build \
+  --tag myapp:arm64 \
+  --platform linux/arm64 \
+  --base-image python:3.11-slim \
+  --include-deps
+
+# Build for both platforms and push
+for PLATFORM in linux/amd64 linux/arm64; do
+  ARCH=$(echo $PLATFORM | cut -d/ -f2)
+  pycontainer build \
+    --tag ghcr.io/user/myapp:${ARCH} \
+    --platform $PLATFORM \
+    --push
+done
 ```
 
 ---

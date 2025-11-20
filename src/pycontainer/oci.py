@@ -82,7 +82,7 @@ def build_manifest_json(config_digest, config_size, layers: List[OCILayer]):
 def build_oci_layout():
     return {"imageLayoutVersion":"1.0.0"}
 
-def build_index_json(manifest_digest, manifest_size, tag=None):
-    desc=OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,{"architecture":"amd64","os":"linux"})
+def build_index_json(manifest_digest, manifest_size, tag=None, architecture="amd64", os_name="linux"):
+    desc=OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,{"architecture":architecture,"os":os_name})
     annot={"org.opencontainers.image.ref.name":tag} if tag else None
     return OCIIndex(2,[desc],annot).to_json()

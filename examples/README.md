@@ -23,6 +23,23 @@ A complete FastAPI web application showcasing all integration methods:
 
 [View Example →](./fastapi-app/)
 
+### [Cross-Platform Builds](./cross-platform/)
+
+Demonstrates building container images for different CPU architectures:
+
+- ✅ Build AMD64 from ARM Macs
+- ✅ Build ARM64 for AWS Graviton
+- ✅ Multi-platform GitHub Actions
+- ✅ Docker manifest lists
+
+**Key Features**:
+- Platform-specific base image selection
+- Multi-architecture deployment patterns
+- Real-world use cases and workflows
+- Testing cross-platform images
+
+[View Example →](./cross-platform/)
+
 ## Quick Start
 
 ### Try the FastAPI Example
@@ -89,6 +106,13 @@ Include:
 - All integration configs
 - Working application code
 - Deployment examples (optional)
+
+## Quick Comparison
+
+| Example | Complexity | Demonstrates | Best For |
+|---------|-----------|--------------|----------|
+| **FastAPI App** | Medium | Full integration suite | Learning all features |
+| **Cross-Platform** | Simple | Multi-arch builds | ARM/AMD64 deployment |
 
 ## More Examples Coming Soon
 

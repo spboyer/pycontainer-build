@@ -313,6 +313,22 @@ class OCIIndex:
     manifests: list[OCIDescriptor]
 ```
 
+**Platform Support**:
+
+```python
+def parse_platform(platform: str) -> Tuple[str, str]:
+    """Parse platform string (e.g., 'linux/amd64') into (os, arch)."""
+    parts = platform.split('/')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid platform format: {platform}")
+    return parts[0], parts[1]  # (os, architecture)
+```
+
+The builder uses this to:
+1. Parse the `--platform` flag into OS and architecture
+2. Select the correct manifest from multi-platform base images
+3. Generate OCI config and index with proper platform metadata
+
 **Key Functions**:
 
 ```python
@@ -324,20 +340,22 @@ def build_manifest(config_desc: OCIDescriptor,
         layers=layer_descs
     )
 
-def build_config_json(build_config: BuildConfig, 
+def build_config_json(architecture: str, os_name: str,
+                      build_config: BuildConfig, 
                       metadata: ProjectMetadata) -> OCIConfig:
     """
     Create OCI config JSON from build configuration.
     
     Includes:
+    - Architecture and OS (from --platform flag)
     - Env vars (from build_config.env)
     - Cmd (from metadata.entry_point)
     - WorkingDir (from build_config.workdir)
     - Labels (from build_config.labels)
     """
     return OCIConfig(
-        architecture="amd64",
-        os="linux",
+        architecture=architecture,
+        os=os_name,
         config={
             "Env": [f"{k}={v}" for k, v in build_config.env.items()],
             "Cmd": metadata.entry_point,
