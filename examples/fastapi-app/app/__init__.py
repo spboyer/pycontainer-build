@@ -1,0 +1,1 @@
+"""FastAPI demo application."""

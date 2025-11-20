@@ -144,3 +144,14 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# VS Code extension build artifacts
+plugins/vscode-pycontainer/node_modules/
+plugins/vscode-pycontainer/dist/
+plugins/vscode-pycontainer/out/
+plugins/vscode-pycontainer/*.vsix
+
+# Plugin build artifacts
+plugins/*/dist/
+plugins/*/build/
+plugins/*/*.egg-info/
