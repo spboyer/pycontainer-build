@@ -57,11 +57,23 @@ class ContainerBuildCommand(Command):
         base_image = self.option("base-image") or tool_config.get("base_image", "python:3.11-slim")
         registry = self.option("registry") or tool_config.get("registry")
         push = self.option("push") if self.option("push") is not None else tool_config.get("push", False)
-        include_deps = self.option("include-deps") or tool_config.get("include_deps", True)
+        if self.input.has_parameter_option("--include-deps"):
+            include_deps = self.option("include-deps")
+        else:
+            include_deps = tool_config.get("include_deps", True)
         sbom = self.option("sbom") or tool_config.get("sbom")
-        verbose = self.option("verbose") or tool_config.get("verbose", False)
-        dry_run = self.option("dry-run") or tool_config.get("dry_run", False)
-        no_cache = self.option("no-cache") or tool_config.get("no_cache", False)
+        if self.input.has_parameter_option("--verbose"):
+            verbose = self.option("verbose")
+        else:
+            verbose = tool_config.get("verbose", False)
+        if self.input.has_parameter_option("--dry-run"):
+            dry_run = self.option("dry-run")
+        else:
+            dry_run = tool_config.get("dry_run", False)
+        if self.input.has_parameter_option("--no-cache"):
+            no_cache = self.option("no-cache")
+        else:
+            no_cache = tool_config.get("no_cache", False)
         
         # Get environment variables from config
         env = tool_config.get("env", {})
