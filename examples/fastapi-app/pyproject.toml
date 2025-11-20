@@ -1,0 +1,46 @@
+# Example FastAPI application for demonstrating pycontainer-build integrations
+
+[project]
+name = "fastapi-demo"
+version = "1.0.0"
+description = "Demo FastAPI app for pycontainer-build"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0"
+]
+
+[project.scripts]
+start = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# Note: Both Poetry and Hatch configurations are included to demonstrate
+# that pycontainer-build can be used with either tool. In a real project,
+# you would typically only include the section for the tool you're using.
+
+# Poetry plugin configuration
+[tool.pycontainer]
+tag = "fastapi-demo:latest"
+base_image = "python:3.11-slim"
+include_deps = true
+
+[tool.pycontainer.env]
+ENV = "production"
+LOG_LEVEL = "info"
+
+[tool.pycontainer.labels]
+maintainer = "demo@example.com"
+description = "FastAPI demo application"
+
+# Hatch plugin configuration
+[tool.hatch.build.hooks.pycontainer]
+tag = "fastapi-demo:latest"
+base-image = "python:3.11-slim"
+include-deps = true
+
+[tool.hatch.build.hooks.pycontainer.env]
+ENV = "production"
+LOG_LEVEL = "info"

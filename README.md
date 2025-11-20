@@ -167,10 +167,65 @@ builder.build()  # Creates dist/image/
 ```
 
 Perfect for integration with:
-- **Azure Developer CLI (azd)** — Custom build strategies
-- **GitHub Actions** — Automated CI/CD workflows
-- **Poetry/Hatch** — Build plugins
+- **Azure Developer CLI (azd)** — Custom build strategies ([docs](docs/azd-integration.md))
+- **GitHub Actions** — Automated CI/CD workflows ([docs](docs/github-actions.md))
+- **Poetry/Hatch** — Build plugins ([plugins](plugins/))
+- **VS Code** — Extension for container builds ([plugin](plugins/vscode-pycontainer/))
 - **AI agents** — Copilot, MCP servers, automated scaffolding
+
+## 🔌 Integrations
+
+pycontainer-build integrates seamlessly with popular Python tools:
+
+### Poetry Plugin
+
+```bash
+poetry self add poetry-pycontainer
+poetry build-container --tag myapp:latest --push
+```
+
+[See full documentation →](plugins/poetry-pycontainer/)
+
+### Hatch Plugin
+
+```bash
+pip install hatch-pycontainer
+hatch build  # Builds both wheel and container
+```
+
+[See full documentation →](plugins/hatch-pycontainer/)
+
+### GitHub Actions
+
+```yaml
+jobs:
+  build:
+    uses: spboyer/pycontainer-build/.github/workflows/pycontainer-build.yml@main
+    with:
+      tag: ghcr.io/${{ github.repository }}:latest
+      push: true
+```
+
+[See full documentation →](docs/github-actions.md)
+
+### Azure Developer CLI
+
+```yaml
+# azure.yaml
+hooks:
+  build:
+    run: pycontainer build --tag ${SERVICE_IMAGE_NAME} --push
+```
+
+[See full documentation →](docs/azd-integration.md)
+
+### VS Code Extension
+
+Install from VS Code Marketplace or command palette:
+- "Build Container Image"
+- "Build and Push Container Image"
+
+[See full documentation →](plugins/vscode-pycontainer/)
 
 ---
 
@@ -300,13 +355,13 @@ url = "ghcr.io/myorg/myapp"
 - [x] Package pip-installed dependencies into layers
 - [x] Respect base image configuration (env, labels, user)
 
-### 📋 **Phase 3: Toolchain Integrations** (Planned)
+### ✅ **Phase 3: Toolchain Integrations** (COMPLETE)
 
-- [ ] Poetry plugin (`poetry build --container`)
-- [ ] Hatch build hook
-- [ ] Azure Developer CLI (azd) integration
-- [ ] GitHub Actions reusable workflow
-- [ ] VS Code extension / Copilot templates
+- [x] Poetry plugin (`poetry build-container`)
+- [x] Hatch build hook
+- [x] Azure Developer CLI (azd) integration
+- [x] GitHub Actions reusable workflow
+- [x] VS Code extension
 
 ### ✅ **Phase 4: Polish & Production Readiness** (COMPLETE)
 

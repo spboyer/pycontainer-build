@@ -1,0 +1,61 @@
+# Example: Using the pycontainer-build reusable workflow
+# 
+# Copy this file to your repository as .github/workflows/build-container.yml
+# and customize as needed.
+
+name: Build and Push Container
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # Basic build - just create the container image
+  build-basic:
+    name: Build Container (Basic)
+    uses: spboyer/pycontainer-build/.github/workflows/pycontainer-build.yml@main
+    with:
+      tag: ghcr.io/${{ github.repository }}:${{ github.sha }}
+      push: false  # Don't push on PRs
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+  # Build with all features enabled
+  build-full:
+    name: Build Container (Full Features)
+    uses: spboyer/pycontainer-build/.github/workflows/pycontainer-build.yml@main
+    with:
+      python-version: '3.11'
+      tag: ghcr.io/${{ github.repository }}:latest
+      base-image: 'python:3.11-slim'
+      context: '.'
+      push: true
+      include-deps: true
+      sbom: 'spdx'
+      registry: 'ghcr.io'
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+    # Only push on main branch
+    if: github.ref == 'refs/heads/main'
+
+  # Matrix build - multiple Python versions
+  build-matrix:
+    name: Build Container (Python ${{ matrix.python-version }})
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    uses: spboyer/pycontainer-build/.github/workflows/pycontainer-build.yml@main
+    with:
+      python-version: ${{ matrix.python-version }}
+      tag: ghcr.io/${{ github.repository }}:py${{ matrix.python-version }}-${{ github.sha }}
+      base-image: python:${{ matrix.python-version }}-slim
+      push: false
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}

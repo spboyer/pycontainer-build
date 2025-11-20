@@ -1,0 +1,128 @@
+{
+  "name": "vscode-pycontainer",
+  "displayName": "pycontainer-build",
+  "description": "Build OCI container images from Python projects without Docker",
+  "version": "0.1.0",
+  "publisher": "pycontainer",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "python",
+    "container",
+    "docker",
+    "oci",
+    "build"
+  ],
+  "activationEvents": [
+    "onLanguage:python",
+    "workspaceContains:**/pyproject.toml",
+    "workspaceContains:**/requirements.txt"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pycontainer.build",
+        "title": "Build Container Image",
+        "category": "pycontainer"
+      },
+      {
+        "command": "pycontainer.buildAndPush",
+        "title": "Build and Push Container Image",
+        "category": "pycontainer"
+      },
+      {
+        "command": "pycontainer.configure",
+        "title": "Configure Container Build",
+        "category": "pycontainer"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "when": "resourceFilename == pyproject.toml",
+          "command": "pycontainer.build",
+          "group": "pycontainer@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "pycontainer.build",
+          "when": "workspaceContains:**/pyproject.toml"
+        },
+        {
+          "command": "pycontainer.buildAndPush",
+          "when": "workspaceContains:**/pyproject.toml"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "pycontainer-build",
+      "properties": {
+        "pycontainer.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to Python executable"
+        },
+        "pycontainer.defaultTag": {
+          "type": "string",
+          "default": "myapp:latest",
+          "description": "Default container image tag"
+        },
+        "pycontainer.defaultBaseImage": {
+          "type": "string",
+          "default": "python:3.11-slim",
+          "description": "Default base container image"
+        },
+        "pycontainer.autoInstall": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically install pycontainer-build if not found"
+        },
+        "pycontainer.showOutput": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show build output in terminal"
+        },
+        "pycontainer.verbose": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose build output"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0",
+    "@vscode/test-electron": "^2.3.0",
+    "@vscode/vsce": "^2.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spboyer/pycontainer-build"
+  },
+  "bugs": {
+    "url": "https://github.com/spboyer/pycontainer-build/issues"
+  },
+  "homepage": "https://github.com/spboyer/pycontainer-build#readme",
+  "license": "MIT"
+}
