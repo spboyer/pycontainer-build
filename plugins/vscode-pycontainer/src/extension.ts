@@ -53,22 +53,22 @@ async function buildContainer(push: boolean) {
     const verbose = config.get('verbose', false);
     const pythonPath = config.get('pythonPath', 'python');
 
-    // Build command
-    let command = `${pythonPath} -m pycontainer build --tag ${tag} --base-image ${baseImage}`;
+    // Build command arguments (using array to prevent command injection)
+    const args = ['-m', 'pycontainer', 'build', '--tag', tag, '--base-image', baseImage];
     
     if (push) {
-        command += ' --push';
+        args.push('--push');
     }
     
     if (verbose) {
-        command += ' --verbose';
+        args.push('--verbose');
     }
 
     // Create output channel
     const outputChannel = vscode.window.createOutputChannel('pycontainer-build');
     outputChannel.show();
     outputChannel.appendLine(`Building container: ${tag}`);
-    outputChannel.appendLine(`Command: ${command}\n`);
+    outputChannel.appendLine(`Command: ${pythonPath} ${args.join(' ')}\n`);
 
     // Show progress
     vscode.window.withProgress({
@@ -77,33 +77,10 @@ async function buildContainer(push: boolean) {
         cancellable: false
     }, async (progress) => {
         return new Promise<void>((resolve, reject) => {
-            const proc = child_process.exec(
-                command,
-                { cwd: workspaceFolder.uri.fsPath },
-                (error, stdout, stderr) => {
-                    if (error) {
-                        outputChannel.appendLine(`\nError: ${error.message}`);
-                        vscode.window.showErrorMessage(`Build failed: ${error.message}`);
-                        reject(error);
-                        return;
-                    }
-                    
-                    if (stdout) {
-                        outputChannel.appendLine(stdout);
-                    }
-                    
-                    if (stderr) {
-                        outputChannel.appendLine(stderr);
-                    }
-                    
-                    const successMsg = push 
-                        ? `Container built and pushed: ${tag}`
-                        : `Container built: ${tag}`;
-                    
-                    outputChannel.appendLine(`\n✓ ${successMsg}`);
-                    vscode.window.showInformationMessage(successMsg);
-                    resolve();
-                }
+            const proc = child_process.spawn(
+                pythonPath,
+                args,
+                { cwd: workspaceFolder.uri.fsPath }
             );
 
             proc.stdout?.on('data', (data) => {
@@ -112,6 +89,30 @@ async function buildContainer(push: boolean) {
 
             proc.stderr?.on('data', (data) => {
                 outputChannel.append(data.toString());
+            });
+
+            proc.on('error', (error) => {
+                outputChannel.appendLine(`\nError: ${error.message}`);
+                vscode.window.showErrorMessage(`Build failed: ${error.message}`);
+                reject(error);
+            });
+
+            proc.on('close', (code) => {
+                if (code !== 0) {
+                    const errorMsg = `Build failed with exit code ${code}`;
+                    outputChannel.appendLine(`\n${errorMsg}`);
+                    vscode.window.showErrorMessage(errorMsg);
+                    reject(new Error(errorMsg));
+                    return;
+                }
+                
+                const successMsg = push 
+                    ? `Container built and pushed: ${tag}`
+                    : `Container built: ${tag}`;
+                
+                outputChannel.appendLine(`\n✓ ${successMsg}`);
+                vscode.window.showInformationMessage(successMsg);
+                resolve();
             });
         });
     });
@@ -170,27 +171,43 @@ async function checkPycontainerInstalled() {
     const pythonPath = config.get('pythonPath', 'python');
     const autoInstall = config.get('autoInstall', true);
 
-    child_process.exec(
-        `${pythonPath} -m pycontainer --help`,
-        (error) => {
-            if (error) {
-                const message = 'pycontainer-build is not installed';
-                
-                if (autoInstall) {
-                    vscode.window.showWarningMessage(
-                        message + '. Install now?',
-                        'Yes', 'No'
-                    ).then(answer => {
-                        if (answer === 'Yes') {
-                            installPycontainer(pythonPath);
-                        }
-                    });
-                } else {
-                    vscode.window.showWarningMessage(message);
+    const proc = child_process.spawn(pythonPath, ['-m', 'pycontainer', '--help']);
+    
+    proc.on('error', () => {
+        const message = 'pycontainer-build is not installed';
+        
+        if (autoInstall) {
+            vscode.window.showWarningMessage(
+                message + '. Install now?',
+                'Yes', 'No'
+            ).then(answer => {
+                if (answer === 'Yes') {
+                    installPycontainer(pythonPath);
                 }
+            });
+        } else {
+            vscode.window.showWarningMessage(message);
+        }
+    });
+
+    proc.on('close', (code) => {
+        if (code !== 0) {
+            const message = 'pycontainer-build is not installed';
+            
+            if (autoInstall) {
+                vscode.window.showWarningMessage(
+                    message + '. Install now?',
+                    'Yes', 'No'
+                ).then(answer => {
+                    if (answer === 'Yes') {
+                        installPycontainer(pythonPath);
+                    }
+                });
+            } else {
+                vscode.window.showWarningMessage(message);
             }
         }
-    );
+    });
 }
 
 function installPycontainer(pythonPath: string) {
@@ -204,27 +221,36 @@ function installPycontainer(pythonPath: string) {
         cancellable: false
     }, async () => {
         return new Promise<void>((resolve, reject) => {
-            const proc = child_process.exec(
-                `${pythonPath} -m pip install pycontainer-build`,
-                (error, stdout, stderr) => {
-                    if (error) {
-                        outputChannel.appendLine(`Error: ${error.message}`);
-                        vscode.window.showErrorMessage(`Installation failed: ${error.message}`);
-                        reject(error);
-                        return;
-                    }
-                    
-                    if (stdout) {
-                        outputChannel.appendLine(stdout);
-                    }
-                    
-                    outputChannel.appendLine('\n✓ pycontainer-build installed successfully');
-                    vscode.window.showInformationMessage('pycontainer-build installed successfully');
-                    resolve();
-                }
-            );
+            const args = ['-m', 'pip', 'install', 'pycontainer-build'];
+            const proc = child_process.spawn(pythonPath, args);
 
-            // Removed duplicate stream handlers for stdout and stderr
+            proc.stdout?.on('data', (data) => {
+                outputChannel.append(data.toString());
+            });
+
+            proc.stderr?.on('data', (data) => {
+                outputChannel.append(data.toString());
+            });
+
+            proc.on('error', (error) => {
+                outputChannel.appendLine(`Error: ${error.message}`);
+                vscode.window.showErrorMessage(`Installation failed: ${error.message}`);
+                reject(error);
+            });
+
+            proc.on('close', (code) => {
+                if (code !== 0) {
+                    const errorMsg = `Installation failed with exit code ${code}`;
+                    outputChannel.appendLine(`\n${errorMsg}`);
+                    vscode.window.showErrorMessage(errorMsg);
+                    reject(new Error(errorMsg));
+                    return;
+                }
+                
+                outputChannel.appendLine('\n✓ pycontainer-build installed successfully');
+                vscode.window.showInformationMessage('pycontainer-build installed successfully');
+                resolve();
+            });
         });
     });
 }

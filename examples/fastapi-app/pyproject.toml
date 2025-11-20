@@ -17,6 +17,10 @@ start = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+# Note: Both Poetry and Hatch configurations are included to demonstrate
+# that pycontainer-build can be used with either tool. In a real project,
+# you would typically only include the section for the tool you're using.
+
 # Poetry plugin configuration
 [tool.pycontainer]
 tag = "fastapi-demo:latest"

@@ -4,7 +4,6 @@
   "description": "Build OCI container images from Python projects without Docker",
   "version": "0.1.0",
   "publisher": "pycontainer",
-  "icon": "icon.png",
   "engines": {
     "vscode": "^1.80.0"
   },

@@ -41,5 +41,5 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.poetry.plugins."poetry.application.plugin"]
+[project.entry-points."poetry.application.plugin"]
 pycontainer = "poetry_pycontainer.plugin:PycontainerPlugin"
