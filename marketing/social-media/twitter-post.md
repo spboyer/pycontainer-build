@@ -6,9 +6,9 @@
 
 No Docker daemon. No Dockerfile. Just pure Python APIs.
 
-Inspired by .NET's container tooling—auto-detects Python version, deps & entrypoints.
+Inspired by .NET—auto-detects Python version, deps & entrypoints.
 
-Try it out & drop feedback in issues! 🚀
+Try it out & share feedback! 🚀
 
 🔗 https://github.com/spboyer/pycontainer-build
 
