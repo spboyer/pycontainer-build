@@ -469,9 +469,17 @@ This style is intentional for the experimental phase.
 
 ## 📚 Resources
 
-- **OCI Image Spec**: https://github.com/opencontainers/image-spec
-- **Docker Registry v2 API**: https://docs.docker.com/registry/spec/api/
-- **.NET Native Containers**: https://devblogs.microsoft.com/dotnet/announcing-builtin-container-support-for-the-dotnet-sdk/
+### Documentation
+
+- **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
+- **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
+- **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+
+### External References
+
+- **OCI Image Spec**: [opencontainers/image-spec](https://github.com/opencontainers/image-spec)
+- **Docker Registry v2 API**: [Docker Registry HTTP API V2](https://docs.docker.com/registry/spec/api/)
+- **.NET Native Containers**: [Announcing built-in container support](https://devblogs.microsoft.com/dotnet/announcing-builtin-container-support-for-the-dotnet-sdk/)
 - **Project Tracking**: See `IMPLEMENTATION_PLAN.md` for detailed roadmap
 
 ---
@@ -485,10 +493,11 @@ MIT License - See [LICENSE](LICENSE) for details
 ## 🙏 Acknowledgments
 
 Inspired by:
+
 - [.NET SDK's native container support](https://github.com/dotnet/sdk-container-builds)
 - [Jib (Java)](https://github.com/GoogleContainerTools/jib) — Daemonless container builds
 - [ko (Go)](https://github.com/ko-build/ko) — Simple container images for Go
 
 ---
 
-**Built with ❤️ by the Microsoft Python & Azure tooling teams**
+Built with ❤️ by the Microsoft Python & Azure tooling teams
