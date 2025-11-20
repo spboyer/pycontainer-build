@@ -6,6 +6,7 @@ This directory contains ready-to-use social media posts and guidelines for annou
 
 - **`linkedin-post.md`** - Professional LinkedIn announcement post with posting tips
 - **`twitter-post.md`** - Concise X/Twitter post with alternative versions and threading strategy
+- **`devto-blog-post.md`** - Comprehensive dev.to blog post with technical depth and examples
 - **`launch-guide.md`** - Comprehensive guide for scheduling, publishing, and monitoring posts
 - **`CHECKLIST.md`** - Launch execution checklist for tracking progress through the campaign
 

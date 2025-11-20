@@ -6,9 +6,11 @@ Use this checklist to track your progress through the launch process.
 
 - [ ] Review and customize LinkedIn post (`linkedin-post.md`)
 - [ ] Review and customize X/Twitter post (`twitter-post.md`)
+- [ ] Review and customize dev.to blog post (`devto-blog-post.md`)
 - [ ] Create visual assets:
   - [ ] Terminal screenshot of `pycontainer build` command
   - [ ] Workflow comparison diagram (Docker vs pycontainer)
+  - [ ] Cover image for dev.to (1000x420px recommended)
   - [ ] Optional: Demo GIF or video
 - [ ] Test pycontainer-build yourself to ensure it works
 - [ ] Update repository README if needed
@@ -66,11 +68,16 @@ Use this checklist to track your progress through the launch process.
   - LinkedIn: ___ likes, ___ comments, ___ shares
   - Twitter: ___ likes, ___ retweets, ___ replies
   - GitHub: ___ stars, ___ forks, ___ issues
-- [ ] Consider cross-posting to communities:
+- [ ] Publish dev.to blog post
+  - [ ] Add cover image
+  - [ ] Set published: true in metadata
+  - [ ] Share link on LinkedIn and Twitter
+  - [ ] Engage with comments
+- [ ] Consider cross-posting to other communities:
   - [ ] Reddit (r/Python, r/devops)
-  - [ ] Dev.to blog post
   - [ ] Hacker News (Show HN)
   - [ ] Python Discord
+  - [ ] Medium/Hashnode (cross-post from dev.to)
   - [ ] Relevant forums
 
 ## Week 2

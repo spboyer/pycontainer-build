@@ -70,6 +70,34 @@ This guide covers scheduling, publishing, and monitoring social media posts for 
 - Use Twitter's native scheduling feature for follow-ups
 - Avoid posting duplicate content immediately after LinkedIn (space by 2-4 hours)
 
+### Dev.to
+
+1. **Log in** to your dev.to account (or create one at https://dev.to)
+2. **Click** "Write a post" button
+3. **Copy** content from `devto-blog-post.md`
+4. **Update metadata** at the top:
+   - Set `published: true` when ready to publish
+   - Add `cover_image` URL if you have one
+   - Verify tags are correct (max 4 tags)
+5. **Preview** the post to ensure formatting is correct
+6. **Add images** or code screenshots if available
+7. **Click** "Publish" when ready
+8. **Share** the published article link on LinkedIn and Twitter
+
+**Pro Tips:**
+- Upload cover image first, then add URL to metadata
+- Use code blocks with syntax highlighting (\`\`\`python)
+- Add discussion questions at the end to encourage engagement
+- Cross-post to Medium or Hashnode using canonical URL
+- Respond to all comments within 24 hours
+- Edit post to add updates as project evolves
+- Consider adding to a series if you write more Python content
+
+**Best Publishing Time:**
+- Monday-Wednesday mornings (8-10 AM EST)
+- Avoid Fridays (lower engagement)
+- Check dev.to trending page to avoid competing with major posts
+
 ## Community Posting
 
 After initial announcement, share to relevant communities:
@@ -81,8 +109,13 @@ After initial announcement, share to relevant communities:
 - Use "Show and Tell" or "Project" flair where applicable
 
 ### Dev.to
-- Write a blog post expanding on the concept
+- Publish the prepared blog post from `devto-blog-post.md`
+- Add cover image (1000x420px recommended)
+- Set `published: true` in front matter
+- Use tags: python, docker, devops, opensource
 - Cross-link to GitHub repo
+- Engage with comments within 24 hours
+- Share article on LinkedIn and Twitter once published
 
 ### Hacker News
 - Post as "Show HN: pycontainer-build - Docker-free OCI images for Python"
