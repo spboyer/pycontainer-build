@@ -3,7 +3,7 @@ name = "pycontainer-build"
 version = "0.1.0"
 description = "Experimental .NET-style native OCI image builder for Python projects (no Docker daemon, no Dockerfile)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
   { name = "pycontainer contributors" }
 ]
