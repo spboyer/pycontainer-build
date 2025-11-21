@@ -31,8 +31,14 @@ This mirrors the elegant developer experience that .NET provides with its SDK's 
 ### Installation
 
 ```bash
-# Install from source (PyPI package coming soon)
+# Using pip
 pip install -e .
+
+# Using uv (faster)
+uv pip install -e .
+
+# Or run directly with uvx (no install needed)
+uvx --from git+https://github.com/spboyer/pycontainer-build pycontainer build --tag myapp:latest
 ```
 
 ### Build Your First Image
