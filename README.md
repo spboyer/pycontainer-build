@@ -81,6 +81,45 @@ dist/image/
       └── <tag-name>              # Tag reference
 ```
 
+### Testing Locally
+
+**Important**: `pycontainer` creates OCI-compliant image layouts, not Docker-specific images. To test locally:
+
+#### Option 1: Use Skopeo (Recommended)
+
+```bash
+# Install skopeo
+brew install skopeo  # macOS
+# OR: sudo apt-get install skopeo  (Ubuntu)
+
+# Copy OCI layout to Docker
+skopeo copy oci:dist/image docker-daemon:myapp:latest
+docker run -p 8000:8000 myapp:latest
+```
+
+#### Option 2: Use Podman (Native OCI Support)
+
+```bash
+# Install Podman
+brew install podman  # macOS
+
+# Run directly from OCI layout
+podman run --rm -p 8000:8000 oci:dist/image:myapp
+```
+
+#### Option 3: Push to Registry (Production)
+
+```bash
+# Build and push (works with any container runtime)
+pycontainer build --tag ghcr.io/user/myapp:latest --push
+
+# Pull and run with Docker or Podman
+docker pull ghcr.io/user/myapp:latest
+docker run -p 8000:8000 ghcr.io/user/myapp:latest
+```
+
+**See [Local Development Guide](docs/local-development.md) for detailed testing instructions.**
+
 ---
 
 ## ✨ Features
@@ -464,7 +503,14 @@ version = "0.1.0"
 EOF
 
 # Build it
-pycontainer build --tag test:latest
+pycontainer build --tag test:latest --verbose
+
+# Test with skopeo + Docker
+skopeo copy oci:dist/image docker-daemon:test:latest
+docker run test:latest
+
+# Or test with Podman (native OCI support)
+podman run oci:dist/image:test
 ```
 
 ### Code Style
