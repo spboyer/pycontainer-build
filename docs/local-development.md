@@ -122,19 +122,77 @@ This shows:
 
 ## 🧪 Testing Your Builds
 
-### Option 1: Use Docker for Testing
+> **Important**: `pycontainer` creates OCI-compliant image layouts in `dist/image/`. These are not directly runnable by Docker without importing. See the options below for testing your built images.
 
-The easiest way to test locally-built images is with Docker:
+### Option 1: Use Skopeo (Recommended for OCI Layouts)
+
+**Skopeo** is the proper tool for working with OCI image layouts and can copy them directly to Docker:
+
+```bash
+# Install skopeo
+# macOS:
+brew install skopeo
+
+# Ubuntu/Debian:
+sudo apt-get install skopeo
+
+# Fedora/RHEL:
+sudo dnf install skopeo
+
+# 1. Build the image with pycontainer
+pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+
+# 2. Copy the OCI layout to Docker daemon
+skopeo copy oci:dist/image docker-daemon:myapp:latest
+
+# 3. Run the container
+docker run -p 8000:8000 myapp:latest
+
+# Alternative: Copy to a registry
+skopeo copy oci:dist/image docker://localhost:5000/myapp:latest
+```
+
+### Option 2: Use Podman (Native OCI Support)
+
+**Podman** natively supports OCI layouts without conversion:
+
+```bash
+# Install Podman
+# macOS:
+brew install podman
+podman machine init
+podman machine start
+
+# Ubuntu/Debian:
+sudo apt-get install podman
+
+# Fedora/RHEL (included by default):
+sudo dnf install podman
+
+# 1. Build with pycontainer
+pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+
+# 2. Run directly from the OCI layout
+podman run --rm -p 8000:8000 oci:dist/image:myapp
+
+# Or import into Podman's local storage
+skopeo copy oci:dist/image containers-storage:localhost/myapp:latest
+podman run -p 8000:8000 localhost/myapp:latest
+```
+
+### Option 3: Use Docker with Manual Import
+
+If you only have Docker and can't install skopeo:
 
 ```bash
 # 1. Build the image with pycontainer
 pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
 
-# 2. Import into Docker (loads the OCI layout)
-docker load -i <(tar -C dist/image -cf - .)
+# 2. Create a tar archive and import (less efficient)
+tar -C dist/image -czf - . | docker import - myapp:latest
 
-# Alternative: Use crane to copy to local Docker daemon
-crane copy dist/image docker-daemon:myapp:latest
+# Note: This creates a single-layer image and loses metadata
+# For proper testing, use skopeo (Option 1) instead
 
 # 3. Run the container
 docker run -p 8000:8000 myapp:latest
@@ -153,13 +211,15 @@ podman load -i <(tar -C dist/image -cf - .)
 podman run -p 8000:8000 myapp:latest
 ```
 
-### Option 3: Push to Local Registry
+### Option 4: Push to Local Registry
 
-Run a local registry for testing:
+Run a local registry for testing across tools:
 
 ```bash
-# Start a local registry (Docker required for this step)
+# Start a local registry (Docker or Podman required)
 docker run -d -p 5000:5000 --name registry registry:2
+# OR
+podman run -d -p 5000:5000 --name registry docker.io/library/registry:2
 
 # Build and push to local registry
 pycontainer build \
@@ -172,11 +232,17 @@ pycontainer build \
 docker pull localhost:5000/myapp:latest
 docker run -p 8000:8000 localhost:5000/myapp:latest
 
+# Or with Podman:
+podman pull localhost:5000/myapp:latest
+podman run -p 8000:8000 localhost:5000/myapp:latest
+
 # Clean up when done
 docker stop registry && docker rm registry
+# OR
+podman stop registry && podman rm registry
 ```
 
-### Option 4: Test Without Docker
+### Option 5: Test Without Containers
 
 For pure Python testing (no container runtime needed):
 
@@ -186,6 +252,31 @@ cd /path/to/your/app
 pip install -r requirements.txt
 python -m app  # or uvicorn app.main:app, etc.
 ```
+
+---
+
+## 🐳 Understanding OCI vs Docker Images
+
+**Key Concept**: `pycontainer` creates **OCI image layouts**, not Docker-specific images.
+
+| Format | What is it? | Tools that understand it |
+|--------|-------------|--------------------------|
+| **OCI Layout** | Standard directory structure (`dist/image/`) | Podman, skopeo, buildah, containerd |
+| **Docker Image** | Docker daemon's internal format | Docker only |
+| **Docker Archive** | Tar file with Docker-specific metadata | Docker only |
+| **OCI Tarball** | Tar file with OCI layout | Most tools |
+
+**Why this matters:**
+
+- Docker requires importing/converting OCI layouts before use
+- Podman can use OCI layouts directly
+- Skopeo is the bridge between OCI and Docker formats
+
+**Best practices:**
+
+- **Local testing**: Use Podman or skopeo for native OCI support
+- **CI/CD**: Push to a registry; most tools pull from registries seamlessly
+- **Production**: Always use registries (GHCR, ACR, Docker Hub, etc.)
 
 ---
 
