@@ -185,6 +185,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .cache import LayerCache
+from .remote_cache import RemoteCache, files_cache_key
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -244,6 +245,11 @@ class ImageBuilder:
             self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
         else:
             self.cache=None
+        self.remote_cache=(
+            None
+            if self.dry_run
+            else RemoteCache.from_specs(config.cache_from, config.cache_to)
+        )
 
     def build(self):
         if self.dry_run:
@@ -252,7 +258,10 @@ class ImageBuilder:
             return self.config.tag
 
         with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+            result=self._build_image()
+            if self.remote_cache:
+                self.remote_cache.export()
+            return result
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -696,6 +705,7 @@ class ImageBuilder:
                             f"Cached layer hashes to {actual_digest}, not {digest}."
                         )
                     _publish_content_addressed(tmp, final, digest, size)
+                    self._record_remote(files, digest, size, final)
                     return OCILayer(
                         "application/vnd.oci.image.layer.v1.tar",
                         digest,
@@ -704,6 +714,10 @@ class ImageBuilder:
                     )
                 finally:
                     tmp.unlink(missing_ok=True)
+
+        imported=self._import_remote_layer(files, layers_dir)
+        if imported:
+            return imported
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
@@ -737,9 +751,47 @@ class ImageBuilder:
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
                 )
+            self._record_remote(files, digest, size, final)
 
             return OCILayer(
                 "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
             )
         finally:
             tmp.unlink(missing_ok=True)
+
+    def _record_remote(self, files, digest, size, path):
+        if self.remote_cache:
+            self.remote_cache.record(
+                files_cache_key(files, self.config.workdir, self.config.reproducible),
+                digest,
+                size,
+                path,
+            )
+
+    def _import_remote_layer(self, files, layers_dir):
+        """Return a digest-verified layer from --cache-from, or None on a miss."""
+        if not (self.remote_cache and self.remote_cache.sources):
+            return None
+        key=files_cache_key(files, self.config.workdir, self.config.reproducible)
+        found=self.remote_cache.import_layer(key, layers_dir)
+        if not found:
+            return None
+        digest, size, staged=found
+        final=layers_dir/digest.split(":",1)[1]
+        try:
+            _publish_content_addressed(staged, final, digest, size)
+        finally:
+            staged.unlink(missing_ok=True)
+        if self.cache:
+            self.cache.store_layer(
+                files,
+                digest,
+                final,
+                workdir=self.config.workdir,
+                reproducible=self.config.reproducible,
+            )
+        self.remote_cache.record(key, digest, size, final)
+        logger.info("Remote cache hit: %s", digest)
+        return OCILayer(
+            "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
+        )

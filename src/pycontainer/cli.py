@@ -23,6 +23,8 @@ def main():
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
+    b.add_argument("--cache-from",dest="cache_from",action="append",help="Import cached layers (repeatable): type=registry,ref=REF[,scope=NAME] or type=local,src=DIR[,scope=NAME]")
+    b.add_argument("--cache-to",dest="cache_to",action="append",help="Export cached layers (repeatable): type=registry,ref=REF[,scope=NAME] or type=local,dest=DIR[,scope=NAME]")
     b.add_argument(
         "--include-deps",
         action="store_true",
@@ -59,6 +61,8 @@ def main():
         'exclude_defaults': args.exclude_defaults,
         'use_cache': args.use_cache,
         'cache_dir': args.cache_dir,
+        'cache_from': args.cache_from,
+        'cache_to': args.cache_to,
         'include_deps': args.include_deps,
         'requirements_file': args.requirements_file,
         'verbose': args.verbose,

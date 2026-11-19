@@ -20,6 +20,8 @@ class BuildConfig:
     use_cache: bool = True
     cache_dir: Optional[str] = None
     max_cache_size_mb: int = 5000
+    cache_from: Optional[List[str]] = None
+    cache_to: Optional[List[str]] = None
     labels: Optional[Dict[str, str]] = None
     user: Optional[str] = None
     cmd: Optional[List[str]] = None
