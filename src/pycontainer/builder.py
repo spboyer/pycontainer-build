@@ -1,4 +1,4 @@
-import hashlib, json, tarfile, shutil, tempfile, logging
+import hashlib, json, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -23,12 +23,18 @@ logger=logging.getLogger(__name__)
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
         self.config=apply_framework_defaults(config, Path(config.context_dir))
-        self.cache=LayerCache(
-            cache_dir=Path(config.cache_dir) if config.cache_dir else None,
-            max_size_mb=config.max_cache_size_mb
-        ) if config.use_cache else None
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
+        if config.use_cache and not self.dry_run:
+            default_cache_dir=Path.home()/".pycontainer"/"cache"
+            cache_dir=(
+                Path(config.cache_dir).expanduser()
+                if config.cache_dir
+                else default_cache_dir
+            )
+            self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
+        else:
+            self.cache=None
 
     def build(self):
         if self.dry_run:
@@ -204,12 +210,15 @@ class ImageBuilder:
         files=list(iter_files(ctx, include_paths))
         
         if self.cache:
-            cached=self.cache.get_layer(files)
+            cached=self.cache.get_layer(
+                files,
+                workdir=self.config.workdir,
+                reproducible=self.config.reproducible,
+            )
             if cached:
                 digest, cache_path=cached
                 final=layers_dir/digest.split(":",1)[1]
-                if not final.exists():
-                    shutil.copy2(cache_path, final)
+                self.cache.copy_verified_blob(cache_path, final, digest)
                 return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,cache_path.stat().st_size,str(final))
         
         tmp=layers_dir/'app-layer.tar'
@@ -238,6 +247,12 @@ class ImageBuilder:
         tmp.rename(final)
         
         if self.cache:
-            self.cache.store_layer(files, digest, final)
+            self.cache.store_layer(
+                files,
+                digest,
+                final,
+                workdir=self.config.workdir,
+                reproducible=self.config.reproducible,
+            )
         
         return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,len(data),str(final))

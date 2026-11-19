@@ -408,8 +408,8 @@ time pycontainer build --tag myapp:v1 --base-image python:3.11-slim --include-de
 # Second build (warm cache - should be faster)
 time pycontainer build --tag myapp:v2 --base-image python:3.11-slim --include-deps
 
-# Check cache usage
-ls -lh ~/.pycontainer/cache/layers/
+# Check cached blobs
+ls -lh ~/.pycontainer/cache/blobs/sha256/
 
 # Force rebuild without cache
 pycontainer build --tag myapp:v3 --base-image python:3.11-slim --include-deps --no-cache

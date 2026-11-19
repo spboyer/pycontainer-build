@@ -78,9 +78,9 @@ def _measure_worker(spec):
     cache_hits = {"lookups": 0, "hits": 0}
     original_get_layer = LayerCache.get_layer
 
-    def tracked_get_layer(cache, files):
+    def tracked_get_layer(cache, files, **kwargs):
         cache_hits["lookups"] += 1
-        layer = original_get_layer(cache, files)
+        layer = original_get_layer(cache, files, **kwargs)
         cache_hits["hits"] += layer is not None
         return layer
 
