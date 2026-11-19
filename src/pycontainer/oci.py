@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
@@ -34,10 +35,10 @@ class OCIIndex:
         if self.annotations: idx["annotations"]=self.annotations
         return idx
 
-def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None):
+def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None):
     """Build OCI config, optionally merging with base image config."""
     if base_config:
-        cfg=base_config.copy()
+        cfg=deepcopy(base_config)
         base_env={kv.split('=',1)[0]:kv.split('=',1)[1] for kv in base_config.get('config',{}).get('Env',[]) if '=' in kv}
         merged_env={**base_env, **env}
         cfg['config']['Env']=[f"{k}={v}" for k,v in merged_env.items()]
@@ -65,6 +66,9 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         if labels: cfg['config']['Labels']=labels
         if user: cfg['config']['User']=user
         if cmd: cfg['config']['Cmd']=cmd
+    rootfs=cfg.setdefault("rootfs", {})
+    rootfs["type"]=rootfs.get("type", "layers")
+    rootfs["diff_ids"]=[*rootfs.get("diff_ids", []), *(layer_diff_ids or [])]
     if exposed_ports:
         cfg["config"]["ExposedPorts"]={f"{p}/tcp":{} for p in exposed_ports}
     return cfg
