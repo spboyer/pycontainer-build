@@ -1,24 +1,176 @@
 import errno
+import fnmatch
 import hashlib
 import os
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+
+DEFAULT_CONTEXT_EXCLUDES = (
+    "**/.git",
+    "**/.hg",
+    "**/.svn",
+    "**/.venv",
+    "**/venv",
+    "**/env",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.mypy_cache",
+    "**/.ruff_cache",
+    "**/.tox",
+    "**/.nox",
+    "**/.pycontainer",
+    "**/.cache",
+    "**/.hypothesis",
+    "**/build",
+    "**/dist",
+    "**/tests",
+    "**/test",
+    "**/fixtures",
+    "setup.py",
+    "**/test.py",
+    "**/test_*.py",
+    "**/*_test.py",
+)
+VIRTUALENV_EXCLUDES = ("**/.venv", "**/venv", "**/env")
 
 
 def ensure_dir(path):
     p=Path(path); p.mkdir(parents=True, exist_ok=True); return p
 
 
-def iter_files(base, relative_paths):
-    for rel in relative_paths:
-        abs_path = base/rel
-        if abs_path.is_dir():
-            for child in abs_path.rglob("*"):
-                if child.is_file():
-                    yield child, child.relative_to(base)
-        elif abs_path.is_file():
-            yield abs_path, abs_path.relative_to(base)
+def relative_context_path(path):
+    normalized = str(path).replace("\\", "/").removeprefix("./").rstrip("/")
+    relative = Path(normalized or ".")
+    windows_path = PureWindowsPath(normalized)
+    if (
+        relative.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+        or ".." in relative.parts
+    ):
+        raise ValueError(f"Context paths must be relative and stay inside the context: {path!r}")
+    return relative
+
+
+def _glob_matches(path_parts, pattern_parts):
+    if not pattern_parts:
+        return not path_parts
+    if pattern_parts[0] == "**":
+        return _glob_matches(path_parts, pattern_parts[1:]) or (
+            bool(path_parts) and _glob_matches(path_parts[1:], pattern_parts)
+        )
+    return bool(path_parts) and fnmatch.fnmatchcase(
+        path_parts[0], pattern_parts[0]
+    ) and _glob_matches(path_parts[1:], pattern_parts[1:])
+
+
+def path_is_excluded(relative_path, excludes):
+    parts = Path(relative_path).as_posix().split("/")
+    for exclude in excludes:
+        pattern = str(exclude).replace("\\", "/").removeprefix("./").rstrip("/")
+        if not pattern:
+            continue
+        if pattern == ".":
+            return True
+        has_glob = any(character in pattern for character in "*?[")
+        if pattern.startswith("**/") and pattern.count("/") == 1:
+            component_pattern = pattern[3:]
+            if any(character in component_pattern for character in "*?["):
+                if any(
+                    fnmatch.fnmatchcase(part, component_pattern) for part in parts
+                ):
+                    return True
+            elif component_pattern in parts:
+                return True
+            continue
+        if has_glob and "/" not in pattern and any(
+            fnmatch.fnmatchcase(part, pattern) for part in parts
+        ):
+            return True
+        pattern_parts = pattern.split("/")
+        for end in range(1, len(parts) + 1):
+            candidate_parts = parts[:end]
+            if has_glob:
+                if _glob_matches(candidate_parts, pattern_parts):
+                    return True
+            elif candidate_parts[: len(pattern_parts)] == pattern_parts:
+                return True
+    return False
+
+
+def _raise_walk_error(error):
+    raise error
+
+
+def context_exclude_paths(
+    context_dir,
+    *,
+    output_dir=None,
+    cache_dir=None,
+    exclude_paths=(),
+    exclude_defaults=True,
+):
+    """Return root-relative paths and patterns excluded from context scans."""
+    excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
+    context = Path(os.path.abspath(context_dir))
+    for generated_path in (output_dir, cache_dir):
+        if generated_path is None:
+            continue
+        absolute_path = Path(os.path.abspath(generated_path))
+        try:
+            excludes.append(absolute_path.relative_to(context).as_posix())
+        except ValueError:
+            continue
+
+    for path in exclude_paths:
+        excludes.append(relative_context_path(path).as_posix())
+    return tuple(dict.fromkeys(excludes))
+
+
+def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=True):
+    """Yield unique context files, pruning excluded directories during traversal."""
+    base = Path(base)
+    excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
+    if exclude_paths is not None:
+        excludes.extend(exclude_paths)
+
+    seen = set()
+    for relative_path in relative_paths:
+        relative = relative_context_path(relative_path)
+        absolute = base / relative
+        if absolute.is_dir():
+            for root, directories, filenames in os.walk(
+                absolute, topdown=True, onerror=_raise_walk_error
+            ):
+                root_path = Path(root)
+                root_relative = root_path.relative_to(base)
+                directories[:] = sorted(
+                    directory
+                    for directory in directories
+                    if not path_is_excluded(root_relative / directory, excludes)
+                )
+                for filename in sorted(filenames):
+                    child = root_path / filename
+                    child_relative = child.relative_to(base)
+                    relative_name = child_relative.as_posix()
+                    if (
+                        child.is_file()
+                        and relative_name not in seen
+                        and not path_is_excluded(child_relative, excludes)
+                    ):
+                        seen.add(relative_name)
+                        yield child, child_relative
+        elif absolute.is_file():
+            child_relative = absolute.relative_to(base)
+            relative_name = child_relative.as_posix()
+            if (
+                relative_name not in seen
+                and not path_is_excluded(child_relative, excludes)
+            ):
+                seen.add(relative_name)
+                yield absolute, child_relative
 
 
 @contextmanager

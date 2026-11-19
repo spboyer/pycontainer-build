@@ -1,7 +1,7 @@
 # Maintenance execution plan
 
 Observed: **2026-11-19**. Baseline: `628f623`.
-Status: #68-#72 merged; #67 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
+Status: #67-#72 merged; #73 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
 Evidence and methods: [performance audit/design](2026-11-19-performance-maintenance-design.md).
 
 ## Outcomes and delivery rules
@@ -26,7 +26,7 @@ The audit documentation PR closes only #80, not any implementation issues.
 | Local cache identity, activation and atomic index handling | #70 | #68 | Merged in PR #84; local tests, four-platform CI, package smoke and post-merge workflow passed. |
 | Preserve configuration-file values | #71 | #68 | Merged in PR #85; CLI tests verify omitted settings, explicit overrides and invalid config diagnostics. |
 | Atomic repeat-build publication on Windows | #72 | #68 | Merged in PR #86; same-output rebuilds, interruption and ownership tests passed across the four-platform CI matrix. |
-| Basic credentials versus bearer tokens | Existing #67 | None; use #68 gate before merge | CLI/environment/Docker-config flows preserve username/password, challenge exchange works with synthetic HTTP fixtures, credentials not logged. |
+| Basic credentials versus bearer tokens | Existing #67 | None; use #68 gate before merge | Merged in PR #87; CLI/environment/Docker-config flows preserve username/password, challenge exchange works with synthetic HTTP fixtures, and credentials are not logged. |
 
 CI is a verification prerequisite for merging changes, not a reason to block
 writing regressions or investigating the independent P0 defects.

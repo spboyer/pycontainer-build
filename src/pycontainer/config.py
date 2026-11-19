@@ -11,6 +11,8 @@ class BuildConfig:
     env: Dict[str, str] = field(default_factory=dict)
     exposed_ports: List[int] = field(default_factory=list)
     include_paths: Optional[List[str]] = None
+    exclude_paths: List[str] = field(default_factory=list)
+    exclude_defaults: bool = True
     output_dir: str = "dist/image"
     use_cache: bool = True
     cache_dir: Optional[str] = None
