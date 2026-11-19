@@ -16,6 +16,8 @@ daemon without discussing the trade-off first.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
+- `integrations/aspire/`: experimental C# Aspire hosting adapter; validate with
+  `dotnet test integrations/aspire/tests/PyContainer.Aspire.Hosting.Tests`.
 - `tests/`: actual pytest suite; `docs/TESTING.md` describes an aspirational
   strategy, including directories and tooling that do not yet exist.
 

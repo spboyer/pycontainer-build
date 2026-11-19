@@ -270,6 +270,19 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Aspire
+
+Experimental: build and push Aspire Python app images without Docker or Podman during
+`aspire publish`, `aspire deploy` and `aspire do`. Local `aspire run` is unchanged.
+
+```csharp
+builder.AddUvicornApp("api", "../api", "main:app")
+    .WithUv()
+    .WithPyContainerBuild();
+```
+
+[See full documentation →](integrations/aspire/)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>Aspire.Hosting</RootNamespace>
+    <PackageId>PyContainer.Aspire.Hosting</PackageId>
+    <Description>Publishes Aspire Python resources as OCI images with pycontainer-build, without Docker or Podman.</Description>
+    <PackageTags>aspire;python;oci;container;pycontainer</PackageTags>
+    <!-- Pipeline and container-registry APIs are marked experimental in Aspire 13.x. -->
+    <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIREPIPELINES003;ASPIRECOMPUTE003</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Python" Version="13.6.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PyContainer.Aspire.Hosting.Tests" />
+  </ItemGroup>
+
+</Project>
