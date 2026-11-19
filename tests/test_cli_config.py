@@ -28,6 +28,7 @@ def _capture_config(monkeypatch, argv):
 
 def test_cli_preserves_config_values_when_options_are_omitted(tmp_path, monkeypatch):
     context = tmp_path / "configured-context"
+    context_value = context.as_posix()
     config_path = tmp_path / "pycontainer.toml"
     logging_levels = []
     monkeypatch.setattr(
@@ -38,7 +39,7 @@ def test_cli_preserves_config_values_when_options_are_omitted(tmp_path, monkeypa
     config_path.write_text(
         f"""
 [build]
-context-dir = "{context}"
+context-dir = "{context_value}"
 platform = "linux/arm64"
 include-deps = true
 requirements-file = "requirements-prod.txt"
@@ -52,7 +53,7 @@ generate-sbom = true
         monkeypatch, ["build", "--config", str(config_path)]
     )
 
-    assert config.context_dir == str(context)
+    assert config.context_dir == context_value
     assert config.platform == "linux/arm64"
     assert config.include_deps is True
     assert config.requirements_file == "requirements-prod.txt"
