@@ -127,6 +127,56 @@ def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     assert config.generate_sbom is False
 
 
+def test_cli_forwards_basic_credentials_without_logging_them(monkeypatch, capsys):
+    pushed = []
+
+    class FakeImageBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            return "layout"
+
+        def push(self, **kwargs):
+            pushed.append(kwargs)
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.11")
+    _run_cli(
+        monkeypatch,
+        [
+            "build",
+            "--push",
+            "--username",
+            "registry-user",
+            "--password",
+            "registry-password",
+        ],
+    )
+
+    assert pushed == [
+        {
+            "registry_url": None,
+            "username": "registry-user",
+            "password": "registry-password",
+            "show_progress": True,
+        }
+    ]
+    assert "registry-password" not in capsys.readouterr().out
+
+
+def test_cli_rejects_username_without_password_or_password_environment(
+    monkeypatch, capsys
+):
+    monkeypatch.delenv("REGISTRY_PASSWORD", raising=False)
+
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--push", "--username", "registry-user"])
+
+    assert error.value.code == 2
+    assert "--username requires --password or REGISTRY_PASSWORD" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("setting", "value", "message"),
     [

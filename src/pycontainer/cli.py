@@ -29,6 +29,11 @@ def main():
     b.add_argument("--sbom",dest="generate_sbom",action="store_true",default=None,help="Generate SBOM (Software Bill of Materials)")
     args=parser.parse_args()
 
+    if args.push and args.username and not (
+        args.password or os.getenv('REGISTRY_PASSWORD')
+    ):
+        parser.error("--username requires --password or REGISTRY_PASSWORD.")
+
     cli_overrides={
         'tag': args.tag,
         'base_image': args.base_image,
@@ -66,9 +71,15 @@ def main():
     print("Built:", out)
     
     if args.push:
-        auth_token=args.password or os.getenv('GITHUB_TOKEN') or os.getenv('REGISTRY_TOKEN')
-        username=args.username or os.getenv('REGISTRY_USERNAME')
-        builder.push(registry_url=args.registry, auth_token=auth_token, username=username, show_progress=not args.no_progress)
+        password=args.password
+        if args.username and not password:
+            password=os.getenv('REGISTRY_PASSWORD')
+        builder.push(
+            registry_url=args.registry,
+            username=args.username,
+            password=password,
+            show_progress=not args.no_progress,
+        )
 
 if __name__=="__main__":
     main()

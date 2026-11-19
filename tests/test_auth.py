@@ -1,12 +1,14 @@
 """Tests for authentication providers."""
 import json, tempfile, os
 from pathlib import Path
+import pycontainer.auth as auth_module
 from pycontainer.auth import (
     EnvironmentAuthProvider,
     DockerConfigAuthProvider,
     AzureCLIAuthProvider,
     ChainAuthProvider,
-    get_auth_for_registry
+    get_auth_for_registry,
+    get_registry_auth,
 )
 
 def test_environment_auth_provider():
@@ -77,6 +79,60 @@ def test_docker_config_base64_decode():
         provider=DockerConfigAuthProvider(config_path)
         creds=provider.get_credentials('test.io')
         assert creds==('user','pass')
+
+def test_docker_config_password_is_not_a_bearer_token(tmp_path, monkeypatch):
+    config_path=tmp_path/'config.json'
+    config_path.write_text(json.dumps({
+        "auths": {
+            "registry.example": {
+                "auth": "dXNlcjpwYXNzd29yZA=="
+            }
+        }
+    }))
+    provider=DockerConfigAuthProvider(config_path)
+    monkeypatch.setattr(auth_module, "get_default_auth_provider", lambda: provider)
+
+    auth=get_registry_auth("registry.example")
+
+    assert auth.bearer_token is None
+    assert auth.username=="user"
+    assert auth.password=="password"
+    assert provider.get_token("registry.example") is None
+
+def test_environment_username_password_resolve_as_basic_auth(monkeypatch):
+    monkeypatch.setenv("REGISTRY_USERNAME", "env-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "env-password")
+    monkeypatch.delenv("REGISTRY_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(
+        auth_module,
+        "get_default_auth_provider",
+        lambda: EnvironmentAuthProvider(),
+    )
+
+    auth=get_registry_auth("registry.example")
+
+    assert auth.bearer_token is None
+    assert auth.username=="env-user"
+    assert auth.password=="env-password"
+
+def test_explicit_credentials_keep_bearer_and_basic_types_distinct():
+    basic=get_registry_auth(
+        "registry.example", username="cli-user", password="cli-password"
+    )
+    token=get_registry_auth("registry.example", password="cli-token")
+
+    assert basic.bearer_token is None
+    assert (basic.username, basic.password)==("cli-user", "cli-password")
+    assert token.bearer_token=="cli-token"
+    assert token.username is None
+    assert token.password is None
+
+def test_username_without_password_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="must be paired with a password"):
+        get_registry_auth("registry.example", username="cli-user")
 
 def test_chain_auth_provider():
     """Test chaining multiple auth providers."""

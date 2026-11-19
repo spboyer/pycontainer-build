@@ -111,7 +111,7 @@ from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_lay
 from .project import detect_entrypoint, default_include_paths, find_dependencies
 from .framework import apply_framework_defaults
 from .registry_client import RegistryClient, parse_image_reference
-from .auth import get_auth_for_registry
+from .auth import get_registry_auth
 from .cache import LayerCache
 from .sbom import generate_sbom
 
@@ -208,8 +208,14 @@ class ImageBuilder:
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull base image from registry, return (base_layers, base_config)."""
         registry, repo, tag=parse_image_reference(self.config.base_image)
-        auth_token=get_auth_for_registry(registry)
-        client=RegistryClient(registry, repo, auth_token=auth_token)
+        auth=get_registry_auth(registry)
+        client=RegistryClient(
+            registry,
+            repo,
+            auth_token=auth.bearer_token,
+            username=auth.username,
+            password=auth.password,
+        )
         
         print(f"Pulling base image {self.config.base_image} for {os_name}/{arch}...")
         manifest, _=client.pull_manifest(tag)
@@ -249,10 +255,19 @@ class ImageBuilder:
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         
-        if not auth_token and not password:
-            auth_token=get_auth_for_registry(registry, username, password)
-        
-        client=RegistryClient(registry, repo, auth_token=auth_token, username=username, password=password)
+        auth=get_registry_auth(
+            registry,
+            bearer_token=auth_token,
+            username=username,
+            password=password,
+        )
+        client=RegistryClient(
+            registry,
+            repo,
+            auth_token=auth.bearer_token,
+            username=auth.username,
+            password=auth.password,
+        )
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         

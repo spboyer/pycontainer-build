@@ -16,7 +16,8 @@ pycontainer-build supports multiple authentication methods for pushing images to
 Push Request
     │
     ├─> Check CLI flags (--username, --password)
-    │   └─> If present: Use Basic Auth or Bearer Token
+    │   ├─> Username + password: Use Basic Auth
+    │   └─> Password only: Use it as a bearer token
     │
     ├─> Check Environment Variables
     │   ├─> GITHUB_TOKEN (for ghcr.io)
@@ -34,7 +35,7 @@ Push Request
     └─> Make Request
         ├─> If 401 + Www-Authenticate header
         │   ├─> Parse OAuth2 challenge
-        │   ├─> Exchange credentials for bearer token
+        │   │   ├─> Exchange Basic credentials or bearer token for a registry token
         │   └─> Retry with bearer token
         └─> Success
 ```
@@ -57,7 +58,7 @@ class AuthProvider(ABC):
 
 #### `EnvironmentAuthProvider`
 Reads credentials from environment variables:
-- `REGISTRY_USERNAME` + `REGISTRY_PASSWORD`
+- `REGISTRY_USERNAME` + `REGISTRY_PASSWORD` (Basic Auth)
 - `GITHUB_TOKEN` (for ghcr.io)
 - `REGISTRY_TOKEN` (generic)
 
@@ -67,6 +68,7 @@ Reads `~/.docker/config.json`:
 - Decodes base64 auth strings
 - Handles both encoded and plain credentials
 - Tries multiple registry key formats
+- Returns decoded username/password as Basic credentials, never as a bearer token
 
 #### `AzureCLIAuthProvider`
 For Azure Container Registry (`*.azurecr.io`):
@@ -104,9 +106,9 @@ Both methods supported, auto-selected based on available credentials.
 ### 3. Builder Integration (`src/pycontainer/builder.py`)
 
 The `push()` method:
-1. Calls `get_auth_for_registry()` if no explicit credentials
-2. Passes auth to `RegistryClient`
-3. Client handles OAuth2 flow automatically
+1. Resolves explicit CLI arguments or the environment, Docker config and Azure CLI providers
+2. Preserves bearer tokens and username/password as distinct credential types
+3. Passes credentials to `RegistryClient`, which handles the OAuth2 challenge flow
 
 ## Registry-Specific Behavior
 
@@ -157,9 +159,13 @@ pycontainer build --tag myregistry.azurecr.io/app:v1 --push
 pycontainer build \
   --tag registry.example.com/app:v1 \
   --username myuser \
-  --password mytoken \
+  --password mypassword \
   --push
 ```
+
+The username and password are sent using Basic authentication. A password/token
+without `--username` is treated as a bearer token. Supplying `--username`
+without either `--password` or `REGISTRY_PASSWORD` is an error.
 
 ### Environment Variables
 ```bash
@@ -175,6 +181,8 @@ pycontainer build --tag registry.example.com/app:v1 --push
 - **Docker config**: Stored unencrypted (or via credential helper)
 - **Azure CLI**: Token cached by Azure CLI
 - **CLI flags**: Visible in shell history
+- Credentials are not written to application logs. Avoid passing secrets on
+  command lines in shared or recorded shells.
 
 **Recommendation**: Use Docker config with credential helpers or Azure CLI for best security.
 
