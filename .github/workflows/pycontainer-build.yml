@@ -1,5 +1,7 @@
 name: Build Container with pycontainer
 
+# The pinned Node 24 actions require Actions Runner 2.327.1 or later.
+
 on:
   workflow_call:
     inputs:
@@ -26,6 +28,11 @@ on:
         description: 'Push image to registry'
         required: false
         default: true
+        type: boolean
+      dry-run:
+        description: 'Preview the build without pulling images or writing output'
+        required: false
+        default: false
         type: boolean
       include-deps:
         description: 'Include dependencies from venv/requirements.txt'
@@ -61,18 +68,25 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout the immutable pycontainer-build workflow source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .pycontainer-build
+          persist-credentials: false
       
       - name: Set up Python ${{ inputs.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ inputs.python-version }}
       
       - name: Install pycontainer-build
-        run: |
-          python -m pip install --upgrade pip
-          # Install from PyPI only; fallback to GitHub removed for reproducibility and clarity.
-          pip install pycontainer-build
+        run: python -m pip install --no-deps ./.pycontainer-build
       
       - name: Build container image
         env:
@@ -85,6 +99,7 @@ jobs:
           INCLUDE_DEPS: ${{ inputs.include-deps }}
           SBOM_FORMAT: ${{ inputs.sbom }}
           PUSH_IMAGE: ${{ inputs.push }}
+          DRY_RUN: ${{ inputs.dry-run }}
         run: |
           case "$SBOM_FORMAT" in
             ""|spdx|cyclonedx) ;;
@@ -104,6 +119,10 @@ jobs:
           if [ "$PUSH_IMAGE" = "true" ]; then
             args+=(--push)
           fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
           
           args+=(--verbose)
           
@@ -122,6 +141,7 @@ jobs:
           echo "- **Python Version**: \`${{ inputs.python-version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Context**: \`${{ inputs.context }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Pushed**: ${{ inputs.push }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run**: ${{ inputs.dry-run }}" >> $GITHUB_STEP_SUMMARY
           if [ -n "$SBOM_FORMAT" ]; then
             echo "- **SBOM**: \`$SBOM_FORMAT\`" >> "$GITHUB_STEP_SUMMARY"
           fi

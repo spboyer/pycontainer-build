@@ -39,26 +39,33 @@ or corrupt blobs are discarded and rebuilt.
 PowerShell examples, run from the repository root:
 
 ```powershell
-uv venv
-uv pip install --python .venv\Scripts\python.exe -e . pytest jsonschema
-.venv\Scripts\python.exe -m pycontainer.cli --help
+uv sync --locked --group test --group build
+uv run --locked --group test --group build python -m pycontainer.cli --help
+uv run --locked --group test --group build python -m pytest tests -q
+uv run --locked --group test --group build python scripts/smoke_distributions.py
 ```
 
-For an existing interpreter with pytest and jsonschema, source-tree testing
-needs no package installation:
+For plugin contract tests, sync the relevant locked group and install the
+plugin source without resolving dependencies:
 
 ```powershell
-$env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m pytest --collect-only -q
-python -m pytest tests -q
-python -m pycontainer.cli build --dry-run --tag audit:local --context examples\fastapi-app
+uv sync --locked --group test --group build --group poetry-plugin
+uv pip install --python .venv\Scripts\python.exe --no-deps --no-build-isolation -e plugins/poetry-pycontainer
+uv run --locked --group test --group build --group poetry-plugin python -m pytest plugins/poetry-pycontainer/tests -q
+
+uv sync --locked --group test --group build --group hatch-plugin
+uv pip install --python .venv\Scripts\python.exe --no-deps --no-build-isolation -e plugins/hatch-pycontainer
+uv run --locked --group test --group build --group hatch-plugin python -m pytest plugins/hatch-pycontainer/tests -q
+
+uv run --locked --group test --group build python -m pycontainer.cli build --dry-run --tag audit:local --context examples\fastapi-app
 ```
 
 Registry-pulling tests are explicitly marked `registry_integration` and are
 excluded by default. Run them deliberately with
-`python -m pytest tests -q -o addopts= -m registry_integration`; they make real
-base-image pulls and must have a bounded timeout. At baseline `628f623`,
-46 tests collected and the offline selection passed 42 tests. The excluded tests are:
+`uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration`;
+they make real base-image pulls and must have a bounded timeout. The lockfile
+pins development tools only; the core package continues to declare no runtime
+dependencies. The excluded tests are:
 
 - `tests/test_base_image.py::test_dependency_layer_creation`
 - `tests/test_build_push.py::test_build_and_push_workflow`

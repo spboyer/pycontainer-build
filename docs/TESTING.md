@@ -11,8 +11,9 @@ The SBOM schema regressions require the test-only `jsonschema` package. SPDX
 2.3 and CycloneDX 1.4 schemas are checked-in fixtures; validation is offline.
 
 ```shell
-python -m pytest --collect-only -q
-python -m pytest tests -q
+uv sync --locked --group test --group build
+uv run --locked --group test python -m pytest --collect-only -q
+uv run --locked --group test python -m pytest tests -q
 ```
 
 The cache regressions cover same-size/same-mtime content edits, layer-affecting
@@ -22,13 +23,14 @@ Run the marked tests only when network access is intended, and bound execution
 time:
 
 ```shell
-python -m pytest tests -q -o addopts= -m registry_integration
+uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration
 ```
 
 The pull-request workflow checks Linux and Windows on Python 3.11 and 3.15.
-`python scripts/smoke_distributions.py` builds wheel and sdist packages, installs
-each in a fresh virtual environment, and checks the installed CLI without
-installing runtime dependencies.
+`uv run --locked --group build python scripts/smoke_distributions.py` builds
+wheel and sdist packages using the pinned build backend, installs each in a
+fresh virtual environment, and checks the installed CLI without installing
+runtime dependencies.
 
 Run `python benchmarks/run_build_benchmarks.py --repetitions 3` to write a JSON
 trend report. It measures app-layer creation and full local OCI assembly for
@@ -669,8 +671,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       
       - name: Install dependencies
-        run: |
-          pip install -e .[dev]
+        run: uv sync --locked --group test
       
       - name: Run unit tests
         run: |
@@ -703,7 +704,7 @@ jobs:
           sudo apt-get install -y skopeo
       
       - name: Install dependencies
-        run: pip install -e .[dev]
+        run: uv sync --locked --group test
       
       - name: Run integration tests
         run: pytest tests/integration/
@@ -727,7 +728,7 @@ jobs:
           python-version: "3.11"
       
       - name: Install dependencies
-        run: pip install -e .[dev]
+        run: uv sync --locked --group test
       
       - name: Run E2E tests
         run: pytest tests/e2e/ -m e2e
@@ -751,7 +752,7 @@ jobs:
           python-version: "3.11"
       
       - name: Install dependencies
-        run: pip install -e .[dev]
+        run: uv sync --locked --group test
       
       - name: Run black
         run: black --check src/ tests/

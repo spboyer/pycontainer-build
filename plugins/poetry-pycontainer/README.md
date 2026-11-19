@@ -179,6 +179,9 @@ org.opencontainers.image.source = "https://github.com/user/repo"
 
 ### With GitHub Actions
 
+This example uses published packages. Until they are published, install both
+packages from a repository checkout as described in [Installation](#installation).
+
 ```yaml
 name: Build and Push Container
 
@@ -218,6 +221,9 @@ jobs:
 ```
 
 ### With Azure Developer CLI
+
+This example uses published packages. Until they are published, install both
+packages from a repository checkout as described in [Installation](#installation).
 
 ```yaml
 # azure.yaml
@@ -304,13 +310,9 @@ poetry self add poetry-pycontainer
 
 ### Build Fails: "pycontainer-build not found"
 
-```bash
-# Install pycontainer-build
-pip install pycontainer-build
-
-# Or add as a dev dependency
-poetry add --group dev pycontainer-build
-```
+Install the core package into Poetry's plugin environment as described in the
+[Installation](#installation) section. Adding it to the application project
+does not install it into the environment that loads this plugin.
 
 ### Dependencies Not Included
 

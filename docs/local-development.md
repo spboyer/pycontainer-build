@@ -15,24 +15,27 @@ The recommended way for local development:
 git clone https://github.com/spboyer/pycontainer-build.git
 cd pycontainer-build
 
-# Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install in editable mode
-pip install -e .
+# Create the project environment with locked development tools
+uv sync --locked --group test --group build
 ```
 
-This installs the `pycontainer` command globally in your virtual environment, and any code changes you make are immediately reflected.
+This installs the core package in editable mode with locked test and build
+tools. The core package itself continues to declare no runtime dependencies.
+Activate the environment for the CLI examples below:
+
+```bash
+source .venv/bin/activate
+# PowerShell: .\.venv\Scripts\Activate.ps1
+```
 
 ### Verify Installation
 
 ```bash
 # Check that the command is available
-pycontainer --help
+uv run --locked --group test --group build pycontainer --help
 
 # Verify the Python API works
-python -c "from pycontainer.builder import ImageBuilder; print('✓ Import successful')"
+uv run --locked --group test --group build python -c "from pycontainer.builder import ImageBuilder; print('Import successful')"
 ```
 
 ---
@@ -692,10 +695,10 @@ code /path/to/project
 
 ### Using with Poetry
 
-```bash
-# Add Poetry plugin
-poetry self add poetry-pycontainer
+Follow the [Poetry plugin guide](../plugins/poetry-pycontainer/README.md) to
+install from this repository checkout.
 
+```bash
 # Build container
 cd /path/to/poetry/project
 poetry build-container --tag myapp:latest
@@ -709,10 +712,10 @@ push = false
 
 ### Using with Hatch
 
-```bash
-# Install Hatch plugin
-pip install hatch-pycontainer
+Follow the [Hatch plugin guide](../plugins/hatch-pycontainer/README.md) to
+install from this repository checkout.
 
+```bash
 # Build (creates both wheel and container)
 cd /path/to/hatch/project
 hatch build

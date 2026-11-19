@@ -31,7 +31,9 @@ class ContainerBuildCommand(Command):
         except ImportError:
             self.line_error(
                 "<error>pycontainer-build is not installed. "
-                "Install it with: pip install pycontainer-build</error>"
+                "Install it into Poetry's environment; until the core package "
+                "is published, follow the source-install instructions in the "
+                "pycontainer-build repository.</error>"
             )
             return 1
 

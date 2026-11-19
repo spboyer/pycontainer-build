@@ -7,6 +7,8 @@ This directory contains toolchain integrations for pycontainer-build, enabling s
 ### [Poetry Plugin](./poetry-pycontainer/)
 
 Build containers with Poetry projects using the `poetry build-container` command.
+The installation command is available after publication; until then, use the
+source-install instructions in the plugin README.
 
 ```bash
 poetry self add poetry-pycontainer
@@ -22,6 +24,8 @@ poetry build-container --tag myapp:latest --push
 ### [Hatch Plugin](./hatch-pycontainer/)
 
 Build containers during Hatch builds with automatic integration.
+The installation command is available after publication; until then, use the
+source-install instructions in the plugin README.
 
 ```bash
 pip install hatch-pycontainer
@@ -52,10 +56,14 @@ code --install-extension vscode-pycontainer-0.1.0.vsix
 
 ## Installation
 
-Each plugin is independently installable. Choose the one(s) that match your workflow:
+The package install commands below apply after publication. Until then, follow
+the selected plugin's README to install the core and plugin from this checkout:
+[Poetry](./poetry-pycontainer/README.md), [Hatch](./hatch-pycontainer/README.md).
+The VS Code extension's core install requirements are documented
+[here](./vscode-pycontainer/README.md).
 
-| Tool | Installation | Usage |
-|------|--------------|-------|
+| Tool | Installation after publication | Usage |
+|------|---------------------------------|-------|
 | Poetry | `poetry self add poetry-pycontainer` | `poetry build-container` |
 | Hatch | `pip install hatch-pycontainer` | `hatch build` |
 | VS Code | Install from marketplace | Command palette |

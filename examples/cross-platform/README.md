@@ -191,7 +191,7 @@ jobs:
           python-version: '3.11'
       
       - name: Install pycontainer
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       
       - name: Extract architecture
         id: arch

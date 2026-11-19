@@ -1,5 +1,6 @@
 name: Tests and performance baseline
 
+# The pinned Node 24 actions require Actions Runner 2.327.1 or later.
 on:
   pull_request:
   push:
@@ -31,16 +32,19 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.15"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test runner
-        run: python -m pip install pytest jsonschema
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked test dependencies
+        run: uv sync --locked --group test
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: python -m pytest tests -q -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
 
   package-smoke:
     name: Isolated wheel and sdist smoke test
@@ -48,74 +52,105 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Install package builder
-        run: python -m pip install build
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked build dependencies
+        run: uv sync --locked --group build
       - name: Build and install distributions in isolated environments
-        run: python scripts/smoke_distributions.py
+        run: uv run --locked --group build python scripts/smoke_distributions.py
 
   poetry-plugin:
     name: Poetry plugin contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Install core and plugin test dependencies
-        run: python -m pip install -e . "plugins/poetry-pycontainer[dev]"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked Poetry plugin dependencies
+        run: uv sync --locked --group test --group build --group poetry-plugin
+      - name: Install Poetry plugin without resolving dependencies
+        run: uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e plugins/poetry-pycontainer
       - name: Test Poetry registration, options, and CLI smoke
-        run: python -m pytest plugins/poetry-pycontainer/tests -q
+        run: uv run --locked --group test --group build --group poetry-plugin python -m pytest plugins/poetry-pycontainer/tests -q
 
   hatch-plugin:
     name: Hatch plugin contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Install core and plugin test dependencies
-        run: python -m pip install -e . "plugins/hatch-pycontainer[dev]"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked Hatch plugin dependencies
+        run: uv sync --locked --group test --group build --group hatch-plugin
+      - name: Install Hatch plugin without resolving dependencies
+        run: uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e plugins/hatch-pycontainer
       - name: Test Hatch registration, options, and CLI smoke
-        run: python -m pytest plugins/hatch-pycontainer/tests -q
+        run: uv run --locked --group test --group build --group hatch-plugin python -m pytest plugins/hatch-pycontainer/tests -q
 
   vscode-extension:
     name: VS Code extension contract
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: plugins/vscode-pycontainer/package-lock.json
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
       - name: Install the core for the extension smoke test
-        run: python -m pip install -e .
+        run: uv sync --locked
       - name: Install extension development dependencies
         working-directory: plugins/vscode-pycontainer
-        run: npm ci
+        run: uv run --locked npm ci
       - name: Compile extension
         working-directory: plugins/vscode-pycontainer
-        run: npm run compile
+        run: uv run --locked npm run compile
       - name: Lint extension
         working-directory: plugins/vscode-pycontainer
-        run: npm run lint
+        run: uv run --locked npm run lint
       - name: Test extension commands and core integration
         working-directory: plugins/vscode-pycontainer
-        run: npm test
+        run: uv run --locked npm test
       - name: Package extension
         working-directory: plugins/vscode-pycontainer
-        run: npm run package
+        run: uv run --locked npm run package
+
+  reusable-workflow-smoke:
+    name: Reusable workflow source-install smoke
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/pycontainer-build.yml
+    with:
+      python-version: "3.11"
+      tag: smoke:local
+      context: examples/fastapi-app
+      push: false
+      include-deps: false
+      dry-run: true
+    permissions:
+      contents: read
+      packages: write
 
   registry-integration:
     name: Opt-in registry integration tests
@@ -123,16 +158,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Install test runner
-        run: python -m pip install pytest jsonschema
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked test dependencies
+        run: uv sync --locked --group test
       - name: Run registry-pulling tests
         env:
           PYTHONPATH: src
-        run: python -m pytest tests -q -o addopts= -m registry_integration
+        run: uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration
 
   performance-baseline:
     name: Synthetic performance baseline
@@ -141,13 +179,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
       - name: Record repeatable build measurements
         run: python benchmarks/run_build_benchmarks.py --repetitions 3 --files 1000 --file-bytes 1024 --output benchmark-results.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: performance-${{ github.sha }}
           path: benchmark-results.json
