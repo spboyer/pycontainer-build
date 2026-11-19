@@ -30,11 +30,13 @@ installing runtime dependencies.
 Run `python benchmarks/run_build_benchmarks.py --repetitions 3` to write a JSON
 trend report. It measures app-layer creation and full local OCI assembly for
 cold, warm, unchanged, app-changed, and dependency-changed inputs using a
-synthetic empty base. It excludes real base-image pulls, registry pushes, and
-runtime startup; these measurements are not real end-to-end builds. Per-sample
-peak RSS includes Python startup/imports; `tracemalloc` reports Python-tracked
-allocations during builder construction and build work. Compare only matching
-environments and fixture settings; no timing threshold is enforced.
+synthetic empty base. It also measures loopback registry blob upload/download
+at multiple sizes against a local synthetic server. These transfer cases are
+not external registry throughput; the report excludes real base-image pulls
+and runtime startup. Per-sample peak RSS includes Python startup/imports;
+`tracemalloc` reports Python-tracked allocations during builder construction,
+build work, or the transfer. Compare only matching environments and fixture
+settings; no timing threshold is enforced.
 
 For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
 start a Docker daemon, and allow the builder to pull the selected registry base

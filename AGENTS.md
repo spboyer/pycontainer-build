@@ -85,7 +85,10 @@ part of the default test suite or CI.
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
-and 3.15. Do not describe suggested tools as existing required checks.
+and 3.15. The benchmark includes synthetic loopback registry transfers at
+multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
+does not measure external registry throughput. Do not describe suggested tools
+as existing required checks.
 
 ## Change discipline
 
@@ -108,7 +111,9 @@ For caching or transfer changes, verify equal-size/equal-time source edits,
 layer-affecting configuration, repeated builds, corruption, interruption and
 concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
-redirected storage hosts.
+redirected storage hosts. Registry blob downloads verify descriptor digest and
+size before publication; only safe reads use bounded retries and explicit
+request timeouts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.

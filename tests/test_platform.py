@@ -182,16 +182,16 @@ def test_platform_manifest_selection():
             
             arm64_manifest = {
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {"digest": "sha256:config123", "size": 1000},
-                "layers": [{"digest": "sha256:layer1", "size": 5000, "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]
+                "config": {"digest": "sha256:" + "c" * 64, "size": 1000},
+                "layers": [{"digest": "sha256:" + "1" * 64, "size": 5000, "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]
             }
             
             # First call returns index, second call returns arm64 manifest
             mock_manifest.side_effect = [(multi_platform_index, None), (arm64_manifest, None)]
             
-            def mock_pull_blob(digest, path):
+            def mock_pull_blob(digest, path, expected_size):
                 """Mock blob pull to create config and layer files."""
-                if "config" in digest:
+                if digest == "sha256:" + "c" * 64:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(json.dumps(arm64_config))
                 else:

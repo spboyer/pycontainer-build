@@ -2,6 +2,15 @@ import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+from .blob_store import (
+    BlobIntegrityError,
+    HASH_CHUNK_SIZE as _HASH_CHUNK_SIZE,
+    blob_matches as _blob_matches,
+    create_temporary_file as _create_temporary_file,
+    digest_filename as _digest_filename,
+    hash_file as _hash_file,
+    publish_content_addressed as _publish_content_addressed,
+)
 from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     context_exclude_paths,
@@ -11,67 +20,8 @@ from .fs_utils import (
 )
 
 
-_HASH_CHUNK_SIZE = 1024 * 1024
-
-
-class LayerIntegrityError(RuntimeError):
+class LayerIntegrityError(BlobIntegrityError):
     """Raised when a staged layer does not match its expected content."""
-
-
-def _create_temporary_file(directory: Path, prefix: str) -> Path:
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{prefix}-", suffix=".tmp", dir=directory
-    )
-    os.close(descriptor)
-    return Path(name)
-
-
-def _hash_file(path: Path) -> Tuple[str, int]:
-    hasher = hashlib.sha256()
-    size = 0
-    with path.open("rb") as source:
-        while True:
-            chunk = source.read(_HASH_CHUNK_SIZE)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            size += len(chunk)
-    return f"sha256:{hasher.hexdigest()}", size
-
-
-def _blob_matches(path: Path, digest: str, size: int) -> bool:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
-        return False
-    actual_digest, actual_size = _hash_file(path)
-    return actual_digest == digest and actual_size == size
-
-
-def _publish_content_addressed(
-    staged: Path, destination: Path, digest: str, size: int
-) -> Tuple[str, int]:
-    try:
-        with staged.open("rb+") as source:
-            source.flush()
-            os.fsync(source.fileno())
-        if _blob_matches(destination, digest, size):
-            return digest, size
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError(
-                f"Existing content-addressed blob {destination} does not match "
-                f"{digest}; refusing to overwrite it."
-            )
-
-        try:
-            os.link(staged, destination)
-        except FileExistsError:
-            if not _blob_matches(destination, digest, size):
-                raise FileExistsError(
-                    f"Existing content-addressed blob {destination} does not match "
-                    f"{digest}; refusing to overwrite it."
-                )
-        return digest, size
-    finally:
-        staged.unlink(missing_ok=True)
 
 
 def _write_content_addressed_bytes(
@@ -305,19 +255,25 @@ class ImageBuilder:
         
         config_desc=manifest.get('config',{})
         config_digest=config_desc.get('digest')
-        config_path=layers_dir/config_digest.split(':',1)[1]
-        if not config_path.exists():
-            client.pull_blob(config_digest, config_path)
+        config_size = config_desc.get("size")
+        if type(config_size) is not int or config_size < 0:
+            raise ValueError("Base image config descriptor has an invalid size.")
+        config_path=layers_dir/_digest_filename(config_digest)
+        client.pull_blob(config_digest, config_path, config_size)
         base_config=json.loads(config_path.read_bytes())
         
         base_layers=[]
         for i, layer_desc in enumerate(manifest.get('layers',[]), 1):
             layer_digest=layer_desc['digest']
             layer_size=layer_desc['size']
-            layer_path=layers_dir/layer_digest.split(':',1)[1]
-            if not layer_path.exists():
+            if type(layer_size) is not int or layer_size < 0:
+                raise ValueError(
+                    f"Base image layer {i} has an invalid descriptor size."
+                )
+            layer_path=layers_dir/_digest_filename(layer_digest)
+            if not layer_path.exists() or layer_path.is_symlink():
                 print(f"  Pulling layer {i}/{len(manifest['layers'])} ({layer_digest[:19]}...)")
-                client.pull_blob(layer_digest, layer_path)
+            client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(OCILayer(layer_desc['mediaType'], layer_digest, layer_size, str(layer_path)))
         
         print(f"✓ Base image pulled ({len(base_layers)} layers)")

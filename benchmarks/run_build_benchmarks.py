@@ -5,6 +5,7 @@ import contextlib
 import csv
 import ctypes
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -14,11 +15,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +31,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
+from pycontainer.registry_client import RegistryClient
 
 
 def _peak_rss_bytes():
@@ -73,7 +78,142 @@ def _peak_rss_bytes():
     return int(peak if sys.platform == "darwin" else peak * 1024)
 
 
+def _start_benchmark_registry(root):
+    root.mkdir(parents=True, exist_ok=True)
+    blob_dir = root / "blobs"
+    upload_dir = root / "uploads"
+    blob_dir.mkdir()
+    upload_dir.mkdir()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_HEAD(self):
+            digest = urlsplit(self.path).path.rsplit("/", 1)[-1]
+            blob = self.server.blob_dir / digest.split(":", 1)[-1]
+            self.send_response(200 if blob.is_file() else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            upload_id = uuid.uuid4().hex
+            self.server.uploads[upload_id] = (
+                self.server.upload_dir / f"{upload_id}.tmp"
+            )
+            self.send_response(202)
+            self.send_header(
+                "Location", f"/upload/{upload_id}?session=benchmark"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_PUT(self):
+            parsed = urlsplit(self.path)
+            upload_id = parsed.path.rsplit("/", 1)[-1]
+            digest = parse_qs(parsed.query).get("digest", [None])[0]
+            staged = self.server.uploads.pop(upload_id, None)
+            if staged is None or not digest or not digest.startswith("sha256:"):
+                self.send_error(400)
+                return
+
+            hasher = hashlib.sha256()
+            remaining = int(self.headers["Content-Length"])
+            size = 0
+            try:
+                with staged.open("wb") as target:
+                    while remaining:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ConnectionError("truncated benchmark upload")
+                        target.write(chunk)
+                        hasher.update(chunk)
+                        size += len(chunk)
+                        remaining -= len(chunk)
+                actual_digest = f"sha256:{hasher.hexdigest()}"
+                if actual_digest != digest:
+                    staged.unlink(missing_ok=True)
+                    self.send_error(400)
+                    return
+                destination = self.server.blob_dir / digest.split(":", 1)[1]
+                os.replace(staged, destination)
+            except OSError:
+                staged.unlink(missing_ok=True)
+                self.send_error(500)
+                return
+
+            self.send_response(201)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            digest = urlsplit(self.path).path.rsplit("/", 1)[-1]
+            blob = self.server.blob_dir / digest.split(":", 1)[-1]
+            if not blob.is_file():
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(blob.stat().st_size))
+            self.end_headers()
+            with blob.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server.blob_dir = blob_dir
+    server.upload_dir = upload_dir
+    server.uploads = {}
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}/v2"
+
+
+def _write_transfer_fixture(path, size, seed):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hasher = hashlib.sha256()
+    prefix = f"{seed:08d}".encode()
+    chunk = prefix + b"x" * (1024 * 1024 - len(prefix))
+    remaining = size
+    with path.open("wb") as target:
+        while remaining:
+            part = chunk[: min(len(chunk), remaining)]
+            target.write(part)
+            hasher.update(part)
+            remaining -= len(part)
+    return f"sha256:{hasher.hexdigest()}"
+
+
+def _measure_transfer_worker(spec):
+    source = Path(spec["source"])
+    destination = Path(spec["destination"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    client = RegistryClient("benchmark.invalid", "benchmark")
+    client.base_url = spec["registry_url"]
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    client.push_blob(spec["digest"], source, check_exists=False)
+    client.pull_blob(spec["digest"], destination, spec["size_bytes"])
+    wall_seconds = time.perf_counter() - started
+    _, python_peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return {
+        "wall_seconds": wall_seconds,
+        "process_peak_rss_bytes": _peak_rss_bytes(),
+        "python_tracemalloc_peak_bytes": python_peak_bytes,
+        "output_bytes": 2 * spec["size_bytes"],
+        "app_layer_bytes": 0,
+        "dependency_layer_bytes": 0,
+        "cache_lookups": 0,
+        "cache_hits": 0,
+        "uploaded_bytes": spec["size_bytes"],
+        "downloaded_bytes": spec["size_bytes"],
+    }
+
+
 def _measure_worker(spec):
+    if spec["mode"] == "transfer":
+        return _measure_transfer_worker(spec)
+
     context = Path(spec["context"])
     output = Path(spec["output"])
     output.mkdir(parents=True, exist_ok=True)
@@ -158,19 +298,27 @@ def _invoke_worker(spec):
 def _measured_case(name, description, specs):
     samples = [_invoke_worker(spec) for spec in specs]
     rss_values = [sample["process_peak_rss_bytes"] for sample in samples]
+    summary = {
+        "median_wall_seconds": statistics.median(sample["wall_seconds"] for sample in samples),
+        "median_process_peak_rss_bytes": statistics.median(rss_values),
+        "median_python_tracemalloc_peak_bytes": statistics.median(
+            sample["python_tracemalloc_peak_bytes"] for sample in samples
+        ),
+        "median_output_bytes": statistics.median(sample["output_bytes"] for sample in samples),
+        "total_cache_hits": sum(sample["cache_hits"] for sample in samples),
+    }
+    if "uploaded_bytes" in samples[0]:
+        summary["median_uploaded_bytes"] = statistics.median(
+            sample["uploaded_bytes"] for sample in samples
+        )
+        summary["median_downloaded_bytes"] = statistics.median(
+            sample["downloaded_bytes"] for sample in samples
+        )
     return {
         "name": name,
         "description": description,
         "samples": samples,
-        "summary": {
-            "median_wall_seconds": statistics.median(sample["wall_seconds"] for sample in samples),
-            "median_process_peak_rss_bytes": statistics.median(rss_values),
-            "median_python_tracemalloc_peak_bytes": statistics.median(
-                sample["python_tracemalloc_peak_bytes"] for sample in samples
-            ),
-            "median_output_bytes": statistics.median(sample["output_bytes"] for sample in samples),
-            "total_cache_hits": sum(sample["cache_hits"] for sample in samples),
-        },
+        "summary": summary,
     }
 
 
@@ -346,6 +494,41 @@ def run_benchmarks(args):
             )
         )
 
+        server, server_thread, registry_url = _start_benchmark_registry(
+            root / "synthetic-registry"
+        )
+        try:
+            for size_mib in args.transfer_sizes_mib:
+                size_bytes = size_mib * 1024 * 1024
+                transfer_specs = []
+                for sample in range(args.repetitions):
+                    source = root / f"transfer-{size_mib}-{sample}.source"
+                    destination = root / f"transfer-{size_mib}-{sample}.download"
+                    digest = _write_transfer_fixture(
+                        source, size_bytes, size_mib * 1000 + sample
+                    )
+                    transfer_specs.append(
+                        {
+                            "mode": "transfer",
+                            "registry_url": registry_url,
+                            "source": str(source),
+                            "destination": str(destination),
+                            "digest": digest,
+                            "size_bytes": size_bytes,
+                        }
+                    )
+                cases.append(
+                    _measured_case(
+                        f"registry-blob-transfer-{size_mib}MiB",
+                        "One streamed upload and verified download against a local synthetic registry; excludes external registry bandwidth.",
+                        transfer_specs,
+                    )
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join()
+
         return {
             "schema_version": 1,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -363,8 +546,12 @@ def run_benchmarks(args):
                 "app_files": args.files,
                 "bytes_per_file": args.file_bytes,
                 "repetitions": args.repetitions,
+                "registry_transfer_sizes_mib": args.transfer_sizes_mib,
                 "base_image": "synthetic empty OCI base",
-                "excluded": ["registry pull/push", "container runtime startup"],
+                "excluded": [
+                    "external registry pull/push",
+                    "container runtime startup",
+                ],
             },
             "measurement_notes": {
                 "wall_seconds": "Builder construction and measured layer/build work; fixture setup and output-size scans are excluded.",
@@ -372,6 +559,7 @@ def run_benchmarks(args):
                 "python_tracemalloc_peak_bytes": "Python-tracked peak allocations during builder construction and measured work.",
                 "output_bytes": "App-layer tar bytes for app-only; total local OCI output file bytes for full builds.",
                 "cache_hits": "App-layer cache hits observed during the measured build.",
+                "registry_transfer": "Per-sample loopback synthetic registry upload/download; server storage and fixture generation are excluded from the measured worker process. These are not external registry throughput results.",
                 "timing_gates": "None; compare trends only across matching environments and fixture parameters.",
             },
             "cases": cases,
@@ -383,6 +571,7 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--file-bytes", type=int, default=1024)
+    parser.add_argument("--transfer-sizes-mib", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
     parser.add_argument("--worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -390,8 +579,15 @@ def main():
     if args.worker:
         print(json.dumps(_measure_worker(json.loads(args.worker))))
         return
-    if args.repetitions < 1 or args.files < 1 or args.file_bytes < 1:
-        parser.error("--repetitions, --files, and --file-bytes must be positive")
+    if (
+        args.repetitions < 1
+        or args.files < 1
+        or args.file_bytes < 1
+        or any(size < 1 for size in args.transfer_sizes_mib)
+    ):
+        parser.error(
+            "--repetitions, --files, --file-bytes, and transfer sizes must be positive"
+        )
 
     results = run_benchmarks(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
