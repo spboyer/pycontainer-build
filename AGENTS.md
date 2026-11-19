@@ -125,8 +125,10 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 These are known gaps, **not fixed behavior**:
 
 - CLI defaults can overwrite TOML settings.
-- Plugin API/entrypoint contracts need repair, and PyPI installation of this
-  project returned HTTP 404 during the 2026-11-19 audit.
+- PyPI installation of this project returned HTTP 404 during the 2026-11-19
+  audit; publication remains pending in #79. The plugins now declare the core
+  package dependency, so source installs must place the core and plugin in the
+  same host environment until publication.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,

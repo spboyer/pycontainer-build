@@ -20,13 +20,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "hatchling>=1.18.0",
+    "pycontainer-build>=0.3.1,<0.4.0",
+    "hatchling>=1.18.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "hatch>=1.6.0,<2.0.0",
 ]
 
 [project.urls]

@@ -81,7 +81,7 @@
         },
         "pycontainer.autoInstall": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Automatically install pycontainer-build if not found"
         },
         "pycontainer.showOutput": {
@@ -102,8 +102,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
-    "test": "node ./out/test/runTest.js",
-    "lint": "eslint src --ext ts",
+    "test": "node --test dist/test/commands.test.js",
+    "lint": "eslint src --ext .ts",
     "package": "vsce package"
   },
   "devDependencies": {
@@ -113,8 +113,7 @@
     "@typescript-eslint/parser": "^6.0.0",
     "eslint": "^8.0.0",
     "typescript": "^5.0.0",
-    "@vscode/test-electron": "^2.3.0",
-    "@vscode/vsce": "^2.19.0"
+    "@vscode/vsce": "^3.9.1"
   },
   "repository": {
     "type": "git",

@@ -1,7 +1,7 @@
 # Maintenance execution plan
 
 Observed: **2026-11-19**. Baseline: `628f623`.
-Status: #67-#75 merged; #76 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
+Status: #67-#76 merged; #77 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
 Evidence and methods: [performance audit/design](2026-11-19-performance-maintenance-design.md).
 
 ## Outcomes and delivery rules
@@ -38,8 +38,8 @@ writing regressions or investigating the independent P0 defects.
 | Context and framework discovery boundaries | #73 | #68 | Merged in PR #88; no output/venv/test false positives by default; flat and src app layouts; portable dotted module names; scan profile. |
 | Importable target dependency staging | #74 | #68, #69, #73 | Merged in PR #89; target wheel staging, import path, ABI checks, SBOM inventory, reproducible tar and runtime smoke passed. |
 | Streaming tar/blob I/O and transfer integrity | #75 | #68, #69, #70, #72 | Merged in PR #90; bounded-chunk transfers, measured RSS, verified atomic downloads, safe timeout/retry and interruption coverage. |
-| SBOM CLI formats and shipped inventory | #76 | #68, #71, #74 | In progress on `issue-76-sbom-formats`; supported format arguments, schema validation, staged-only inventory, correct tool metadata and separate reproducibility semantics. |
-| Poetry/Hatch/VS Code contracts | #77 | #68, #71 | Real supported plugin registration, valid BuildConfig usage and subprocess entrypoint; working extension checks. |
+| SBOM CLI formats and shipped inventory | #76 | #68, #71, #74 | Merged in PR #92; supported format arguments, schema validation, staged-only inventory, correct tool metadata and separate reproducibility semantics. |
+| Poetry/Hatch/VS Code contracts | #77 | #68, #71 | In progress on `issue-77-plugin-contracts`; valid BuildConfig usage, tested plugin registration/options, working VS Code module invocation and extension checks. |
 | Digest references and platform-selection errors | #78 | #68, #69 | Tags/digests/ports, OCI index/Docker list and missing-platform tests; exact target selection. |
 | Installation, packaging, release/action refresh | #79 | #68-#78 and existing #67 before release | Isolated wheel/sdist install; verified workflow install provenance; reviewed/pinned action upgrades; owner-confirmed license; runtime release gates. |
 
