@@ -39,7 +39,7 @@ writing regressions or investigating the independent P0 defects.
 | Importable target dependency staging | #74 | #68, #69, #73 | Merged in PR #89; target wheel staging, import path, ABI checks, SBOM inventory, reproducible tar and runtime smoke passed. |
 | Streaming tar/blob I/O and transfer integrity | #75 | #68, #69, #70, #72 | Merged in PR #90; bounded-chunk transfers, measured RSS, verified atomic downloads, safe timeout/retry and interruption coverage. |
 | SBOM CLI formats and shipped inventory | #76 | #68, #71, #74 | Merged in PR #92; supported format arguments, schema validation, staged-only inventory, correct tool metadata and separate reproducibility semantics. |
-| Poetry/Hatch/VS Code contracts | #77 | #68, #71 | In progress on `issue-77-plugin-contracts`; valid BuildConfig usage, tested plugin registration/options, working VS Code module invocation and extension checks. |
+| Poetry/Hatch/VS Code contracts | #77 | #68, #71 | PR #93 open; host APIs, package dependencies, registry/push options, dry-run integration tests and locked VS Code checks are implemented. |
 | Digest references and platform-selection errors | #78 | #68, #69 | Tags/digests/ports, OCI index/Docker list and missing-platform tests; exact target selection. |
 | Installation, packaging, release/action refresh | #79 | #68-#78 and existing #67 before release | Isolated wheel/sdist install; verified workflow install provenance; reviewed/pinned action upgrades; owner-confirmed license; runtime release gates. |
 
