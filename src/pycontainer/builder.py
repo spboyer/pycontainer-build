@@ -24,6 +24,24 @@ class LayerIntegrityError(BlobIntegrityError):
     """Raised when a staged layer does not match its expected content."""
 
 
+class UnsupportedPlatformError(ValueError):
+    """Raised when a base image cannot satisfy the requested platform."""
+
+
+OCI_INDEX_MEDIA_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+IMAGE_MANIFEST_MEDIA_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+IMAGE_CONFIG_MEDIA_TYPES = {
+    "application/vnd.oci.image.config.v1+json",
+    "application/vnd.docker.container.image.v1+json",
+}
+
+
 def _write_content_addressed_bytes(
     destination: Path, content: bytes, digest: str
 ) -> Tuple[str, int]:
@@ -57,16 +75,114 @@ def _atomic_write_bytes(destination: Path, content: bytes) -> None:
     finally:
         staged.unlink(missing_ok=True)
 
+
 def parse_platform(platform: str) -> Tuple[str, str]:
-    """Parse platform string (e.g., 'linux/amd64') into (os, arch)."""
-    parts=platform.split('/')
-    if len(parts)!=2:
-        raise ValueError(f"Invalid platform format: {platform}. Expected 'os/arch' (e.g., 'linux/amd64')")
+    """Parse a platform string into its OS and architecture components."""
+    parts = platform.split("/")
+    if (
+        len(parts) not in (2, 3)
+        or any(not part for part in parts)
+        or any(part.strip() != part for part in parts)
+    ):
+        raise ValueError(
+            f"Invalid platform format: {platform}. Expected 'os/arch[/variant]' "
+            "(e.g., 'linux/amd64' or 'linux/arm/v7')."
+        )
     return parts[0], parts[1]
+
+
+def parse_platform_variant(platform: str) -> Optional[str]:
+    """Return an optional platform variant after validating the platform string."""
+    parse_platform(platform)
+    parts = platform.split("/")
+    return parts[2] if len(parts) == 3 else None
+
+
+def _validate_registry_descriptor(
+    descriptor: Dict, description: str
+) -> Tuple[str, int, str]:
+    if not isinstance(descriptor, dict):
+        raise RegistryRequestError(f"{description} is not a descriptor object.")
+    digest = descriptor.get("digest")
+    try:
+        _digest_filename(digest)
+    except ValueError as error:
+        raise RegistryRequestError(f"{description} has an invalid digest.") from error
+    size = descriptor.get("size")
+    if type(size) is not int or size < 0:
+        raise RegistryRequestError(f"{description} has an invalid size.")
+    media_type = descriptor.get("mediaType")
+    if not isinstance(media_type, str) or not media_type:
+        raise RegistryRequestError(f"{description} has an invalid media type.")
+    return digest, size, media_type
+
+
+def _select_index_descriptor(
+    index: Dict, os_name: str, arch: str, variant: Optional[str]
+) -> Tuple[Dict, Optional[str]]:
+    descriptors = index.get("manifests")
+    if not isinstance(descriptors, list):
+        raise RegistryRequestError("Base image index does not contain a manifest list.")
+
+    candidates = []
+    available = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            raise RegistryRequestError("Base image index contains an invalid descriptor.")
+        platform = descriptor.get("platform")
+        if not isinstance(platform, dict):
+            continue
+        descriptor_os = platform.get("os")
+        descriptor_arch = platform.get("architecture")
+        descriptor_variant = platform.get("variant")
+        if (
+            not isinstance(descriptor_os, str)
+            or not descriptor_os
+            or not isinstance(descriptor_arch, str)
+            or not descriptor_arch
+        ):
+            continue
+        if descriptor_variant is not None and (
+            not isinstance(descriptor_variant, str) or not descriptor_variant
+        ):
+            raise RegistryRequestError(
+                "Base image index contains an invalid platform variant."
+            )
+        available.append(
+            f"{descriptor_os}/{descriptor_arch}"
+            + (f"/{descriptor_variant}" if descriptor_variant else "")
+        )
+        if descriptor_os == os_name and descriptor_arch == arch:
+            candidates.append((descriptor, descriptor_variant))
+
+    if variant is not None:
+        candidates = [item for item in candidates if item[1] == variant]
+    else:
+        unqualified = [item for item in candidates if item[1] is None]
+        if len(unqualified) == 1:
+            candidates = unqualified
+
+    if len(candidates) == 1:
+        return candidates[0]
+    target = f"{os_name}/{arch}" + (f"/{variant}" if variant else "")
+    available_text = ", ".join(sorted(set(available))) or "none"
+    if not candidates:
+        raise UnsupportedPlatformError(
+            f"Base image has no exact manifest for {target}. "
+            f"Available platforms: {available_text}."
+        )
+    raise UnsupportedPlatformError(
+        f"Base image has multiple manifests matching {target}; specify an exact "
+        f"variant. Available platforms: {available_text}."
+    )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
 from .framework import apply_framework_defaults
-from .registry_client import RegistryClient, parse_image_reference
+from .registry_client import (
+    RegistryClient,
+    RegistryRequestError,
+    parse_image_reference,
+)
 from .auth import get_registry_auth
 from .cache import LayerCache
 from .sbom import generate_sbom
@@ -146,6 +262,9 @@ class ImageBuilder:
 
         os_name, arch = parse_platform(self.config.platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        variant = (
+            base_config.get("variant") if base_config else None
+        ) or parse_platform_variant(self.config.platform)
         
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
         include = self.context_include_paths
@@ -206,7 +325,14 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
-        index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag,arch,os_name)
+        index=build_index_json(
+            manifest_digest,
+            len(manifest_bytes),
+            self.config.tag,
+            arch,
+            os_name,
+            variant=variant,
+        )
         _atomic_write_bytes(
             output/'index.json',
             json.dumps(index,separators=(',',':')).encode(),
@@ -238,7 +364,7 @@ class ImageBuilder:
     
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, tag=parse_image_reference(self.config.base_image)
+        registry, repo, reference=parse_image_reference(self.config.base_image)
         auth=get_registry_auth(registry)
         client=RegistryClient(
             registry,
@@ -248,38 +374,123 @@ class ImageBuilder:
             password=auth.password,
         )
         
-        print(f"Pulling base image {self.config.base_image} for {os_name}/{arch}...")
-        manifest, _=client.pull_manifest(tag)
-        
-        if manifest.get('mediaType')=='application/vnd.oci.image.index.v1+json':
-            for m in manifest.get('manifests',[]):
-                plat=m.get('platform',{})
-                if plat.get('architecture')==arch and plat.get('os')==os_name:
-                    manifest, _=client.pull_manifest(m['digest'])
-                    break
-        
-        config_desc=manifest.get('config',{})
-        config_digest=config_desc.get('digest')
-        config_size = config_desc.get("size")
-        if type(config_size) is not int or config_size < 0:
-            raise ValueError("Base image config descriptor has an invalid size.")
+        platform = self.config.platform
+        requested_variant = parse_platform_variant(platform)
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
+        )
+        print(f"Pulling base image {self.config.base_image} for {target}...")
+        manifest, _ = client.pull_manifest(
+            reference,
+            expected_digest=reference if reference.startswith("sha256:") else None,
+        )
+
+        selected_variant = None
+        selected_from_index = False
+        if manifest.get("mediaType") in OCI_INDEX_MEDIA_TYPES:
+            selected_from_index = True
+            descriptor, selected_variant = _select_index_descriptor(
+                manifest, os_name, arch, requested_variant
+            )
+            manifest_digest, manifest_size, descriptor_media_type = (
+                _validate_registry_descriptor(
+                    descriptor, "Selected base image manifest descriptor"
+                )
+            )
+            if descriptor_media_type not in IMAGE_MANIFEST_MEDIA_TYPES:
+                raise RegistryRequestError(
+                    "Selected base image descriptor does not reference an image manifest."
+                )
+            manifest, _ = client.pull_manifest(
+                manifest_digest,
+                expected_digest=manifest_digest,
+                expected_size=manifest_size,
+            )
+            if manifest.get("mediaType") != descriptor_media_type:
+                raise RegistryRequestError(
+                    "Selected base image manifest media type does not match its index descriptor."
+                )
+        elif manifest.get("mediaType") not in IMAGE_MANIFEST_MEDIA_TYPES:
+            raise RegistryRequestError(
+                f"Base image has unsupported manifest media type "
+                f"{manifest.get('mediaType')!r}."
+            )
+
+        if manifest.get("schemaVersion") != 2:
+            raise RegistryRequestError("Base image manifest has an unsupported schema version.")
+
+        config_digest, config_size, config_media_type = _validate_registry_descriptor(
+            manifest.get("config"), "Base image config descriptor"
+        )
+        if config_media_type not in IMAGE_CONFIG_MEDIA_TYPES:
+            raise RegistryRequestError(
+                f"Base image config has unsupported media type {config_media_type!r}."
+            )
+
+        layer_descriptors = manifest.get("layers")
+        if not isinstance(layer_descriptors, list):
+            raise RegistryRequestError("Base image manifest does not contain a layer list.")
+        validated_layers = [
+            _validate_registry_descriptor(
+                descriptor, f"Base image layer {index}"
+            )
+            for index, descriptor in enumerate(layer_descriptors, 1)
+        ]
+
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
-        base_config=json.loads(config_path.read_bytes())
-        
+        try:
+            base_config=json.loads(config_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RegistryRequestError("Base image config is not valid JSON.") from error
+        if not isinstance(base_config, dict):
+            raise RegistryRequestError("Base image config is not a JSON object.")
+
+        config_os = base_config.get("os")
+        config_arch = base_config.get("architecture")
+        if config_os != os_name or config_arch != arch:
+            raise UnsupportedPlatformError(
+                "Pulled base image config platform "
+                f"{config_os!r}/{config_arch!r} does not match requested {target}."
+            )
+        config_variant = base_config.get("variant")
+        if config_variant is not None and (
+            not isinstance(config_variant, str) or not config_variant
+        ):
+            raise RegistryRequestError("Base image config has an invalid platform variant.")
+        if (
+            selected_from_index
+            and config_variant is not None
+            and config_variant != selected_variant
+        ):
+            raise UnsupportedPlatformError(
+                "Pulled base image config variant "
+                f"{config_variant!r} does not match index variant "
+                f"{selected_variant!r}."
+            )
+        resolved_variant = (
+            selected_variant if selected_from_index else config_variant
+        )
+        if requested_variant is not None and resolved_variant != requested_variant:
+            raise UnsupportedPlatformError(
+                "Resolved base image variant "
+                f"{resolved_variant!r} does not match requested variant "
+                f"{requested_variant!r}."
+            )
+        if resolved_variant is not None:
+            base_config["variant"] = resolved_variant
+
         base_layers=[]
-        for i, layer_desc in enumerate(manifest.get('layers',[]), 1):
-            layer_digest=layer_desc['digest']
-            layer_size=layer_desc['size']
-            if type(layer_size) is not int or layer_size < 0:
-                raise ValueError(
-                    f"Base image layer {i} has an invalid descriptor size."
-                )
+        for i, (layer_digest, layer_size, media_type) in enumerate(
+            validated_layers, 1
+        ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(manifest['layers'])} ({layer_digest[:19]}...)")
+                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
-            base_layers.append(OCILayer(layer_desc['mediaType'], layer_digest, layer_size, str(layer_path)))
+            base_layers.append(
+                OCILayer(media_type, layer_digest, layer_size, str(layer_path))
+            )
         
         print(f"✓ Base image pulled ({len(base_layers)} layers)")
         return base_layers, base_config

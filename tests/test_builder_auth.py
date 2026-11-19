@@ -13,12 +13,17 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
         def __init__(self, registry, repository, **auth):
             clients.append((registry, repository, auth))
 
-        def pull_manifest(self, reference):
+        def pull_manifest(self, reference, **expected):
             return (
                 {
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
                         "digest": "sha256:" + "a" * 64,
-                        "size": len(json.dumps({"architecture": "amd64"}).encode()),
+                        "size": len(
+                            json.dumps({"architecture": "amd64", "os": "linux"}).encode()
+                        ),
                     },
                     "layers": [],
                 },
@@ -27,7 +32,7 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
 
         def pull_blob(self, digest, path, expected_size):
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"architecture": "amd64"}))
+            path.write_text(json.dumps({"architecture": "amd64", "os": "linux"}))
 
     monkeypatch.setattr(
         builder_module,
@@ -60,7 +65,7 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
         )
     ]
     assert layers == []
-    assert config == {"architecture": "amd64"}
+    assert config == {"architecture": "amd64", "os": "linux"}
 
 
 def test_image_push_passes_resolved_basic_credentials(tmp_path, monkeypatch):
