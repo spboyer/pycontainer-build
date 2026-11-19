@@ -471,7 +471,8 @@ class ImageBuilder:
                             info.gname = "root"
                             info.mode = (
                                 0o755
-                                if path.stat().st_mode & 0o111
+                                if relative.parts[0] == "bin"
+                                or path.stat().st_mode & 0o111
                                 else 0o644
                             )
                             with path.open("rb") as source:

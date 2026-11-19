@@ -186,7 +186,11 @@ def test_windows_virtualenv_layout_stages_only_pure_python_packages(tmp_path, mo
         assert "app/.python/site-packages/windows_fixture.py" in names
         assert "app/.venv/Lib/site-packages/windows_fixture.py" not in names
         assert "app/.python/bin/windows-fixture" in names
-        assert archive.getmember("app/.python/site-packages/package_tool").mode & 0o111
+        if os.name != "nt":
+            assert (
+                archive.getmember("app/.python/site-packages/package_tool").mode
+                & 0o111
+            )
         assert builder._staged_packages == [("windows-fixture", "2.0")]
 
 
