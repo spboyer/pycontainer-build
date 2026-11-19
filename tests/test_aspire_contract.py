@@ -51,6 +51,7 @@ def test_aspire_adapter_build_and_push_contract(tmp_path, monkeypatch):
         "--include-deps",
         "--requirements", ".pycontainer-aspire/api/requirements.txt",
         "--exclude", ".venv", "--exclude", "venv", "--exclude", "env",
+        "--exclude", ".pycontainer-aspire",
         "--push",
         "--registry", "localhost:5443/samples/api:latest",
     ])
@@ -68,6 +69,6 @@ def test_aspire_adapter_build_and_push_contract(tmp_path, monkeypatch):
     assert config.base_image == "python:3.12-slim"
     assert config.include_deps is True
     assert config.requirements_file == ".pycontainer-aspire/api/requirements.txt"
-    assert config.exclude_paths == [".venv", "venv", "env"]
+    assert config.exclude_paths == [".venv", "venv", "env", ".pycontainer-aspire"]
     assert push["registry_url"] == "localhost:5443/samples/api:latest"
     assert push["show_progress"] is False
