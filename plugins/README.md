@@ -156,9 +156,10 @@ from pycontainer.builder import ImageBuilder
 
 config = BuildConfig(
     tag="myapp:latest",
-    context_path=".",
+    context_dir=".",
     base_image="python:3.11-slim",
-    include_deps=True
+    include_deps=True,
+    generate_sbom="cyclonedx"
 )
 
 builder = ImageBuilder(config)

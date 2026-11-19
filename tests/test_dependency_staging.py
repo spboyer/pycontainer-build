@@ -18,6 +18,7 @@ from pycontainer.dependencies import (
     MAX_REQUIREMENTS_BYTES,
     _target_options,
     install_requirements,
+    staged_packages,
     target_python_version,
     validate_requirements,
 )
@@ -83,6 +84,16 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
             **options,
         )
     )
+
+
+def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):
+    metadata = tmp_path / "broken-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir()
+    metadata.write_text("Metadata-Version: 2.1\nName: broken\n\n")
+
+    assert staged_packages(tmp_path) == []
+    with pytest.raises(ValueError, match="missing Name or Version"):
+        staged_packages(tmp_path, strict=True)
 
 
 def test_requirements_install_stages_importable_target_wheel_and_sbom(
@@ -154,6 +165,56 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
     assert [(package["name"], package["versionInfo"]) for package in sbom["packages"]] == [
         ("fixture-dep", "1.0")
     ]
+
+
+def test_builder_selects_cyclonedx_for_staged_inventory(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path,
+        monkeypatch,
+        context=context,
+        generate_sbom="cyclonedx",
+    )
+
+    builder.build()
+
+    sbom = json.loads((Path(builder.config.output_dir) / "sbom.json").read_text())
+    assert sbom["bomFormat"] == "CycloneDX"
+    assert sbom["components"] == []
+
+
+def test_sbom_metadata_does_not_change_reproducible_image_digest(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    first = _builder(
+        tmp_path / "first",
+        monkeypatch,
+        context=context,
+        generate_sbom=True,
+        reproducible=True,
+    )
+    second = _builder(
+        tmp_path / "second",
+        monkeypatch,
+        context=context,
+        generate_sbom=True,
+        reproducible=True,
+    )
+
+    first.build()
+    second.build()
+
+    first_sbom = json.loads((Path(first.config.output_dir) / "sbom.json").read_text())
+    second_sbom = json.loads((Path(second.config.output_dir) / "sbom.json").read_text())
+    assert first.manifest_digest == second.manifest_digest
+    assert first_sbom["documentNamespace"] != second_sbom["documentNamespace"]
+    assert (
+        first_sbom["creationInfo"]["created"]
+        != second_sbom["creationInfo"]["created"]
+    )
 
 
 def test_windows_virtualenv_layout_stages_only_pure_python_packages(tmp_path, monkeypatch):

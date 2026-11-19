@@ -7,6 +7,9 @@ and CI configuration are not all implemented. The current pytest suite is under
 `tests/`. Registry-pulling tests carry the `registry_integration` marker and are
 excluded by default:
 
+The SBOM schema regressions require the test-only `jsonschema` package. SPDX
+2.3 and CycloneDX 1.4 schemas are checked-in fixtures; validation is offline.
+
 ```shell
 python -m pytest --collect-only -q
 python -m pytest tests -q

@@ -107,7 +107,7 @@ reproducible = true
     assert config.requirements_file == "requirements-cli.txt"
     assert config.verbose is True
     assert config.dry_run is True
-    assert config.generate_sbom is True
+    assert config.generate_sbom == "spdx"
     assert config.use_cache is False
     assert config.reproducible is False
 
@@ -157,6 +157,35 @@ def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     assert config.verbose is False
     assert config.dry_run is False
     assert config.generate_sbom is False
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_format"),
+    [
+        (["--sbom"], "spdx"),
+        (["--sbom", "spdx"], "spdx"),
+        (["--sbom", "cyclonedx"], "cyclonedx"),
+    ],
+)
+def test_cli_sbom_format_options(monkeypatch, arguments, expected_format):
+    config = _capture_config(monkeypatch, ["build", *arguments])
+
+    assert config.generate_sbom == expected_format
+
+
+def test_cli_accepts_sbom_format_from_config_and_cli_overrides_it(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text('[build]\ngenerate-sbom = "cyclonedx"\n')
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+    assert config.generate_sbom == "cyclonedx"
+
+    config = _capture_config(
+        monkeypatch, ["build", "--config", str(config_path), "--sbom", "spdx"]
+    )
+    assert config.generate_sbom == "spdx"
 
 
 def test_cli_forwards_basic_credentials_without_logging_them(monkeypatch, capsys):
@@ -214,6 +243,7 @@ def test_cli_rejects_username_without_password_or_password_environment(
     [
         ("unexpected-setting", "true", "Unknown [build] setting"),
         ("include_deps", '"yes"', "Invalid value for [build].include_deps"),
+        ("generate-sbom", '"cyclonedx-json"', "generate_sbom must be a boolean"),
     ],
 )
 def test_cli_reports_invalid_config(tmp_path, monkeypatch, capsys, setting, value, message):

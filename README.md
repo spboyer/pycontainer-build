@@ -356,11 +356,17 @@ exclude-defaults = true
 
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
-- `--sbom FORMAT` — Generate SBOM (`spdx` or `cyclonedx`)
+- `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (e.g., `linux/arm64`)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
+new for each generation, even when the OCI image build is reproducible. They do
+not affect the image manifest digest. Inventory contains Python distributions
+staged by pycontainer, not host packages, uninstalled requirements, or packages
+inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
@@ -375,7 +381,7 @@ from pycontainer.builder import ImageBuilder
 
 config = BuildConfig(
     tag="myapp:latest",
-    context_path=".",
+    context_dir=".",
     base_image="python:3.11-slim",  # Optional: auto-detected if omitted
     include_deps=True,
     workdir="/app",
@@ -384,7 +390,7 @@ config = BuildConfig(
     include_paths=["src/", "lib/", "pyproject.toml"],
     exclude_paths=["src/generated", "fixtures/**"],
     entrypoint=["python", "-m", "myapp"],
-    generate_sbom="spdx",
+    generate_sbom="spdx",  # or "cyclonedx"; True defaults to SPDX
     reproducible=True,
     verbose=True
 )
@@ -401,6 +407,7 @@ base_image = "python:3.11-slim"
 workdir = "/app"
 include_deps = true
 reproducible = true
+generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
 
 [build.labels]
 maintainer = "team@example.com"
@@ -513,7 +520,7 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
-- **SBOM scope** — Python packages only; doesn't parse OS packages from base images
+- **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 
 **Note**: Cross-platform builds pull the correct architecture variant from multi-platform base images and generate proper OCI metadata. For Python applications (interpreted language), no actual cross-compilation is needed.
 

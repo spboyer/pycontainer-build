@@ -440,7 +440,9 @@ def _validate_wheel_metadata(site_packages: Path, python_version: str) -> None:
             )
 
 
-def staged_packages(site_packages: Path) -> List[Tuple[str, str]]:
+def staged_packages(
+    site_packages: Path, *, strict: bool = False
+) -> List[Tuple[str, str]]:
     packages = []
     metadata_files = list(site_packages.glob("*.dist-info/METADATA"))
     metadata_files.extend(site_packages.glob("*.egg-info/PKG-INFO"))
@@ -448,11 +450,18 @@ def staged_packages(site_packages: Path) -> List[Tuple[str, str]]:
         path for path in site_packages.glob("*.egg-info") if path.is_file()
     )
     for metadata in sorted(metadata_files):
-        with metadata.open(encoding="utf-8", errors="replace") as stream:
+        with metadata.open(
+            encoding="utf-8",
+            errors="strict" if strict else "replace",
+        ) as stream:
             message = Parser().parse(stream, headersonly=True)
         name, version = message.get("Name"), message.get("Version")
         if name and version:
             packages.append((name.strip(), version.strip()))
+        elif strict:
+            raise ValueError(
+                f"Staged package metadata is missing Name or Version: {metadata}"
+            )
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
 
 

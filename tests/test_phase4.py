@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from pycontainer.framework import detect_framework, apply_framework_defaults
 from pycontainer.config import BuildConfig
-from pycontainer.sbom import generate_sbom, _get_python_packages
+from pycontainer.sbom import generate_sbom
 from pycontainer.config_loader import load_config_file, merge_configs
 
 def test_fastapi_detection():
@@ -68,18 +68,6 @@ def test_reproducible_build_sorting():
     cfg_non=BuildConfig(tag="test:v1", reproducible=False)
     assert cfg_non.reproducible==False
 
-def test_sbom_package_detection():
-    """Test Python package detection for SBOM."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ctx=Path(tmpdir)
-        (ctx/"requirements.txt").write_text("flask==2.0.0\nrequests==2.28.0\n")
-        
-        packages=_get_python_packages(ctx)
-        assert len(packages)>=2
-        names=[p[0] for p in packages]
-        assert "flask" in names
-        assert "requests" in names
-
 def test_sbom_generation_spdx():
     """Test SBOM generation in SPDX format."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,7 +75,9 @@ def test_sbom_generation_spdx():
         (ctx/"requirements.txt").write_text("flask==2.0.0\n")
         output=Path(tmpdir)/"sbom.json"
         
-        sbom=generate_sbom(ctx, output, format="spdx")
+        sbom=generate_sbom(
+            ctx, output, format="spdx", package_inventory=[("flask", "2.0.0")]
+        )
         
         assert sbom["spdxVersion"]=="SPDX-2.3"
         assert "packages" in sbom
@@ -100,7 +90,9 @@ def test_sbom_generation_cyclonedx():
         (ctx/"requirements.txt").write_text("requests==2.28.0\n")
         output=Path(tmpdir)/"sbom.json"
         
-        sbom=generate_sbom(ctx, output, format="cyclonedx")
+        sbom=generate_sbom(
+            ctx, output, format="cyclonedx", package_inventory=[("requests", "2.28.0")]
+        )
         
         assert sbom["bomFormat"]=="CycloneDX"
         assert "components" in sbom

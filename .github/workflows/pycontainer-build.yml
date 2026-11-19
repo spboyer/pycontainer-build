@@ -33,7 +33,7 @@ on:
         default: true
         type: boolean
       sbom:
-        description: 'Generate SBOM (spdx or cyclonedx)'
+        description: 'SBOM format: spdx or cyclonedx; empty disables SBOM'
         required: false
         default: ''
         type: string
@@ -79,30 +79,41 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          IMAGE_TAG: ${{ inputs.tag }}
+          BASE_IMAGE: ${{ inputs.base-image }}
+          CONTEXT_DIR: ${{ inputs.context }}
+          INCLUDE_DEPS: ${{ inputs.include-deps }}
+          SBOM_FORMAT: ${{ inputs.sbom }}
+          PUSH_IMAGE: ${{ inputs.push }}
         run: |
-          # Build command with all options
-          CMD="pycontainer build --tag ${{ inputs.tag }} --context ${{ inputs.context }} --base-image ${{ inputs.base-image }}"
+          case "$SBOM_FORMAT" in
+            ""|spdx|cyclonedx) ;;
+            *) echo "::error::Unsupported SBOM format: $SBOM_FORMAT"; exit 2 ;;
+          esac
+
+          args=(pycontainer build --tag "$IMAGE_TAG" --context "$CONTEXT_DIR" --base-image "$BASE_IMAGE")
           
-          # Add optional flags
-          if [ "${{ inputs.include-deps }}" = "true" ]; then
-            CMD="$CMD --include-deps"
+          if [ "$INCLUDE_DEPS" = "true" ]; then
+            args+=(--include-deps)
           fi
           
-          if [ -n "${{ inputs.sbom }}" ]; then
-            CMD="$CMD --sbom ${{ inputs.sbom }}"
+          if [ -n "$SBOM_FORMAT" ]; then
+            args+=(--sbom "$SBOM_FORMAT")
           fi
           
-          if [ "${{ inputs.push }}" = "true" ]; then
-            CMD="$CMD --push"
+          if [ "$PUSH_IMAGE" = "true" ]; then
+            args+=(--push)
           fi
           
-          CMD="$CMD --verbose"
+          args+=(--verbose)
           
-          echo "Executing: $CMD"
-          $CMD
+          echo "Executing: ${args[*]}"
+          "${args[@]}"
       
       - name: Generate build summary
         if: always()
+        env:
+          SBOM_FORMAT: ${{ inputs.sbom }}
         run: |
           echo "## Container Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -111,6 +122,6 @@ jobs:
           echo "- **Python Version**: \`${{ inputs.python-version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Context**: \`${{ inputs.context }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Pushed**: ${{ inputs.push }}" >> $GITHUB_STEP_SUMMARY
-          if [ -n "${{ inputs.sbom }}" ]; then
-            echo "- **SBOM**: \`${{ inputs.sbom }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$SBOM_FORMAT" ]; then
+            echo "- **SBOM**: \`$SBOM_FORMAT\`" >> "$GITHUB_STEP_SUMMARY"
           fi
