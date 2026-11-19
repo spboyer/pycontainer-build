@@ -1,0 +1,94 @@
+name: Tests and performance baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run-registry-integration:
+        description: Run tests that pull real registry layers
+        required: false
+        type: boolean
+        default: false
+      run-benchmarks:
+        description: Record the synthetic build performance baseline
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.15"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Run hermetic tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest tests -q -m "not registry_integration"
+
+  package-smoke:
+    name: Isolated wheel and sdist smoke test
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package builder
+        run: python -m pip install build
+      - name: Build and install distributions in isolated environments
+        run: python scripts/smoke_distributions.py
+
+  registry-integration:
+    name: Opt-in registry integration tests
+    if: github.event_name == 'workflow_dispatch' && inputs['run-registry-integration']
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Run registry-pulling tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest tests -q -o addopts= -m registry_integration
+
+  performance-baseline:
+    name: Synthetic performance baseline
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs['run-benchmarks'])
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Record repeatable build measurements
+        run: python benchmarks/run_build_benchmarks.py --repetitions 3 --files 1000 --file-bytes 1024 --output benchmark-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ github.sha }}
+          path: benchmark-results.json
+          retention-days: 90

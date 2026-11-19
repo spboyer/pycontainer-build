@@ -41,26 +41,34 @@ installation:
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 python -m pytest --collect-only -q
-python -m pytest tests -q -k 'not dependency_layer_creation and not build_and_push_workflow and not oci_layout_structure and not tag_extraction'
+python -m pytest tests -q
 python -m pycontainer.cli build --dry-run --tag audit:local --context examples\fastapi-app
 ```
 
-At baseline `628f623`, 46 tests collect and this offline selection passes
-42 tests. It excludes exactly these registry-pulling tests:
+Registry-pulling tests are explicitly marked `registry_integration` and are
+excluded by default. Run them deliberately with
+`python -m pytest tests -q -o addopts= -m registry_integration`; they make real
+base-image pulls and must have a bounded timeout. At baseline `628f623`,
+46 tests collected and the offline selection passed 42 tests. The excluded tests are:
 
 - `tests/test_base_image.py::test_dependency_layer_creation`
 - `tests/test_build_push.py::test_build_and_push_workflow`
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 
-The full command is `python -m pytest tests -v`. It makes real base-image pulls;
-run it deliberately with network access and bounded execution time. A passing
-layout assertion is not evidence that an image starts in a container runtime.
-Do not silently remove, mock away, or claim success for unrun integration tests.
+The pull-request workflow runs hermetic tests on Linux and Windows with Python
+3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
+in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`
+records repeatable synthetic app-only and local full-build trends; its synthetic
+base excludes registry pull/push and container startup. Benchmark timing is not
+a pass/fail gate. A passing layout assertion is not evidence that an image
+starts in a container runtime. Do not silently remove, mock away, or claim
+success for unrun integration tests.
 
-There is no configured root formatter, linter, type checker, benchmark runner
-or PR CI gate yet. Do not describe suggested tools as existing required checks.
-The release workflow currently tests only Linux/Python 3.11 and 3.12.
+There is no configured root formatter, linter, type checker, or timing gate.
+The PR workflow runs the test matrix and records benchmark
+trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
+and 3.15. Do not describe suggested tools as existing required checks.
 
 ## Change discipline
 

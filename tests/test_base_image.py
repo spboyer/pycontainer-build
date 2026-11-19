@@ -92,6 +92,7 @@ def test_layer_ordering():
             assert builder.layers[1].digest == "sha256:base2"
             assert "sha256:base" not in builder.layers[2].digest
 
+@pytest.mark.registry_integration
 def test_dependency_layer_creation():
     """Test separate dependency layer creation."""
     with tempfile.TemporaryDirectory() as tmpdir:

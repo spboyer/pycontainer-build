@@ -1,9 +1,11 @@
 """Integration test demonstrating build and push workflow."""
+import pytest
 import tempfile, json
 from pathlib import Path
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 
+@pytest.mark.registry_integration
 def test_build_and_push_workflow():
     """Test complete build workflow preparing for push."""
     with tempfile.TemporaryDirectory() as tmpdir:

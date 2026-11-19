@@ -1,5 +1,38 @@
 # Testing Strategy: pycontainer-build
 
+## Current executable checks
+
+The strategy below records proposed coverage; its sample paths, tools, targets,
+and CI configuration are not all implemented. The current pytest suite is under
+`tests/`. Registry-pulling tests carry the `registry_integration` marker and are
+excluded by default:
+
+```shell
+python -m pytest --collect-only -q
+python -m pytest tests -q
+```
+
+Run the marked tests only when network access is intended, and bound execution
+time:
+
+```shell
+python -m pytest tests -q -o addopts= -m registry_integration
+```
+
+The pull-request workflow checks Linux and Windows on Python 3.11 and 3.15.
+`python scripts/smoke_distributions.py` builds wheel and sdist packages, installs
+each in a fresh virtual environment, and checks the installed CLI without
+installing runtime dependencies.
+
+Run `python benchmarks/run_build_benchmarks.py --repetitions 3` to write a JSON
+trend report. It measures app-layer creation and full local OCI assembly for
+cold, warm, unchanged, app-changed, and dependency-changed inputs using a
+synthetic empty base. It excludes real base-image pulls, registry pushes, and
+runtime startup; these measurements are not real end-to-end builds. Per-sample
+peak RSS includes Python startup/imports; `tracemalloc` reports Python-tracked
+allocations during builder construction and build work. Compare only matching
+environments and fixture settings; no timing threshold is enforced.
+
 ## Overview
 
 This document defines the comprehensive testing strategy for pycontainer-build, ensuring quality, reliability, and correctness at every phase of development.
