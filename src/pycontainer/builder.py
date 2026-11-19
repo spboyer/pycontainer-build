@@ -1,7 +1,105 @@
-import hashlib, json, tarfile, tempfile, logging
+import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+from .fs_utils import ensure_dir, iter_files, output_directory_lock
+
+
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+
+class LayerIntegrityError(RuntimeError):
+    """Raised when a staged layer does not match its expected content."""
+
+
+def _create_temporary_file(directory: Path, prefix: str) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{prefix}-", suffix=".tmp", dir=directory
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _hash_file(path: Path) -> Tuple[str, int]:
+    hasher = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            size += len(chunk)
+    return f"sha256:{hasher.hexdigest()}", size
+
+
+def _blob_matches(path: Path, digest: str, size: int) -> bool:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+        return False
+    actual_digest, actual_size = _hash_file(path)
+    return actual_digest == digest and actual_size == size
+
+
+def _publish_content_addressed(
+    staged: Path, destination: Path, digest: str, size: int
+) -> Tuple[str, int]:
+    try:
+        with staged.open("rb+") as source:
+            source.flush()
+            os.fsync(source.fileno())
+        if _blob_matches(destination, digest, size):
+            return digest, size
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(
+                f"Existing content-addressed blob {destination} does not match "
+                f"{digest}; refusing to overwrite it."
+            )
+
+        try:
+            os.link(staged, destination)
+        except FileExistsError:
+            if not _blob_matches(destination, digest, size):
+                raise FileExistsError(
+                    f"Existing content-addressed blob {destination} does not match "
+                    f"{digest}; refusing to overwrite it."
+                )
+        return digest, size
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _write_content_addressed_bytes(
+    destination: Path, content: bytes, digest: str
+) -> Tuple[str, int]:
+    staged = _create_temporary_file(destination.parent, destination.name)
+    try:
+        with staged.open("wb") as target:
+            target.write(content)
+            target.flush()
+            os.fsync(target.fileno())
+        actual_digest, size = _hash_file(staged)
+        if actual_digest != digest:
+            raise LayerIntegrityError(
+                f"Staged blob hashes to {actual_digest}, not {digest}."
+            )
+        return _publish_content_addressed(staged, destination, digest, size)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(destination: Path, content: bytes) -> None:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{destination.name}-", suffix=".tmp", dir=destination.parent
+    )
+    staged = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(content)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
 
 def parse_platform(platform: str) -> Tuple[str, str]:
     """Parse platform string (e.g., 'linux/amd64') into (os, arch)."""
@@ -12,7 +110,6 @@ def parse_platform(platform: str) -> Tuple[str, str]:
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
 from .framework import apply_framework_defaults
-from .fs_utils import ensure_dir, iter_files
 from .registry_client import RegistryClient, parse_image_reference
 from .auth import get_auth_for_registry
 from .cache import LayerCache
@@ -41,7 +138,11 @@ class ImageBuilder:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
             return self.config.tag
-        
+
+        with output_directory_lock(self.config.output_dir):
+            return self._build_image()
+
+    def _build_image(self):
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -69,22 +170,28 @@ class ImageBuilder:
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
-        cfg_path.write_bytes(cfg_bytes)
+        _write_content_addressed_bytes(cfg_path, cfg_bytes, cfg_digest)
 
         manifest=build_manifest_json(cfg_digest,len(cfg_bytes),all_layers)
         manifest_bytes=json.dumps(manifest,separators=(',',':')).encode()
         manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
         manifest_path=layers_dir/manifest_digest.split(":",1)[1]
-        manifest_path.write_bytes(manifest_bytes)
+        _write_content_addressed_bytes(manifest_path, manifest_bytes, manifest_digest)
 
         oci_layout=build_oci_layout()
-        (output/'oci-layout').write_bytes(json.dumps(oci_layout,separators=(',',':')).encode())
+        _atomic_write_bytes(
+            output/'oci-layout',
+            json.dumps(oci_layout,separators=(',',':')).encode(),
+        )
 
         index=build_index_json(manifest_digest,len(manifest_bytes),self.config.tag,arch,os_name)
-        (output/'index.json').write_bytes(json.dumps(index,separators=(',',':')).encode())
+        _atomic_write_bytes(
+            output/'index.json',
+            json.dumps(index,separators=(',',':')).encode(),
+        )
 
         _, _, tag_name=parse_image_reference(self.config.tag)
-        (refs_dir/tag_name).write_text(manifest_digest)
+        _atomic_write_bytes(refs_dir/tag_name, manifest_digest.encode())
 
         self.manifest_digest=manifest_digest
         self.config_digest=cfg_digest
@@ -191,24 +298,29 @@ class ImageBuilder:
         deps_paths=find_dependencies(ctx, self.config.requirements_file)
         if not deps_paths:
             return None
-        
+
         print(f"Creating dependency layer ({len(deps_paths)} files)...")
-        tmp=layers_dir/'deps-layer.tar'
-        with tarfile.open(tmp,'w') as tar:
-            for abs_path, rel in deps_paths:
-                arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
-                tar.add(abs_path,arcname=arc)
-        data=tmp.read_bytes()
-        digest="sha256:"+hashlib.sha256(data).hexdigest()
-        final=layers_dir/digest.split(":",1)[1]
-        tmp.rename(final)
-        print(f"✓ Dependency layer created ({digest[:19]}...)")
-        return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,len(data),str(final))
+        layers_dir=Path(layers_dir)
+        tmp=_create_temporary_file(layers_dir,"deps-layer")
+        try:
+            with tarfile.open(tmp,'w') as tar:
+                for abs_path, rel in deps_paths:
+                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    tar.add(abs_path,arcname=arc)
+            digest, size = _hash_file(tmp)
+            final=layers_dir/digest.split(":",1)[1]
+            _publish_content_addressed(tmp, final, digest, size)
+            print(f"✓ Dependency layer created ({digest[:19]}...)")
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
         files=list(iter_files(ctx, include_paths))
-        
+
         if self.cache:
             cached=self.cache.get_layer(
                 files,
@@ -218,41 +330,62 @@ class ImageBuilder:
             if cached:
                 digest, cache_path=cached
                 final=layers_dir/digest.split(":",1)[1]
-                self.cache.copy_verified_blob(cache_path, final, digest)
-                return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,cache_path.stat().st_size,str(final))
-        
-        tmp=layers_dir/'app-layer.tar'
+                tmp=_create_temporary_file(layers_dir,"app-cache")
+                try:
+                    with cache_path.open("rb") as source, tmp.open("wb") as target:
+                        shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    actual_digest, size = _hash_file(tmp)
+                    if actual_digest != digest:
+                        raise LayerIntegrityError(
+                            f"Cached layer hashes to {actual_digest}, not {digest}."
+                        )
+                    _publish_content_addressed(tmp, final, digest, size)
+                    return OCILayer(
+                        "application/vnd.oci.image.layer.v1.tar",
+                        digest,
+                        size,
+                        str(final),
+                    )
+                finally:
+                    tmp.unlink(missing_ok=True)
+
+        tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
-        
-        with tarfile.open(tmp,'w') as tar:
-            for abs_path, rel in files_sorted:
-                arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
-                if self.config.reproducible:
-                    tarinfo=tar.gettarinfo(abs_path, arcname=arc)
-                    tarinfo.mtime=0
-                    tarinfo.uid=0
-                    tarinfo.gid=0
-                    tarinfo.uname="root"
-                    tarinfo.gname="root"
-                    if tarinfo.isfile():
-                        with open(abs_path, 'rb') as f:
-                            tar.addfile(tarinfo, f)
+        try:
+            with tarfile.open(tmp,'w') as tar:
+                for abs_path, rel in files_sorted:
+                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    if self.config.reproducible:
+                        tarinfo=tar.gettarinfo(abs_path, arcname=arc)
+                        tarinfo.mtime=0
+                        tarinfo.uid=0
+                        tarinfo.gid=0
+                        tarinfo.uname="root"
+                        tarinfo.gname="root"
+                        if tarinfo.isfile():
+                            with open(abs_path, 'rb') as f:
+                                tar.addfile(tarinfo, f)
+                        else:
+                            tar.addfile(tarinfo)
                     else:
-                        tar.addfile(tarinfo)
-                else:
-                    tar.add(abs_path,arcname=arc)
-        data=tmp.read_bytes()
-        digest="sha256:"+hashlib.sha256(data).hexdigest()
-        final=layers_dir/digest.split(":",1)[1]
-        tmp.rename(final)
-        
-        if self.cache:
-            self.cache.store_layer(
-                files,
-                digest,
-                final,
-                workdir=self.config.workdir,
-                reproducible=self.config.reproducible,
+                        tar.add(abs_path,arcname=arc)
+            digest, size = _hash_file(tmp)
+            final=layers_dir/digest.split(":",1)[1]
+            _publish_content_addressed(tmp, final, digest, size)
+
+            if self.cache:
+                self.cache.store_layer(
+                    files,
+                    digest,
+                    final,
+                    workdir=self.config.workdir,
+                    reproducible=self.config.reproducible,
+                )
+
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
             )
-        
-        return OCILayer("application/vnd.oci.image.layer.v1.tar",digest,len(data),str(final))
+        finally:
+            tmp.unlink(missing_ok=True)

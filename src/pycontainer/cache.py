@@ -1,5 +1,4 @@
 """Content-addressed application layer cache."""
-import errno
 import hashlib
 import json
 import logging
@@ -12,6 +11,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from .fs_utils import file_lock
 
 
 logger = logging.getLogger(__name__)
@@ -145,36 +146,8 @@ class LayerCache:
 
     @contextmanager
     def _index_lock(self):
-        with self.lock_file.open("a+b") as lock:
-            if os.name == "nt":
-                import msvcrt
-
-                lock.seek(0, os.SEEK_END)
-                if lock.tell() == 0:
-                    lock.write(b"\0")
-                    lock.flush()
-                lock.seek(0)
-                while True:
-                    try:
-                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError as error:
-                        if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                            raise
-                        time.sleep(0.05)
-                try:
-                    yield
-                finally:
-                    lock.seek(0)
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        with file_lock(self.lock_file):
+            yield
 
     def _load_index(self) -> Dict[str, CacheEntry]:
         if not self.index_file.exists():
