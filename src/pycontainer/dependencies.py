@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -193,8 +194,8 @@ def install_requirements(
             "TMPDIR": str(destination.parent),
         }
     )
-    try:
-        with open(os.devnull, "wb") as null_output:
+    with open(os.devnull, "wb") as null_output:
+        try:
             process = subprocess.Popen(
                 command,
                 cwd=context_dir,
@@ -202,35 +203,26 @@ def install_requirements(
                 stdout=null_output,
                 stderr=null_output,
             )
+        except OSError as exc:
+            raise RuntimeError(
+                "Unable to start pip for target dependency installation."
+            ) from exc
+        try:
             started = time.monotonic()
             while True:
                 try:
                     returncode = process.wait(timeout=0.5)
                     break
                 except subprocess.TimeoutExpired:
-                    try:
-                        _check_stage_limits(destination.parent)
-                    except ValueError:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                        raise
+                    _check_stage_limits(destination.parent)
                     if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
                         raise TimeoutError(
                             f"Target dependency installation exceeded "
                             f"{INSTALL_TIMEOUT_SECONDS} seconds."
                         )
-    except OSError as exc:
-        raise RuntimeError("Unable to start pip for target dependency installation.") from exc
+        except BaseException:
+            _stop_process(process)
+            raise
 
     if returncode:
         raise RuntimeError(
@@ -516,15 +508,33 @@ def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
     _check_stage_limits(scripts_dir.parent)
 
 
+def _stop_process(process) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _check_stage_limits(directory: Path) -> None:
+    # pip creates and moves files while this runs, so entries that vanish
+    # between listing and stat are skipped rather than treated as errors.
     total_bytes = 0
     total_files = 0
-    for path in directory.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"Staged dependency symlinks are unsupported: {path.name}")
-        if path.is_file():
+    for root, dirs, files in os.walk(directory):
+        for name in (*dirs, *files):
+            path = Path(root) / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"Staged dependency symlinks are unsupported: {name}")
+            if not stat.S_ISREG(info.st_mode):
+                continue
             total_files += 1
-            total_bytes += path.stat().st_size
+            total_bytes += info.st_size
             if total_files > MAX_STAGED_FILES or total_bytes > MAX_STAGED_BYTES:
                 raise ValueError(
                     "Staged dependencies exceed the limit of "
