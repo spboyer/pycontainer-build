@@ -365,7 +365,8 @@ exclude-defaults = true
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
-- `--platform PLATFORM` — Target platform (e.g., `linux/arm64`)
+- `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
+  `linux/arm64` or `linux/arm/v7`)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
@@ -530,7 +531,12 @@ Known limitations and future enhancements:
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 
-**Note**: Cross-platform builds pull the correct architecture variant from multi-platform base images and generate proper OCI metadata. For Python applications (interpreted language), no actual cross-compilation is needed.
+Multi-platform base images select an exact OS/architecture/variant match.
+If the platform omits a variant, the image must have one unambiguous match;
+otherwise specify it explicitly. Missing targets and inconsistent image
+metadata fail before base layers are downloaded. Base-image references may
+include a registry port or an immutable `@sha256:...` digest. Platform
+selection writes target metadata; it does not cross-compile dependencies.
 
 ---
 

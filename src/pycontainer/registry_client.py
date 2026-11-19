@@ -400,14 +400,27 @@ class RegistryClient:
             )
         return True
 
-    def pull_manifest(self, reference: str) -> Tuple[Dict, str]:
+    def pull_manifest(
+        self,
+        reference: str,
+        expected_digest: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> Tuple[Dict, str]:
         """Pull manifest, returning its decoded JSON and registry digest."""
+        if expected_digest is not None:
+            digest_filename(expected_digest)
+        if expected_size is not None and (
+            type(expected_size) is not int or expected_size < 0
+        ):
+            raise ValueError("Expected manifest size must be a non-negative integer.")
+
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {
             "Accept": (
                 "application/vnd.oci.image.manifest.v1+json,"
                 "application/vnd.docker.distribution.manifest.v2+json,"
-                "application/vnd.oci.image.index.v1+json"
+                "application/vnd.oci.image.index.v1+json,"
+                "application/vnd.docker.distribution.manifest.list.v2+json"
             )
         }
         status, body, response_headers = self._make_request(
@@ -422,6 +435,16 @@ class RegistryClient:
             raise RegistryRequestError(
                 f"Registry returned an empty manifest response for {reference}."
             )
+        if expected_size is not None and len(body) != expected_size:
+            raise BlobIntegrityError(
+                f"Downloaded manifest has size {len(body)}, expected {expected_size}."
+            )
+        body_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+        if expected_digest is not None and body_digest != expected_digest:
+            raise BlobIntegrityError(
+                f"Downloaded manifest hashes to {body_digest}, expected "
+                f"{expected_digest}."
+            )
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
@@ -430,10 +453,19 @@ class RegistryClient:
                 f"Registry returned invalid manifest JSON: {error}\n"
                 f"Body preview: {preview}"
             ) from error
+        if not isinstance(manifest, dict):
+            raise RegistryRequestError(
+                f"Registry returned a non-object manifest for {reference}."
+            )
         digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
             "docker-content-digest"
         )
-        return manifest, digest
+        if digest and digest.startswith("sha256:") and digest != body_digest:
+            raise BlobIntegrityError(
+                f"Registry reported manifest digest {digest}, but its body hashes "
+                f"to {body_digest}."
+            )
+        return manifest, digest or body_digest
 
     def _open_blob_response(self, url: str):
         request = urllib.request.Request(
@@ -583,25 +615,66 @@ class RegistryClient:
 
 
 def parse_image_reference(ref: str) -> Tuple[str, str, str]:
-    """Parse image reference into registry, repository, and tag."""
-    if "/" not in ref:
-        return (
-            "docker.io",
-            f"library/{ref.split(':')[0]}",
-            ref.split(":")[-1] if ":" in ref else "latest",
+    """Parse an image reference into registry, repository, and tag or digest."""
+    if not isinstance(ref, str) or not ref or ref != ref.strip():
+        raise ValueError("Image reference must be a non-empty string.")
+    if (
+        "://" in ref
+        or any(character.isspace() for character in ref)
+        or any(character in ref for character in "?#")
+    ):
+        raise ValueError(
+            "Image references must not include a URL scheme, query, fragment, "
+            "or whitespace."
         )
 
-    parts = ref.split("/")
-    if "." in parts[0] or ":" in parts[0]:
-        registry = parts[0]
-        repo = "/".join(parts[1:])
-    else:
-        registry = "docker.io"
-        repo = ref
+    name, separator, digest = ref.partition("@")
+    if separator:
+        if "@" in digest:
+            raise ValueError("Image reference contains more than one digest separator.")
+        try:
+            digest_filename(digest)
+        except ValueError as error:
+            raise ValueError(
+                "Image digest references must use a lowercase sha256 digest."
+            ) from error
 
-    if ":" in repo:
-        repo, tag = repo.rsplit(":", 1)
+    final_slash = name.rfind("/")
+    final_component = name[final_slash + 1 :]
+    if not final_component:
+        raise ValueError("Image reference is missing a repository name.")
+    if ":" in final_component:
+        repository_component, tag = final_component.rsplit(":", 1)
+        if not tag:
+            raise ValueError("Image reference contains an empty tag.")
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+            raise ValueError(f"Image reference contains an invalid tag: {tag!r}.")
+        name = name[: final_slash + 1] + repository_component
     else:
         tag = "latest"
 
-    return registry, repo, tag
+    if not name or name.startswith("/") or name.endswith("/") or "//" in name:
+        raise ValueError("Image reference contains an invalid repository name.")
+
+    parts = name.split("/")
+    first = parts[0]
+    has_registry = len(parts) > 1 and (
+        first == "localhost" or "." in first or ":" in first
+    )
+    if has_registry:
+        registry = first
+        repository = "/".join(parts[1:])
+    else:
+        registry = "docker.io"
+        repository = name
+        if "/" not in repository:
+            repository = f"library/{repository}"
+
+    if not repository or any(
+        part in {"", ".", ".."} for part in repository.split("/")
+    ):
+        raise ValueError("Image reference contains an invalid repository name.")
+    if registry in {"docker.io", "index.docker.io"} and "/" not in repository:
+        repository = f"library/{repository}"
+
+    return registry, repository, digest if separator else tag

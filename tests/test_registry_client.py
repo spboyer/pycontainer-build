@@ -57,10 +57,66 @@ def test_parse_image_reference():
     assert parse_image_reference("ghcr.io/user/app:v1")==("ghcr.io","user/app","v1")
     assert parse_image_reference("docker.io/library/python:3.11")==("docker.io","library/python","3.11")
     assert parse_image_reference("localhost:5000/test:latest")==("localhost:5000","test","latest")
+    assert parse_image_reference("localhost:5000/team/app:3.11")==("localhost:5000","team/app","3.11")
     assert parse_image_reference("myapp:v2")==("docker.io","library/myapp","v2")
     assert parse_image_reference("user/app:tag")==("docker.io","user/app","tag")
     assert parse_image_reference("localhost:5000/test")==("localhost:5000","test","latest")
     assert parse_image_reference("alpine")==("docker.io","library/alpine","latest")
+    digest = "sha256:" + "a" * 64
+    assert parse_image_reference(f"alpine@{digest}") == (
+        "docker.io",
+        "library/alpine",
+        digest,
+    )
+    assert parse_image_reference(f"registry.example/team/app:v1@{digest}") == (
+        "registry.example",
+        "team/app",
+        digest,
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "registry.example/team/app@sha512:" + "a" * 128,
+        "registry.example/team/app@",
+        "registry.example/team/app:",
+        "https://registry.example/team/app:latest",
+        "registry.example/team/app?tag=latest",
+        "registry.example/team/../app:latest",
+    ],
+)
+def test_parse_image_reference_rejects_invalid_references(reference):
+    with pytest.raises(ValueError):
+        parse_image_reference(reference)
+
+
+def test_pull_manifest_verifies_digest_and_size(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    body = json.dumps({"schemaVersion": 2, "mediaType": "application/test"}).encode()
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    requests = []
+
+    def fake_request(method, url, headers=None):
+        requests.append((method, url, headers))
+        return 200, body, {"Docker-Content-Digest": digest}
+
+    monkeypatch.setattr(client, "_make_request", fake_request)
+
+    manifest, returned_digest = client.pull_manifest(
+        digest, expected_digest=digest, expected_size=len(body)
+    )
+    assert manifest["schemaVersion"] == 2
+    assert returned_digest == digest
+    assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
+        requests[0][2]["Accept"]
+    )
+
+    with pytest.raises(BlobIntegrityError, match="size"):
+        client.pull_manifest(digest, expected_size=len(body) + 1)
+
+    with pytest.raises(BlobIntegrityError, match="hashes"):
+        client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
 
 def test_registry_client_construction():
     """Test RegistryClient initialization."""
