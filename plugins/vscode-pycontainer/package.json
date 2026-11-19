@@ -111,7 +111,7 @@
     "@types/vscode": "^1.80.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
-    "eslint": "^8.0.0",
+    "eslint": "^10.15.0",
     "typescript": "^5.0.0",
     "@vscode/vsce": "^3.9.1"
   },
