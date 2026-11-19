@@ -14,9 +14,18 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
             clients.append((registry, repository, auth))
 
         def pull_manifest(self, reference):
-            return ({"config": {"digest": "sha256:config"}, "layers": []}, None)
+            return (
+                {
+                    "config": {
+                        "digest": "sha256:" + "a" * 64,
+                        "size": len(json.dumps({"architecture": "amd64"}).encode()),
+                    },
+                    "layers": [],
+                },
+                None,
+            )
 
-        def pull_blob(self, digest, path):
+        def pull_blob(self, digest, path, expected_size):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"architecture": "amd64"}))
 

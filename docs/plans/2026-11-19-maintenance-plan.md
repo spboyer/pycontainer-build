@@ -1,7 +1,7 @@
 # Maintenance execution plan
 
 Observed: **2026-11-19**. Baseline: `628f623`.
-Status: #67-#73 merged; #74 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
+Status: #67-#74 merged; #75 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
 Evidence and methods: [performance audit/design](2026-11-19-performance-maintenance-design.md).
 
 ## Outcomes and delivery rules
@@ -36,12 +36,25 @@ writing regressions or investigating the independent P0 defects.
 | Work | Issue | Prerequisites | Completion evidence |
 | --- | --- | --- | --- |
 | Context and framework discovery boundaries | #73 | #68 | Merged in PR #88; no output/venv/test false positives by default; flat and src app layouts; portable dotted module names; scan profile. |
-| Importable target dependency staging | #74 | #68, #69, #73 | Requirements resolve/install or fail explicitly; correct target import prefix and ABI; real target imports; reproducible dependency tar. In progress on `issue-74-target-dependencies`. |
-| Streaming tar/blob I/O and transfer integrity | #75 | #68, #69, #70, #72 | Bounded-chunk hashing/transfers; measured RSS; verified atomic downloads; timeout/retry/interruption fixtures. |
+| Importable target dependency staging | #74 | #68, #69, #73 | Merged in PR #89; target wheel staging, import path, ABI checks, SBOM inventory, reproducible tar and runtime smoke passed. |
+| Streaming tar/blob I/O and transfer integrity | #75 | #68, #69, #70, #72 | In progress on `issue-75-streaming-blob-io`; bounded-chunk transfers, measured RSS, verified atomic downloads, safe timeout/retry and interruption coverage. |
 | SBOM CLI formats and shipped inventory | #76 | #68, #71, #74 | Supported format arguments match all callers; schema validation; no host inventory leakage; correct tool metadata. |
 | Poetry/Hatch/VS Code contracts | #77 | #68, #71 | Real supported plugin registration, valid BuildConfig usage and subprocess entrypoint; working extension checks. |
 | Digest references and platform-selection errors | #78 | #68, #69 | Tags/digests/ports, OCI index/Docker list and missing-platform tests; exact target selection. |
 | Installation, packaging, release/action refresh | #79 | #68-#78 and existing #67 before release | Isolated wheel/sdist install; verified workflow install provenance; reviewed/pinned action upgrades; owner-confirmed license; runtime release gates. |
+
+Issue #75's loopback synthetic-registry benchmark (Linux, CPython 3.12.3,
+x86_64; three repetitions; transfer cache disabled) measured these medians:
+
+| Blob size | Wall time | Process peak RSS | Python-tracked peak |
+| ---: | ---: | ---: | ---: |
+| 8 MiB upload + download | 0.094 s | 31.5 MiB | 2.16 MiB |
+| 32 MiB upload + download | 0.209 s | 31.5 MiB | 2.16 MiB |
+
+Process RSS includes interpreter startup/imports; synthetic server storage and
+fixture creation are outside the measured worker process. These are local
+transfer/memory observations, not external registry throughput or performance
+claims.
 
 #75 implements shared blob verification/publication; #78 should consume it
 rather than introducing a second transport implementation. Their parsing and
