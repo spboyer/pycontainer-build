@@ -322,6 +322,23 @@ pycontainer build \
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
 - `--include-deps` — Package dependencies from venv or requirements.txt
 
+**Context Selection**:
+- `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
+- `--exclude PATH` — Exclude a context-root-relative path or glob; repeat to add exclusions
+- Default exclusions prune VCS metadata, virtual environments, generated output/cache directories, and test/fixture files and directories before scanning
+- `--no-default-excludes` disables those defaults; use it only when those files are intentionally part of the image
+
+The same options are available in `[build]` as `include-paths`, `exclude-paths`,
+and `exclude-defaults`. Include paths are relative to the build context and
+overlapping paths are deduplicated. For example:
+
+```toml
+[build]
+include-paths = ["src", "pyproject.toml"]
+exclude-paths = ["src/generated", "fixtures/**"]
+exclude-defaults = true
+```
+
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
@@ -354,6 +371,7 @@ config = BuildConfig(
     env={"DEBUG": "false", "ENV": "production"},
     labels={"version": "1.0", "maintainer": "team@example.com"},
     include_paths=["src/", "lib/", "pyproject.toml"],
+    exclude_paths=["src/generated", "fixtures/**"],
     entrypoint=["python", "-m", "myapp"],
     generate_sbom="spdx",
     reproducible=True,

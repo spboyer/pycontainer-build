@@ -2,7 +2,13 @@ import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
-from .fs_utils import ensure_dir, iter_files, output_directory_lock
+from .fs_utils import (
+    VIRTUALENV_EXCLUDES,
+    context_exclude_paths,
+    ensure_dir,
+    iter_files,
+    output_directory_lock,
+)
 
 
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -119,16 +125,48 @@ logger=logging.getLogger(__name__)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
-        self.config=apply_framework_defaults(config, Path(config.context_dir))
+        context_dir=Path(config.context_dir)
+        default_cache_dir=Path.home()/".pycontainer"/"cache"
+        cache_dir=(
+            Path(config.cache_dir).expanduser()
+            if config.cache_dir
+            else default_cache_dir
+        )
+        self.context_excludes=context_exclude_paths(
+            context_dir,
+            output_dir=config.output_dir,
+            cache_dir=cache_dir,
+            exclude_paths=config.exclude_paths,
+            exclude_defaults=config.exclude_defaults,
+        )
+        self.context_include_paths=(
+            config.include_paths
+            if config.include_paths is not None
+            else default_include_paths(
+                context_dir,
+                exclude_paths=self.context_excludes,
+                exclude_defaults=config.exclude_defaults,
+            )
+        )
+        self.dependency_excludes=tuple(
+            exclude
+            for exclude in self.context_excludes
+            if not (
+                config.exclude_defaults
+                and exclude in VIRTUALENV_EXCLUDES
+                and exclude not in config.exclude_paths
+            )
+        )
+        self.config=apply_framework_defaults(
+            config,
+            context_dir,
+            self.context_include_paths,
+            self.context_excludes,
+            exclude_defaults=False,
+        )
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
         if config.use_cache and not self.dry_run:
-            default_cache_dir=Path.home()/".pycontainer"/"cache"
-            cache_dir=(
-                Path(config.cache_dir).expanduser()
-                if config.cache_dir
-                else default_cache_dir
-            )
             self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
         else:
             self.cache=None
@@ -152,7 +190,7 @@ class ImageBuilder:
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
-        include = self.config.include_paths or default_include_paths(self.config.context_dir)
+        include = self.context_include_paths
 
         app_layers=[]
         if self.config.include_deps:
@@ -310,7 +348,12 @@ class ImageBuilder:
     def _create_deps_layer(self, layers_dir: Path) -> Optional[OCILayer]:
         """Create dependency layer from venv or requirements.txt."""
         ctx=Path(self.config.context_dir)
-        deps_paths=find_dependencies(ctx, self.config.requirements_file)
+        deps_paths=find_dependencies(
+            ctx,
+            self.config.requirements_file,
+            exclude_paths=self.dependency_excludes,
+            exclude_defaults=False,
+        )
         if not deps_paths:
             return None
 
@@ -334,7 +377,14 @@ class ImageBuilder:
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
-        files=list(iter_files(ctx, include_paths))
+        files=list(
+            iter_files(
+                ctx,
+                include_paths,
+                exclude_paths=self.context_excludes,
+                exclude_defaults=self.config.exclude_defaults,
+            )
+        )
 
         if self.cache:
             cached=self.cache.get_layer(

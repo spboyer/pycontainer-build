@@ -112,6 +112,38 @@ reproducible = true
     assert config.reproducible is False
 
 
+def test_cli_context_include_and_exclude_options_override_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        """
+[build]
+include-paths = ["from-file"]
+exclude-paths = ["generated"]
+exclude-defaults = true
+"""
+    )
+
+    config = _capture_config(
+        monkeypatch,
+        [
+            "build",
+            "--config",
+            str(config_path),
+            "--include",
+            "app.py",
+            "--include",
+            "pyproject.toml",
+            "--exclude",
+            "artifacts/**",
+            "--no-default-excludes",
+        ],
+    )
+
+    assert config.include_paths == ["app.py", "pyproject.toml"]
+    assert config.exclude_paths == ["artifacts/**"]
+    assert config.exclude_defaults is False
+
+
 def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.12")
 

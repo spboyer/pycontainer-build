@@ -17,6 +17,9 @@ def main():
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
     b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
     b.add_argument("--password",help="Registry password/token (or use env vars)")
+    b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
+    b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
+    b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
@@ -38,6 +41,9 @@ def main():
         'tag': args.tag,
         'base_image': args.base_image,
         'context_dir': args.context_dir,
+        'include_paths': args.include_paths,
+        'exclude_paths': args.exclude_paths,
+        'exclude_defaults': args.exclude_defaults,
         'use_cache': args.use_cache,
         'cache_dir': args.cache_dir,
         'include_deps': args.include_deps,

@@ -121,7 +121,6 @@ These are known gaps, **not fixed behavior**:
   libraries are not wired into the runtime import path.
 - CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,
   not the documented format argument. SBOM inventory can include host packages.
-- Context/framework scans can include generated/dependency/test files.
 - Plugin API/entrypoint contracts need repair, and PyPI installation of this
   project returned HTTP 404 during the 2026-11-19 audit.
 
