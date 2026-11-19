@@ -1,0 +1,114 @@
+# Agent and contributor guidance
+
+## Scope and architecture
+
+pycontainer-build is an experimental, Docker-daemon-free OCI image builder.
+The core requires **Python 3.11+** (`tomllib`) and has **zero declared runtime
+dependencies**. Do not introduce a runtime dependency or an external build
+daemon without discussing the trade-off first.
+
+- `src/pycontainer/cli.py`: argparse interface and configuration overrides.
+- `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
+- `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
+- `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
+- `oci.py`: image configuration, descriptors, manifest and index serialization.
+- `cache.py`: optional local application-layer cache.
+- `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
+- `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `plugins/`: separate Poetry, Hatch and VS Code integrations.
+- `tests/`: actual pytest suite; `docs/TESTING.md` describes an aspirational
+  strategy, including directories and tooling that do not yet exist.
+
+The layout is `dist/image/oci-layout`, `index.json`, `blobs/sha256/<digest>`,
+and `refs/tags/<tag>`, not a top-level `manifest.json`.
+`BuildConfig` accepts `context_dir`, not `context_path`.
+The working module invocation is `python -m pycontainer.cli`; the package
+currently has no `__main__.py`.
+
+## Setup and verified checks
+
+PowerShell examples, run from the repository root:
+
+```powershell
+uv venv
+uv pip install --python .venv\Scripts\python.exe -e . pytest
+.venv\Scripts\python.exe -m pycontainer.cli --help
+```
+
+For an existing interpreter with pytest, source-tree testing needs no package
+installation:
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+python -m pytest --collect-only -q
+python -m pytest tests -q -k 'not dependency_layer_creation and not build_and_push_workflow and not oci_layout_structure and not tag_extraction'
+python -m pycontainer.cli build --dry-run --tag audit:local --context examples\fastapi-app
+```
+
+At baseline `628f623`, 46 tests collect and this offline selection passes
+42 tests. It excludes exactly these registry-pulling tests:
+
+- `tests/test_base_image.py::test_dependency_layer_creation`
+- `tests/test_build_push.py::test_build_and_push_workflow`
+- `tests/test_oci_layout.py::test_oci_layout_structure`
+- `tests/test_oci_layout.py::test_tag_extraction`
+
+The full command is `python -m pytest tests -v`. It makes real base-image pulls;
+run it deliberately with network access and bounded execution time. A passing
+layout assertion is not evidence that an image starts in a container runtime.
+Do not silently remove, mock away, or claim success for unrun integration tests.
+
+There is no configured root formatter, linter, type checker, benchmark runner
+or PR CI gate yet. Do not describe suggested tools as existing required checks.
+The release workflow currently tests only Linux/Python 3.11 and 3.12.
+
+## Change discipline
+
+Keep changes surgical and follow the surrounding module's style. Existing core
+modules are compact; do not combine fixes with wholesale reformatting.
+Use focused pytest regressions that fail before the fix. Patch network/auth
+boundaries in unit tests and use synthetic credentials, not local login state.
+Surface invalid inputs and operational errors explicitly.
+
+Use host `Path` operations for local files and POSIX paths for Linux OCI
+entries. Target metadata selection does not compile native dependencies for
+another platform. Never silently copy incompatible host binaries into an image.
+
+For image changes, check ordered manifest layers against `rootfs.diff_ids`,
+digest/size/media-type consistency, config inheritance and target platform.
+DiffIDs hash **uncompressed** layer tar content, not compressed base blobs.
+Use an opt-in real runtime import/startup check for runnable-image claims.
+
+For caching or transfer changes, verify equal-size/equal-time source edits,
+layer-affecting configuration, repeated builds, corruption, interruption and
+concurrent writers. Hash and transfer large blobs incrementally, publish
+verified files atomically, and do not forward registry authorization to
+redirected storage hosts.
+
+Report benchmark fixtures, environment, repetitions and cache state. Include
+builder construction, traversal, copies and relevant I/O in lifecycle costs.
+Distinguish Python-tracked allocations from process RSS and app-only timings
+from real end-to-end builds. Do not promise speedups from synthetic results.
+
+## Current limitations and work plan
+
+These are known gaps, **not fixed behavior**:
+
+- Default `use_cache=True` does not enable caching without `cache_dir`; local
+  cache identity can reuse stale or wrong-workdir layers.
+- App/dependency layers are not appended to the base config's DiffIDs.
+- `--include-deps` does not install a requirements file; copied virtualenv
+  libraries are not wired into the runtime import path.
+- CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,
+  not the documented format argument. SBOM inventory can include host packages.
+- A repeated uncached layer build can fail on Windows; context/framework scans
+  can include generated/dependency/test files.
+- Plugin API/entrypoint contracts need repair, and PyPI installation of this
+  project returned HTTP 404 during the 2026-11-19 audit.
+
+Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
+and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
+Roadmap: `spboyer/pycontainer-build#66`. Reuse existing issues before opening
+another; do not close duplicate candidates without preserving their scope.
+Keep fixes separate from the documentation audit. Commit on a feature branch
+using conventional commit messages; never put credentials in code or issues.
