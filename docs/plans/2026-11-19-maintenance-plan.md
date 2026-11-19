@@ -1,7 +1,7 @@
 # Maintenance execution plan
 
 Observed: **2026-11-19**. Baseline: `628f623`.
-Status: planned, **not implemented**. Roadmap: `spboyer/pycontainer-build#66`.
+Status: #68-#70 merged; #71 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
 Evidence and methods: [performance audit/design](2026-11-19-performance-maintenance-design.md).
 
 ## Outcomes and delivery rules
@@ -23,7 +23,7 @@ The audit documentation PR closes only #80, not any implementation issues.
 | --- | --- | --- | --- |
 | Offline PR CI and performance harness baseline | #68 | None | Linux/Windows hermetic suite, declared minimum/current interpreter policy, explicit network-test separation, repeatable trend artifacts. |
 | Correct ordered OCI DiffIDs | #69 | #68 | Manifest/rootfs consistency for base+deps+app, compressed/uncompressed digest fixtures, opt-in runtime validation. |
-| Local cache identity, activation and atomic index handling | #70 | #68 | Equal-size/time edits miss; workdir/settings differ; defaults truthful; corruption, concurrent-writer and eviction tests. |
+| Local cache identity, activation and atomic index handling | #70 | #68 | Merged in PR #84; local tests, four-platform CI, package smoke and post-merge workflow passed. |
 | Preserve configuration-file values | #71 | #68 | Actual CLI tests prove omitted args do not override file values; explicit overrides do. |
 | Atomic repeat-build publication on Windows | #72 | #68 | Same-output cached/uncached app/dependency rebuilds pass on Linux/Windows; interruption and ownership tested. |
 | Basic credentials versus bearer tokens | Existing #67 | None; use #68 gate before merge | CLI/environment/Docker-config flows preserve username/password, challenge exchange works with synthetic HTTP fixtures, credentials not logged. |

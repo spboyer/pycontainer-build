@@ -386,6 +386,11 @@ DEBUG = "false"
 url = "ghcr.io/myorg/myapp"
 ```
 
+Explicit CLI options override `[build]` values; omitted options leave the file
+values intact, and settings absent from both use `BuildConfig` defaults. Keys
+in `[build]` may use hyphens or underscores. Unknown settings and values with
+the wrong TOML type are reported as configuration errors.
+
 ---
 
 ## 🗺️ Roadmap
