@@ -1,9 +1,11 @@
 """Tests for OCI Image Layout structure validation."""
+import pytest
 import json, tempfile, shutil
 from pathlib import Path
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 
+@pytest.mark.registry_integration
 def test_oci_layout_structure():
     """Verify complete OCI layout structure is created."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -40,6 +42,7 @@ def test_oci_layout_structure():
         assert manifest["mediaType"]=="application/vnd.oci.image.manifest.v1+json"
         assert len(manifest["layers"])>=1,"Expected at least 1 layer"
 
+@pytest.mark.registry_integration
 def test_tag_extraction():
     """Verify tag name is correctly extracted for refs."""
     with tempfile.TemporaryDirectory() as tmpdir:

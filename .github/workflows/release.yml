@@ -12,9 +12,10 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ['3.11', '3.12']
+        python-version: ['3.11', '3.15']
     steps:
       - uses: actions/checkout@v4
       
@@ -30,7 +31,7 @@ jobs:
           pip install pytest
       
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v -m "not registry_integration"
 
   build:
     name: Build Package

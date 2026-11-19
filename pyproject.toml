@@ -9,6 +9,13 @@ authors = [
 ]
 dependencies = []
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-m", "not registry_integration"]
+markers = [
+  "registry_integration: requires external registry access and pulls real base-image layers",
+]
+
 [project.scripts]
 pycontainer = "pycontainer.cli:main"
 
