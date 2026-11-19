@@ -47,6 +47,8 @@ class RegistryClient:
         if self.username and self.password:
             creds=base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
             headers['Authorization']=f'Basic {creds}'
+        elif self.auth_token:
+            headers['Authorization']=f'Bearer {self.auth_token}'
         elif self.password:
             headers['Authorization']=f'Bearer {self.password}'
         

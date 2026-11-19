@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 from pycontainer.builder import ImageBuilder, parse_platform
+from pycontainer.auth import RegistryAuth
 from pycontainer.config import BuildConfig
 from pycontainer.oci import build_config_json, build_index_json, OCILayer
 
@@ -198,7 +199,10 @@ def test_platform_manifest_selection():
                     path.write_bytes(b"fake layer data")
             
             with patch('pycontainer.registry_client.RegistryClient.pull_blob', side_effect=mock_pull_blob):
-                with patch('pycontainer.auth.get_auth_for_registry', return_value=None):
+                with patch(
+                    'pycontainer.builder.get_registry_auth',
+                    return_value=RegistryAuth(),
+                ):
                     cfg = BuildConfig(
                         tag="test:v1",
                         base_image="python:3.11-slim",

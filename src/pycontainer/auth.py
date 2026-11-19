@@ -1,8 +1,17 @@
 """Authentication providers for container registries."""
 import json, base64, os, subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
+
+
+@dataclass(frozen=True)
+class RegistryAuth:
+    bearer_token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+
 
 class AuthProvider(ABC):
     """Base authentication provider interface."""
@@ -85,8 +94,6 @@ class DockerConfigAuthProvider(AuthProvider):
         return None
     
     def get_token(self, registry: str) -> Optional[str]:
-        creds=self.get_credentials(registry)
-        if creds: return creds[1]
         return None
 
 class AzureCLIAuthProvider(AuthProvider):
@@ -138,20 +145,47 @@ def get_default_auth_provider() -> AuthProvider:
         AzureCLIAuthProvider()
     ])
 
-def get_auth_for_registry(registry: str, username: Optional[str]=None, password: Optional[str]=None) -> Optional[str]:
-    """Get auth token for registry, trying multiple sources."""
+
+def get_registry_auth(
+    registry: str,
+    *,
+    bearer_token: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> RegistryAuth:
+    """Resolve registry credentials without treating a password as a bearer token."""
+    if bearer_token:
+        return RegistryAuth(bearer_token=bearer_token)
+    if username:
+        if not password:
+            raise ValueError("A registry username must be paired with a password.")
+        return RegistryAuth(username=username, password=password)
     if password:
-        return password
-    
-    if username and password:
-        return password
-    
+        return RegistryAuth(bearer_token=password)
+
     provider=get_default_auth_provider()
-    
+
     token=provider.get_token(registry)
-    if token: return token
-    
+    if token:
+        return RegistryAuth(bearer_token=token)
+
     creds=provider.get_credentials(registry)
-    if creds: return creds[1]
-    
-    return None
+    if creds:
+        credential_username, credential_password = creds
+        if credential_username and credential_password:
+            return RegistryAuth(
+                username=credential_username, password=credential_password
+            )
+        if credential_password:
+            return RegistryAuth(bearer_token=credential_password)
+
+    return RegistryAuth()
+
+
+def get_auth_for_registry(
+    registry: str, username: Optional[str] = None, password: Optional[str] = None
+) -> Optional[str]:
+    """Return a bearer token only; basic credentials are resolved separately."""
+    return get_registry_auth(
+        registry, username=username, password=password
+    ).bearer_token
