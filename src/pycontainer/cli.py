@@ -12,65 +12,55 @@ def main():
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
     b.add_argument("--tag")
     b.add_argument("--base-image",help="Base image to layer on (auto-detected from requires-python if not specified)")
-    b.add_argument("--context",default=".")
+    b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
     b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
     b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
-    b.add_argument("--no-cache",action="store_true",help="Disable layer caching, force full rebuild")
+    b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
-    b.add_argument("--include-deps",action="store_true",help="Include dependencies from venv or requirements.txt")
-    b.add_argument("--requirements",default="requirements.txt",help="Requirements file for dependency layer")
-    b.add_argument("--verbose","-v",action="store_true",help="Verbose output with detailed logging")
-    b.add_argument("--dry-run",action="store_true",help="Show build plan without building")
-    b.add_argument("--platform",default="linux/amd64",help="Target platform (e.g., linux/amd64, linux/arm64)")
-    b.add_argument("--no-reproducible",action="store_true",help="Disable reproducible builds")
-    b.add_argument("--sbom",action="store_true",help="Generate SBOM (Software Bill of Materials)")
+    b.add_argument("--include-deps",action="store_true",default=None,help="Include dependencies from venv or requirements.txt")
+    b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer")
+    b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
+    b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
+    b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
+    b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
+    b.add_argument("--sbom",dest="generate_sbom",action="store_true",default=None,help="Generate SBOM (Software Bill of Materials)")
     args=parser.parse_args()
 
-    if args.verbose:
+    cli_overrides={
+        'tag': args.tag,
+        'base_image': args.base_image,
+        'context_dir': args.context_dir,
+        'use_cache': args.use_cache,
+        'cache_dir': args.cache_dir,
+        'include_deps': args.include_deps,
+        'requirements_file': args.requirements_file,
+        'verbose': args.verbose,
+        'dry_run': args.dry_run,
+        'platform': args.platform,
+        'reproducible': args.reproducible,
+        'generate_sbom': args.generate_sbom
+    }
+    cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
+
+    try:
+        if args.config:
+            cfg=config_from_file(Path(args.config), cli_overrides)
+        else:
+            cfg=BuildConfig(**cli_overrides)
+            if 'base_image' not in cli_overrides:
+                py_ver=detect_python_version(cfg.context_dir)
+                cfg.base_image=f"python:{py_ver}-slim"
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+
+    if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    if args.config:
-        cli_overrides={
-            'tag': args.tag,
-            'base_image': args.base_image,
-            'context_dir': args.context,
-            'use_cache': not args.no_cache if args.no_cache else None,
-            'cache_dir': args.cache_dir,
-            'include_deps': args.include_deps,
-            'requirements_file': args.requirements,
-            'verbose': args.verbose,
-            'dry_run': args.dry_run,
-            'platform': args.platform,
-            'reproducible': not args.no_reproducible if args.no_reproducible else None,
-            'generate_sbom': args.sbom
-        }
-        cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
-        cfg=config_from_file(Path(args.config), cli_overrides)
-    else:
-        tag=args.tag or "local/test:latest"
-        base_img=args.base_image
-        if not base_img:
-            py_ver=detect_python_version(args.context)
-            base_img=f"python:{py_ver}-slim"
-        cfg=BuildConfig(
-            tag=tag, 
-            base_image=base_img,
-            context_dir=args.context,
-            use_cache=not args.no_cache,
-            cache_dir=args.cache_dir,
-            include_deps=args.include_deps,
-            requirements_file=args.requirements,
-            verbose=args.verbose,
-            dry_run=args.dry_run,
-            platform=args.platform,
-            reproducible=not args.no_reproducible
-        )
-        cfg.generate_sbom=args.sbom
     builder=ImageBuilder(cfg)
     out=builder.build()
     print("Built:", out)
