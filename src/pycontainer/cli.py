@@ -43,6 +43,8 @@ def main():
         default=None,
         help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
     )
+    b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
+    b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
     args=parser.parse_args()
 
     if args.push and args.username and not (
@@ -65,7 +67,9 @@ def main():
         'dry_run': args.dry_run,
         'platform': args.platform,
         'reproducible': args.reproducible,
-        'generate_sbom': args.generate_sbom
+        'generate_sbom': args.generate_sbom,
+        'system_packages': args.system_packages,
+        'detect_system_packages': args.detect_system_packages,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 

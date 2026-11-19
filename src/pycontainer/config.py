@@ -30,8 +30,13 @@ class BuildConfig:
     platform: str = "linux/amd64"
     reproducible: bool = True
     generate_sbom: Union[bool, str] = False
+    system_packages: List[str] = field(default_factory=list)
+    detect_system_packages: bool = True
 
     def __post_init__(self):
+        from .system_packages import validate_system_packages
+
+        self.system_packages = validate_system_packages(self.system_packages)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
