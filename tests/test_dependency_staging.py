@@ -173,6 +173,37 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
     ]
 
 
+def test_excluded_explicit_requirements_still_install_dependencies(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    generated = context / "gen"
+    generated.mkdir(parents=True)
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(generated / "wheelhouse")
+    (generated / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _builder(
+        tmp_path,
+        monkeypatch,
+        context=context,
+        include_deps=True,
+        requirements_file="gen/requirements.txt",
+        exclude_paths=["gen"],
+    )
+
+    builder.build()
+
+    dependency_layer, app_layer = builder.layers
+    with tarfile.open(dependency_layer.tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+    with tarfile.open(app_layer.tar_path) as archive:
+        app_names = archive.getnames()
+    assert "app/app.py" in app_names
+    assert not [name for name in app_names if name.startswith("app/gen")]
+
+
 def test_builder_selects_cyclonedx_for_staged_inventory(tmp_path, monkeypatch):
     context = tmp_path / "context"
     context.mkdir()
