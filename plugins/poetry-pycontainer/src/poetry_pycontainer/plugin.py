@@ -104,19 +104,16 @@ class ContainerBuildCommand(Command):
         # Create build configuration
         config = BuildConfig(
             tag=tag,
-            context_path=str(project_path),
+            context_dir=str(project_path),
             base_image=base_image,
             include_deps=include_deps,
+            generate_sbom=sbom or False,
             env=env,
             labels=labels,
             verbose=verbose,
             dry_run=dry_run,
             use_cache=not no_cache,
         )
-        
-        # Generate SBOM if requested
-        if sbom:
-            config.generate_sbom = sbom
         
         # Build the image
         try:

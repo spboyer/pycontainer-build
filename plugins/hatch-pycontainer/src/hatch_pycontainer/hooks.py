@@ -69,17 +69,15 @@ class ContainerBuildHook:
         # Create build configuration
         config = BuildConfig(
             tag=tag,
-            context_path=str(self.root),
+            context_dir=str(self.root),
             base_image=base_image,
             include_deps=include_deps,
+            generate_sbom=sbom or False,
             env=env,
             labels=labels,
             verbose=verbose,
             use_cache=use_cache,
         )
-
-        if sbom:
-            config.generate_sbom = sbom
 
         # Build the image
         try:

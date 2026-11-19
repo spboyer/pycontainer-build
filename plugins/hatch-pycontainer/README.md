@@ -84,8 +84,8 @@ push = false
 # Include project dependencies
 include-deps = true
 
-# Generate SBOM (spdx or cyclonedx)
-sbom = "spdx"
+# Generate SBOM: true defaults to SPDX; a string selects its format
+sbom = "cyclonedx"
 
 # Enable verbose output
 verbose = true

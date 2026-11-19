@@ -1,6 +1,6 @@
 import argparse, os, logging
 from pathlib import Path
-from .config import BuildConfig
+from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
@@ -34,7 +34,15 @@ def main():
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
-    b.add_argument("--sbom",dest="generate_sbom",action="store_true",default=None,help="Generate SBOM (Software Bill of Materials)")
+    b.add_argument(
+        "--sbom",
+        dest="generate_sbom",
+        nargs="?",
+        const="spdx",
+        choices=SBOM_FORMATS,
+        default=None,
+        help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
+    )
     args=parser.parse_args()
 
     if args.push and args.username and not (

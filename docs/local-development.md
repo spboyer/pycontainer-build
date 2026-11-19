@@ -368,10 +368,10 @@ pycontainer build \
 pycontainer build --tag myapp:latest --sbom spdx --verbose
 
 # Check the SBOM was created
-ls -lh dist/image/sbom.spdx.json
+ls -lh dist/image/sbom.json
 
 # View the SBOM
-cat dist/image/sbom.spdx.json | jq '.packages[].name'
+cat dist/image/sbom.json | jq '.packages[].name'
 ```
 
 ### Use Case 4: Testing Framework Auto-Detection

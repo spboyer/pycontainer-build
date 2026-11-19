@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
+
+SBOM_FORMATS = ("spdx", "cyclonedx")
+
 
 @dataclass
 class BuildConfig:
@@ -26,4 +29,14 @@ class BuildConfig:
     dry_run: bool = False
     platform: str = "linux/amd64"
     reproducible: bool = True
-    generate_sbom: bool = False
+    generate_sbom: Union[bool, str] = False
+
+    def __post_init__(self):
+        if not isinstance(self.generate_sbom, (bool, str)):
+            raise ValueError(
+                "generate_sbom must be a boolean or one of: spdx, cyclonedx"
+            )
+        if isinstance(self.generate_sbom, str) and self.generate_sbom not in SBOM_FORMATS:
+            raise ValueError(
+                "generate_sbom must be a boolean or one of: spdx, cyclonedx"
+            )

@@ -40,12 +40,12 @@ PowerShell examples, run from the repository root:
 
 ```powershell
 uv venv
-uv pip install --python .venv\Scripts\python.exe -e . pytest
+uv pip install --python .venv\Scripts\python.exe -e . pytest jsonschema
 .venv\Scripts\python.exe -m pycontainer.cli --help
 ```
 
-For an existing interpreter with pytest, source-tree testing needs no package
-installation:
+For an existing interpreter with pytest and jsonschema, source-tree testing
+needs no package installation:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
@@ -124,8 +124,7 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,
-  not the documented format argument. SBOM inventory can include host packages.
+- CLI defaults can overwrite TOML settings.
 - Plugin API/entrypoint contracts need repair, and PyPI installation of this
   project returned HTTP 404 during the 2026-11-19 audit.
 

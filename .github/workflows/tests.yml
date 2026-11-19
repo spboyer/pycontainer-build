@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test runner
-        run: python -m pip install pytest
+        run: python -m pip install pytest jsonschema
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
@@ -68,7 +68,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test runner
-        run: python -m pip install pytest
+        run: python -m pip install pytest jsonschema
       - name: Run registry-pulling tests
         env:
           PYTHONPATH: src

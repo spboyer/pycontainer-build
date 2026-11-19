@@ -76,7 +76,7 @@ Build an OCI container image from your Poetry project.
 - `--registry, -r` - Container registry URL
 - `--push, -p` - Push image to registry
 - `--include-deps, -d` - Include Poetry dependencies (default: true)
-- `--sbom, -s` - Generate SBOM (`spdx` or `cyclonedx`)
+- `--sbom, -s FORMAT` - Generate an SBOM (`spdx` or `cyclonedx`)
 - `--verbose, -v` - Verbose output
 - `--dry-run` - Show what would be built without building
 - `--no-cache` - Disable layer caching
@@ -127,8 +127,8 @@ push = false
 # Include Poetry dependencies in the image
 include_deps = true
 
-# Generate SBOM (spdx or cyclonedx)
-sbom = "spdx"
+# Generate SBOM: true defaults to SPDX; a string selects its format
+sbom = "cyclonedx"
 
 # Enable verbose output
 verbose = false

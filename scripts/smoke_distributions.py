@@ -92,7 +92,28 @@ def main() -> None:
                 env=_isolated_environment(),
             )
             package_type = "wheel" if artifact.suffix == ".whl" else "sdist"
+            sbom_output = temp / f"{package_type}-sbom.json"
+            subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    (
+                        "import sys; from importlib.metadata import version; "
+                        "from pathlib import Path; "
+                        "from pycontainer.sbom import generate_sbom; "
+                        "output = Path(sys.argv[1]); "
+                        "document = generate_sbom(output.parent, output, "
+                        "format='cyclonedx', package_inventory=[]); "
+                        "assert document['metadata']['tools'][0]['version'] "
+                        "== version('pycontainer-build')"
+                    ),
+                    str(sbom_output),
+                ],
+                check=True,
+                env=_isolated_environment(),
+            )
             print(f"PASS: isolated {package_type} install ({artifact.name})")
+            print(f"PASS: installed version in {package_type} SBOM metadata")
 
 
 if __name__ == "__main__":

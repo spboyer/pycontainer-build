@@ -225,6 +225,11 @@ class ImageBuilder:
             generate_sbom(
                 Path(self.config.context_dir),
                 sbom_path,
+                format=(
+                    self.config.generate_sbom
+                    if isinstance(self.config.generate_sbom, str)
+                    else "spdx"
+                ),
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
@@ -399,7 +404,10 @@ class ImageBuilder:
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")
-            self._staged_packages = staged_packages(site_packages)
+            self._staged_packages = staged_packages(
+                site_packages,
+                strict=bool(self.config.generate_sbom),
+            )
             files = sorted(
                 (path for path in stage_root.rglob("*") if path.is_file()),
                 key=lambda path: path.relative_to(stage_root).as_posix(),
