@@ -150,6 +150,12 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         env=environment,
     )
     assert result.stdout.strip() == "fixture-dependency-import-ok"
+    record = (
+        staged / "site-packages" / "fixture_dep-1.0.dist-info" / "RECORD"
+    ).read_text()
+    record_paths = [line.split(",", 1)[0] for line in record.splitlines() if line]
+    assert "fixture_dep/__init__.py" in record_paths
+    assert not [path for path in record_paths if ".." in path.replace("\\", "/")]
 
     config_path = (
         Path(builder.config.output_dir)

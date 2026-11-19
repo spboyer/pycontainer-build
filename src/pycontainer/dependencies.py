@@ -1,5 +1,6 @@
 """Target-aware staging for Python runtime dependencies."""
 import configparser
+import csv
 import os
 import re
 import shlex
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import time
 from email.parser import Parser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
 
@@ -242,8 +243,26 @@ def install_requirements(
     for scripts_dir in (destination / "bin", destination / "Scripts"):
         if scripts_dir.exists():
             shutil.rmtree(scripts_dir)
+    _drop_external_record_entries(destination)
 
     _check_stage_limits(destination.parent)
+
+
+def _drop_external_record_entries(site_packages: Path) -> None:
+    # Launcher entries point outside site-packages, and their hashes differ per build on Windows.
+    for record in sorted(site_packages.glob("*.dist-info/RECORD")):
+        lines = record.read_bytes().splitlines(keepends=True)
+        kept = [line for line in lines if not _is_external_record_line(line)]
+        if len(kept) != len(lines):
+            record.write_bytes(b"".join(kept))
+
+
+def _is_external_record_line(line: bytes) -> bool:
+    text = line.decode("utf-8", errors="replace").strip()
+    if not text:
+        return False
+    path = next(csv.reader([text]))[0].replace("\\", "/")
+    return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
 def validate_requirements(requirements: Path, context_dir: Path) -> None:
