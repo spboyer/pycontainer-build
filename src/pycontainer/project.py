@@ -101,9 +101,7 @@ def find_dependencies(
     if not deps:
         requirements_relative=relative_context_path(requirements_file)
         req_path=ctx/requirements_relative
-        if req_path.exists() and not path_is_excluded(
-            requirements_relative, excludes
-        ):
+        if req_path.exists():
             deps.append((req_path, requirements_relative))
     
     return deps
