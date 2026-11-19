@@ -1,7 +1,7 @@
 # Maintenance execution plan
 
 Observed: **2026-11-19**. Baseline: `628f623`.
-Status: #67-#72 merged; #73 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
+Status: #67-#73 merged; #74 is in progress. Roadmap: `spboyer/pycontainer-build#66`.
 Evidence and methods: [performance audit/design](2026-11-19-performance-maintenance-design.md).
 
 ## Outcomes and delivery rules
@@ -35,8 +35,8 @@ writing regressions or investigating the independent P0 defects.
 
 | Work | Issue | Prerequisites | Completion evidence |
 | --- | --- | --- | --- |
-| Context and framework discovery boundaries | #73 | #68 | No output/venv/test false positives by default; flat and src app layouts; portable dotted module names; scan profile. |
-| Importable target dependency staging | #74 | #68, #69, #73 | Requirements resolve/install or fail explicitly; correct target import prefix and ABI; real target imports; reproducible dependency tar. |
+| Context and framework discovery boundaries | #73 | #68 | Merged in PR #88; no output/venv/test false positives by default; flat and src app layouts; portable dotted module names; scan profile. |
+| Importable target dependency staging | #74 | #68, #69, #73 | Requirements resolve/install or fail explicitly; correct target import prefix and ABI; real target imports; reproducible dependency tar. In progress on `issue-74-target-dependencies`. |
 | Streaming tar/blob I/O and transfer integrity | #75 | #68, #69, #70, #72 | Bounded-chunk hashing/transfers; measured RSS; verified atomic downloads; timeout/retry/interruption fixtures. |
 | SBOM CLI formats and shipped inventory | #76 | #68, #71, #74 | Supported format arguments match all callers; schema validation; no host inventory leakage; correct tool metadata. |
 | Poetry/Hatch/VS Code contracts | #77 | #68, #71 | Real supported plugin registration, valid BuildConfig usage and subprocess entrypoint; working extension checks. |

@@ -237,9 +237,7 @@ def test_build_output_and_cache_are_excluded_but_requested_venv_deps_are_staged(
     assert [relative.as_posix() for _, relative in dependencies] == [
         ".venv/lib/python3.11/site-packages/pkg.py"
     ]
-    assert dependency_names == [
-        "app/.venv/lib/python3.11/site-packages/pkg.py"
-    ]
+    assert dependency_names == ["app/.python/site-packages/pkg.py"]
     assert names == ["app/app.py"]
     cache_entries = json.loads((context / "cache" / "index.json").read_text())
     assert [entry["source_files"] for entry in cache_entries.values()] == [["app.py"]]

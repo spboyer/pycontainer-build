@@ -120,6 +120,14 @@ from .registry_client import RegistryClient, parse_image_reference
 from .auth import get_registry_auth
 from .cache import LayerCache
 from .sbom import generate_sbom
+from .dependencies import (
+    create_console_entrypoints,
+    install_requirements,
+    staged_packages,
+    stage_virtualenv,
+    target_python_version,
+    validate_target_platform,
+)
 
 logger=logging.getLogger(__name__)
 
@@ -194,7 +202,9 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(layers_dir)
+            deps_layer=self._create_deps_layer(
+                layers_dir, base_config=base_config, os_name=os_name, arch=arch
+            )
             if deps_layer: app_layers.append(deps_layer)
         
         app_layer=self._create_app_layer(layers_dir, include)
@@ -202,7 +212,31 @@ class ImageBuilder:
         
         all_layers=base_layers+app_layers
 
-        cfg = build_config_json(arch,os_name,self.config.env,self.config.workdir,entry,self.config.exposed_ports,
+        image_env = dict(self.config.env)
+        if getattr(self, "_dependency_site_packages", False):
+            base_env = {
+                item.split("=", 1)[0]: item.split("=", 1)[1]
+                for item in base_config.get("config", {}).get("Env", [])
+                if "=" in item
+            }
+            prefix = self.config.workdir.rstrip("/") + "/.python"
+            site_path = f"{prefix}/site-packages"
+            bin_path = f"{prefix}/bin"
+            current_pythonpath = image_env.get(
+                "PYTHONPATH", base_env.get("PYTHONPATH", "")
+            )
+            current_path = image_env.get(
+                "PATH",
+                base_env.get(
+                    "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                ),
+            )
+            image_env["PYTHONPATH"] = ":".join(
+                part for part in (site_path, current_pythonpath) if part
+            )
+            image_env["PATH"] = f"{bin_path}:{current_path}"
+
+        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers])
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
@@ -238,7 +272,11 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(Path(self.config.context_dir), sbom_path)
+            generate_sbom(
+                Path(self.config.context_dir),
+                sbom_path,
+                package_inventory=getattr(self, "_staged_packages", []),
+            )
             logger.info(f"✓ SBOM saved to {sbom_path}")
         
         return self.config.tag
@@ -345,8 +383,15 @@ class ImageBuilder:
         print(f"  Include Dependencies: {self.config.include_deps}")
         print(f"  Use Cache: {self.config.use_cache}")
 
-    def _create_deps_layer(self, layers_dir: Path) -> Optional[OCILayer]:
-        """Create dependency layer from venv or requirements.txt."""
+    def _create_deps_layer(
+        self,
+        layers_dir: Path,
+        *,
+        base_config: Optional[Dict] = None,
+        os_name: Optional[str] = None,
+        arch: Optional[str] = None,
+    ) -> Optional[OCILayer]:
+        """Create a target-compatible dependency layer from a venv or requirements."""
         ctx=Path(self.config.context_dir)
         deps_paths=find_dependencies(
             ctx,
@@ -354,26 +399,94 @@ class ImageBuilder:
             exclude_paths=self.dependency_excludes,
             exclude_defaults=False,
         )
+        requirements_relative = Path(self.config.requirements_file)
+        if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
+            raise ValueError("Requirements path must be relative and stay inside the build context.")
+        is_requirements = any(
+            relative == requirements_relative for _, relative in deps_paths
+        )
         if not deps_paths:
-            return None
-
-        print(f"Creating dependency layer ({len(deps_paths)} files)...")
-        layers_dir=Path(layers_dir)
-        tmp=_create_temporary_file(layers_dir,"deps-layer")
-        try:
-            with tarfile.open(tmp,'w') as tar:
-                for abs_path, rel in deps_paths:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
-                    tar.add(abs_path,arcname=arc)
-            digest, size = _hash_file(tmp)
-            final=layers_dir/digest.split(":",1)[1]
-            _publish_content_addressed(tmp, final, digest, size)
-            print(f"✓ Dependency layer created ({digest[:19]}...)")
-            return OCILayer(
-                "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
+            raise FileNotFoundError(
+                "Dependency staging was requested, but no supported virtualenv "
+                f"site-packages or {self.config.requirements_file!r} was found."
             )
-        finally:
-            tmp.unlink(missing_ok=True)
+        if os_name is None or arch is None:
+            os_name, arch = parse_platform(self.config.platform)
+        validate_target_platform(os_name, arch)
+        if base_config and (
+            base_config.get("os") != os_name
+            or base_config.get("architecture") != arch
+        ):
+            raise ValueError(
+                "Pulled base image platform does not match the requested "
+                f"target {os_name}/{arch}."
+            )
+        version = target_python_version(self.config.base_image, base_config)
+        layers_dir=Path(layers_dir)
+        with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
+            stage_root = Path(stage)
+            site_packages = stage_root / "site-packages"
+            if is_requirements:
+                install_requirements(
+                    ctx / requirements_relative,
+                    site_packages,
+                    ctx,
+                    os_name,
+                    arch,
+                    version,
+                    self.config.base_image,
+                    base_config,
+                )
+            else:
+                stage_virtualenv(
+                    deps_paths, site_packages, version, os_name, arch
+                )
+
+            create_console_entrypoints(site_packages, stage_root / "bin")
+            self._staged_packages = staged_packages(site_packages)
+            files = sorted(
+                (path for path in stage_root.rglob("*") if path.is_file()),
+                key=lambda path: path.relative_to(stage_root).as_posix(),
+            )
+            self._dependency_site_packages = bool(files)
+            if not files:
+                return None
+
+            print(f"Creating dependency layer ({len(files)} staged files)...")
+            tmp=_create_temporary_file(layers_dir,"deps-layer")
+            try:
+                with tarfile.open(tmp, "w") as tar:
+                    for path in files:
+                        relative = path.relative_to(stage_root)
+                        arc = (
+                            f"{self.config.workdir.rstrip('/')}/.python/"
+                            f"{relative.as_posix()}"
+                        )
+                        if self.config.reproducible:
+                            info = tar.gettarinfo(path, arcname=arc)
+                            info.mtime = 0
+                            info.uid = 0
+                            info.gid = 0
+                            info.uname = "root"
+                            info.gname = "root"
+                            info.mode = (
+                                0o755
+                                if path.stat().st_mode & 0o111
+                                else 0o644
+                            )
+                            with path.open("rb") as source:
+                                tar.addfile(info, source)
+                        else:
+                            tar.add(path, arcname=arc)
+                digest, size = _hash_file(tmp)
+                final=layers_dir/digest.split(":",1)[1]
+                _publish_content_addressed(tmp, final, digest, size)
+                print(f"✓ Dependency layer created ({digest[:19]}...)")
+                return OCILayer(
+                    "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
+                )
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)

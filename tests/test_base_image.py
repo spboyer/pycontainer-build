@@ -140,7 +140,7 @@ def test_build_appends_layer_diffids_without_mutating_base_config(tmp_path, monk
     monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull_base_image)
 
     if include_deps:
-        def create_deps_layer(self, layers_dir):
+        def create_deps_layer(self, layers_dir, **kwargs):
             layer_bytes = layer_tar("site-packages/dependency.py", b"dependency")
             digest = "sha256:" + hashlib.sha256(layer_bytes).hexdigest()
             path = layers_dir / digest.split(":", 1)[1]

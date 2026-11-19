@@ -1,10 +1,15 @@
 """Software Bill of Materials (SBOM) generation."""
 import json, hashlib, subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 from datetime import datetime, timezone
 
-def generate_sbom(context_dir: Path, output_path: Path, format: str="spdx") -> Dict:
+def generate_sbom(
+    context_dir: Path,
+    output_path: Path,
+    format: str="spdx",
+    package_inventory: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Dict:
     """Generate SBOM in SPDX or CycloneDX format.
     
     Args:
@@ -16,18 +21,25 @@ def generate_sbom(context_dir: Path, output_path: Path, format: str="spdx") -> D
         SBOM dictionary
     """
     if format=="spdx":
-        sbom=_generate_spdx(context_dir)
+        sbom=_generate_spdx(context_dir, package_inventory)
     elif format=="cyclonedx":
-        sbom=_generate_cyclonedx(context_dir)
+        sbom=_generate_cyclonedx(context_dir, package_inventory)
     else:
         raise ValueError(f"Unsupported SBOM format: {format}")
     
     output_path.write_text(json.dumps(sbom, indent=2))
     return sbom
 
-def _generate_spdx(context_dir: Path) -> Dict:
+def _generate_spdx(
+    context_dir: Path,
+    package_inventory: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Dict:
     """Generate SPDX 2.3 format SBOM."""
-    packages=_get_python_packages(context_dir)
+    packages=(
+        sorted(package_inventory)
+        if package_inventory is not None
+        else _get_python_packages(context_dir)
+    )
     
     sbom={
         "spdxVersion": "SPDX-2.3",
@@ -57,9 +69,16 @@ def _generate_spdx(context_dir: Path) -> Dict:
     
     return sbom
 
-def _generate_cyclonedx(context_dir: Path) -> Dict:
+def _generate_cyclonedx(
+    context_dir: Path,
+    package_inventory: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Dict:
     """Generate CycloneDX 1.4 format SBOM."""
-    packages=_get_python_packages(context_dir)
+    packages=(
+        sorted(package_inventory)
+        if package_inventory is not None
+        else _get_python_packages(context_dir)
+    )
     
     sbom={
         "bomFormat": "CycloneDX",

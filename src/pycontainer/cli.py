@@ -23,7 +23,12 @@ def main():
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
-    b.add_argument("--include-deps",action="store_true",default=None,help="Include dependencies from venv or requirements.txt")
+    b.add_argument(
+        "--include-deps",
+        action="store_true",
+        default=None,
+        help="Stage target-compatible dependencies from a venv or requirements file",
+    )
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
