@@ -25,6 +25,15 @@ and `refs/tags/<tag>`, not a top-level `manifest.json`.
 The working module invocation is `python -m pycontainer.cli`; the package
 currently has no `__main__.py`.
 
+## Cache behavior
+
+Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
+selects another location and `--no-cache` disables it. Cache keys include file
+content, normalized relative paths, workdir, and reproducibility settings.
+Index updates are locked and atomically replaced; cache blobs are verified
+before reuse. A malformed index raises an explicit `CacheIndexError`; missing
+or corrupt blobs are discarded and rebuilt.
+
 ## Setup and verified checks
 
 PowerShell examples, run from the repository root:
@@ -108,8 +117,6 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- Default `use_cache=True` does not enable caching without `cache_dir`; local
-  cache identity can reuse stale or wrong-workdir layers.
 - `--include-deps` does not install a requirements file; copied virtualenv
   libraries are not wired into the runtime import path.
 - CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,

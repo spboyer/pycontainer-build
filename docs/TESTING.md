@@ -12,6 +12,9 @@ python -m pytest --collect-only -q
 python -m pytest tests -q
 ```
 
+The cache regressions cover same-size/same-mtime content edits, layer-affecting
+settings, shared blobs, corruption, and concurrent process writers.
+
 Run the marked tests only when network access is intended, and bound execution
 time:
 

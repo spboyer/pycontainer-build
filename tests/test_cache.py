@@ -1,5 +1,5 @@
 """Tests for layer caching system."""
-import tempfile; import shutil; import time
+import hashlib; import tempfile; import shutil; import time
 from pathlib import Path
 from pycontainer.cache import LayerCache
 
@@ -19,16 +19,18 @@ def test_cache_miss_then_hit():
         assert result is None,"Expected cache miss on first lookup"
         
         # Store layer
+        layer_data=b"fake tar content"
         layer_tar=Path(td)/"layer.tar"
-        layer_tar.write_bytes(b"fake tar content")
-        cache.store_layer(files, "sha256:abc123", layer_tar)
+        layer_tar.write_bytes(layer_data)
+        digest="sha256:"+hashlib.sha256(layer_data).hexdigest()
+        cache.store_layer(files, digest, layer_tar)
         
         # Cache hit
         result=cache.get_layer(files)
         assert result is not None,"Expected cache hit after store"
-        digest, cache_path=result
-        assert digest=="sha256:abc123"
-        assert cache_path.read_bytes()==b"fake tar content"
+        actual_digest, cache_path=result
+        assert actual_digest==digest
+        assert cache_path.read_bytes()==layer_data
 
 def test_cache_invalidation_on_content_change():
     """Test cache invalidation when file content changes."""
@@ -41,14 +43,16 @@ def test_cache_invalidation_on_content_change():
         files=[(test_file, Path("test.py"))]
         
         # Store layer v1
+        layer_data=b"layer v1"
         layer_tar=Path(td)/"layer.tar"
-        layer_tar.write_bytes(b"layer v1")
-        cache.store_layer(files, "sha256:v1", layer_tar)
+        layer_tar.write_bytes(layer_data)
+        digest="sha256:"+hashlib.sha256(layer_data).hexdigest()
+        cache.store_layer(files, digest, layer_tar)
         
         # Cache hit
         result=cache.get_layer(files)
         assert result is not None
-        assert result[0]=="sha256:v1"
+        assert result[0]==digest
         
         # Modify file (change mtime and size)
         time.sleep(0.01)  # Ensure mtime differs
@@ -74,14 +78,12 @@ def test_lru_eviction():
         files_b=[(src/"b.py",Path("b.py"))]
         files_c=[(src/"c.py",Path("c.py"))]
         
-        # Store 3 layers (600 bytes each)
-        for i, (files, digest) in enumerate([
-            (files_a, "sha256:aaa"),
-            (files_b, "sha256:bbb"),
-            (files_c, "sha256:ccc")
-        ]):
+        # Store 3 distinct layers (600 bytes each)
+        for i, files in enumerate([files_a, files_b, files_c]):
+            layer_data=bytes([ord("x")+i])*600
+            digest="sha256:"+hashlib.sha256(layer_data).hexdigest()
             layer_tar=Path(td)/f"layer{i}.tar"
-            layer_tar.write_bytes(b"x"*600)  # 600 bytes
+            layer_tar.write_bytes(layer_data)
             cache.store_layer(files, digest, layer_tar)
             time.sleep(0.01)  # Ensure different access times
         
@@ -107,9 +109,11 @@ def test_cache_with_different_file_lists():
         files_ab=[(src/"a.py",Path("a.py")),(src/"b.py",Path("b.py"))]
         
         # Store layer for files_a
+        layer_data=b"layer a"
         layer_tar=Path(td)/"layer_a.tar"
-        layer_tar.write_bytes(b"layer a")
-        cache.store_layer(files_a, "sha256:aaa", layer_tar)
+        layer_tar.write_bytes(layer_data)
+        digest="sha256:"+hashlib.sha256(layer_data).hexdigest()
+        cache.store_layer(files_a, digest, layer_tar)
         
         # Different file list should miss cache
         result=cache.get_layer(files_ab)

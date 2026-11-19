@@ -146,7 +146,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Detects file changes via mtime + size checks
+- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
+  reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
