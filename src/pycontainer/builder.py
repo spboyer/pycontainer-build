@@ -58,7 +58,8 @@ class ImageBuilder:
         all_layers=base_layers+app_layers
 
         cfg = build_config_json(arch,os_name,self.config.env,self.config.workdir,entry,self.config.exposed_ports,
-                                labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config)
+                                labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
+                                layer_diff_ids=[layer.digest for layer in app_layers])
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]

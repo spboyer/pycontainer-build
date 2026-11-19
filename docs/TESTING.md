@@ -33,6 +33,18 @@ peak RSS includes Python startup/imports; `tracemalloc` reports Python-tracked
 allocations during builder construction and build work. Compare only matching
 environments and fixture settings; no timing threshold is enforced.
 
+For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
+start a Docker daemon, and allow the builder to pull the selected registry base
+image. The script imports the generated OCI layout into Docker and starts a container:
+
+```shell
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim
+```
+
+This check is not part of default pytest or CI. It uses a unique temporary image
+tag and removes that tag after execution; registry pulls and image startup are
+real runtime evidence, unlike the synthetic benchmark above.
+
 ## Overview
 
 This document defines the comprehensive testing strategy for pycontainer-build, ensuring quality, reliability, and correctness at every phase of development.

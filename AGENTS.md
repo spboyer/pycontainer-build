@@ -65,6 +65,12 @@ a pass/fail gate. A passing layout assertion is not evidence that an image
 starts in a container runtime. Do not silently remove, mock away, or claim
 success for unrun integration tests.
 
+An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
+and a running Docker daemon:
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+It pulls the selected base image, imports the generated layout into Docker, and
+starts a container. This check is not part of the default test suite or CI.
+
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
@@ -104,7 +110,6 @@ These are known gaps, **not fixed behavior**:
 
 - Default `use_cache=True` does not enable caching without `cache_dir`; local
   cache identity can reuse stale or wrong-workdir layers.
-- App/dependency layers are not appended to the base config's DiffIDs.
 - `--include-deps` does not install a requirements file; copied virtualenv
   libraries are not wired into the runtime import path.
 - CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,
