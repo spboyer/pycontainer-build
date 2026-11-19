@@ -1,7 +1,10 @@
 """Record repeatable local build measurements without registry or runtime access."""
 import argparse
+import base64
 import contextlib
+import csv
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import time
 import tracemalloc
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -189,8 +193,37 @@ def _create_fixture(context, files, file_bytes):
     payload = b"x" * file_bytes
     for index in range(files):
         (app / f"module_{index:05}.py").write_bytes(payload)
-    (context / "requirements.txt").write_text("benchmark-dependency==1.0\n", encoding="utf-8")
+    (context / "wheelhouse").mkdir()
+    _write_benchmark_wheel(context / "wheelhouse", "1.0")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nbenchmark-dependency==1.0\n",
+        encoding="utf-8",
+    )
     return payload
+
+
+def _write_benchmark_wheel(wheelhouse, version):
+    files = {
+        f"benchmark_dependency-{version}.dist-info/METADATA": (
+            f"Metadata-Version: 2.1\nName: benchmark-dependency\nVersion: {version}\n\n"
+        ).encode(),
+        f"benchmark_dependency-{version}.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ).encode(),
+        "benchmark_dependency/__init__.py": f"version = {version!r}\n".encode(),
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for name, content in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode()
+        writer.writerow((name, f"sha256={digest.rstrip('=')}", len(content)))
+    record_name = f"benchmark_dependency-{version}.dist-info/RECORD"
+    writer.writerow((record_name, "", ""))
+    files[record_name] = record.getvalue().encode()
+    wheel = wheelhouse / f"benchmark_dependency-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
 
 
 def _spec(context, output, cache, *, mode="full", use_cache=True, include_deps=False):
@@ -289,8 +322,10 @@ def run_benchmarks(args):
             _spec(context, root / "dependency-baseline-output", dependency_cache)
         )
         (context / "requirements.txt").write_text(
-            "benchmark-dependency==2.0\n", encoding="utf-8"
+            "--no-index\n--find-links ./wheelhouse\nbenchmark-dependency==2.0\n",
+            encoding="utf-8",
         )
+        _write_benchmark_wheel(context / "wheelhouse", "2.0")
         dependency_change_specs = []
         for sample in range(args.repetitions):
             cache_copy = root / f"dependency-change-cache-{sample}"

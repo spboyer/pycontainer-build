@@ -320,7 +320,18 @@ pycontainer build \
 
 **Base Image & Dependencies**:
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
-- `--include-deps` — Package dependencies from venv or requirements.txt
+- `--include-deps` — Stage importable dependencies from a venv or install a
+  requirements file as target-compatible binary wheels. Requirements installs
+  are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
+  supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
+  must match the target Python minor version and contain only pure-Python
+  packages. Dependencies are placed under `<workdir>/.python`, added to
+  `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
+  interpreter running pycontainer must have `pip` available. Source
+  distributions, cross-compilation, and lockfile resolution are not supported.
+  Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
+  `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
+  `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

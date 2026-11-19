@@ -81,16 +81,22 @@ def find_dependencies(
     venv_dirs=['venv','.venv','env']
     for venv in venv_dirs:
         venv_path=ctx/venv
-        if venv_path.exists() and (venv_path/'lib').exists():
+        if venv_path.exists():
             for item, relative in iter_files(
                 ctx,
                 [venv],
                 exclude_paths=excludes,
                 exclude_defaults=False,
             ):
-                if 'site-packages' in relative.parts:
+                if (
+                    "site-packages" in relative.parts
+                    and relative.parts.index("site-packages") > 0
+                    and "__pycache__" not in relative.parts
+                    and relative.suffix != ".pyc"
+                ):
                     deps.append((item, relative))
-            break
+            if deps:
+                break
     
     if not deps:
         requirements_relative=relative_context_path(requirements_file)

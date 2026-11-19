@@ -23,7 +23,13 @@ def _create_builder(tmp_path, monkeypatch, *, use_cache, output_dir=None):
     context = tmp_path / "context"
     context.mkdir(exist_ok=True)
     (context / "app.py").write_text("print('hello')\n")
-    (context / "requirements.txt").write_text("example==1.0\n")
+    (context / "requirements.txt").write_text("# dependencies staged from fixture venv\n")
+    site_packages = context / ".venv" / "lib" / "python3.11" / "site-packages"
+    (site_packages / "example-1.0.dist-info").mkdir(parents=True, exist_ok=True)
+    (site_packages / "example.py").write_text("value = 1\n")
+    (site_packages / "example-1.0.dist-info" / "WHEEL").write_text(
+        "Root-Is-Purelib: true\nTag: py3-none-any\n"
+    )
 
     monkeypatch.setattr(
         ImageBuilder,

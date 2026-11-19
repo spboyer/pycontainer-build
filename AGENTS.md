@@ -78,7 +78,9 @@ An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
 and a running Docker daemon:
 `PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
 It pulls the selected base image, imports the generated layout into Docker, and
-starts a container. This check is not part of the default test suite or CI.
+starts a container. To test only dependency importability in the real target
+base image, without Skopeo, add `--dependency-layer-only`. These checks are not
+part of the default test suite or CI.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
@@ -117,12 +119,20 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- `--include-deps` does not install a requirements file; copied virtualenv
-  libraries are not wired into the runtime import path.
 - CLI defaults can overwrite TOML settings; `--sbom` currently accepts a boolean,
   not the documented format argument. SBOM inventory can include host packages.
 - Plugin API/entrypoint contracts need repair, and PyPI installation of this
   project returned HTTP 404 during the 2026-11-19 audit.
+
+Dependency staging installs wheel-only requirements for `linux/amd64` and
+`linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
+512 MiB staged size and 100,000 files); the builder interpreter must provide
+`pip`. Existing virtualenv staging accepts
+pure-Python packages only and rejects native binaries; its Python minor version
+must match the target base image. Custom images provide
+`PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
+`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
+source distributions, lockfiles and cross-compilation are not supported.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
