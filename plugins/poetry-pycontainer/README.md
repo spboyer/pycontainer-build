@@ -13,15 +13,29 @@ A Poetry plugin that integrates [pycontainer-build](https://github.com/spboyer/p
 
 ## Installation
 
+`poetry-pycontainer` depends on `pycontainer-build`, so the core is installed
+into the same Poetry environment that loads the plugin.
+
+After both packages are published:
+
 ```bash
 poetry self add poetry-pycontainer
 ```
 
-Or install pycontainer-build and the plugin:
+Until the core package is published to PyPI, install both packages from a
+repository checkout into Poetry's own environment:
 
 ```bash
-pip install poetry-pycontainer pycontainer-build
+poetry self add /path/to/pycontainer-build
+poetry self add /path/to/pycontainer-build/plugins/poetry-pycontainer
 ```
+
+## Compatibility
+
+Python 3.11 or newer, Poetry 1.2.x through 2.x, and Cleo 2.x are supported.
+Versions outside these ranges, including Poetry 3.x and Cleo 3.x, are
+unsupported. CI exercises the latest Poetry version allowed by the package
+constraints; it does not claim coverage of every earlier release.
 
 ## Quick Start
 
@@ -75,7 +89,8 @@ Build an OCI container image from your Poetry project.
 - `--base-image, -b` - Base container image (default: `python:3.11-slim`)
 - `--registry, -r` - Container registry URL
 - `--push, -p` - Push image to registry
-- `--include-deps, -d` - Include Poetry dependencies (default: true)
+- `--include-deps, -d` - Include Poetry dependencies
+- `--no-include-deps` - Exclude Poetry dependencies
 - `--sbom, -s FORMAT` - Generate an SBOM (`spdx` or `cyclonedx`)
 - `--verbose, -v` - Verbose output
 - `--dry-run` - Show what would be built without building

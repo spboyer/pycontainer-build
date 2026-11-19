@@ -228,7 +228,13 @@ Perfect for integration with:
 
 pycontainer-build integrates seamlessly with popular Python tools:
 
+The core package is not yet available from PyPI (release work is tracked in
+[#79](https://github.com/spboyer/pycontainer-build/issues/79)). Until then,
+follow each plugin's README for installing the core and plugin from source.
+
 ### Poetry Plugin
+
+After the packages are published:
 
 ```bash
 poetry self add poetry-pycontainer
@@ -239,8 +245,10 @@ poetry build-container --tag myapp:latest --push
 
 ### Hatch Plugin
 
+After the packages are published:
+
 ```bash
-pip install hatch-pycontainer
+pip install hatch hatch-pycontainer
 hatch build  # Builds both wheel and container
 ```
 

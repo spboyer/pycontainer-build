@@ -1,0 +1,12 @@
+[tool.poetry]
+name = "sample-app"
+version = "1.2.3"
+description = "Fixture project for the Poetry plugin"
+authors = ["Example Author <author@example.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+
+[tool.pycontainer]
+dry_run = true
+base_image = "python:3.12-slim"

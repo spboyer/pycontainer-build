@@ -57,6 +57,66 @@ jobs:
       - name: Build and install distributions in isolated environments
         run: python scripts/smoke_distributions.py
 
+  poetry-plugin:
+    name: Poetry plugin contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core and plugin test dependencies
+        run: python -m pip install -e . "plugins/poetry-pycontainer[dev]"
+      - name: Test Poetry registration, options, and CLI smoke
+        run: python -m pytest plugins/poetry-pycontainer/tests -q
+
+  hatch-plugin:
+    name: Hatch plugin contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core and plugin test dependencies
+        run: python -m pip install -e . "plugins/hatch-pycontainer[dev]"
+      - name: Test Hatch registration, options, and CLI smoke
+        run: python -m pytest plugins/hatch-pycontainer/tests -q
+
+  vscode-extension:
+    name: VS Code extension contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: plugins/vscode-pycontainer/package-lock.json
+      - name: Install the core for the extension smoke test
+        run: python -m pip install -e .
+      - name: Install extension development dependencies
+        working-directory: plugins/vscode-pycontainer
+        run: npm ci
+      - name: Compile extension
+        working-directory: plugins/vscode-pycontainer
+        run: npm run compile
+      - name: Lint extension
+        working-directory: plugins/vscode-pycontainer
+        run: npm run lint
+      - name: Test extension commands and core integration
+        working-directory: plugins/vscode-pycontainer
+        run: npm test
+      - name: Package extension
+        working-directory: plugins/vscode-pycontainer
+        run: npm run package
+
   registry-integration:
     name: Opt-in registry integration tests
     if: github.event_name == 'workflow_dispatch' && inputs['run-registry-integration']

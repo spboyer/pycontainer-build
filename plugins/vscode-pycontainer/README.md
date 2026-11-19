@@ -14,7 +14,7 @@ Build OCI container images from Python projects directly in Visual Studio Code â
 
 - Visual Studio Code 1.80.0 or higher
 - Python 3.11 or higher
-- pycontainer-build (automatically installed if needed)
+- pycontainer-build 0.3.x installed in the selected Python environment
 
 ## Installation
 
@@ -71,7 +71,7 @@ Configure the extension in VS Code settings:
   "pycontainer.pythonPath": "python",
   "pycontainer.defaultTag": "myapp:latest",
   "pycontainer.defaultBaseImage": "python:3.11-slim",
-  "pycontainer.autoInstall": true,
+  "pycontainer.autoInstall": false,
   "pycontainer.showOutput": true,
   "pycontainer.verbose": false
 }
@@ -90,10 +90,33 @@ include_deps = true
 [build.env]
 ENV = "production"
 PORT = "8080"
-
-[registry]
-url = "ghcr.io/user/myapp"
 ```
+
+The extension invokes `python -m pycontainer.cli`; use the Python interpreter
+selected by `pycontainer.pythonPath`. Registry pushes use the image tag entered
+in the build prompt. Configure the registry credentials using the core
+builder's supported credential providers.
+
+## Development
+
+From the repository root, install the core into the selected Python
+environment, then run the extension checks:
+
+```bash
+python -m pip install -e .
+cd plugins/vscode-pycontainer
+npm ci
+npm run compile
+npm run lint
+npm test
+npm run package
+```
+
+`npm test` includes a dry-run smoke test of the exact Python module and
+arguments generated for the extension. The core package is not yet available
+from PyPI; until its release, install it from this repository as shown above.
+The automatic-install prompt uses pip and therefore requires a published
+package. Automatic installation defaults off until the core is published.
 
 ## Commands
 
@@ -179,6 +202,7 @@ jobs:
           python-version: '3.11'
       - name: Build and push
         run: |
+          # Requires the pycontainer-build package to be published.
           pip install pycontainer-build
           pycontainer build --tag ghcr.io/${{ github.repository }}:latest --push
         env:
@@ -189,10 +213,12 @@ jobs:
 
 ### "pycontainer-build not installed"
 
-The extension will automatically prompt to install it. Or install manually:
+The extension can prompt to install it, but pip installation requires a
+published package. Until then, install the core from a repository checkout
+into the interpreter selected by `pycontainer.pythonPath`:
 
 ```bash
-pip install pycontainer-build
+python -m pip install /path/to/pycontainer-build
 ```
 
 ### "No pyproject.toml found"

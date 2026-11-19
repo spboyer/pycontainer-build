@@ -13,9 +13,37 @@ A Hatch plugin that integrates [pycontainer-build](https://github.com/spboyer/py
 
 ## Installation
 
+The plugin depends on `pycontainer-build` and `hatchling`. Install it in the
+same Python environment as the Hatch CLI:
+
 ```bash
-pip install hatch-pycontainer
+pip install hatch hatch-pycontainer
 ```
+
+Until the core package is published to PyPI, install both packages from a
+repository checkout. Because Hatch builds in an isolated environment, the
+project's `build-system.requires` must also point at that checkout:
+
+```bash
+python -m pip install hatch
+```
+
+```toml
+[build-system]
+requires = [
+  "hatchling",
+  "pycontainer-build @ file:///absolute/path/to/pycontainer-build",
+  "hatch-pycontainer @ file:///absolute/path/to/pycontainer-build/plugins/hatch-pycontainer",
+]
+build-backend = "hatchling.build"
+```
+
+## Compatibility
+
+Python 3.11 or newer, Hatch 1.6.x through 1.x, and Hatchling 1.18.x through
+1.x are supported. Hatch 2.x and Hatchling 2.x are unsupported. CI exercises
+the latest Hatch and Hatchling versions allowed by the package constraints;
+it does not claim coverage of every earlier release.
 
 ## Quick Start
 
@@ -92,6 +120,9 @@ verbose = true
 
 # Disable layer caching
 no-cache = false
+
+# Preview without building
+dry-run = false
 
 # Environment variables
 [tool.hatch.build.hooks.pycontainer.env]
