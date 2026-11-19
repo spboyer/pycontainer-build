@@ -4,7 +4,8 @@ This document shows how to use pycontainer-build to push images to various conta
 
 ## Prerequisites
 
-- pycontainer-build installed: `pip install -e .`
+- pycontainer-build installed from the repository checkout root:
+  `python -m pip install --no-deps -e .`
 - Authentication tokens for your target registry
 
 ## GitHub Container Registry (GHCR)

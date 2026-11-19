@@ -16,7 +16,8 @@ Azure Developer CLI (azd) is a tool for deploying applications to Azure. By inte
 - [Azure Developer CLI](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/install-azd) installed
 - Python 3.11+
 - Azure subscription
-- pycontainer-build installed: `pip install pycontainer-build`
+- pycontainer-build installed from a verified commit:
+  `python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'`
 
 ## Quick Start
 
@@ -49,7 +50,7 @@ services:
     hooks:
       prebuild:
         shell: sh
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |
@@ -90,7 +91,7 @@ services:
     hooks:
       prebuild:
         shell: sh
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |
@@ -118,7 +119,7 @@ services:
     hooks:
       prebuild:
         shell: sh
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |
@@ -137,7 +138,7 @@ services:
     hooks:
       prebuild:
         shell: sh
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |
@@ -162,7 +163,7 @@ services:
     hooks:
       prebuild:
         shell: sh
-        run: pip install pycontainer-build
+        run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |
@@ -319,7 +320,7 @@ Test your azd configuration locally:
 
 ```bash
 # Install pycontainer-build
-pip install pycontainer-build
+python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
 
 # Test the build locally
 export SERVICE_IMAGE_NAME="localhost:5000/myapp"
@@ -344,7 +345,7 @@ Ensure the prebuild hook installs pycontainer-build:
 hooks:
   prebuild:
     shell: sh
-    run: pip install pycontainer-build
+    run: python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
 ```
 
 ### Authentication Fails to ACR
@@ -422,7 +423,7 @@ services:
         shell: sh
         run: |
           pip install --upgrade pip
-          pip install pycontainer-build
+          python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
       build:
         shell: sh
         run: |

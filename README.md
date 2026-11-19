@@ -30,15 +30,18 @@ This mirrors the elegant developer experience that .NET provides with its SDK's 
 
 ### Installation
 
+Requires Python 3.11 or newer. Until a package release is available, install
+from a repository checkout:
+
 ```bash
-# Using pip
-pip install -e .
+# From a repository checkout
+python -m pip install --no-deps -e .
 
 # Using uv (faster)
-uv pip install -e .
+uv pip install --no-deps -e .
 
-# Or run directly with uvx (no install needed)
-uvx --from git+https://github.com/spboyer/pycontainer-build pycontainer build --tag myapp:latest
+# Or run directly from a verified commit with uvx
+uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7 pycontainer build --tag myapp:latest
 ```
 
 ### Build Your First Image
@@ -544,15 +547,15 @@ selection writes target metadata; it does not cross-compile dependencies.
 
 ### Prerequisites
 
-- Python 3.10+ (uses `tomllib` for TOML parsing)
+- Python 3.11+ (uses `tomllib` for TOML parsing)
 - No other dependencies — pure stdlib
 
 ### Install for Development
 
 ```bash
-git clone https://github.com/microsoft/pycontainer-build.git
+git clone https://github.com/spboyer/pycontainer-build.git
 cd pycontainer-build
-pip install -e .
+python -m pip install -e .
 ```
 
 ### Test a Build

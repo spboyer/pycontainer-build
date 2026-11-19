@@ -335,13 +335,11 @@ skip = false
 
 ### pycontainer-build Not Found
 
-Install it explicitly:
+Follow the source-install instructions in [Installation](#installation) to
+install the core into the Hatch build environment. The build-system
+requirements must also include both source packages until publication.
 
-```bash
-pip install pycontainer-build
-```
-
-Or add to build requirements:
+After publication, add the plugin and core packages to build requirements:
 
 ```toml
 [build-system]

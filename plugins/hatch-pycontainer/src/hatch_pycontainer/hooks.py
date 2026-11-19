@@ -24,7 +24,9 @@ class ContainerBuildHook(BuildHookInterface):
         except ImportError:
             raise RuntimeError(
                 "pycontainer-build is not installed. "
-                "Install it with: pip install pycontainer-build"
+                "Install it into the Hatch build environment; until the core "
+                "package is published, follow the source-install instructions "
+                "in the pycontainer-build repository."
             )
 
         # Get configuration

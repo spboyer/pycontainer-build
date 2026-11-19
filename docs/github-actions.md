@@ -29,9 +29,16 @@ jobs:
 This will:
 1. Check out your code
 2. Set up Python 3.11
-3. Install pycontainer-build
+3. Check out and install pycontainer-build from the immutable commit that contains the called workflow
 4. Build your container image
 5. Push to GitHub Container Registry (ghcr.io)
+
+The reusable workflow does not install the unpublished core package from
+PyPI. It uses GitHub's `job.workflow_repository` and `job.workflow_sha` values
+to install from the exact commit serving the workflow. Pin the `uses` reference
+to a commit or release tag when you also need a fixed workflow definition.
+Pinned Node 24 actions require Actions Runner 2.327.1 or later; the workflow's
+`ubuntu-latest` runner satisfies this requirement.
 
 ### Complete Configuration
 
@@ -54,6 +61,9 @@ jobs:
       
       # Push to registry (true/false)
       push: true
+
+      # Preview without pulling images or writing output
+      dry-run: false
       
       # Include dependencies from venv/requirements.txt
       include-deps: true
@@ -178,14 +188,24 @@ jobs:
       packages: write
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout a verified pycontainer-build source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: spboyer/pycontainer-build
+          ref: d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7
+          path: .pycontainer-build
+          persist-credentials: false
       
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       
       - name: Install pycontainer-build
-        run: pip install pycontainer-build
+        run: python -m pip install --no-deps ./.pycontainer-build
       
       - name: Build and push container
         env:

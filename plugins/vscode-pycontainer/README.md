@@ -202,8 +202,7 @@ jobs:
           python-version: '3.11'
       - name: Build and push
         run: |
-          # Requires the pycontainer-build package to be published.
-          pip install pycontainer-build
+          python -m pip install 'pycontainer-build @ git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7'
           pycontainer build --tag ghcr.io/${{ github.repository }}:latest --push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

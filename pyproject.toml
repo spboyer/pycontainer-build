@@ -9,6 +9,32 @@ authors = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/spboyer/pycontainer-build"
+Repository = "https://github.com/spboyer/pycontainer-build"
+Issues = "https://github.com/spboyer/pycontainer-build/issues"
+Documentation = "https://github.com/spboyer/pycontainer-build/tree/main/docs"
+
+[dependency-groups]
+test = [
+  "pip>=25.0,<27.0",
+  "pytest>=9.0.0,<10.0.0",
+  "jsonschema>=4.25.0,<5.0.0",
+]
+build = [
+  "build>=1.2.2,<2.0.0",
+  "editables>=0.5,<1.0",
+  "setuptools==84.2.1",
+]
+poetry-plugin = [
+  "cleo>=2.0.0,<3.0.0",
+  "poetry>=2.0.0,<3.0.0",
+]
+hatch-plugin = [
+  "hatch>=1.6.0,<2.0.0",
+  "hatchling>=1.18.0,<2.0.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-m", "not registry_integration"]
@@ -20,7 +46,7 @@ markers = [
 pycontainer = "pycontainer.cli:main"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

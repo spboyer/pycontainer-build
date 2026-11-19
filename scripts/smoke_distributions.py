@@ -45,7 +45,15 @@ def main() -> None:
         temp = Path(temp_dir)
         distributions = temp / "dist"
         subprocess.run(
-            [sys.executable, "-m", "build", "--outdir", str(distributions), str(ROOT)],
+            [
+                sys.executable,
+                "-m",
+                "build",
+                "--no-isolation",
+                "--outdir",
+                str(distributions),
+                str(ROOT),
+            ],
             cwd=ROOT,
             check=True,
         )
