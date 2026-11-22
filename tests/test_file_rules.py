@@ -163,42 +163,65 @@ def test_multi_target_rules_are_rejected_even_when_inactive(when):
         )
 
 
-def test_cli_overrides_precede_rules_in_build_and_dry_run(tmp_path, monkeypatch):
+CLI_OVERRIDES = ["--platform", "linux/arm64", "--build-arg", "BUILD_MODE=dev"]
+CLI_ENTRY_POINTS = {
+    "build": ["build"],
+    "dry-run": ["build", "--dry-run"],
+    "validate": ["validate", "config"],
+}
+
+
+@pytest.mark.parametrize("entry_point", list(CLI_ENTRY_POINTS))
+def test_cli_overrides_resolve_before_rules_in_every_entry_point(
+    tmp_path, monkeypatch, entry_point
+):
+    if entry_point == "validate" and not hasattr(cli, "_validate_config_command"):
+        pytest.skip("pycontainer validate config arrives with #186; runs after integration")
+    import pycontainer.config as config_module
+
     context = _context(tmp_path)
     path = tmp_path / "pycontainer.toml"
     path.write_text(
-        '[build]\ninclude-paths = ["app.py"]\nplatform = "linux/amd64"\n'
+        f'[build]\ncontext-dir = {str(context)!r}\n'
+        f'output-dir = {str(tmp_path / "out")!r}\n'
+        'include-paths = ["app.py"]\nplatform = "linux/amd64"\n'
         '[build.build-args]\nBUILD_MODE = "production"\n'
         '[[build.file-rules]]\n'
         'when = \'BUILD_MODE == "dev" and target.arch == "arm64"\'\n'
         'include = "debug_tools/**"\n'
     )
-    resolved = []
+    evaluations, selections = [], []
+    real_evaluate = config_module.evaluate_file_rules
+
+    def recording_evaluate(rules, arguments, platform):
+        result = real_evaluate(rules, arguments, platform)
+        evaluations.append((dict(arguments), platform, result))
+        return result
 
     class CapturingBuilder:
         def __init__(self, config):
-            resolved.append((
-                config._conditional_includes,
-                _selected(config),
-                config.dry_run,
-            ))
+            selections.append(_selected(config))
 
         def build(self):
             return tmp_path / "out"
 
+    monkeypatch.setattr(config_module, "evaluate_file_rules", recording_evaluate)
     monkeypatch.setattr(cli, "ImageBuilder", CapturingBuilder)
-    for operational in ([], ["--dry-run"]):
-        monkeypatch.setattr(sys, "argv", [
-            "pycontainer", "build", "--config", str(path),
-            "--context", str(context), "--platform", "linux/arm64",
-            "--build-arg", "BUILD_MODE=dev", *operational,
-        ])
-        cli.main()
-    expected = (
-        ("debug_tools/**",),
-        ["app.py", "debug_tools/inspect.py", "debug_tools/nested/trace.py"],
+    command = CLI_ENTRY_POINTS[entry_point]
+    config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
+    monkeypatch.setattr(
+        sys, "argv", ["pycontainer", *command, *config_args, *CLI_OVERRIDES]
     )
-    assert resolved == [(*expected, False), (*expected, True)]
+    cli.main()
+
+    # File defaults never reach evaluation; only the resolved overrides do.
+    assert evaluations and set(map(repr, evaluations)) == {repr((
+        {"BUILD_MODE": "dev"}, "linux/arm64", (("debug_tools/**",), ()),
+    ))}
+    if entry_point != "validate":
+        assert selections == [
+            ["app.py", "debug_tools/inspect.py", "debug_tools/nested/trace.py"]
+        ]
 
 
 def test_excludes_win_over_overlapping_includes(tmp_path):
