@@ -192,6 +192,16 @@ def test_default_selection_skips_unrelated_pyprojects(installed_hook):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Skipped" in result.stdout
     assert "ok:" not in result.stdout
+
+    selected = _run(
+        [sys.executable, "-m", "pre_commit", "run", "--files",
+         str(path.relative_to(project))],
+        project, env,
+    )
+    assert selected.returncode == 1, selected.stdout + selected.stderr
+    assert "exit code: 2" in selected.stdout + selected.stderr
+    assert "defines neither [build] nor [tool.pycontainer]" in selected.stdout + selected.stderr
+
     explicit = _run(
         [str(executable), "validate", "config", "--", str(path.relative_to(project))],
         project, env,
