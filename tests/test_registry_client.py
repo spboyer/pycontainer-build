@@ -182,8 +182,8 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
-        requests.append((method, url, headers))
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        requests.append((method, url, headers, max_response_bytes))
         return 200, body, {"Docker-Content-Digest": digest}
 
     monkeypatch.setattr(client, "_make_request", fake_request)
@@ -191,6 +191,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     manifest, returned_digest = client.pull_manifest(
         digest, expected_digest=digest, expected_size=len(body)
     )
+    assert requests[0][3] == len(body)
     assert manifest["schemaVersion"] == 2
     assert returned_digest == digest
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
@@ -202,6 +203,18 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
 
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
+
+
+def test_pull_manifest_bounds_read_to_expected_size(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(b"{}" + b" " * 4096)
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda request, timeout: response,
+    )
+    with pytest.raises(RegistryRequestError, match="exceeded 2 bytes"):
+        client.pull_manifest("sha256:" + "a" * 64, expected_size=2)
+    assert response.read_sizes == [3]
 
 
 @pytest.mark.parametrize("mismatch", [None, "digest", "size", "media_type", "missing"])

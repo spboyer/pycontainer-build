@@ -586,7 +586,7 @@ class RegistryClient:
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Accept": MANIFEST_ACCEPT}
         status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
+            "GET", url, headers=headers, max_response_bytes=expected_size
         )
         if status != 200:
             body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
