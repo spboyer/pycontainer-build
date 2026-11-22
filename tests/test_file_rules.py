@@ -313,6 +313,8 @@ def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys
         "conda_env/lib/site-packages/fastapi_shim.py": "from fastapi import FastAPI\napp = FastAPI()\n",
         "debug_tools/deep/conda/conda-meta/history": "",
         "debug_tools/deep/conda/bin/python.py": "native",
+        ".venv/conda-meta/history": "",
+        ".venv/lib/site-packages/conda_dependency.py": "dependency",
         "requirements.txt": "flask\n",
     }.items():
         path = context / name
@@ -323,13 +325,13 @@ def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys
                      exclude_defaults=False, verbose=True, dry_run=True)
     builder = ImageBuilder(config)
     selected = [relative.as_posix() for _, relative in builder.context_files]
-    assert not any(name.startswith(("conda_env/", "debug_tools/deep/")) for name in selected)
+    assert not any(name.startswith(("conda_env/", "debug_tools/deep/", ".venv/")) for name in selected)
     assert "debug_tools/nested/trace.py" in selected
+    assert builder.config.entrypoint is None
     builder.build()
     plan_lines = [line.strip() for line in capsys.readouterr().out.splitlines()]
-    assert not any(line.startswith(("conda_env", "debug_tools/deep")) for line in plan_lines)
+    assert not any(line.startswith(("conda_env", "debug_tools/deep", ".venv/")) for line in plan_lines)
     assert "debug_tools/nested/trace.py" in plan_lines
-    assert "fastapi_shim" not in " ".join(config.entrypoint or [])
 
     layers = tmp_path / "layers"
     layers.mkdir()
