@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -17,6 +18,8 @@ from pycontainer.registry_client import (
     TRANSFER_CHUNK_SIZE,
     RegistryAuthenticationError,
     RegistryClient,
+    RegistryQuotaError,
+    RegistryRateLimitError,
     RegistryRequestError,
     _retry_delay,
     parse_image_reference,
@@ -597,6 +600,400 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
     assert len(requests) == MAX_REQUEST_RETRIES + 1
     assert all(timeout == 2.5 for _, timeout in requests)
     assert len(delays) == MAX_REQUEST_RETRIES
+
+
+def _errors_body(*entries):
+    return json.dumps(
+        {"errors": [{"code": code, "message": message} for code, message in entries]}
+    ).encode()
+
+
+def _patch_urlopen(monkeypatch, handler):
+    requests = []
+    delays = []
+
+    def fake_open(_opener, request, timeout):
+        requests.append(request)
+        return handler(request, len(requests))
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.OpenerDirector.open", fake_open
+    )
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
+    return requests, delays
+
+
+def test_denied_manifest_push_reports_registry_operation_code_and_message(
+    monkeypatch,
+):
+    client = RegistryClient("registry.example", "team/app")
+    requests, delays = _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(
+                request.full_url,
+                403,
+                body=_errors_body(("DENIED", "requested access to the resource is denied")),
+            )
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    message = str(error.value)
+    assert not isinstance(error.value, (RegistryRateLimitError, RegistryQuotaError))
+    assert "Manifest push failed with HTTP 403 from registry.example" in message
+    assert "DENIED: requested access to the resource is denied" in message
+    assert "push permission" in message
+    assert len(requests) == 1
+    assert delays == []
+
+
+def test_rate_limit_with_long_retry_after_fails_fast_with_reset_time(monkeypatch):
+    client = RegistryClient("docker.io", "library/python")
+    headers = {
+        "Retry-After": "3600",
+        "ratelimit-limit": "100;w=21600",
+        "ratelimit-remaining": "0;w=21600",
+    }
+    requests, delays = _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(
+                request.full_url,
+                429,
+                headers,
+                _errors_body(("TOOMANYREQUESTS", "You have reached your pull rate limit.")),
+            )
+        ),
+    )
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("3.11")
+
+    message = str(error.value)
+    assert error.value.retry_after_seconds == 3600
+    assert "registry-1.docker.io" in message
+    assert "TOOMANYREQUESTS: You have reached your pull rate limit." in message
+    assert "resets in about 3600 seconds" in message
+    assert "0 of 100 remaining" in message
+    assert "Authenticate" in message
+    assert len(requests) == 1
+    assert delays == []
+
+
+def test_rate_limit_http_date_reports_utc_reset(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    reset = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=2)
+    retry_after = reset.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 429, {"Retry-After": retry_after})
+        ),
+    )
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("latest")
+
+    assert 7100 <= error.value.retry_after_seconds <= 7200
+    assert reset.strftime("%Y-%m-%dT%H:%M:%SZ") in str(error.value)
+
+
+def test_get_rate_limit_with_short_retry_after_retries_then_reports(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    requests, delays = _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 429, {"Retry-After": "1"})
+        ),
+    )
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("latest")
+
+    assert len(requests) == MAX_REQUEST_RETRIES + 1
+    assert delays == [1.0] * MAX_REQUEST_RETRIES
+    assert "resets in about 1 second" in str(error.value)
+    assert "(empty response)" in str(error.value)
+
+
+@pytest.mark.parametrize("retry_after", ["soon", "nan", "inf", "-5"])
+def test_malformed_retry_after_uses_bounded_backoff(monkeypatch, retry_after):
+    client = RegistryClient("registry.example", "team/app")
+    requests, delays = _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 429, {"Retry-After": retry_after})
+        ),
+    )
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("latest")
+
+    assert len(requests) == MAX_REQUEST_RETRIES + 1
+    assert all(0 <= delay <= 5 for delay in delays)
+    if retry_after == "-5":
+        assert error.value.retry_after_seconds == 0
+    else:
+        assert error.value.retry_after_seconds is None
+        assert "did not report when the limit resets" in str(error.value)
+
+
+@pytest.mark.parametrize("operation", ["initiate", "blob", "manifest", "index"])
+def test_write_requests_are_never_retried_on_rate_limit(
+    tmp_path, monkeypatch, operation
+):
+    client = RegistryClient("registry.example", "team/app")
+    content = b"layer"
+    blob = tmp_path / "blob"
+    blob.write_bytes(content)
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+    def handler(request, _count):
+        if operation == "blob" and request.get_method() == "POST":
+            return _Response(status=202, headers={"Location": "/upload/1"})
+        raise _http_error(request.full_url, 429, {"Retry-After": "1"})
+
+    requests, delays = _patch_urlopen(monkeypatch, handler)
+
+    with pytest.raises(RegistryRateLimitError):
+        if operation == "initiate":
+            client.initiate_blob_upload()
+        elif operation == "blob":
+            client.upload_blob_monolithic(digest, blob)
+        elif operation == "manifest":
+            client.push_manifest("latest", b"{}")
+        else:
+            client.push_index("latest", b"{}")
+
+    write_methods = [r.get_method() for r in requests if r.get_method() in {"PUT", "POST"}]
+    assert len(write_methods) == len(requests)
+    assert len(requests) == (2 if operation == "blob" else 1)
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    ("fail_method", "status", "body"),
+    [
+        ("PUT", 413, b""),
+        ("POST", 413, b""),
+        ("PUT", 403, _errors_body(("DENIED", "storage quota exceeded for namespace"))),
+        ("PUT", 400, _errors_body(("QUOTA_EXCEEDED", "repository is over quota"))),
+    ],
+)
+def test_upload_quota_errors_name_blob_size(
+    tmp_path, monkeypatch, fail_method, status, body
+):
+    client = RegistryClient("registry.example", "team/app")
+    content = b"x" * 2048
+    blob = tmp_path / "blob"
+    blob.write_bytes(content)
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+    def handler(request, _count):
+        if request.get_method() == fail_method:
+            raise _http_error(request.full_url, status, body=body)
+        return _Response(status=202, headers={"Location": "/upload/1"})
+
+    _patch_urlopen(monkeypatch, handler)
+
+    with pytest.raises(RegistryQuotaError) as error:
+        client.upload_blob_monolithic(digest, blob)
+
+    assert error.value.blob_size == 2048
+    assert "2048 bytes (2.0 KiB)" in str(error.value)
+    assert "quota" in str(error.value).lower()
+
+
+def test_error_bodies_are_truncated_sanitized_and_redacted(monkeypatch):
+    client = RegistryClient(
+        "registry.example",
+        "team/app",
+        username="robot",
+        password="super-secret-password",
+    )
+    body = (
+        b"<html>\x1b[31mBearer abc.def.ghi Basic cm9ib3Q6c2VjcmV0 "
+        b'"access_token": "tok-123" password=super-secret-password '
+        + b"A" * 10000
+    )
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 400, body=body)
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    message = str(error.value)
+    assert len(message) < 1000
+    for secret in ("abc.def.ghi", "cm9ib3Q6c2VjcmV0", "tok-123", "super-secret-password"):
+        assert secret not in message
+    assert "[REDACTED]" in message
+    assert "\x1b" not in message
+    assert "..." in message
+
+
+def test_malformed_and_oversized_error_json_is_summarized(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    many = _errors_body(*[("DENIED", f"entry {index} " + "m" * 400) for index in range(8)])
+    bodies = iter([b'{"errors": [{"code": "DENIED"', many])
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 403, body=next(bodies))
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as malformed:
+        client.push_manifest("latest", b"{}")
+    with pytest.raises(RegistryRequestError) as oversized:
+        client.push_manifest("latest", b"{}")
+
+    assert '{"errors": [{"code": "DENIED"' in str(malformed.value)
+    message = str(oversized.value)
+    assert "entry 4" in message
+    assert "entry 5" not in message
+    assert "3 more error(s)" in message
+    assert len(message) < 2000
+
+
+def test_malformed_manifest_preview_is_redacted(monkeypatch):
+    client = RegistryClient("registry.example", "team/app", auth_token="tok-secret-1")
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: _Response(b"not json Bearer leaked-token tok-secret-1"),
+    )
+
+    with pytest.raises(RegistryRequestError, match="invalid manifest JSON") as error:
+        client.pull_manifest("latest")
+
+    assert "leaked-token" not in str(error.value)
+    assert "tok-secret-1" not in str(error.value)
+
+
+def test_rate_limit_headers_are_logged_and_low_remaining_warns_once(
+    monkeypatch, caplog
+):
+    client = RegistryClient("docker.io", "library/python")
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, count: _Response(
+            b"{}",
+            headers={
+                "RateLimit-Limit": "100;w=21600",
+                "RateLimit-Remaining": f"{10 - count};w=21600",
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        client._make_request("GET", f"{client.base_url}/")
+        client._make_request("GET", f"{client.base_url}/")
+
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("remaining=9" in line and "limit=100" in line for line in debug)
+    assert len(warnings) == 1
+    assert "9 of 100" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"ratelimit-limit": "lots", "ratelimit-remaining": "-1"},
+        {"ratelimit-remaining": "99999999999999999999999999;w=1x"},
+        {"ratelimit-limit": "100;w=21600", "ratelimit-remaining": "50;w=21600"},
+    ],
+)
+def test_malformed_or_healthy_rate_limit_headers_do_not_warn(
+    monkeypatch, caplog, headers
+):
+    client = RegistryClient("registry.example", "team/app")
+    _patch_urlopen(monkeypatch, lambda request, _count: _Response(headers=headers))
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        status, _, _ = client._make_request("GET", f"{client.base_url}/")
+
+    assert status == 200
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_token_exchange_rate_limit_reports_reset_without_echoing_secrets(
+    monkeypatch,
+):
+    client = RegistryClient(
+        "registry.example", "team/app", username="robot", password="pw-secret-value"
+    )
+
+    def handler(request, _count):
+        if request.full_url.startswith(client.base_url):
+            raise _http_error(
+                request.full_url,
+                401,
+                {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+            )
+        raise _http_error(
+            request.full_url,
+            429,
+            {"Retry-After": "120"},
+            _errors_body(("TOOMANYREQUESTS", "token rate exceeded for pw-secret-value")),
+        )
+
+    requests, delays = _patch_urlopen(monkeypatch, handler)
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("latest")
+
+    message = str(error.value)
+    assert "bearer-token exchange failed with HTTP 429 from auth.example" in message
+    assert "resets in about 120 seconds" in message
+    assert "pw-secret-value" not in message
+    assert delays == []
+    assert len(requests) == 2
+
+
+def test_pull_blob_rate_limit_fails_fast_and_observes_redirect_headers(
+    tmp_path, monkeypatch, caplog
+):
+    attempts = []
+
+    class Opener:
+        def open(self, request, timeout):
+            attempts.append(request)
+            raise _http_error(
+                request.full_url,
+                429,
+                {
+                    "Retry-After": "600",
+                    "ratelimit-limit": "100",
+                    "ratelimit-remaining": "0",
+                },
+                _errors_body(("TOOMANYREQUESTS", "slow down")),
+            )
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    delays = []
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
+    client = RegistryClient("registry.example", "team/app")
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        with pytest.raises(RegistryRateLimitError) as error:
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    assert "Blob download failed with HTTP 429 from registry.example" in str(error.value)
+    assert "resets in about 600 seconds" in str(error.value)
+    assert len(attempts) == 1
+    assert delays == []
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
 if __name__=="__main__":
