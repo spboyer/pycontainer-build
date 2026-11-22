@@ -39,7 +39,7 @@ hatch-plugin = [
 testpaths = ["tests"]
 addopts = ["-m", "not registry_integration"]
 markers = [
-  "registry_integration: requires external registry access and pulls real base-image layers",
+  "registry_integration: requires real registry access and may publish test artifacts",
 ]
 
 [project.scripts]

@@ -32,6 +32,12 @@ TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MANIFEST_ACCEPT = (
+    "application/vnd.oci.image.manifest.v1+json,"
+    "application/vnd.docker.distribution.manifest.v2+json,"
+    "application/vnd.oci.image.index.v1+json,"
+    "application/vnd.docker.distribution.manifest.list.v2+json"
+)
 
 
 class RegistryRequestError(RuntimeError):
@@ -47,6 +53,42 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _is_safe_https_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return bool(
+            parsed.scheme.lower() == "https"
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+        )
+    except ValueError:
+        return False
+
+
+class SafeRegistryRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep registry credentials off cross-origin or insecure redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_safe_https_url(newurl):
+            raise RegistryRequestError("Registry redirects must use HTTPS without embedded credentials.")
+        source = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected and (
+            source.scheme.lower(), source.netloc.lower()
+        ) != (target.scheme.lower(), target.netloc.lower()):
+            for name in ("Authorization", "Proxy-Authorization", "Cookie"):
+                redirected.remove_header(name)
+        return redirected
+
+
+def _open_registry_request(request, timeout):
+    return urllib.request.build_opener(SafeRegistryRedirect()).open(
+        request, timeout=timeout
+    )
 
 
 def _safe_url(url: str) -> str:
@@ -144,6 +186,25 @@ class RegistryClient:
             return {"Authorization": f"Basic {credentials}"}
         return {}
 
+    def _is_unauthenticated_loopback_request(self, url: str) -> bool:
+        # A caller-configured loopback registry must never receive credentials.
+        try:
+            target = urllib.parse.urlsplit(url)
+            base = urllib.parse.urlsplit(self.base_url)
+            return bool(
+                target.scheme == base.scheme == "http"
+                and target.hostname == base.hostname == "127.0.0.1"
+                and target.netloc == base.netloc
+                and not target.username
+                and not target.password
+                and all(
+                    value is None
+                    for value in (self.auth_token, self.username, self.password, self._bearer_token)
+                )
+            )
+        except ValueError:
+            return False
+
     def _get_bearer_token(self, auth_params: Dict[str, str]) -> str:
         """Exchange registry credentials for a bearer token."""
         realm = auth_params.get("realm")
@@ -152,6 +213,10 @@ class RegistryClient:
                 "Registry authentication challenge did not include a token realm."
             )
 
+        if not _is_safe_https_url(realm):
+            raise RegistryAuthenticationError(
+                "Registry bearer-token realm must use HTTPS without embedded credentials."
+            )
         parsed = urllib.parse.urlsplit(realm)
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
@@ -176,11 +241,13 @@ class RegistryClient:
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
-                ) as response:
+                with _open_registry_request(request, timeout=self.timeout) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
+            except RegistryRequestError:
+                raise RegistryAuthenticationError(
+                    "Registry bearer-token redirect was rejected."
+                ) from None
             except urllib.error.HTTPError as error:
                 if (
                     error.code in RETRYABLE_STATUSES
@@ -237,6 +304,15 @@ class RegistryClient:
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
     ) -> Tuple[int, bytes, Dict]:
+        if not _is_safe_https_url(url):
+            sensitive_headers = any(
+                name.lower() in {"authorization", "proxy-authorization", "cookie"}
+                for name in (headers or {})
+            )
+            if sensitive_headers or not self._is_unauthenticated_loopback_request(url):
+                raise RegistryRequestError(
+                    "Registry requests must use HTTPS without embedded credentials."
+                )
         method = method.upper()
         retry_safe = method in {"GET", "HEAD"}
         body_position = None
@@ -252,9 +328,7 @@ class RegistryClient:
                 url, data=data, headers=request_headers, method=method
             )
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
-                ) as response:
+                with _open_registry_request(request, timeout=self.timeout) as response:
                     return response.status, response.read(), dict(response.headers)
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
@@ -415,14 +489,7 @@ class RegistryClient:
             raise ValueError("Expected manifest size must be a non-negative integer.")
 
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
-        headers = {
-            "Accept": (
-                "application/vnd.oci.image.manifest.v1+json,"
-                "application/vnd.docker.distribution.manifest.v2+json,"
-                "application/vnd.oci.image.index.v1+json,"
-                "application/vnd.docker.distribution.manifest.list.v2+json"
-            )
-        }
+        headers = {"Accept": MANIFEST_ACCEPT}
         status, body, response_headers = self._make_request(
             "GET", url, headers=headers
         )
@@ -467,7 +534,37 @@ class RegistryClient:
             )
         return manifest, digest or body_digest
 
+    def verify_manifest_descriptor(
+        self, reference: str, expected_digest: str, expected_size: int, expected_media_type: str
+    ) -> None:
+        """Verify the manifest descriptor a signer resolves through HEAD."""
+        digest_filename(expected_digest)
+        if type(expected_size) is not int or expected_size < 0:
+            raise ValueError("Expected manifest size must be a non-negative integer.")
+        url = f"{self.base_url}/{self.repository}/manifests/{reference}"
+        status, _, headers = self._make_request("HEAD", url, headers={"Accept": MANIFEST_ACCEPT})
+        if status != 200:
+            raise RegistryRequestError(f"Manifest descriptor HEAD failed with HTTP {status}.")
+        normalized = {name.lower(): value for name, value in headers.items()}
+        try:
+            size = int(normalized.get("content-length", ""))
+        except (TypeError, ValueError):
+            size = None
+        media_type = (normalized.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if (
+            normalized.get("docker-content-digest") != expected_digest
+            or size != expected_size
+            or media_type != expected_media_type.lower()
+        ):
+            raise BlobIntegrityError(
+                "Registry manifest HEAD descriptor does not match the built digest, size, or media type."
+            )
+
     def _open_blob_response(self, url: str):
+        if not _is_safe_https_url(url) and not self._is_unauthenticated_loopback_request(url):
+            raise RegistryRequestError(
+                "Registry blob requests must use HTTPS without embedded credentials."
+            )
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
@@ -484,7 +581,11 @@ class RegistryClient:
                     "Registry blob redirect did not include a Location."
                 ) from error
             target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
+            if not _is_safe_https_url(target):
+                raise RegistryRequestError(
+                    "Registry blob redirects must use HTTPS without embedded credentials."
+                )
+            return _open_registry_request(
                 urllib.request.Request(target), timeout=self.timeout
             )
 

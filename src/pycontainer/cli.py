@@ -1,6 +1,6 @@
 import argparse, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, SBOM_FORMATS, SIGNING_PROVIDERS, NOTATION_SIGNATURE_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
@@ -27,6 +27,14 @@ def main():
     b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
+    b.add_argument("--sign",action=argparse.BooleanOptionalAction,default=None,help="Sign the registry-published image before moving tags (requires --push)")
+    b.add_argument("--sign-provider",choices=SIGNING_PROVIDERS,help="Signing provider: cosign or notation")
+    b.add_argument("--sign-key",help="Cosign key reference or configured Notation key name")
+    b.add_argument("--sign-plugin",help="Notation signing plugin name")
+    b.add_argument("--sign-key-id",help="Notation plugin key identifier")
+    b.add_argument("--sign-timestamp-url",help="Notation timestamp authority URL (without credentials)")
+    b.add_argument("--sign-timestamp-root-cert",help="Notation timestamp authority root certificate path")
+    b.add_argument("--sign-signature-format",choices=NOTATION_SIGNATURE_FORMATS,help="Notation signature envelope format")
     b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
     b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
@@ -102,6 +110,14 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'sign': args.sign,
+        'sign_provider': args.sign_provider,
+        'sign_key': args.sign_key,
+        'sign_plugin': args.sign_plugin,
+        'sign_key_id': args.sign_key_id,
+        'sign_timestamp_url': args.sign_timestamp_url,
+        'sign_timestamp_root_cert': args.sign_timestamp_root_cert,
+        'sign_signature_format': args.sign_signature_format,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
@@ -115,6 +131,11 @@ def main():
                 cfg.base_image=f"python:{py_ver}-slim"
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
+
+    if cfg.sign and not args.push:
+        parser.error("--sign requires --push; local-only image signing is not supported.")
+    if cfg.sign and cfg.dry_run:
+        parser.error("--sign cannot be used with --dry-run.")
 
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')

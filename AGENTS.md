@@ -63,17 +63,20 @@ uv run --locked --group test --group build --group hatch-plugin python -m pytest
 uv run --locked --group test --group build python -m pycontainer.cli build --dry-run --tag audit:local --context examples\fastapi-app
 ```
 
-Registry-pulling tests are explicitly marked `registry_integration` and are
+Real-registry tests are explicitly marked `registry_integration` and are
 excluded by default. Run them deliberately with
 `uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration`;
-they make real base-image pulls and must have a bounded timeout. The lockfile
-pins development tools only; the core package continues to declare no runtime
+they require a bounded timeout and may pull base images or publish signing
+fixtures. Signing tests require explicit disposable-registry credentials and
+provider configuration; see `docs/image-signing.md`. The lockfile pins
+development tools only; the core package continues to declare no runtime
 dependencies. The excluded tests are:
 
 - `tests/test_base_image.py::test_dependency_layer_creation`
 - `tests/test_build_push.py::test_build_and_push_workflow`
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
+- `tests/test_signing_integration.py::test_real_provider_signs_and_independently_verifies` (eight provider/platform combinations)
 
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts

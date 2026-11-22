@@ -1,4 +1,4 @@
-import hashlib, json, os, shutil, tarfile, tempfile, logging
+import hashlib, json, os, re, shutil, tarfile, tempfile, logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -178,6 +178,7 @@ def _select_index_descriptor(
         f"variant. Available platforms: {available_text}."
     )
 from .oci import (
+    OCI_INDEX_MEDIA_TYPE,
     OCI_MANIFEST_MEDIA_TYPE,
     OCILayer,
     OCIManifestDescriptor,
@@ -196,6 +197,7 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
+from .signing import SigningError, create_signer
 from .local_image import (
     LocalImageError,
     check_local_image_bounds,
@@ -801,6 +803,7 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
+        self.signed_ref=None
         
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
@@ -808,6 +811,13 @@ class ImageBuilder:
         for tag_ref in self.config.all_tags()[1:]:
             extra_tag=parse_image_reference(tag_ref)[2]
             if extra_tag not in push_tags: push_tags.append(extra_tag)
+
+        signer=None
+        if self.config.sign:
+            self.pushed_refs=[]
+            if "@" in target:
+                raise ValueError("A signed push target must specify a tag, not a digest.")
+            signer=create_signer(self.config)
 
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
@@ -829,6 +839,12 @@ class ImageBuilder:
         layers_dir=output/'blobs'/'sha256'
         
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
+
+        if signer:
+            self._push_signed_image(
+                client, layers_dir, push_tags, f"{registry}/{repo}", signer, show_progress
+            )
+            return f"{registry}/{repo}:{tag}"
 
         if getattr(self, "index_digest", None):
             self._push_image_index(client, layers_dir, push_tags, f"{registry}/{repo}", show_progress)
@@ -853,6 +869,145 @@ class ImageBuilder:
         self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
 
         return f"{registry}/{repo}:{tag}"
+
+    @staticmethod
+    def _verify_published_manifest(client, reference: str, digest: str, size: int, media_type: str) -> None:
+        manifest, actual_digest=client.pull_manifest(
+            reference, expected_digest=digest, expected_size=size
+        )
+        if actual_digest != digest or manifest.get("mediaType") != media_type:
+            raise BlobIntegrityError(
+                "Registry manifest digest or media type does not match the built image."
+            )
+        client.verify_manifest_descriptor(reference, digest, size, media_type)
+
+    def _push_signed_image(self, client, layers_dir: Path, push_tags: List[str], repository: str, signer, show_progress: bool) -> None:
+        is_index=bool(getattr(self, "index_digest", None))
+        digest=self.index_digest if is_index else self.manifest_digest
+        size=self.index_size if is_index else self.platform_images[0].manifest_size
+        media_type=OCI_INDEX_MEDIA_TYPE if is_index else OCI_MANIFEST_MEDIA_TYPE
+        subject=f"{repository}@{digest}"
+        if any(
+            re.fullmatch(r"sha256-[0-9a-f]{64}(?:\.(?:sig|att|sbom))?", tag)
+            for tag in push_tags
+        ):
+            raise ValueError(
+                "Requested image tags conflict with signature or referrers storage tags."
+            )
+
+        if is_index:
+            _verify_image_index(
+                layers_dir, digest, size, self.platform_images, check_diff_ids=True
+            )
+        else:
+            _verify_platform_image(layers_dir, self.platform_images[0], check_diff_ids=True)
+        data=_read_verified_blob(layers_dir, digest, size, "Signed image")
+        blobs={}
+        for image in self.platform_images:
+            for layer in image.layers:
+                blobs.setdefault(layer.digest, None)
+            blobs.setdefault(image.config_digest, None)
+        tag_refs=[f"{repository}:{tag}" for tag in push_tags]
+        blob_results=[]
+        acknowledged_manifests=[]
+        verified_manifests=[]
+
+        def publication_details():
+            return (
+                f"Blob results: {', '.join(blob_results) or '(none)'}. "
+                f"Acknowledged manifest writes: "
+                f"{', '.join(acknowledged_manifests) or '(none)'}. "
+                f"GET-verified manifests: {', '.join(verified_manifests) or '(none)'}."
+            )
+
+        active_stage=subject
+        try:
+            for blob_digest in blobs:
+                active_stage=f"blob {blob_digest}"
+                uploaded=client.push_blob(
+                    blob_digest, layers_dir/_digest_filename(blob_digest), check_exists=True
+                )
+                state="upload acknowledged" if uploaded else "already present"
+                blob_results.append(f"{blob_digest} ({state})")
+            if is_index:
+                for image in self.platform_images:
+                    active_stage=f"{repository}@{image.manifest_digest}"
+                    manifest_data=_read_verified_blob(
+                        layers_dir, image.manifest_digest, image.manifest_size,
+                        "Platform manifest",
+                    )
+                    client.push_manifest(image.manifest_digest, manifest_data)
+                    acknowledged_manifests.append(active_stage)
+                    self._verify_published_manifest(
+                        client, image.manifest_digest, image.manifest_digest,
+                        image.manifest_size, OCI_MANIFEST_MEDIA_TYPE,
+                    )
+                    verified_manifests.append(active_stage)
+                active_stage=subject
+                client.push_index(digest, data)
+                acknowledged_manifests.append(active_stage)
+            else:
+                active_stage=subject
+                client.push_manifest(digest, data)
+                acknowledged_manifests.append(active_stage)
+            self._verify_published_manifest(client, digest, digest, size, media_type)
+            verified_manifests.append(subject)
+        except (RegistryRequestError, BlobIntegrityError, OSError) as error:
+            raise RegistryRequestError(
+                f"Preparing {subject}: unable to stage or verify {active_stage} "
+                f"({type(error).__name__}). "
+                f"{publication_details()} The failed operation's outcome may be unknown; "
+                "uploaded content may remain. Digest-first publication is required. "
+                f"Requested image tags not attempted: {', '.join(tag_refs)}."
+            ) from None
+
+        try:
+            signer.sign(subject)
+        except SigningError as error:
+            raise SigningError(
+                f"Signing {subject} failed: {error} {publication_details()} "
+                "signature publication may be incomplete. Requested image tags "
+                f"not attempted: {', '.join(tag_refs)}."
+            ) from None
+
+        try:
+            self._verify_published_manifest(client, digest, digest, size, media_type)
+        except (RegistryRequestError, BlobIntegrityError, OSError):
+            raise RegistryRequestError(
+                f"Signed subject {subject} could not be reverified. {publication_details()} "
+                f"Signature artifacts may remain. Requested image tags not attempted: "
+                f"{', '.join(tag_refs)}."
+            ) from None
+
+        self.signed_ref=subject
+        if show_progress:
+            print(f"✓ Signed {subject}")
+        push_method=client.push_index if is_index else client.push_manifest
+        for index, tag in enumerate(push_tags):
+            ref=tag_refs[index]
+            remaining=", ".join(tag_refs[index+1:]) or "(none)"
+            try:
+                push_method(tag, data)
+            except (RegistryRequestError, OSError):
+                confirmed=", ".join(self.pushed_refs) or "(none)"
+                raise RegistryRequestError(
+                    f"Signed subject: {subject}. {publication_details()} "
+                    f"Acknowledged tag writes: {confirmed}. "
+                    f"Failed tag write (outcome unknown): {ref}. Not attempted: "
+                    f"{remaining}. No rollback was attempted."
+                ) from None
+            self.pushed_refs.append(ref)
+            try:
+                self._verify_published_manifest(client, tag, digest, size, media_type)
+            except (RegistryRequestError, BlobIntegrityError, OSError):
+                raise RegistryRequestError(
+                    f"Signed subject: {subject}. {publication_details()} Acknowledged tag writes: "
+                    f"{', '.join(self.pushed_refs)}. Tag readback failed or mismatched: "
+                    f"{ref}; its current outcome is unknown. Not attempted: {remaining}. "
+                    "No rollback was attempted."
+                ) from None
+            if show_progress:
+                print(f"✓ Pushed signed image tag {ref}")
 
     def _push_image_index(self, client, layers_dir: Path, push_tags: List[str], repository: str, show_progress: bool) -> None:
         """Push blobs, then platform manifests by digest, then the index; tags go last."""

@@ -5,6 +5,7 @@ import io
 import json
 import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.message import Message
@@ -18,6 +19,7 @@ from pycontainer.registry_client import (
     RegistryAuthenticationError,
     RegistryClient,
     RegistryRequestError,
+    SafeRegistryRedirect,
     _retry_delay,
     parse_image_reference,
 )
@@ -51,6 +53,89 @@ def _http_error(url, status, headers=None, body=b""):
     return urllib.error.HTTPError(
         url, status, "HTTP error", response_headers, io.BytesIO(body)
     )
+
+
+def test_registry_redirect_preserves_same_origin_auth_and_strips_cross_origin_auth():
+    handler = SafeRegistryRedirect()
+    request = urllib.request.Request(
+        "https://registry.example/v2/app/manifests/test",
+        headers={"Authorization": "Bearer synthetic-secret", "Cookie": "secret=synthetic"},
+    )
+    same = handler.redirect_request(
+        request, None, 302, "redirect", {}, "https://registry.example/new"
+    )
+    cross = handler.redirect_request(
+        request, None, 302, "redirect", {}, "https://storage.example/new"
+    )
+    assert same.get_header("Authorization") == "Bearer synthetic-secret"
+    assert cross.get_header("Authorization") is None
+    assert cross.get_header("Cookie") is None
+
+
+@pytest.mark.parametrize(
+    "target", ["http://storage.example/blob", "https://user:secret@storage.example/blob", "https://[bad"]
+)
+def test_registry_redirect_rejects_insecure_or_embedded_credentials(target):
+    handler = SafeRegistryRedirect()
+    request = urllib.request.Request("https://registry.example/v2/app")
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        handler.redirect_request(request, None, 302, "redirect", {}, target)
+
+
+def test_manifest_and_token_requests_use_safe_redirect_handler(monkeypatch):
+    client = RegistryClient("registry.example", "team/app", auth_token="synthetic-secret")
+    redirected = []
+
+    def fake_opener(handler):
+        assert isinstance(handler, SafeRegistryRedirect)
+
+        class Opener:
+            def open(self, request, timeout):
+                target = handler.redirect_request(
+                    request, None, 302, "redirect", {}, "https://storage.example/resource"
+                )
+                redirected.append(target)
+                return _Response(b'{"token":"temporary"}')
+
+        return Opener()
+
+    monkeypatch.setattr("pycontainer.registry_client.urllib.request.build_opener", fake_opener)
+    client._make_request("GET", "https://registry.example/v2/team/app/manifests/latest")
+    assert client._get_bearer_token({"realm": "https://auth.example/token"}) == "temporary"
+    assert all(request.get_header("Authorization") is None for request in redirected)
+
+
+@pytest.mark.parametrize("realm", ["http://auth.example/token", "https://user:secret@auth.example/token"])
+def test_token_exchange_rejects_unsafe_realms(monkeypatch, realm):
+    client = RegistryClient("registry.example", "team/app", username="user", password="secret")
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda *args, **kwargs: pytest.fail("unsafe token realm must not be contacted"),
+    )
+    with pytest.raises(RegistryAuthenticationError, match="HTTPS"):
+        client._get_bearer_token({"realm": realm})
+
+
+def test_only_unauthenticated_same_origin_loopback_http_is_allowed(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    client.base_url = "http://127.0.0.1:12345/v2"
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda request, timeout: _Response(b"ok"),
+    )
+    assert client._make_request("GET", "http://127.0.0.1:12345/v2/test")[0] == 200
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._make_request(
+            "GET", "http://127.0.0.1:12345/v2/test",
+            headers={"Authorization": "Bearer synthetic-secret"},
+        )
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._make_request("GET", "http://127.0.0.1:12346/v2/test")
+    client.auth_token = "synthetic-secret"
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._make_request("GET", "http://127.0.0.1:12345/v2/test")
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._open_blob_response("http://127.0.0.1:12345/v2/test")
 
 def test_parse_image_reference():
     """Test parsing various image reference formats."""
@@ -117,6 +202,39 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
 
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
+
+
+@pytest.mark.parametrize("mismatch", [None, "digest", "size", "media_type", "missing"])
+def test_head_manifest_verifies_signer_visible_descriptor(monkeypatch, mismatch):
+    client = RegistryClient("registry.example", "team/app")
+    digest = "sha256:" + "a" * 64
+    media_type = "application/vnd.oci.image.manifest.v1+json"
+    headers = {
+        "Docker-Content-Digest": digest,
+        "Content-Length": "42",
+        "Content-Type": media_type + "; charset=utf-8",
+    }
+    if mismatch == "digest":
+        headers["Docker-Content-Digest"] = "sha256:" + "b" * 64
+    elif mismatch == "size":
+        headers["Content-Length"] = "43"
+    elif mismatch == "media_type":
+        headers["Content-Type"] = "application/octet-stream"
+    elif mismatch == "missing":
+        del headers["Content-Length"]
+
+    def fake_request(method, url, headers=None):
+        assert method == "HEAD"
+        assert "application/vnd.oci.image.manifest.v1+json" in headers["Accept"]
+        return 200, b"", response_headers
+
+    response_headers = headers
+    monkeypatch.setattr(client, "_make_request", fake_request)
+    if mismatch is None:
+        client.verify_manifest_descriptor(digest, digest, 42, media_type)
+    else:
+        with pytest.raises(BlobIntegrityError, match="HEAD descriptor"):
+            client.verify_manifest_descriptor(digest, digest, 42, media_type)
 
 def test_registry_client_construction():
     """Test RegistryClient initialization."""
@@ -204,7 +322,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         return Response(b'{"token":"exchanged-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
 
     status, body, _=client._make_request(
@@ -254,7 +372,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
         raise _http_error(request.full_url, 403)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
 
     with pytest.raises(
@@ -300,7 +418,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
         return _Response(b'{"token":"access-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
@@ -441,6 +559,21 @@ def test_pull_blob_cleans_only_owned_temp_after_interrupted_download(
     assert list(tmp_path.glob(".*.tmp")) == [sentinel]
 
 
+def test_blob_download_rejects_insecure_redirect(monkeypatch):
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    class Opener:
+        def open(self, request, timeout):
+            raise _http_error(request.full_url, 302, {"Location": "http://storage.example/blob"})
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
+
+
 def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
     tmp_path, monkeypatch
 ):
@@ -476,7 +609,7 @@ def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
         lambda *_handlers: Opener(),
     )
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
@@ -528,7 +661,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
     client = RegistryClient("registry.example", "team/app", auth_token="token")
     monkeypatch.setattr(client, "initiate_blob_upload", lambda: location)
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
 
     assert client.upload_blob_monolithic(digest, source)
@@ -563,7 +696,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
         return _Response(status=201)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
 
     client.upload_blob_monolithic(
@@ -571,6 +704,27 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
     )
 
     assert requests[0].get_header("Authorization") is None
+
+
+def test_upload_rejects_insecure_external_location_without_exposing_query(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.blob"
+    source.write_bytes(b"upload")
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+    monkeypatch.setattr(
+        client, "initiate_blob_upload",
+        lambda: "http://storage.example/upload?token=synthetic-secret",
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda *args, **kwargs: pytest.fail("insecure upload must not be contacted"),
+    )
+    with pytest.raises(RegistryRequestError, match="HTTPS") as raised:
+        client.upload_blob_monolithic(
+            f"sha256:{hashlib.sha256(b'upload').hexdigest()}", source
+        )
+    assert "synthetic-secret" not in str(raised.value)
 
 
 def test_upload_rejects_local_blob_digest_mismatch_before_initiating_upload(
@@ -611,7 +765,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
         raise TimeoutError("not included in public error")
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_registry_request", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append

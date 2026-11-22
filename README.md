@@ -68,6 +68,9 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Opt in to Cosign keyless signing with an ambient OIDC identity
+pycontainer build --tag ghcr.io/user/myapp:v1 --push --sign --sign-provider cosign
+
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build --tag myapp:latest --platform linux/amd64
 
@@ -143,6 +146,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Command-line interface** — Simple `pycontainer build` workflow
 - ✅ **Programmatic API** — Use as a library in your tools
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
+- **Experimental image signing** — Opt-in Cosign or Notation signing of a
+  registry-published digest; see [signing prerequisites and status](docs/image-signing.md)
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
@@ -343,6 +348,13 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+
+**Image signing:** `--sign --sign-provider cosign|notation` requires `--push`
+and an independently configured signer. The registry must accept publication
+by digest. The image manifest, or the top-level multi-platform image index, is
+verified and signed before tags are written. See the
+[signing guide](docs/image-signing.md) for keys, OIDC, verification, limitations
+and real-registry test prerequisites.
 
 ### Local base images
 

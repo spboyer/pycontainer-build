@@ -61,6 +61,14 @@ the error reports confirmed pushes, the failed or unknown-outcome reference,
 and references not attempted, regardless of progress output; tags are not
 rolled back. A single `--tag` behaves exactly as before.
 
+Opt-in signed pushes stage and verify the immutable manifest or image index,
+then sign it before writing any requested tag. Each acknowledged tag write is
+read back; a failed write or mismatched readback stops subsequent writes and
+reports acknowledged, unknown, and unattempted references. An acknowledgement
+or successful readback is not a guarantee against a later concurrent retag.
+Signature-storage fallback tags cannot also be requested image tags. See
+[image signing](image-signing.md) for provider-specific limitations.
+
 For multi-platform builds, the layout `index.json` has one image-index
 descriptor per configured tag. Each has the same digest and size, and an
 `org.opencontainers.image.ref.name` annotation holding the full configured
