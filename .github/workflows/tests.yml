@@ -44,7 +44,7 @@ jobs:
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
 
   package-smoke:
     name: Isolated wheel and sdist smoke test

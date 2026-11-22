@@ -1,6 +1,6 @@
 import argparse, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
@@ -57,6 +57,15 @@ def main():
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
+    b.add_argument("--scan-executable",help="Grype executable path or name")
+    b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
+    b.add_argument("--scan-unknown",choices=("fail","ignore"),help="Unknown severity policy (default: fail)")
+    b.add_argument("--scan-report-format",choices=("json","sarif"),help="Report format (default: json)")
+    b.add_argument("--scan-report",help="Report destination (default: output directory)")
+    b.add_argument("--scan-offline",action="store_true",default=None,help="Use an imported database without updates; freshness still enforced")
+    b.add_argument("--scan-db-dir",help="Grype database cache (default: ~/.pycontainer/grype-db)")
+    b.add_argument("--scan-db-max-age-hours",type=int,help="Maximum database build age (default: 120 hours)")
     # --- import subcommand (Dockerfile migration) ---
     imp=sub.add_parser("import",help="Convert a Dockerfile to [tool.pycontainer] settings")
     imp.add_argument("dockerfile",help="Path to the Dockerfile")
@@ -102,6 +111,15 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'scan': args.scan,
+        'scan_executable': args.scan_executable,
+        'scan_threshold': args.scan_threshold,
+        'scan_unknown': args.scan_unknown,
+        'scan_report_format': args.scan_report_format,
+        'scan_report': args.scan_report,
+        'scan_offline': args.scan_offline,
+        'scan_db_dir': args.scan_db_dir,
+        'scan_db_max_age_hours': args.scan_db_max_age_hours,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
@@ -122,19 +140,26 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     builder=ImageBuilder(cfg)
-    out=builder.build()
+    from .scanning import ScanError
+    try:
+        out=builder.build()
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
     print("Built:", out)
     
     if args.push:
         password=args.password
         if args.username and not password:
             password=os.getenv('REGISTRY_PASSWORD')
-        builder.push(
-            registry_url=args.registry,
-            username=args.username,
-            password=password,
-            show_progress=not args.no_progress,
-        )
+        try:
+            builder.push(
+                registry_url=args.registry,
+                username=args.username,
+                password=password,
+                show_progress=not args.no_progress,
+            )
+        except ScanError as exc:
+            parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
 
 if __name__=="__main__":
     main()

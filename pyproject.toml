@@ -37,9 +37,10 @@ hatch-plugin = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-m", "not registry_integration"]
+addopts = ["-m", "not registry_integration and not scanner_integration"]
 markers = [
   "registry_integration: requires external registry access and pulls real base-image layers",
+  "scanner_integration: opt-in real Grype and controlled vulnerability database",
 ]
 
 [project.scripts]

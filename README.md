@@ -68,6 +68,9 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Experimental opt-in vulnerability gate (requires Grype 0.119.0)
+pycontainer build --tag ghcr.io/user/myapp:v1 --scan --push
+
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build --tag myapp:latest --platform linux/amd64
 
@@ -128,6 +131,28 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 ```
 
 **See [Local Development Guide](docs/local-development.md) for detailed testing instructions.**
+
+### Optional vulnerability gate
+
+`--scan` uses an external **Grype 0.119.0** executable against the complete
+selected OCI image, not the Python-only SBOM. It defaults to failing on
+high/critical findings and unknown severity, and blocks registry publication
+before authentication or uploads. Core runtime dependencies remain empty.
+
+```bash
+pycontainer build --scan --scan-report-format sarif --scan-report scan.sarif
+pycontainer build --scan --scan-threshold critical --scan-unknown ignore
+```
+
+JSON/SARIF reports include image digest, scanner version, database content
+digest/build time, policy and coverage limits, and are retained on findings
+failures. Database freshness is enforced even offline. **The adapter is
+experimental: fake-scanner tests pass; a real native-Windows run exposed an
+upstream `oci-dir:` cache-path failure, so that scanner host is rejected.
+Non-Windows compatibility and controlled-database/whiteout acceptance remain
+unverified.**
+See [Vulnerability scanning](docs/vulnerability-scanning.md) for prerequisites,
+offline preparation, error behavior and the opt-in acceptance test.
 
 ---
 

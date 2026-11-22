@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 
 
 @dataclass
@@ -35,11 +36,30 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    scan: bool = False
+    scan_executable: str = "grype"
+    scan_threshold: str = "high"
+    scan_unknown: str = "fail"
+    scan_report_format: str = "json"
+    scan_report: Optional[str] = None
+    scan_offline: bool = False
+    scan_db_dir: Optional[str] = None
+    scan_db_max_age_hours: int = 120
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.scan_threshold not in SCAN_SEVERITIES:
+            raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
+        if self.scan_unknown not in ("fail", "ignore"):
+            raise ValueError("scan_unknown must be fail or ignore")
+        if self.scan_report_format not in ("json", "sarif"):
+            raise ValueError("scan_report_format must be json or sarif")
+        if type(self.scan_db_max_age_hours) is not int or self.scan_db_max_age_hours <= 0:
+            raise ValueError("scan_db_max_age_hours must be a positive integer")
+        if not isinstance(self.scan_executable, str) or not self.scan_executable.strip():
+            raise ValueError("scan_executable must be a nonempty executable path or name")
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

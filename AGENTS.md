@@ -15,6 +15,7 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -74,6 +75,12 @@ dependencies. The excluded tests are:
 - `tests/test_build_push.py::test_build_and_push_workflow`
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
+
+Real scanner checks are separately marked `scanner_integration` and excluded
+by default. They require an explicitly selected Grype executable and controlled
+database digest; see [vulnerability scanning](docs/vulnerability-scanning.md)
+for the opt-in command and coverage limits. Fake-executable tests do not prove
+real Grype compatibility or OS/Python whiteout handling.
 
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
