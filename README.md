@@ -420,6 +420,17 @@ exclude-defaults = true
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+- `--analyze-layers` — Write `layer-analysis.json` with per-layer sizes,
+  repeated content and predicted squash savings
+- `--squash` — Opt in to merging the layers pycontainer creates (dependencies
+  and application) into one layer; base-image layers are never squashed
+
+The default layout is unchanged unless `--squash` is given. Squashing
+preserves overlay semantics (whiteouts, opaque directories, links, metadata)
+or fails explicitly, but it usually saves little space for pycontainer's own
+layers and gives up layer-level cache reuse between the dependency and
+application layers. See [Layer analysis and squashing](docs/layer-squashing.md)
+before enabling it.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -467,6 +478,8 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+analyze-layers = false      # true writes layer-analysis.json
+squash = false              # true merges builder-created layers only
 
 [build.labels]
 maintainer = "team@example.com"
@@ -674,6 +687,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Layer Analysis and Squashing](docs/layer-squashing.md)** — Opt-in layer report and builder-layer squashing trade-offs
 
 ### External References
 

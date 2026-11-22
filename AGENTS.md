@@ -15,6 +15,8 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `squash.py`, `layer_analysis.py`: opt-in builder-layer squashing with OCI
+  whiteout/opaque semantics, and the `layer-analysis.json` report.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -91,6 +93,14 @@ It pulls the selected base image, imports the generated layout into Docker, and
 starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
 part of the default test suite or CI.
+
+`--squash` (opt-in) merges only builder-created layers; base layers are never
+squashed. Unrepresentable overlay cases raise `SquashError` rather than being
+approximated. `scripts/check_squash_equivalence.py` is the opt-in Docker
+equivalence check for plain versus squashed images (`--skopeo-image` runs
+Skopeo from a container). Run it from a Linux builder: dependency staging on a
+Windows host writes CRLF console-script shebangs that fail in Linux containers.
+See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
