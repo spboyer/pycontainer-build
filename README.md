@@ -603,8 +603,10 @@ platform is built in isolation: it selects its own base manifest (registry
 builds re-select from the first resolved base-index digest), stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
-Multi-platform dependency staging requires a requirements file; copying a
-host virtualenv is rejected until target-closure checks land in
+Multi-platform dependency staging requires a requirements file; detected
+virtualenvs take precedence, so exclude them (for example, `--exclude .venv`)
+to select the requirements file. Copying a host virtualenv is rejected until
+target-closure checks land in
 [#180](https://github.com/spboyer/pycontainer-build/issues/180).
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
