@@ -144,6 +144,10 @@ def _verify_notation(policy, repository, digest, manifest, manifest_bytes, clien
     executable = resolve_verifier_executable(binary)
     if not executable:
         raise NotationTrustError("Notation executable not found")
+    try:
+        executable = str(Path(executable).resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        raise NotationTrustError("Cannot resolve Notation executable") from exc
     executable = str(_regular_file(executable, "Notation executable"))
 
     # Keep all generated state private to this operation and independent of user policy/plugins.

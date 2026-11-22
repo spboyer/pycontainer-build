@@ -166,6 +166,19 @@ def test_snapshot_uses_system_temp_instead_of_current_directory(case, monkeypatc
     invoke(case)
 
 
+def test_notation_executable_symlink_is_resolved(case, monkeypatch, tmp_path):
+    executable = Path(sys.executable).resolve()
+    link = tmp_path / ("notation.exe" if os.name == "nt" else "notation")
+    try:
+        link.symlink_to(executable)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    case[0]["binary"] = str(link)
+    observed = runner(case, monkeypatch)
+    invoke(case)
+    assert Path(observed[0][0]) == executable
+
+
 def test_other_valid_partial_subject_signature_cannot_rescue_invalid_pinned_signature(case, monkeypatch):
     other = dict(case[4], digest="sha256:" + "b" * 64,
                  certificates=[{"issuedTo": "CN=Exact,O=Example,OU=Extra",
