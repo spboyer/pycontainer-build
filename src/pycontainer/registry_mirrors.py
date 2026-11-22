@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from .registry_client import (
     RegistryClient,
     RegistryConnectionError,
+    RegistryQuotaError,
     RegistryRateLimitError,
     RegistryRequestError,
 )
@@ -19,10 +20,10 @@ _ENDPOINT_FAILURE_STATUSES = frozenset({401, 403})
 def _fallback_reason(error: RegistryRequestError) -> Optional[str]:
     """Return why a mirror error permits trying the next endpoint, if it does.
 
-    Integrity, rate-limit, malformed-response and transport-policy failures
-    are never eligible so a misbehaving mirror cannot be silently skipped.
+    Integrity, rate-limit, quota, malformed-response and transport-policy
+    failures are never eligible so a misbehaving mirror cannot be silently skipped.
     """
-    if isinstance(error, RegistryRateLimitError):
+    if isinstance(error, (RegistryRateLimitError, RegistryQuotaError)):
         return None
     if isinstance(error, RegistryConnectionError):
         return "connection failed"

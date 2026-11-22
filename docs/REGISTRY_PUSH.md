@@ -218,19 +218,39 @@ registry-ca-file = "corp-root-ca.pem"
   and upload locations); the downgrade is rejected before the HTTP target is
   contacted.
 - An HTTPS registry must advertise an HTTPS token realm.
-- `Authorization` is removed when a redirect changes scheme, host, or port;
-  blob storage redirects are always fetched without registry credentials.
+- Initial requests, token realms, upload locations and redirects reject
+  unsupported schemes, malformed authorities/ports (including port zero),
+  whitespace/control characters, invalid percent escapes, embedded credentials,
+  and fragments. Error URLs omit userinfo, queries and fragments; unparseable
+  URLs are reported with a fixed placeholder.
+- `Authorization`, `Proxy-Authorization`, and `Cookie` are removed when a
+  redirect changes scheme, host, or effective port (an omitted port equals its
+  scheme default). Blob storage redirects are always fetched without credentials.
+- Each client reuses one verifying TLS context and request opener. Its
+  non-redirecting blob opener is created once under a lock on first pull,
+  using that same context; push-only clients never construct it. Concurrent
+  initial bearer challenges share one token acquisition and replay once.
+  Rejection of the current bearer token is reported, not refreshed indefinitely.
+
+### Proxy policy
+
+Registry connections are direct. Both request openers explicitly disable urllib
+environment and system proxy discovery, so `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and their lowercase variants do not route registry, token or
+storage requests. Proxy URLs and proxy credentials are not supported.
+This applies to both HTTP and HTTPS, including custom-CA connections.
 
 ### Limitations
 
 - Tests cover an in-process loopback Registry v2 stub over HTTP and a
-  test-generated CA over HTTPS. Compatibility with specific registry products
+  test-generated CA over HTTPS, including token acquisition and manifest/blob
+  redirect targets succeeding with the CA and failing without it. Regressions
+  cover concurrent first-use, opener reuse and token challenge replay.
+  Compatibility with specific registry products
   (for example `registry:2`, Harbor, Nexus, or Artifactory) over HTTP or with
   private CAs has not been verified in CI.
 - The Poetry, Hatch, and VS Code integrations do not expose these options;
   use the CLI or `pycontainer.toml`.
-- Standard proxy environment variables apply to HTTP registries as they do
-  to HTTPS ones.
 
 ## Base-Image Registry Mirrors
 

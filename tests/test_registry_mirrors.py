@@ -23,6 +23,7 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 from pycontainer.registry_client import (
+    RegistryQuotaError,
     RegistryRateLimitError,
     RegistryRequestError,
     parse_image_reference,
@@ -68,6 +69,7 @@ class _Registry:
         self.blobs = {}
         self.requests = []
         self.status = None
+        self.status_body = b""
         self.status_paths = {}
         self.redirect_paths = {}
         self.challenge_realm = None
@@ -112,7 +114,7 @@ def _handler(state):
                     self._send(status)
                     return True
             if state.status:
-                self._send(state.status)
+                self._send(state.status, state.status_body)
                 return True
             return False
 
@@ -282,6 +284,24 @@ def test_mirror_cross_origin_redirect_never_sends_credentials(
     assert all(auth is None for _, _, auth in target.requests)
 
 
+def test_mirror_pull_ignores_environment_proxy(tmp_path, mirror_auth, monkeypatch):
+    with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
+        proxy, proxy_state
+    ):
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("http_proxy", f"http://{proxy}")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        mir.serve_image()
+        layers, config = _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
+
+    assert config["os"] == "linux" and len(layers) == 1
+    assert mir.requests
+    assert proxy_state.requests == []
+    assert up.requests == []
+
+
 @pytest.mark.parametrize("redirected_object", ["manifests", "blobs"])
 def test_https_mirror_refuses_http_redirect_without_fallback(
     tmp_path, mirror_auth, mirror_ca, redirected_object
@@ -413,6 +433,18 @@ def test_rate_limited_mirror_does_not_fall_back(tmp_path, mirror_auth):
         up.serve_image()
         mir.status = 429
         with pytest.raises(RegistryRateLimitError):
+            _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
+
+    assert up.requests == []
+
+
+@pytest.mark.parametrize("status, body", [(413, b""), (507, b""), (500, b"quota exceeded")])
+def test_quota_error_from_mirror_does_not_fall_back(tmp_path, mirror_auth, status, body):
+    with _serve() as (upstream, up), _serve() as (mirror, mir):
+        up.serve_image()
+        mir.status = status
+        mir.status_body = body
+        with pytest.raises(RegistryQuotaError):
             _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
 
     assert up.requests == []

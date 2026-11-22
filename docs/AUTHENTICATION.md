@@ -194,7 +194,12 @@ pycontainer build --tag registry.example.com/app:v1 --push
   other HTTP registry, or a token challenge from one, fail with
   `RegistryAuthenticationError` before secrets leave the process.
 - HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
-  rejected, and `Authorization` is dropped on cross-origin redirects. See
+  rejected. `Authorization`, `Proxy-Authorization` and `Cookie` are dropped on
+  cross-origin redirects; blob storage redirects are credential-free.
+- Embedded URL credentials are rejected and error URLs omit userinfo/query
+  secrets. Registry connections ignore environment/system proxies.
+- Concurrent initial bearer challenges share token acquisition and replay once;
+  rejection of the current token is reported without indefinite refresh. See
   [REGISTRY_PUSH.md](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
 - Base-image mirrors (`--registry-mirror`) resolve credentials with
   `get_mirror_auth`, which uses only host-scoped sources (the mirror's own

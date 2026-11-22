@@ -388,6 +388,10 @@ exclude-defaults = true
   Pushes never use mirrors, and mirrors never receive upstream credentials.
   See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
 
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
+
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
 not affect the image manifest digest. Inventory contains Python distributions

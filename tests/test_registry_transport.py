@@ -9,6 +9,7 @@ import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,7 +23,10 @@ from pycontainer.registry_client import (
     RegistryAuthenticationError,
     RegistryClient,
     RegistryRequestError,
+    NoRedirect,
     SafeRedirect,
+    _origin,
+    _safe_url,
     is_loopback_host,
 )
 
@@ -40,6 +44,8 @@ class _Registry:
         self.manifests = {}
         self.requests = []
         self.redirect = None
+        self.token_realm = None
+        self.token_response = None
 
 
 def _handler(state):
@@ -63,7 +69,19 @@ def _handler(state):
 
         def do_GET(self):
             self._record()
-            if state.redirect:
+            if (
+                state.token_realm
+                and self.headers.get("Authorization") != "Bearer acquired-token"
+            ):
+                self._send(
+                    401,
+                    headers={
+                        "Www-Authenticate": f'Bearer realm="{state.token_realm}"'
+                    },
+                )
+            elif state.token_response is not None:
+                self._send(200, json.dumps(state.token_response).encode())
+            elif state.redirect:
                 self._send(state.redirect[0], headers={"Location": state.redirect[1]})
             elif "/manifests/" in self.path:
                 body = state.manifests.get(self.path.rsplit("/", 1)[1])
@@ -139,6 +157,23 @@ def certificate_authority(tmp_path):
 @pytest.fixture
 def no_sleep(monkeypatch):
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _delay: None)
+
+
+@pytest.fixture
+def opener_constructions(monkeypatch):
+    original = urllib.request.build_opener
+    calls = []
+
+    def construct(*handlers):
+        calls.append(handlers)
+        return original(*handlers)
+
+    def unexpected_urlopen(*_args, **_kwargs):
+        pytest.fail("Registry request bypassed its configured opener")
+
+    monkeypatch.setattr(urllib.request, "build_opener", construct)
+    monkeypatch.setattr(urllib.request, "urlopen", unexpected_urlopen)
+    return calls
 
 
 def _http_error(url, code, headers):
@@ -320,12 +355,106 @@ def test_safe_redirect_keeps_authorization_only_for_same_origin(
     target, keeps_authorization
 ):
     request = urllib.request.Request(
-        "http://127.0.0.1:5000/v2/", headers={"Authorization": "Bearer secret"}
+        "http://127.0.0.1:5000/v2/",
+        headers={
+            "Authorization": "Bearer secret",
+            "Proxy-Authorization": "Basic proxy-secret",
+            "Cookie": "session=secret",
+        },
     )
-    redirected = SafeRedirect().redirect_request(
+    redirected = SafeRedirect(insecure=True).redirect_request(
         request, None, 307, "Temporary Redirect", {}, target
     )
-    assert redirected.has_header("Authorization") is keeps_authorization
+    for header in ("Authorization", "Proxy-Authorization", "Cookie"):
+        assert redirected.has_header(header.capitalize()) is keeps_authorization
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["request", "blob", "realm", "upload", "redirect", "blob-redirect"]
+)
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:url-password@registry.example/path?token=query-secret",
+        "https://user:url-password@[broken/path?token=query-secret",
+        "https://registry.example:99999/path?token=query-secret",
+        "https://registry.example:0/path?token=query-secret",
+        "https://registry.example:/path?token=query-secret",
+        "https://registry.example/path#query-secret",
+        "https://registry.example/path#",
+        "https://registry.example/\tpath?token=query-secret",
+        "https:///path?token=query-secret",
+        "ftp://registry.example/path?token=query-secret",
+        "http://registry.example/path?token=query-secret",
+        "https://registry.example/%broken?token=query-secret",
+    ],
+)
+def test_all_transport_entrypoints_reject_unsafe_urls(monkeypatch, entrypoint, url):
+    client = RegistryClient("registry.example", "team/app")
+
+    def unexpected_request(*_args, **_kwargs):
+        pytest.fail("Unsafe URL reached an opener")
+
+    monkeypatch.setattr(client._opener, "open", unexpected_request)
+    monkeypatch.setattr(client, "_get_blob_opener", unexpected_request)
+    with pytest.raises(RegistryRequestError) as error:
+        if entrypoint == "request":
+            client._make_request("GET", url)
+        elif entrypoint == "blob":
+            client._open_blob_response(url)
+        elif entrypoint == "realm":
+            client._get_bearer_token({"realm": url})
+        elif entrypoint == "blob-redirect":
+            client._open_blob_redirect(f"{client.base_url}/blob", url)
+        elif entrypoint == "upload":
+            monkeypatch.setattr(
+                client, "_make_request",
+                lambda *_args, **_kwargs: (202, b"", {"Location": url}),
+            )
+            client.initiate_blob_upload()
+        else:
+            request = urllib.request.Request(f"{client.base_url}/manifest")
+            headers = Message()
+            headers["Location"] = url
+            SafeRedirect().http_error_302(request, None, 302, "Found", headers)
+    assert "url-password" not in str(error.value)
+    assert "query-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "registry",
+    ["user:url-password@registry.example", "[broken", "registry.example:0",
+     "registry.example/path", "http://registry.example", "registry.example/"],
+)
+def test_constructor_rejects_invalid_registry_authorities(registry):
+    with pytest.raises(RegistryRequestError) as error:
+        RegistryClient(registry, "team/app")
+    assert "url-password" not in str(error.value)
+
+
+def test_origin_uses_actual_port_and_normalizes_default_port():
+    assert _origin("https://registry.example") == _origin("https://registry.example:443")
+    assert _origin("http://registry.example:0") != _origin("http://registry.example")
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+    assert client._authorization_headers("https://registry.example:443/v2") == {
+        "Authorization": "Bearer secret"
+    }
+    assert client._authorization_headers("https://registry.example:444/v2") == {}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:url-password@registry.example/path?token=query-secret",
+        "https://user:url-password@[broken?token=query-secret",
+        "https://user:url-password@registry.example:bad?token=query-secret",
+        "user:url-password@registry.example?token=query-secret",
+    ],
+)
+def test_error_url_redaction_is_safe_for_malformed_urls(url):
+    rendered = _safe_url(url)
+    assert "url-password" not in rendered
+    assert "query-secret" not in rendered
 
 
 def test_custom_ca_is_required_and_trusted(certificate_authority, no_sleep):
@@ -343,6 +472,207 @@ def test_custom_ca_is_required_and_trusted(certificate_authority, no_sleep):
 
     assert trusted.base_url.startswith("https://")
     assert pulled == {"schemaVersion": 2}
+
+
+@pytest.mark.parametrize("insecure", [False, True])
+@pytest.mark.parametrize("redirect", [False, True])
+def test_blob_transfers_reuse_ca_aware_openers(
+    tmp_path, certificate_authority, opener_constructions, insecure, redirect
+):
+    server_context, ca_file = certificate_authority
+    content = b"reusable-opener-layer"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    source_context = None if insecure else server_context
+    with _serve(server_context) as (target_port, target), _serve(
+        source_context
+    ) as (source_port, source):
+        target.blobs[digest] = content
+        source.blobs[digest] = content
+        if redirect:
+            source.redirect = (
+                307, f"https://127.0.0.1:{target_port}/v2/team/app/blobs/{digest}"
+            )
+        client = RegistryClient(
+            f"127.0.0.1:{source_port}", "team/app", auth_token="synthetic-token",
+            insecure=insecure, ca_file=ca_file,
+        )
+
+        assert len(opener_constructions) == 1
+        for attempt in range(2):
+            destination = tmp_path / f"blob-{attempt}"
+            assert client.pull_blob(digest, destination, len(content))
+            assert destination.read_bytes() == content
+
+    assert len(source.requests) == 2
+    assert all(auth == "Bearer synthetic-token" for _, _, auth in source.requests)
+    assert len(target.requests) == (2 if redirect else 0)
+    assert all(auth is None for _, _, auth in target.requests)
+    assert len(opener_constructions) == 2
+    contexts = [
+        handler._context for handlers in opener_constructions
+        for handler in handlers if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert contexts == [client._ssl_context, client._ssl_context]
+    assert any(isinstance(handler, NoRedirect) for handler in opener_constructions[1])
+
+
+def test_concurrent_first_use_reuses_ca_aware_openers(
+    tmp_path, certificate_authority, opener_constructions
+):
+    server_context, ca_file = certificate_authority
+    content = b"concurrent-layer"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    with _serve(server_context) as (port, state):
+        state.blobs[digest] = content
+        state.manifests["latest"] = json.dumps({"schemaVersion": 2}).encode()
+        client = RegistryClient(f"127.0.0.1:{port}", "team/app", ca_file=ca_file)
+        start = threading.Barrier(4)
+
+        assert len(opener_constructions) == 1
+
+        def transfer(index):
+            start.wait(timeout=SERVER_TIMEOUT_SECONDS)
+            if index % 2:
+                return client.pull_manifest("latest")[0] == {"schemaVersion": 2}
+            destination = tmp_path / f"concurrent-{index}"
+            return (
+                client.pull_blob(digest, destination, len(content))
+                and destination.read_bytes() == content
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(transfer, index) for index in range(4)]
+            assert all(future.result(timeout=20) for future in futures)
+    assert len(state.requests) == 4
+    assert len(opener_constructions) == 2
+
+
+def test_push_only_client_does_not_construct_blob_opener(tmp_path, opener_constructions):
+    content = b"push-only"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    source = tmp_path / "push-source"
+    source.write_bytes(content)
+    with _serve() as (port, state):
+        client = RegistryClient(f"127.0.0.1:{port}", "team/app", insecure=True)
+        assert client.push_blob(digest, source)
+        assert client.push_manifest("latest", json.dumps({"schemaVersion": 2}).encode())
+    assert len(opener_constructions) == 1
+    assert state.blobs[digest] == content
+
+
+def test_concurrent_ca_token_exchange_is_acquired_once(certificate_authority):
+    server_context, ca_file = certificate_authority
+    with _serve(server_context) as (auth_port, auth), _serve(server_context) as (
+        registry_port, registry
+    ):
+        auth.token_response = {"token": "acquired-token"}
+        registry.token_realm = f"https://127.0.0.1:{auth_port}/token"
+        registry.manifests["latest"] = json.dumps({"schemaVersion": 2}).encode()
+        content = b"authenticated-blob"
+        digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        registry.blobs[digest] = content
+        client = RegistryClient(
+            f"127.0.0.1:{registry_port}", "team/app",
+            username="synthetic-user", password="synthetic-password", ca_file=ca_file,
+        )
+        start = threading.Barrier(4)
+
+        def pull(index):
+            start.wait(timeout=SERVER_TIMEOUT_SECONDS)
+            if index % 2:
+                with client._open_blob_response(
+                    f"{client.base_url}/team/app/blobs/{digest}"
+                ) as response:
+                    return response.read() == content
+            return client.pull_manifest("latest")[0] == {"schemaVersion": 2}
+
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(pull, index) for index in range(4)]
+            assert all(
+                future.result(timeout=20) for future in futures
+            )
+    assert len(auth.requests) == 1
+    assert auth.requests[0][2].startswith("Basic ")
+
+
+@pytest.mark.parametrize("location", ["https://[broken", "https://user:secret@localhost/x"])
+def test_real_blob_redirect_rejects_malformed_location(location, tmp_path):
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+    with _serve() as (port, state):
+        state.redirect = (307, location)
+        client = RegistryClient(f"127.0.0.1:{port}", "team/app", insecure=True)
+        with pytest.raises(RegistryRequestError) as error:
+            client.pull_blob(digest, tmp_path / "invalid-redirect", 1)
+    assert "secret" not in str(error.value)
+    assert len(state.requests) == 1
+    assert not (tmp_path / "invalid-redirect").exists()
+
+
+@pytest.mark.parametrize("path", ["manifest", "blob", "token"])
+@pytest.mark.parametrize("trusted", [False, True])
+def test_redirect_and_token_targets_require_custom_ca(
+    tmp_path, certificate_authority, no_sleep, path, trusted
+):
+    server_context, ca_file = certificate_authority
+    content = b"private-ca-layer"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    with _serve(server_context) as (target_port, target), _serve() as (
+        source_port, source
+    ):
+        target.manifests["latest"] = json.dumps({"schemaVersion": 2}).encode()
+        target.blobs[digest] = content
+        if path == "token":
+            target.token_response = {"token": "acquired-token"}
+            source.token_realm = f"https://127.0.0.1:{target_port}/token"
+            source.manifests["latest"] = json.dumps({"schemaVersion": 2}).encode()
+        else:
+            suffix = "manifests/latest" if path == "manifest" else f"blobs/{digest}"
+            source.redirect = (
+                307, f"https://127.0.0.1:{target_port}/v2/team/app/{suffix}"
+            )
+        client = RegistryClient(
+            f"127.0.0.1:{source_port}", "team/app", insecure=True,
+            username="synthetic-user", password="synthetic-password",
+            ca_file=ca_file if trusted else None,
+        )
+
+        def transfer():
+            if path == "blob":
+                destination = tmp_path / "ca-blob"
+                assert client.pull_blob(digest, destination, len(content))
+                assert destination.read_bytes() == content
+            else:
+                assert client.pull_manifest("latest")[0] == {"schemaVersion": 2}
+
+        if trusted:
+            transfer()
+        else:
+            with pytest.raises(RegistryRequestError):
+                transfer()
+
+    if trusted:
+        assert target.requests
+        if path == "token":
+            assert target.requests[0][2].startswith("Basic ")
+            assert source.requests[-1][2] == "Bearer acquired-token"
+        else:
+            assert all(auth is None for _, _, auth in target.requests)
+    else:
+        assert target.requests == []
+
+
+def test_environment_proxies_are_not_used(monkeypatch):
+    manifest = json.dumps({"schemaVersion": 2}).encode()
+    with _serve() as (proxy_port, proxy), _serve() as (port, state):
+        for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            monkeypatch.setenv(name, f"http://proxy-user:proxy-secret@127.0.0.1:{proxy_port}")
+        monkeypatch.setenv("no_proxy", "")
+        monkeypatch.setenv("NO_PROXY", "")
+        state.manifests["latest"] = manifest
+        client = RegistryClient(f"127.0.0.1:{port}", "team/app", insecure=True)
+        assert client.pull_manifest("latest")[0] == {"schemaVersion": 2}
+    assert proxy.requests == []
+    assert state.requests[0][2] is None
 
 
 @pytest.mark.parametrize("contents", [None, b"not a certificate"])

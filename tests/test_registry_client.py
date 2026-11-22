@@ -4,8 +4,10 @@ import hashlib
 import io
 import json
 import logging
+import threading
 import urllib.error
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.message import Message
@@ -54,6 +56,69 @@ def _http_error(url, status, headers=None, body=b""):
     return urllib.error.HTTPError(
         url, status, "HTTP error", response_headers, io.BytesIO(body)
     )
+
+
+def test_concurrent_initial_challenges_reuse_acquired_token(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    initial_requests = threading.Barrier(2)
+    replay_completed = threading.Event()
+    acquisitions = []
+
+    def acquire(_params):
+        acquisitions.append(True)
+        return "shared-token"
+
+    def open_request(request, timeout):
+        if request.get_header("Authorization") == "Bearer shared-token":
+            replay_completed.set()
+            return _Response(b"ok")
+        if initial_requests.wait(timeout=10) == 1:
+            assert replay_completed.wait(timeout=10)
+        raise _http_error(
+            request.full_url, 401,
+            {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", acquire)
+    monkeypatch.setattr(client._opener, "open", open_request)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(client._make_request, "GET", f"{client.base_url}/test")
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=15) for future in futures]
+    assert [result[0] for result in results] == [200, 200]
+    assert len(acquisitions) == 1
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+@pytest.mark.parametrize("existing_token", [None, "rejected-token"])
+@pytest.mark.parametrize("auth_token", [None, "rejected-token"])
+def test_rejected_bearer_token_does_not_loop_or_refresh(
+    monkeypatch, method, existing_token, auth_token
+):
+    client = RegistryClient("registry.example", "team/app", auth_token=auth_token)
+    client._bearer_token = existing_token
+    requests = []
+    acquisitions = []
+
+    def acquire(_params):
+        acquisitions.append(True)
+        return "rejected-token"
+
+    def reject(request, timeout):
+        requests.append(request)
+        raise _http_error(
+            request.full_url, 401,
+            {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", acquire)
+    monkeypatch.setattr(client._opener, "open", reject)
+    assert client._make_request(method, f"{client.base_url}/test")[0] == 401
+    assert len(requests) == (1 if existing_token else 2)
+    assert len(acquisitions) == (0 if existing_token else 1)
+
 
 def test_parse_image_reference():
     """Test parsing various image reference formats."""
