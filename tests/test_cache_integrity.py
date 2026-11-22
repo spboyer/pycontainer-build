@@ -137,6 +137,22 @@ def test_cache_discards_missing_and_corrupt_blobs(tmp_path, caplog):
     assert cache.get_stats()["entries"] == 0
 
 
+def test_cache_bytes_miss_when_blob_is_evicted_after_lookup(tmp_path, monkeypatch, caplog):
+    cache = LayerCache(tmp_path / "cache")
+    cache.store_bytes("inventory", b"inventory contents", [])
+    original = cache.get_entry
+
+    def evict_after_lookup(key):
+        cached = original(key)
+        cached[1].unlink()
+        return cached
+
+    monkeypatch.setattr(cache, "get_entry", evict_after_lookup)
+    with caplog.at_level(logging.INFO, logger="pycontainer.cache"):
+        assert cache.get_bytes("inventory", 1024) is None
+    assert "evicted" in caplog.text
+
+
 def test_cache_rejects_malformed_index(tmp_path):
     cache_dir = tmp_path / "cache"
     cache = LayerCache(cache_dir)

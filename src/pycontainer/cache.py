@@ -287,8 +287,12 @@ class LayerCache:
         if cached is None:
             return None
         digest, blob_path = cached
-        with blob_path.open("rb") as source:
-            content = source.read(max_bytes + 1)
+        try:
+            with blob_path.open("rb") as source:
+                content = source.read(max_bytes + 1)
+        except FileNotFoundError:
+            logger.info("Layer cache miss: blob %s was evicted while reading", digest)
+            return None
         if len(content) > max_bytes or f"sha256:{hashlib.sha256(content).hexdigest()}" != digest:
             return None
         return content

@@ -69,3 +69,74 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, m
         assert sample["output_bytes"] > 0
         assert sample["process_peak_rss_bytes"] > 0
         assert sample["python_tracemalloc_peak_bytes"] > 0
+
+
+def test_grouped_benchmark_measures_cache_reuse_and_layer_uploads(tmp_path, monkeypatch):
+    monkeypatch.setenv("PIP_NO_DEPS", "1")
+    output = tmp_path / "grouped-benchmark.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "run_build_benchmarks.py"),
+            "--grouped-only",
+            "--repetitions",
+            "1",
+            "--files",
+            "2",
+            "--file-bytes",
+            "64",
+            "--output",
+            str(output),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    results = json.loads(output.read_text(encoding="utf-8"))
+    cases = {case["name"]: case["samples"][0] for case in results["cases"]}
+    assert set(cases) == {
+        "grouped-cold",
+        "grouped-warm",
+        "grouped-app-change",
+        "grouped-dependency-change",
+    }
+    cold = cases["grouped-cold"]
+    warm = cases["grouped-warm"]
+    app_change = cases["grouped-app-change"]
+    dependency_change = cases["grouped-dependency-change"]
+    assert len(cold["layers"]) == 3
+    assert cold["registry_head_requests"] == 3
+    assert cold["registry_put_requests"] == 3
+    assert cold["uploaded_bytes"] == sum(layer["size"] for layer in cold["layers"])
+    assert cold["locked_install_calls"] == 1
+    assert cold["package_index_requests"] > 0
+
+    assert warm["layers"] == cold["layers"]
+    assert warm["group_cache_hits"] == 2
+    assert warm["locked_install_calls"] == 0
+    assert warm["package_index_requests"] == 0
+    assert warm["reused_registry_blobs"] == 3
+    assert warm["registry_put_requests"] == 0
+    assert warm["uploaded_bytes"] == 0
+
+    assert app_change["layers"][:2] == cold["layers"][:2]
+    assert app_change["layers"][2] != cold["layers"][2]
+    assert app_change["locked_install_calls"] == 0
+    assert app_change["package_index_requests"] == 0
+    assert app_change["registry_put_requests"] == 1
+    assert app_change["uploaded_bytes"] == app_change["layers"][2]["size"]
+
+    assert dependency_change["layers"][0] == cold["layers"][0]
+    assert dependency_change["layers"][1] != cold["layers"][1]
+    assert dependency_change["layers"][2] == cold["layers"][2]
+    assert dependency_change["group_cache_hits"] == 1
+    assert dependency_change["locked_install_calls"] == 1
+    assert dependency_change["package_index_requests"] > 0
+    assert dependency_change["registry_put_requests"] == 1
+    assert dependency_change["uploaded_bytes"] == dependency_change["layers"][1]["size"]
+
+    for sample in cases.values():
+        assert sample["process_peak_rss_bytes"] > 0
+        assert sample["python_tracemalloc_peak_bytes"] > 0

@@ -371,7 +371,8 @@ none is added as a dependency:
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
 freshness), Python compatibility and wheel availability are checked during
-the build, not the dry run.
+the build, not the dry run. For history grouping, the dry run also checks
+Git evidence; target-specific group assignments are made during the build.
 
 Only the default/main dependencies are staged; dev groups and project extras
 are not. Supported formats: Poetry lock-version 2.1+, Pipenv pipfile-spec 6,
@@ -399,6 +400,56 @@ its host or path, which fix the source), netrc or keyring, never literal
 secrets; proxy and CA bundle variables such as
 `HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
 normal pip behavior, including your pip configuration.
+
+**Grouped dependency layers (experimental)**: The default remains one
+dependency layer. With `--include-deps`, select `explicit` or `history` to
+partition the target-selected `uv.lock` installation into stable and frequent
+layers, followed by the application layer:
+
+```bash
+pycontainer build --include-deps --dependency-layer-strategy explicit \
+  --stable-dependency numpy --frequent-dependency my-package
+```
+
+```toml
+[build]
+include-deps = true
+dependency-layer-strategy = "explicit"
+stable-dependencies = ["numpy"]
+frequent-dependencies = ["my-package"]
+```
+
+CLI assignments are repeatable and replace the corresponding TOML list.
+Names are Python distribution names, normalized for comparison. In `explicit`
+mode, unassigned packages, including shared transitive dependencies, belong to
+the frequent group. Each installed distribution belongs to exactly one group.
+Explicit assignments override history. A group with no packages produces no
+layer.
+
+The `history` strategy examines up to 20 first-parent commits that changed
+`uv.lock`; `--dependency-history-ref REF` selects a commit or ref instead of
+`HEAD`. It prints the resolved commit, evidence, and assignment reasons.
+Packages with changed or missing versions are frequent; consistently present,
+unchanged versions are stable. Git must be available, the lock must be tracked
+and unmodified without `assume-unchanged` or `skip-worktree` flags, the
+repository must not be shallow or partial, and at least two distinct lock
+snapshots must be available. Missing evidence is an error, not an inferred
+classification.
+
+Grouping currently supports only `uv.lock`: Poetry, Pipenv, PDM, plain
+requirements, and virtualenv sources are rejected rather than silently grouped.
+The single-layer mode still supports those sources as described above. Grouping
+installs the selected graph once, verifies distribution file ownership, and
+rejects collisions or unowned files. The application cannot overwrite the
+reserved `<workdir>/.python` directory. Namespace packages, console scripts,
+metadata and SBOM inventory remain part of the selected installation.
+
+A complete verified group-cache hit skips pip and package-index requests.
+When the lock changes, the full selection is staged again, but an unchanged
+group may reuse its verified layer and registry blob. Grouping does not squash
+layers ([#23](https://github.com/spboyer/pycontainer-build/issues/23)) or add
+build-time/dev dependency and project-extra selection
+([#25](https://github.com/spboyer/pycontainer-build/issues/25)).
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

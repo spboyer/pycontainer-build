@@ -1,6 +1,6 @@
 import argparse, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, DEPENDENCY_LAYER_STRATEGIES, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
@@ -44,6 +44,10 @@ def main():
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over lockfiles and venvs)")
     b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
     b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
+    b.add_argument("--dependency-layer-strategy",choices=DEPENDENCY_LAYER_STRATEGIES,help="Dependency grouping strategy (default: single)")
+    b.add_argument("--stable-dependency",dest="stable_dependencies",action="append",help="Assign a distribution to the stable group (repeatable)")
+    b.add_argument("--frequent-dependency",dest="frequent_dependencies",action="append",help="Assign a distribution to the frequent group (repeatable)")
+    b.add_argument("--dependency-history-ref",help="Git commit/ref for history-based dependency grouping (default: HEAD)")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
@@ -99,6 +103,10 @@ def main():
         'requirements_file': args.requirements_file,
         'lockfile': args.lockfile,
         'use_lockfile': args.use_lockfile,
+        'dependency_layer_strategy': args.dependency_layer_strategy,
+        'stable_dependencies': args.stable_dependencies,
+        'frequent_dependencies': args.frequent_dependencies,
+        'dependency_history_ref': args.dependency_history_ref,
         'verbose': args.verbose,
         'dry_run': args.dry_run,
         'platform': args.platform,

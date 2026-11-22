@@ -194,6 +194,15 @@ from .dependency_cache import (
     dependency_cache_key,
     encode_inventory,
 )
+from .dependency_groups import (
+    GROUPS,
+    decode_group_bundle,
+    encode_group_bundle,
+    group_bundle_key,
+    group_layer_key,
+    partition_staged_files,
+    plan_groups,
+)
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -205,7 +214,7 @@ from .dependencies import (
     target_python_version,
     validate_target_platform,
 )
-from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
+from .lockfiles import LockSelection, detect_lockfile, load_lockfile, preflight_lockfile, target_environment
 
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
@@ -261,14 +270,24 @@ class ImageBuilder:
 
     def build(self):
         if self.dry_run:
+            self._reset_build_state()
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
             return self.config.tag
 
         with output_directory_lock(self.config.output_dir):
+            self._reset_build_state()
             return self._build_image()
 
+    def _reset_build_state(self):
+        self._dependency_source_cache = None
+        self._lock_selection_cache = None
+        self._staged_packages = []
+        self._dependency_site_packages = False
+
     def _build_image(self):
+        if self.config.include_deps and self.config.dependency_layer_strategy != "single":
+            self._grouped_dependency_source()
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -292,10 +311,15 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
-            if deps_layer: app_layers.append(deps_layer)
+            if self.config.dependency_layer_strategy == "single":
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                )
+                if deps_layer: app_layers.append(deps_layer)
+            else:
+                app_layers.extend(self._create_grouped_deps_layers(
+                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                ))
         
         app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(app_layer)
@@ -584,6 +608,13 @@ class ImageBuilder:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.include_deps:
+            print(f"  Dependency Layer Strategy: {self.config.dependency_layer_strategy}")
+            if self.config.dependency_layer_strategy != "single":
+                print(f"  Stable Dependencies: {', '.join(self.config.stable_dependencies) or '<none>'}")
+                print(f"  Frequent Dependencies: {', '.join(self.config.frequent_dependencies) or '<none>'}")
+                if self.config.dependency_layer_strategy == "history":
+                    print(f"  Dependency History Ref: {self.config.dependency_history_ref or 'HEAD'}")
+                self._grouped_dependency_source()
             try:
                 kind, value = self._dependency_source()
             except FileNotFoundError as error:
@@ -591,6 +622,18 @@ class ImageBuilder:
             else:
                 if kind == "lock":
                     preflight_lockfile(Path(self.config.context_dir), value)
+                    if self.config.dependency_layer_strategy == "history":
+                        from .dependency_history import read_dependency_history
+
+                        snapshot, commits, _ = read_dependency_history(
+                            Path(self.config.context_dir), value,
+                            self.config.dependency_history_ref,
+                        )
+                        print(
+                            f"  Dependency history snapshot: {snapshot}; "
+                            f"first-parent lock commits: {', '.join(commits)}"
+                        )
+                        print("  Target-specific history assignments: checked during build.")
                 described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
                 print(f"  Dependency Source: {kind} ({described})")
                 if kind == "lock":
@@ -654,6 +697,15 @@ class ImageBuilder:
         selection = load_lockfile(Path(self.config.context_dir), relative, environment)
         self._lock_selection_cache = selection
         return selection
+
+    def _grouped_dependency_source(self):
+        source_kind, source_value = self._dependency_source()
+        if source_kind != "lock" or source_value.name != "uv.lock":
+            raise ValueError(
+                "Grouped dependency layers currently require uv.lock; requirements, "
+                "other lock formats, and virtualenv grouping are not supported."
+            )
+        return source_kind, source_value
 
     def _create_deps_layer(
         self,
@@ -751,45 +803,189 @@ class ImageBuilder:
                 return None
 
             print(f"Creating dependency layer ({len(files)} staged files)...")
-            tmp=_create_temporary_file(layers_dir,"deps-layer")
-            try:
-                with tarfile.open(tmp, "w") as tar:
-                    for path in files:
-                        relative = path.relative_to(stage_root)
-                        arc = (
-                            f"{self.config.workdir.rstrip('/')}/.python/"
-                            f"{relative.as_posix()}"
-                        )
-                        if self.config.reproducible:
-                            info = tar.gettarinfo(path, arcname=arc)
-                            info.mtime = 0
-                            info.uid = 0
-                            info.gid = 0
-                            info.uname = "root"
-                            info.gname = "root"
-                            info.mode = (
-                                0o755
-                                if relative.parts[0] == "bin"
-                                or path.stat().st_mode & 0o111
-                                else 0o644
-                            )
-                            with path.open("rb") as source:
-                                tar.addfile(info, source)
-                        else:
-                            tar.add(path, arcname=arc)
-                digest, size = _hash_file(tmp)
-                final=layers_dir/digest.split(":",1)[1]
-                _publish_content_addressed(tmp, final, digest, size)
-                print(f"✓ Dependency layer created ({digest[:19]}...)")
-                if cache_key:
-                    self._store_dependency_layer(cache_key, digest, final, site_packages)
-                return OCILayer(
-                    "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
-                )
-            finally:
-                tmp.unlink(missing_ok=True)
+            layer = self._write_dependency_layer(layers_dir, stage_root, files)
+            if cache_key:
+                self._store_dependency_layer(cache_key, layer.digest, Path(layer.tar_path), site_packages)
+            return layer
 
-    def _dependency_cache_key(self, source_kind, source_value, base_config, os_name, arch, version):
+    def _write_dependency_layer(self, layers_dir, stage_root, files):
+        tmp=_create_temporary_file(layers_dir,"deps-layer")
+        try:
+            with tarfile.open(tmp, "w") as tar:
+                for path in files:
+                    relative = path.relative_to(stage_root)
+                    arc = (
+                        f"{self.config.workdir.rstrip('/')}/.python/"
+                        f"{relative.as_posix()}"
+                    )
+                    if self.config.reproducible:
+                        info = tar.gettarinfo(path, arcname=arc)
+                        info.mtime = 0
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = "root"
+                        info.gname = "root"
+                        info.mode = (
+                            0o755
+                            if relative.parts[0] == "bin"
+                            or path.stat().st_mode & 0o111
+                            else 0o644
+                        )
+                        with path.open("rb") as source:
+                            tar.addfile(info, source)
+                    else:
+                        tar.add(path, arcname=arc)
+            digest, size = _hash_file(tmp)
+            final=layers_dir/digest.split(":",1)[1]
+            _publish_content_addressed(tmp, final, digest, size)
+            print(f"✓ Dependency layer created ({digest[:19]}...)")
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _create_grouped_deps_layers(self, layers_dir, *, base_config, os_name, arch):
+        source_kind, source_value = self._grouped_dependency_source()
+        validate_target_platform(os_name, arch)
+        if base_config and (
+            base_config.get("os") != os_name
+            or base_config.get("architecture") != arch
+        ):
+            raise ValueError(
+                "Pulled base image platform does not match the requested "
+                f"target {os_name}/{arch}."
+            )
+        for _, relative in iter_files(
+            Path(self.config.context_dir), self.context_include_paths,
+            exclude_paths=self.context_excludes,
+            exclude_defaults=self.config.exclude_defaults,
+        ):
+            if relative.parts and relative.parts[0].casefold() == ".python":
+                raise ValueError(
+                    "Grouped dependencies reserve the .python directory; "
+                    "application files cannot overwrite it."
+                )
+        version = target_python_version(self.config.base_image, base_config)
+        selection = self._lock_selection(base_config, os_name, arch)
+        plan = plan_groups(
+            selection, self.config.dependency_layer_strategy,
+            self.config.stable_dependencies, self.config.frequent_dependencies,
+            Path(self.config.context_dir), self.config.dependency_history_ref,
+            self.config.platform,
+        )
+        assignments = dict(plan.assignments)
+        cache_key = None
+        if self.cache:
+            try:
+                cache_key = self._dependency_cache_key(
+                    source_kind, source_value, base_config, os_name, arch, version
+                )
+            except DependencyCacheMiss as miss:
+                print(f"Dependency group cache miss: {miss}.")
+            else:
+                cached = self._cached_group_bundle(layers_dir, cache_key, plan, selection)
+                if cached is not None:
+                    return cached
+                print("Dependency group cache miss: no complete verified bundle for these inputs.")
+
+        with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
+            stage_root = Path(stage)
+            site_packages = stage_root / "site-packages"
+            print(f"Staging {len(selection.packages)} locked packages from {selection.path.as_posix()}...")
+            install_locked_requirements(
+                selection.requirement_sets(), site_packages, Path(self.config.context_dir),
+                os_name, arch, version, self.config.base_image, base_config,
+            )
+            script_owners = {}
+            create_console_entrypoints(site_packages, stage_root / "bin", owners=script_owners)
+            self._staged_packages = staged_packages(site_packages, strict=True)
+            groups = partition_staged_files(stage_root, selection, plan, script_owners)
+            self._dependency_site_packages = any(groups.values())
+            layers, bundle_layers = [], []
+            for group in GROUPS:
+                files = groups[group]
+                if not files:
+                    continue
+                key = None
+                if cache_key:
+                    subset = LockSelection(
+                        selection.kind, selection.path,
+                        tuple(package for package in selection.packages if assignments[package.name] == group),
+                    )
+                    scoped = self._dependency_cache_key(
+                        source_kind, source_value, base_config, os_name, arch, version,
+                        selection_override=subset,
+                    )
+                    files_key = self.cache._compute_files_digest(
+                        [(path, path.relative_to(stage_root)) for path in files],
+                        workdir=f"{self.config.workdir.rstrip('/')}/.python",
+                        reproducible=True,
+                    )
+                    key = group_layer_key(scoped.layer, plan, group, files_key)
+                    cached = self.cache.get_entry(key)
+                else:
+                    cached = None
+                if cached:
+                    try:
+                        layer = self._publish_cached_layer(layers_dir, *cached, "deps-group-cache")
+                    except (FileNotFoundError, LayerIntegrityError):
+                        print(
+                            f"Dependency group cache miss: {group} blob was evicted "
+                            "or changed during reuse."
+                        )
+                        cached = None
+                if cached:
+                    print(f"✓ Dependency group cache hit ({group}, {layer.digest[:19]}...)")
+                else:
+                    print(f"Creating {group} dependency layer ({len(files)} staged files)...")
+                    layer = self._write_dependency_layer(layers_dir, stage_root, files)
+                    if key:
+                        self.cache.store_entry(
+                            key, layer.digest, Path(layer.tar_path), list(cache_key.source_files)
+                        )
+                layers.append(layer)
+                if key:
+                    bundle_layers.append({"group": group, "key": key, "digest": layer.digest})
+            if cache_key and layers:
+                self.cache.store_bytes(
+                    group_bundle_key(cache_key.layer, plan),
+                    encode_group_bundle(cache_key.layer, plan, bundle_layers, self._staged_packages),
+                    list(cache_key.source_files),
+                )
+            return layers
+
+    def _cached_group_bundle(self, layers_dir, cache_key, plan, selection):
+        content = self.cache.get_bytes(group_bundle_key(cache_key.layer, plan), MAX_INVENTORY_BYTES)
+        if content is None:
+            return None
+        decoded = decode_group_bundle(content, cache_key.layer, plan, selection)
+        if decoded is None:
+            print("Dependency group cache miss: bundle metadata is invalid.")
+            return None
+        records, packages = decoded
+        cached_layers = []
+        for record in records:
+            cached = self.cache.get_entry(record["key"])
+            if not cached or cached[0] != record["digest"]:
+                print(f"Dependency group cache miss: {record['group']} blob is missing or invalid.")
+                return None
+            cached_layers.append((record["group"], cached))
+        try:
+            layers = [
+                self._publish_cached_layer(layers_dir, *cached, "deps-group-cache")
+                for _, cached in cached_layers
+            ]
+        except (FileNotFoundError, LayerIntegrityError):
+            print("Dependency group cache miss: a blob was evicted or changed during reuse.")
+            return None
+        self._staged_packages = packages
+        self._dependency_site_packages = bool(layers)
+        for (group, _), layer in zip(cached_layers, layers):
+            print(f"✓ Dependency group cache hit ({group}, {layer.digest[:19]}...)")
+        return layers
+
+    def _dependency_cache_key(self, source_kind, source_value, base_config, os_name, arch, version, selection_override=None):
         ctx = Path(self.config.context_dir)
         common = dict(
             source_kind=source_kind,
@@ -804,7 +1000,7 @@ class ImageBuilder:
             reproducible=self.config.reproducible,
         )
         if source_kind == "lock":
-            selection = self._lock_selection(base_config, os_name, arch)
+            selection = selection_override or self._lock_selection(base_config, os_name, arch)
             return dependency_cache_key(
                 requirement_sets=selection.requirement_sets(),
                 lock_name=selection.path.as_posix(),

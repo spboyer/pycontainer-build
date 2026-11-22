@@ -145,6 +145,47 @@ exclude-defaults = true
     assert config.exclude_defaults is False
 
 
+def test_cli_dependency_group_options_preserve_and_override_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        """
+[build]
+include-deps = true
+dependency-layer-strategy = "explicit"
+stable-dependencies = ["stable-from-file"]
+frequent-dependencies = ["frequent-from-file"]
+"""
+    )
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+    assert config.dependency_layer_strategy == "explicit"
+    assert config.stable_dependencies == ["stable-from-file"]
+    assert config.frequent_dependencies == ["frequent-from-file"]
+
+    config = _capture_config(
+        monkeypatch,
+        [
+            "build",
+            "--config",
+            str(config_path),
+            "--dependency-layer-strategy",
+            "history",
+            "--dependency-history-ref",
+            "release-tag",
+            "--stable-dependency",
+            "stable-a",
+            "--stable-dependency",
+            "stable-b",
+            "--frequent-dependency",
+            "frequent-cli",
+        ],
+    )
+    assert config.dependency_layer_strategy == "history"
+    assert config.dependency_history_ref == "release-tag"
+    assert config.stable_dependencies == ["stable-a", "stable-b"]
+    assert config.frequent_dependencies == ["frequent-cli"]
+
+
 def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.12")
 

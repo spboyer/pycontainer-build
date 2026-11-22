@@ -1,4 +1,4 @@
-"""Record repeatable local build measurements without registry or runtime access."""
+"""Record repeatable local build measurements without external registry or runtime access."""
 import argparse
 import base64
 import contextlib
@@ -21,6 +21,7 @@ import tracemalloc
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -28,6 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import pycontainer.builder as builder_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
@@ -90,6 +92,7 @@ def _start_benchmark_registry(root):
             pass
 
         def do_HEAD(self):
+            self.server.stats["heads"] += 1
             digest = urlsplit(self.path).path.rsplit("/", 1)[-1]
             blob = self.server.blob_dir / digest.split(":", 1)[-1]
             self.send_response(200 if blob.is_file() else 404)
@@ -137,6 +140,8 @@ def _start_benchmark_registry(root):
                     return
                 destination = self.server.blob_dir / digest.split(":", 1)[1]
                 os.replace(staged, destination)
+                self.server.stats["puts"] += 1
+                self.server.stats["uploaded_bytes"] += size
             except OSError:
                 staged.unlink(missing_ok=True)
                 self.send_error(500)
@@ -162,6 +167,7 @@ def _start_benchmark_registry(root):
     server.blob_dir = blob_dir
     server.upload_dir = upload_dir
     server.uploads = {}
+    server.stats = {"heads": 0, "puts": 0, "uploaded_bytes": 0}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, f"http://127.0.0.1:{server.server_port}/v2"
@@ -221,9 +227,13 @@ def _measure_worker(spec):
     output.mkdir(parents=True, exist_ok=True)
     layers_dir = output / "blobs" / "sha256"
     layers_dir.mkdir(parents=True, exist_ok=True)
-    cache_hits = {"lookups": 0, "hits": 0, "dependency_lookups": 0, "dependency_hits": 0}
+    cache_hits = {
+        "lookups": 0, "hits": 0, "dependency_lookups": 0, "dependency_hits": 0,
+        "group_lookups": 0, "group_hits": 0, "locked_installs": 0,
+    }
     original_get_layer = LayerCache.get_layer
     original_get_entry = LayerCache.get_entry
+    original_locked_install = builder_module.install_locked_requirements
 
     def tracked_get_layer(cache, files, **kwargs):
         cache_hits["lookups"] += 1
@@ -236,10 +246,18 @@ def _measure_worker(spec):
         if key.startswith("deps-v"):
             cache_hits["dependency_lookups"] += 1
             cache_hits["dependency_hits"] += entry is not None
+        elif key.startswith("deps-group-v"):
+            cache_hits["group_lookups"] += 1
+            cache_hits["group_hits"] += entry is not None
         return entry
+
+    def tracked_locked_install(*args, **kwargs):
+        cache_hits["locked_installs"] += 1
+        return original_locked_install(*args, **kwargs)
 
     LayerCache.get_layer = tracked_get_layer
     LayerCache.get_entry = tracked_get_entry
+    builder_module.install_locked_requirements = tracked_locked_install
     config = BuildConfig(
         tag="benchmark:local",
         context_dir=str(context),
@@ -249,6 +267,9 @@ def _measure_worker(spec):
         include_deps=spec.get("include_deps", False),
         include_paths=["app"],
         reproducible=True,
+        dependency_layer_strategy="explicit" if spec.get("grouped") else "single",
+        stable_dependencies=["stable-dep"] if spec.get("grouped") else [],
+        frequent_dependencies=["frequent-dep"] if spec.get("grouped") else [],
     )
 
     try:
@@ -262,7 +283,10 @@ def _measure_worker(spec):
                     {
                         "architecture": "amd64",
                         "os": "linux",
-                        "config": {"Env": [], "WorkingDir": "/"},
+                        "config": {
+                            "Env": ["PYTHON_VERSION=3.11.8"] if spec.get("grouped") else [],
+                            "WorkingDir": "/",
+                        },
                     },
                 )
                 builder.build()
@@ -281,7 +305,7 @@ def _measure_worker(spec):
             output_bytes = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
         else:
             output_bytes = layer.size
-        return {
+        result = {
             "wall_seconds": wall_seconds,
             "process_peak_rss_bytes": process_peak_rss_bytes,
             "python_tracemalloc_peak_bytes": python_peak_bytes,
@@ -293,10 +317,33 @@ def _measure_worker(spec):
             "dependency_cache_lookups": cache_hits["dependency_lookups"],
             "dependency_cache_hits": cache_hits["dependency_hits"],
         }
+        if spec.get("grouped"):
+            result.update(
+                group_cache_lookups=cache_hits["group_lookups"],
+                group_cache_hits=cache_hits["group_hits"],
+                locked_install_calls=cache_hits["locked_installs"],
+                layers=[{"digest": item.digest, "size": item.size} for item in builder.layers],
+            )
+            if spec.get("registry_url"):
+                client = RegistryClient("benchmark.invalid", "benchmark")
+                client.base_url = spec["registry_url"]
+                push_started = time.perf_counter()
+                pushed = [
+                    client.push_blob(item.digest, Path(item.tar_path), check_exists=True)
+                    for item in builder.layers
+                ]
+                result.update(
+                    layer_push_seconds=time.perf_counter() - push_started,
+                    uploaded_bytes=sum(item.size for item, sent in zip(builder.layers, pushed) if sent),
+                    reused_registry_blobs=sum(not sent for sent in pushed),
+                    pushed_layers=pushed,
+                )
+        return result
     finally:
         tracemalloc.stop()
         LayerCache.get_layer = original_get_layer
         LayerCache.get_entry = original_get_entry
+        builder_module.install_locked_requirements = original_locked_install
 
 
 def _invoke_worker(spec):
@@ -403,6 +450,255 @@ def _spec(context, output, cache, *, mode="full", use_cache=True, include_deps=F
         "use_cache": use_cache,
         "include_deps": include_deps,
     }
+
+
+def _write_group_wheel(wheelhouse, name, version, payload_bytes, requires=()):
+    module = name.replace("-", "_")
+    dist = f"{module}-{version}.dist-info"
+    payload = (f"{name}-{version}:".encode() * (payload_bytes + 1))[:payload_bytes]
+    contents = {
+        f"{module}/__init__.py": f"version = {version!r}\n".encode(),
+        f"{module}/payload.bin": payload,
+        f"{dist}/METADATA": (
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"Requires-Dist: {item}\n" for item in requires)
+            + "\n"
+        ).encode(),
+        f"{dist}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, content in contents.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+        writer.writerow((path, f"sha256={digest}", len(content)))
+    writer.writerow((f"{dist}/RECORD", "", ""))
+    contents[f"{dist}/RECORD"] = record.getvalue().encode()
+    path = wheelhouse / f"{module}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        for item, content in contents.items():
+            archive.writestr(zipfile.ZipInfo(item, (2020, 1, 1, 0, 0, 0)), content)
+    return path
+
+
+def _start_benchmark_index(wheelhouse):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.server.requests += 1
+            parts = [part for part in urlsplit(self.path).path.split("/") if part]
+            body = None
+            content_type = "text/html"
+            wheels = sorted(wheelhouse.glob("*.whl"))
+            if len(parts) == 2 and parts[0] == "simple":
+                links = [
+                    f'<a href="/files/{wheel.name}#sha256={hashlib.sha256(wheel.read_bytes()).hexdigest()}">'
+                    f"{wheel.name}</a>"
+                    for wheel in wheels
+                    if wheel.name.split("-", 1)[0].replace("_", "-") == parts[1]
+                ]
+                if links:
+                    body = ("<html><body>" + "".join(links) + "</body></html>").encode()
+            elif len(parts) == 2 and parts[0] == "files":
+                wheel = next((item for item in wheels if item.name == parts[1]), None)
+                if wheel:
+                    body = wheel.read_bytes()
+                    content_type = "application/octet-stream"
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.requests = 0
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}/simple"
+
+
+def _write_group_project(context, index_url, wheels, frequent_version):
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "benchmark-app"\nversion = "1.0"\nrequires-python = ">=3.10"\n'
+        f'dependencies = ["stable-dep==1.0", "frequent-dep=={frequent_version}"]\n'
+        f"\n[[tool.uv.index]]\nurl = {json.dumps(index_url)}\n",
+        encoding="utf-8",
+    )
+    chunks = [
+        'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n',
+        '[[package]]\nname = "benchmark-app"\nversion = "1.0"\nsource = { virtual = "." }\n'
+        'dependencies = [{ name = "stable-dep" }, { name = "frequent-dep" }]\n'
+        '[package.metadata]\nrequires-dist = ['
+        '{ name = "stable-dep", specifier = "==1.0" }, '
+        f'{{ name = "frequent-dep", specifier = "=={frequent_version}" }}]\n',
+    ]
+    for name in ("stable-dep", "frequent-dep", "shared-dep"):
+        wheel = wheels[name]
+        package_version = frequent_version if name == "frequent-dep" else "1.0"
+        dependencies = (
+            'dependencies = [{ name = "shared-dep" }]\n' if name != "shared-dep" else ""
+        )
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        chunks.append(
+            f'[[package]]\nname = "{name}"\nversion = "{package_version}"\n'
+            f"source = {{ registry = {json.dumps(index_url)} }}\n"
+            f"{dependencies}"
+            f'wheels = [{{ url = "https://example.invalid/{wheel.name}", '
+            f'hash = "sha256:{digest}" }}]\n'
+        )
+    (context / "uv.lock").write_text("\n".join(chunks), encoding="utf-8")
+
+
+def _group_case(name, description, root, context, args, index, baseline=None):
+    samples = []
+    for number in range(args.repetitions):
+        cache = root / f"{name}-cache-{number}"
+        if baseline:
+            shutil.copytree(baseline["cache"], cache)
+        server, thread, registry_url = _start_benchmark_registry(
+            root / f"{name}-registry-{number}"
+        )
+        try:
+            if baseline:
+                for layer in baseline["layers"]:
+                    filename = layer["digest"].split(":", 1)[1]
+                    shutil.copyfile(
+                        baseline["output"] / "blobs" / "sha256" / filename,
+                        server.blob_dir / filename,
+                    )
+            spec = _spec(
+                context, root / f"{name}-output-{number}", cache, include_deps=True
+            )
+            spec.update(grouped=True, registry_url=registry_url)
+            requests_before = index.requests
+            sample = _invoke_worker(spec)
+            sample["package_index_requests"] = index.requests - requests_before
+            sample["registry_head_requests"] = server.stats["heads"]
+            sample["registry_put_requests"] = server.stats["puts"]
+            if sample["uploaded_bytes"] != server.stats["uploaded_bytes"]:
+                raise RuntimeError("Measured layer uploads do not match registry-received bytes.")
+            samples.append(sample)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+    return {
+        "name": name,
+        "description": description,
+        "samples": samples,
+        "summary": {
+            "median_wall_seconds": statistics.median(sample["wall_seconds"] for sample in samples),
+            "median_layer_push_seconds": statistics.median(sample["layer_push_seconds"] for sample in samples),
+            "median_uploaded_bytes": statistics.median(sample["uploaded_bytes"] for sample in samples),
+            "median_process_peak_rss_bytes": statistics.median(sample["process_peak_rss_bytes"] for sample in samples),
+            "median_python_tracemalloc_peak_bytes": statistics.median(sample["python_tracemalloc_peak_bytes"] for sample in samples),
+            "total_group_cache_hits": sum(sample["group_cache_hits"] for sample in samples),
+            "total_registry_reused_blobs": sum(sample["reused_registry_blobs"] for sample in samples),
+        },
+    }
+
+
+def run_grouped_benchmarks(args):
+    with tempfile.TemporaryDirectory(prefix="pycontainer-group-bench-") as temp_dir:
+        root = Path(temp_dir)
+        context = root / "context"
+        app = context / "app"
+        app.mkdir(parents=True)
+        payload = b"x" * args.file_bytes
+        for number in range(args.files):
+            (app / f"module_{number:05}.py").write_bytes(payload)
+        wheelhouse = context / "wheelhouse"
+        wheelhouse.mkdir()
+        stable = _write_group_wheel(wheelhouse, "stable-dep", "1.0", 128 * 1024, ("shared-dep>=1.0",))
+        frequent1 = _write_group_wheel(wheelhouse, "frequent-dep", "1.0", 16 * 1024, ("shared-dep>=1.0",))
+        frequent2 = _write_group_wheel(wheelhouse, "frequent-dep", "2.0", 16 * 1024, ("shared-dep>=1.0",))
+        shared = _write_group_wheel(wheelhouse, "shared-dep", "1.0", 32 * 1024)
+        wheels = {"stable-dep": stable, "frequent-dep": frequent1, "shared-dep": shared}
+        index, index_thread, index_url = _start_benchmark_index(wheelhouse)
+        try:
+            _write_group_project(context, index_url, wheels, "1.0")
+            warm_cache = root / "baseline-cache"
+            warm_output = root / "baseline-output"
+            spec = _spec(context, warm_output, warm_cache, include_deps=True)
+            spec["grouped"] = True
+            warmup = _invoke_worker(spec)
+            baseline = {"cache": warm_cache, "output": warm_output, "layers": warmup["layers"]}
+            cases = [
+                _group_case(
+                    "grouped-cold",
+                    "Empty local cache and empty loopback registry for every sample.",
+                    root, context, args, index,
+                ),
+                _group_case(
+                    "grouped-warm",
+                    "Unchanged inputs with copies of the baseline cache and registry blobs.",
+                    root, context, args, index, baseline,
+                ),
+            ]
+            (app / "module_00000.py").write_bytes(payload + b"\n# changed app\n")
+            cases.append(
+                _group_case(
+                    "grouped-app-change",
+                    "One app file changes; each sample starts from the original warm cache and blobs.",
+                    root, context, args, index, baseline,
+                )
+            )
+            (app / "module_00000.py").write_bytes(payload)
+            wheels["frequent-dep"] = frequent2
+            _write_group_project(context, index_url, wheels, "2.0")
+            cases.append(
+                _group_case(
+                    "grouped-dependency-change",
+                    "The frequent distribution changes from 1.0 to 2.0; each sample starts from the original warm cache and blobs.",
+                    root, context, args, index, baseline,
+                )
+            )
+        finally:
+            index.shutdown()
+            index.server_close()
+            index_thread.join()
+        return {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "git_revision": _git_revision(),
+            "environment": {
+                "python": sys.version,
+                "pip": metadata.version("pip"),
+                "implementation": platform.python_implementation(),
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+                "cpu_count": os.cpu_count(),
+            },
+            "fixture": {
+                "app_files": args.files,
+                "bytes_per_file": args.file_bytes,
+                "repetitions": args.repetitions,
+                "stable_payload_bytes": 128 * 1024,
+                "frequent_payload_bytes": 16 * 1024,
+                "shared_payload_bytes": 32 * 1024,
+                "dependency_versions": "stable-dep 1.0, shared-dep 1.0, frequent-dep 1.0 -> 2.0",
+                "base_image": "synthetic empty Linux/amd64 OCI base with CPython 3.11.8 metadata",
+                "excluded": ["external registry pull/push", "config and manifest uploads", "container runtime startup"],
+                "os_page_cache": "not flushed or controlled",
+            },
+            "measurement_notes": {
+                "wall_seconds": "Builder construction and full local build; fixture setup is excluded.",
+                "layer_push_seconds": "Layer-only HEAD/PUT traffic to a loopback synthetic registry; config and manifest are excluded.",
+                "uploaded_bytes": "Actual verified blob bytes received by the loopback registry; protocol overhead is excluded.",
+                "process_peak_rss_bytes": "Worker process high-water mark at the end of the build, before registry push, including Python startup/imports; pip child processes are excluded.",
+                "python_tracemalloc_peak_bytes": "Python-tracked peak during builder construction and build, excluding the push.",
+                "group_cache_hits": "Verified per-group cache lookups; a complete bundle hit performs one lookup per group.",
+                "locked_install_calls": "Calls to the locked installer; this fixture uses one index and one pip subprocess per call.",
+                "timing_gates": "None; synthetic local observations do not establish external registry throughput or real runtime performance.",
+            },
+            "cases": cases,
+        }
 
 
 def run_benchmarks(args):
@@ -632,6 +928,11 @@ def run_benchmarks(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--grouped-only",
+        action="store_true",
+        help="Measure grouped uv.lock builds and loopback layer uploads instead of the default cases",
+    )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--file-bytes", type=int, default=1024)
@@ -653,7 +954,7 @@ def main():
             "--repetitions, --files, --file-bytes, and transfer sizes must be positive"
         )
 
-    results = run_benchmarks(args)
+    results = run_grouped_benchmarks(args) if args.grouped_only else run_benchmarks(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {len(results['cases'])} benchmark cases to {args.output}")

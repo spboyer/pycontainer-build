@@ -12,7 +12,7 @@ import sys
 import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -599,7 +599,12 @@ def staged_packages(
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
 
 
-def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
+def create_console_entrypoints(
+    site_packages: Path,
+    scripts_dir: Path,
+    *,
+    owners: Optional[Dict[str, List[Path]]] = None,
+) -> None:
     scripts = {}
     entry_point_files = list(
         site_packages.glob("*.dist-info/entry_points.txt")
@@ -630,6 +635,8 @@ def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
             if name in scripts and scripts[name] != (module, attribute):
                 raise ValueError(f"Conflicting console entrypoint name: {name}")
             scripts[name] = (module, attribute)
+            if owners is not None:
+                owners.setdefault(name, []).append(entry_points.parent)
 
     if not scripts:
         return
