@@ -99,8 +99,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "node ./node_modules/@typescript/native/bin/tsc -p ./",
-    "watch": "node ./node_modules/@typescript/native/bin/tsc -watch -p ./",
+    "compile": "node ./node_modules/typescript7/bin/tsc -p ./",
+    "watch": "node ./node_modules/typescript7/bin/tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "node --test dist/test/commands.test.js",
     "lint": "eslint \"src/**/*.ts\"",
@@ -110,12 +110,12 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.6",
     "@types/vscode": "^1.80.0",
-    "@typescript/native": "npm:typescript@^7.0.2",
     "@vscode/vsce": "^4.1.1",
     "eslint": "^10.15.0",
     "globals": "^17.7.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "typescript-eslint": "^8.73.0"
+    "typescript-eslint": "^8.73.0",
+    "typescript7": "npm:typescript@^7.0.2"
   },
   "repository": {
     "type": "git",
