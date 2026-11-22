@@ -1,9 +1,37 @@
 """Authentication providers for container registries."""
-import json, base64, os, subprocess
+import json, base64, os, re, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
+
+GHCR_HOST='ghcr.io'
+HTTPS_PORT='443'
+_DNS_LABEL=re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
+_ACR_LOGIN_SERVER=re.compile(r'([a-z0-9]{5,50})\.azurecr\.io')
+
+
+def _https_registry_host(registry: str) -> Optional[str]:
+    """Return the lowercase hostname of a bare ``host[:443]`` authority, or None."""
+    if not isinstance(registry, str) or not registry.isascii():
+        return None
+    host, separator, port=registry.partition(':')
+    if separator and port!=HTTPS_PORT:
+        return None
+    host=host.lower()
+    if len(host)>253 or not all(_DNS_LABEL.fullmatch(label) for label in host.split('.')):
+        return None
+    return host
+
+
+def _is_ghcr_registry(registry: str) -> bool:
+    return _https_registry_host(registry)==GHCR_HOST
+
+
+def _acr_registry_name(registry: str) -> Optional[str]:
+    host=_https_registry_host(registry)
+    match=_ACR_LOGIN_SERVER.fullmatch(host) if host else None
+    return match.group(1) if match else None
 
 
 @dataclass(frozen=True)
@@ -34,14 +62,14 @@ class EnvironmentAuthProvider(AuthProvider):
         pwd=os.getenv('REGISTRY_PASSWORD')
         if user and pwd: return (user, pwd)
         
-        if 'ghcr.io' in registry:
+        if _is_ghcr_registry(registry):
             token=os.getenv('GITHUB_TOKEN')
             if token: return ('USERNAME', token)
         
         return None
     
     def get_token(self, registry: str) -> Optional[str]:
-        if 'ghcr.io' in registry:
+        if _is_ghcr_registry(registry):
             return os.getenv('GITHUB_TOKEN')
         return os.getenv('REGISTRY_TOKEN')
 
@@ -100,11 +128,12 @@ class AzureCLIAuthProvider(AuthProvider):
     """Get credentials from Azure CLI for ACR."""
     
     def get_credentials(self, registry: str) -> Optional[Tuple[str, str]]:
-        if 'azurecr.io' not in registry: return None
+        registry_name=_acr_registry_name(registry)
+        if not registry_name: return None
         
         try:
             result=subprocess.run(
-                ['az', 'acr', 'login', '--name', registry.split('.')[0], '--expose-token', '--output', 'json'],
+                ['az', 'acr', 'login', '--name', registry_name, '--expose-token', '--output', 'json'],
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode==0:
