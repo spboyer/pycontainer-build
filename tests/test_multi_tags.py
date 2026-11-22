@@ -167,6 +167,12 @@ def _select(index, reference=None):
         ("localhost:5000/u/app:v1", ["v2", "localhost:5000/u/app:v3"],
          ["localhost:5000/u/app:v1", "localhost:5000/u/app:v2", "localhost:5000/u/app:v3"]),
         ("ghcr.io/u/app:v1", ["ghcr.io/u/app:v1"], ["ghcr.io/u/app:v1"]),
+        ("myapp:_dev", ["v1_", "v1..2", "stable"],
+         ["pycontainer-6d796170703a5f646576", "pycontainer-6d796170703a76315f",
+          "pycontainer-6d796170703a76312e2e32", "myapp:stable"]),
+        ("my_app:latest", ["v1"], ["my_app:latest", "my_app:v1"]),
+        ("my__app:latest", ["v1"],
+         ["pycontainer-6d795f5f6170703a6c6174657374", "pycontainer-6d795f5f6170703a7631"]),
     ],
 )
 def test_local_reference_names_follow_primary_spelling(primary, extra, expected):
@@ -204,3 +210,22 @@ def test_single_tag_layout_keeps_unqualified_selection(monkeypatch, tmp_path):
     index = json.loads((tmp_path / "out" / "index.json").read_text())
     assert len(index["manifests"]) == 1
     assert _select(index)["digest"] == _select(index, "myapp:latest")["digest"] == b.manifest_digest
+
+
+def test_unusual_tags_have_selectable_descriptors_and_original_refs(monkeypatch, tmp_path):
+    import json
+
+    b = _fake_build(monkeypatch, tmp_path, tag="myapp:_dev", tags=["v1_", "v1..2"])
+    out = tmp_path / "out"
+    index = json.loads((out / "index.json").read_text())
+    refs = [
+        ("_dev", "pycontainer-6d796170703a5f646576"),
+        ("v1_", "pycontainer-6d796170703a76315f"),
+        ("v1..2", "pycontainer-6d796170703a76312e2e32"),
+    ]
+    assert index["annotations"][REF_NAME] == refs[0][1]
+    for tag, name in refs:
+        descriptor = _select(index, name)
+        assert descriptor["digest"] == b.manifest_digest
+        assert descriptor["size"] == (out / "blobs" / "sha256" / b.manifest_digest[7:]).stat().st_size
+        assert (out / "refs" / "tags" / tag).read_text() == b.manifest_digest

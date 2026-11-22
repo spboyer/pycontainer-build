@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.tags import local_reference_names
 
 
 def _skopeo(*args):
@@ -46,15 +45,22 @@ class TestSkopeoTagReferences(unittest.TestCase):
         print(f"Skopeo resolved {reference} to {digest}")
 
     def test_every_configured_tag_is_selectable(self):
-        for primary in ("myapp:latest", "ghcr.io/example/myapp:v1.2.3"):
+        cases = [
+            ("myapp:latest", ["stable", "v2"],
+             ["myapp:latest", "myapp:stable", "myapp:v2"]),
+            ("ghcr.io/example/myapp:v1.2.3", ["stable", "v2"],
+             ["ghcr.io/example/myapp:v1.2.3", "ghcr.io/example/myapp:stable",
+              "ghcr.io/example/myapp:v2"]),
+            ("myapp:_dev", ["v1_", "v1..2"],
+             ["pycontainer-6d796170703a5f646576", "pycontainer-6d796170703a76315f",
+              "pycontainer-6d796170703a76312e2e32"]),
+        ]
+        for primary, tags, names in cases:
             with self.subTest(primary=primary), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
-                builder, layout = self._build(root, primary, ["stable", "v2"])
-                names = local_reference_names(primary, builder.config.all_tags())
-                self.assertEqual(len(names), 3)
-                for name in names:
+                builder, layout = self._build(root, primary, tags)
+                for name, tag in zip(names, [primary.rsplit(":", 1)[1], *tags]):
                     self._assert_resolves(f"oci:{layout}:{name}", builder, layout)
-                    tag = name.rsplit(":", 1)[1]
                     self.assertEqual((layout / "refs" / "tags" / tag).read_text(),
                                      builder.manifest_digest)
 
@@ -70,14 +76,19 @@ class TestSkopeoTagReferences(unittest.TestCase):
 
                 result = _skopeo("inspect", "--raw", f"oci:{layout}")
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"more than one image", result.stderr)
                 print("Unqualified selection with several references failed as documented: "
                       f"{result.stderr.decode().strip()}")
 
     def test_single_reference_allows_unqualified_selection(self):
-        with tempfile.TemporaryDirectory() as temp:
-            builder, layout = self._build(Path(temp), "myapp:latest", [])
-            self._assert_resolves(f"oci:{layout}", builder, layout)
-            self._assert_resolves(f"oci:{layout}:myapp:latest", builder, layout)
+        for primary, name in [
+            ("myapp:latest", "myapp:latest"),
+            ("myapp:_dev", "pycontainer-6d796170703a5f646576"),
+        ]:
+            with self.subTest(primary=primary), tempfile.TemporaryDirectory() as temp:
+                builder, layout = self._build(Path(temp), primary, [])
+                self._assert_resolves(f"oci:{layout}", builder, layout)
+                self._assert_resolves(f"oci:{layout}:{name}", builder, layout)
 
 
 if __name__ == "__main__":

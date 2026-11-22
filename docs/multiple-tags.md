@@ -56,11 +56,11 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 The layout's `index.json` has one manifest descriptor per tag. Every
 descriptor has the same manifest digest, size and platform, and its
 `org.opencontainers.image.ref.name` annotation is the reference to select.
-The primary keeps the spelling you gave; additional tags use the primary's
-repository spelling. For example, `--tag myapp:v1.2.3 --tag stable` produces
+Names use the primary's repository spelling. For example,
+`--tag myapp:v1.2.3 --tag stable` produces
 `myapp:v1.2.3` and `myapp:stable`, and `--tag ghcr.io/me/app:v1.2.3
 --semver-tags` produces `ghcr.io/me/app:v1.2.3`, `ghcr.io/me/app:v1.2` and
-`ghcr.io/me/app:v1`. The index-level annotation still names the primary.
+`ghcr.io/me/app:v1`. The index-level annotation names the primary descriptor.
 
 Standard OCI tools select an image by that annotation:
 
@@ -72,9 +72,20 @@ skopeo copy oci:dist/image:ghcr.io/me/app:v1 docker-daemon:ghcr.io/me/app:v1
 With a single tag, `oci:dist/image` without a reference also works. With
 several tags, standard tools such as Skopeo require an explicit reference,
 even though every descriptor points to the same image. Bare tag names such as
-`oci:dist/image:stable` are not descriptor references. Skopeo also rejects
-references outside the OCI annotation grammar, such as tags that begin or end
-with `_`, `.` or `-` (`myapp:_dev`); use such tags only for registry pushes.
+`oci:dist/image:stable` are not descriptor references.
+
+Some valid registry tags do not satisfy the OCI reference-name grammar. For
+these, the layout reference is `pycontainer-` followed by lowercase hexadecimal
+UTF-8 bytes of the complete reference in the primary's repository spelling.
+For example, `myapp:_dev` becomes `pycontainer-6d796170703a5f646576`:
+
+```bash
+skopeo inspect oci:dist/image:pycontainer-6d796170703a5f646576
+```
+
+In the unlikely event an encoded name collides with another descriptor name,
+`0` is appended until it is unique. Inspect `index.json` for the exact
+reference. Registry tags and `refs/tags` filenames retain their original values.
 
 The layout also gets one `refs/tags/<tag>` file per tag, all pointing at the
 same manifest digest; standard tools do not read these files. After a push,
