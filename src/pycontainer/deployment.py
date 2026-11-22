@@ -23,6 +23,7 @@ _IMAGE_PATTERN = rf"(?:{_REGISTRY}/)?{_REPOSITORY}{_REFERENCE_SUFFIX}"
 _REGISTRY_IMAGE_PATTERN = rf"{_REGISTRY}/{_REPOSITORY}{_REFERENCE_SUFFIX}"
 _REGISTRY_PREFIX_PATTERN = r"^([^/]*[.:][^/]*|localhost)/"
 _MAX_IMAGE_LENGTH = 255
+_IMAGE_ID_PATTERN = r"^[a-f0-9]{64}$"
 
 _TEMPLATE_NAME = "__pycontainer_name_value__"
 _TEMPLATE_IMAGE = "__pycontainer_image_value__"
@@ -41,6 +42,7 @@ def _validate_image(image: str) -> None:
         not isinstance(image, str)
         or len(image) > _MAX_IMAGE_LENGTH
         or not re.fullmatch(_IMAGE_PATTERN, image)
+        or re.match(_IMAGE_ID_PATTERN, image)
         or (
             re.match(_REGISTRY_PREFIX_PATTERN, image)
             and not re.fullmatch(_REGISTRY_IMAGE_PATTERN, image)
@@ -125,7 +127,7 @@ def _values_schema() -> dict[str, object]:
         "allOf": [{
             "if": {"pattern": _REGISTRY_PREFIX_PATTERN},
             "then": {"pattern": f"^{_REGISTRY_IMAGE_PATTERN}$"},
-        }],
+        }, {"not": {"pattern": _IMAGE_ID_PATTERN}}],
     }
     port = {"type": "integer", "minimum": 1, "maximum": 65535}
     return {
