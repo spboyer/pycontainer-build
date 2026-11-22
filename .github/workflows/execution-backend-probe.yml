@@ -194,8 +194,9 @@ jobs:
             done
           }
 
-          # The overlay mount happens inside crun's user namespace with CAP_SYS_ADMIN
-          # there, which is how a backend step would build its private rootfs.
+          # The overlay mount happens inside crun's user namespace, which is how a
+          # backend step would build its private rootfs. overlayfs creates its work
+          # directory with mode 0000, so the mounter also needs CAP_DAC_OVERRIDE.
           crun_overlay_whiteout() {
             command -v crun >/dev/null && command -v jq >/dev/null || { echo "crun or jq not found; skipped"; return 0; }
             local ov="$tmp/ov-crun"
@@ -217,11 +218,12 @@ jobs:
           done'
             make_bundle crun "$tmp/ovb" \
               '.process.args = ["/usr/bin/sh", "-c", $script]
-               | .process.capabilities.bounding += ["CAP_SYS_ADMIN"]
-               | .process.capabilities.effective += ["CAP_SYS_ADMIN"]
-               | .process.capabilities.permitted += ["CAP_SYS_ADMIN"]
+               | .process.capabilities.bounding += $caps
+               | .process.capabilities.effective += $caps
+               | .process.capabilities.permitted += $caps
                | .mounts += [{"destination": "/ov", "type": "bind", "source": $ov, "options": ["rbind", "rw"]}]' \
-              --arg script "$script" --arg ov "$ov" || { echo "spec failed"; return 1; }
+              --arg script "$script" --arg ov "$ov" \
+              --argjson caps '["CAP_SYS_ADMIN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_CHOWN"]' || { echo "spec failed"; return 1; }
             timeout 30 crun --root "$tmp/state-ov" run --bundle "$tmp/ovb" probe-ov </dev/null
             echo "crun run exit $?"
             crun --root "$tmp/state-ov" delete --force probe-ov >/dev/null 2>&1
