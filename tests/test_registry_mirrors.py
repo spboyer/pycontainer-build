@@ -187,14 +187,29 @@ def mirror_auth(monkeypatch):
     return resolved
 
 
-def _builder(tmp_path, upstream, mirrors, base_ref="team/base:1", **config):
+@pytest.fixture
+def mirror_ca(tmp_path):
+    trustme = pytest.importorskip("trustme")
+    ca = trustme.CA()
+    server_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ca.issue_cert("127.0.0.1").configure_cert(server_context)
+    ca_file = tmp_path / "mirror-ca.pem"
+    ca.cert_pem.write_to_path(str(ca_file))
+    return server_context, str(ca_file)
+
+
+def _builder(
+    tmp_path, upstream, mirrors, base_ref="team/base:1", insecure_registries=None, **config
+):
     (tmp_path / "app.py").write_text("print('hi')\n")
     hosts = [upstream, *mirrors]
+    if insecure_registries is None:
+        insecure_registries = [host for host in hosts if not host.startswith("docker.io")]
     return ImageBuilder(BuildConfig(
         context_dir=str(tmp_path),
         output_dir=str(tmp_path / "out"),
         base_image=f"{upstream}/{base_ref}",
-        insecure_registries=[host for host in hosts if not host.startswith("docker.io")],
+        insecure_registries=insecure_registries,
         registry_mirrors={upstream: mirrors},
         use_cache=False,
         **config,
@@ -224,28 +239,17 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
 
 @pytest.mark.parametrize("trust_mirror", [True, False])
 def test_https_mirror_uses_configured_ca_or_falls_back(
-    tmp_path, mirror_auth, trust_mirror
+    tmp_path, mirror_auth, mirror_ca, trust_mirror
 ):
-    trustme = pytest.importorskip("trustme")
-    ca = trustme.CA()
-    server_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ca.issue_cert("127.0.0.1").configure_cert(server_context)
-    ca_file = tmp_path / "mirror-ca.pem"
-    ca.cert_pem.write_to_path(str(ca_file))
-    (tmp_path / "app.py").write_text("print('hi')\n")
-
+    server_context, ca_file = mirror_ca
     with _serve() as (upstream, up), _serve(server_context) as (mirror, mir):
         up.serve_image()
         mir.serve_image()
-        builder = ImageBuilder(BuildConfig(
-            context_dir=str(tmp_path),
-            output_dir=str(tmp_path / "out"),
-            base_image=f"{upstream}/team/base:1",
+        builder = _builder(
+            tmp_path, upstream, [mirror],
             insecure_registries=[upstream],
-            registry_ca_file=str(ca_file) if trust_mirror else None,
-            registry_mirrors={upstream: [mirror]},
-            use_cache=False,
-        ))
+            registry_ca_file=ca_file if trust_mirror else None,
+        )
         layers, config = _pull(builder, tmp_path)
 
     assert config["os"] == "linux" and len(layers) == 1
@@ -276,6 +280,29 @@ def test_mirror_cross_origin_redirect_never_sends_credentials(
     assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
     assert target.requests
     assert all(auth is None for _, _, auth in target.requests)
+
+
+@pytest.mark.parametrize("redirected_object", ["manifests", "blobs"])
+def test_https_mirror_refuses_http_redirect_without_fallback(
+    tmp_path, mirror_auth, mirror_ca, redirected_object
+):
+    server_context, ca_file = mirror_ca
+    with _serve() as (upstream, up), _serve(server_context) as (mirror, mir), _serve() as (
+        storage, target
+    ):
+        mir.serve_image()
+        mir.redirect_paths[f"/{redirected_object}/"] = f"http://{storage}"
+        builder = _builder(
+            tmp_path, upstream, [mirror],
+            insecure_registries=[upstream],
+            registry_ca_file=ca_file,
+        )
+        with pytest.raises(RegistryRequestError, match="downgrade"):
+            _pull(builder, tmp_path)
+
+    assert mir.requests
+    assert target.requests == []
+    assert up.requests == []
 
 
 def test_fallback_order_connection_404_5xx_then_upstream(tmp_path, mirror_auth, caplog):
