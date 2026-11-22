@@ -73,6 +73,9 @@ pycontainer build --tag myapp:latest --platform linux/amd64
 
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
+
+# Preview pruning old versions (dry run by default; --execute to delete)
+pycontainer registry prune ghcr.io/user/myapp --keep 5
 ```
 
 ### Output
@@ -145,6 +148,9 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
+  dry-run-by-default semver `registry prune` that never deletes digests shared
+  with retained tags ([guide](docs/REGISTRY_CLEANUP.md))
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
@@ -601,7 +607,7 @@ This style is intentional for the experimental phase.
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
-
+- **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
 ### External References
 
 - **OCI Image Spec**: [opencontainers/image-spec](https://github.com/opencontainers/image-spec)

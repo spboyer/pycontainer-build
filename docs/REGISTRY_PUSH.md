@@ -247,6 +247,11 @@ Error bodies are treated as untrusted: at most five errors are shown, each
 message is truncated, control characters are removed, and authorization
 values, tokens and the configured credentials are replaced with `[REDACTED]`.
 
+## Deleting and Pruning Images
+
+To delete images or prune old semantic versions from a registry, see the
+[Registry Cleanup Guide](REGISTRY_CLEANUP.md). Pruning is a dry run by default.
+
 ## Authentication Priority
 
 pycontainer tries authentication methods in this order:
