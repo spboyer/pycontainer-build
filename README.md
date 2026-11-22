@@ -341,10 +341,28 @@ pycontainer build \
   interpreter running pycontainer must have `pip` available. Source
   distributions, cross-compilation, and lockfile resolution are not supported.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
-  `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
-  `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
-  Official `python` tag-only registry pulls derive libc from the resolved tag
-  (`alpine` tags use musl, others glibc). All digest references, including
+  `PYTHON_VERSION`, and `PYTHON_LIBC=glibc-2.N` (N 17-99) or
+  `PYTHON_LIBC=musl-1.N` (N 1-99) in their image config so wheel tags can be
+  validated. pip receives every compatible tag, newest first:
+  `manylinux_2_N` down to `manylinux_2_17` plus the `manylinux2014` alias for
+  glibc, or `musllinux_1_N` down to `musllinux_1_1` for musl. Official
+  `python` tag-only registry pulls derive libc from the resolved tag (`alpine`
+  tags use musl, others glibc). A codename token in such a tag raises the
+  libc version to the lowest one its release ever shipped:
+
+  | Tag codename | Target libc | Source |
+  | --- | --- | --- |
+  | `jessie` / `stretch` / `buster` | glibc 2.19 / 2.24 / 2.28 | [sources.debian.org glibc](https://sources.debian.org/src/glibc/) |
+  | `bullseye` / `bookworm` | glibc 2.31 / 2.36 | same |
+  | `trixie` | glibc 2.40 (2.40-5 was published in trixie before 2.41) | same |
+  | `alpine3.0`-`alpine3.12` | musl 1.1 | [aports `main/musl/APKBUILD`](https://git.alpinelinux.org/aports/tree/main/musl/APKBUILD) on each `3.N-stable` branch |
+  | `alpine3.13`-`alpine3.23` | musl 1.2 | same |
+
+  Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`, and
+  unmapped codenames, keep the conservative `manylinux2014` or `musllinux_1_2`
+  tag; a failed install then suggests pinning a codename or setting
+  `PYTHON_LIBC`. When both a codename and `PYTHON_LIBC` are present they must
+  name the same family, and the lower version wins. All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
   the digest is fetched without verifying that it matches any supplied tag.
   Local image names/annotations also cannot establish libc. Adding a tag to a

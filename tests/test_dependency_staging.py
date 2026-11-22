@@ -21,6 +21,7 @@ from pycontainer.dependencies import (
     staged_packages,
     target_python_version,
     target_wheel_platform,
+    target_wheel_platforms,
     validate_requirements,
 )
 from pycontainer.registry_client import parse_image_reference
@@ -397,7 +398,7 @@ DIGEST = "sha256:" + "a" * 64
         (f"python:3.11-slim@{DIGEST}", "glibc-2.17", "manylinux_2_17_x86_64"),
         (f"python:3.11-slim@{DIGEST}", "musl-1.2", "musllinux_1_2_x86_64"),
         ("python:3.11-alpine", "musl-1.2", "musllinux_1_2_x86_64"),
-        ("python:3.11-slim", "glibc-2.17", "manylinux2014_x86_64"),
+        ("python:3.11-slim", "glibc-2.17", "manylinux_2_17_x86_64"),
         ("python", None, "manylinux2014_x86_64"),
     ],
 )
@@ -415,7 +416,7 @@ def test_official_image_libc_uses_tag_or_explicit_metadata(base_image, libc, exp
         (f"python@{DIGEST}", (), "unverified"),
         (f"python:3.11-slim@{DIGEST}", (), "unverified"),
         (f"python:3.11-alpine@{DIGEST}", (), "unverified"),
-        (f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.1",), "Unsupported PYTHON_LIBC"),
+        (f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.0",), "Unsupported PYTHON_LIBC"),
         (f"python@{DIGEST}", ("PYTHON_LIBC=",), "Unsupported PYTHON_LIBC"),
         ("python:3.11-alpine", ("PYTHON_LIBC=glibc-2.17",), "conflicts"),
         ("python:3.11-slim", ("PYTHON_LIBC=musl-1.2",), "conflicts"),
@@ -559,6 +560,202 @@ def test_digest_only_source_name_with_musl_metadata_stages_musl_wheels_only(
     )
     wheel = (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
     assert "Tag: cp311-cp311-musllinux_1_2_x86_64" in wheel
+
+
+def _glibc_tags(newest, machine):
+    return [f"manylinux_2_{minor}_{machine}" for minor in range(newest, 16, -1)] + [
+        f"manylinux2014_{machine}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arch", "base_image", "env", "verified", "expected"),
+    [
+        ("amd64", "python:3.11-slim", (), True, ["manylinux2014_x86_64"]),
+        ("arm64", "python:3.11", (), True, ["manylinux2014_aarch64"]),
+        ("amd64", "python:3.11-alpine", (), True, ["musllinux_1_2_x86_64"]),
+        ("arm64", "python:3.11-slim-bookworm", (), True, _glibc_tags(36, "aarch64")),
+        ("amd64", "docker.io/library/python:3.11-bullseye", (), True,
+         _glibc_tags(31, "x86_64")),
+        ("amd64", "python:3.13-slim-trixie", (), True, _glibc_tags(40, "x86_64")),
+        ("amd64", "python:3.8-buster", (), True, _glibc_tags(28, "x86_64")),
+        ("arm64", "python:3.11-alpine3.20", (), True,
+         ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
+        ("amd64", "python:3.9-alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
+        ("amd64", "python:3.11-slim-bookworm", ("PYTHON_LIBC=glibc-2.31",), True,
+         _glibc_tags(31, "x86_64")),
+        ("amd64", "example/python:custom", ("PYTHON_LIBC=glibc-2.28",), True,
+         _glibc_tags(28, "x86_64")),
+        ("amd64", "python:3.11-slim-bookworm", ("PYTHON_LIBC=glibc-2.17",), False,
+         _glibc_tags(17, "x86_64")),
+        ("amd64", f"python:3.11-slim-bookworm@{DIGEST}", ("PYTHON_LIBC=glibc-2.17",),
+         True, _glibc_tags(17, "x86_64")),
+        ("arm64", f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.2",), False,
+         ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
+        ("amd64", "python:3.11-notalpine", (), True, ["manylinux2014_x86_64"]),
+        ("amd64", "python:3.11-Slim-Bookworm", (), True, _glibc_tags(36, "x86_64")),
+        ("amd64", "python:3.11-Alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
+        ("amd64", "python:3.11-alpine3.24", (), True, ["musllinux_1_2_x86_64"]),
+        ("amd64", "python:3.11-alpine3.99", (), True, ["musllinux_1_2_x86_64"]),
+    ],
+)
+def test_compatible_wheel_platforms_follow_verified_libc(
+    arch, base_image, env, verified, expected
+):
+    platforms = target_wheel_platforms(
+        "linux", arch, base_image, _libc_config(*env),
+        base_image_tag_verified=verified,
+    )
+    assert platforms == expected
+    options = _target_options(
+        "linux", arch, "3.11", base_image, _libc_config(*env),
+        base_image_tag_verified=verified,
+    )
+    assert options[: 2 * len(expected)] == [
+        item for platform in expected for item in ("--platform", platform)
+    ]
+    assert options[2 * len(expected):] == [
+        "--python-version", "3.11", "--implementation", "cp", "--abi", "cp311",
+        "--only-binary=:all:",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "env", "verified", "message"),
+    [
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-x.y",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.16",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.017",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.100",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=musl-2.1",), True, "Unsupported"),
+        ("python:3.11-slim-bookworm", ("PYTHON_LIBC=musl-1.2",), True, "conflicts"),
+        ("python:3.11-alpine3.20", ("PYTHON_LIBC=glibc-2.36",), True, "conflicts"),
+        ("python:3.11-alpine-bookworm", (), True, "glibc codename"),
+        ("python:3.11-alpine3.20-bookworm", (), True, "more than one"),
+        ("python:3.11-slim-bookworm", (), False, "unverified"),
+        (f"python:3.11-slim-bookworm@{DIGEST}", (), True, "unverified"),
+        ("example/python:3.11-slim-bookworm", (), True, "unverified"),
+    ],
+)
+def test_wheel_platforms_reject_invalid_or_unverifiable_libc_before_pip(
+    tmp_path, monkeypatch, base_image, env, verified, message
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0\n")
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda *a, **k: pytest.fail("pip must not run without a validated libc"),
+    )
+    with pytest.raises(ValueError, match=message):
+        install_requirements(
+            requirements, tmp_path / "staged", tmp_path,
+            "linux", "amd64", "3.11", base_image, _libc_config(*env),
+            base_image_tag_verified=verified,
+        )
+
+
+def _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env=()):
+    context = tmp_path / wheel_tag / base_image.replace(":", "_").replace("/", "_")
+    context.mkdir(parents=True)
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    _write_wheel(context / "wheelhouse", tag=f"cp311-cp311-{wheel_tag}")
+    destination = context / "staged"
+    install_requirements(
+        context / "requirements.txt", destination, context,
+        "linux", arch, "3.11", base_image, _libc_config(*env),
+        base_image_tag_verified="@" not in base_image and not env,
+    )
+    return (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
+
+
+@pytest.mark.parametrize(
+    ("wheel_tag", "arch", "base_image", "env"),
+    [
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-slim-bookworm", ()),
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-bullseye", ()),
+        ("manylinux_2_28_x86_64", "amd64", "example/python:custom",
+         ("PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=glibc-2.28")),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine3.20", ()),
+        ("musllinux_1_1_aarch64", "arm64", f"python@{DIGEST}",
+         ("PYTHON_LIBC=musl-1.2",)),
+    ],
+)
+def test_real_pip_selects_compatible_newer_or_older_libc_wheels(
+    tmp_path, wheel_tag, arch, base_image, env
+):
+    wheel = _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env)
+    assert f"Tag: cp311-cp311-{wheel_tag}" in wheel
+
+
+@pytest.mark.parametrize(
+    ("wheel_tag", "arch", "base_image", "env", "hint"),
+    [
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-slim", (), True),
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-stretch", (), False),
+        ("manylinux_2_28_x86_64", "amd64", "example/python:custom",
+         ("PYTHON_LIBC=glibc-2.27",), False),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine", (), True),
+        ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine3.12", (), False),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-slim-bookworm", (), False),
+        ("manylinux2014_x86_64", "amd64", "python:3.11-alpine3.20", (), False),
+        ("manylinux_2_28_aarch64", "amd64", "python:3.11-slim-bookworm", (), False),
+    ],
+)
+def test_real_pip_rejects_wheels_incompatible_with_target_libc(
+    tmp_path, wheel_tag, arch, base_image, env, hint
+):
+    with pytest.raises(RuntimeError, match="Only wheels compatible with") as error:
+        _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env)
+    assert ("pin a codename tag" in str(error.value)) is hint
+
+
+def test_real_pip_prefers_newest_compatible_libc_wheel(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    for tag in ("manylinux2014_aarch64", "manylinux_2_28_aarch64",
+                "manylinux_2_39_aarch64"):
+        _write_wheel(context / "wheelhouse", tag=f"cp311-cp311-{tag}")
+    for base_image, expected in (
+        ("python:3.11-slim-bookworm", "manylinux_2_28_aarch64"),
+        ("python:3.11-slim", "manylinux2014_aarch64"),
+    ):
+        destination = tmp_path / base_image.replace(":", "_")
+        install_requirements(
+            context / "requirements.txt", destination, context,
+            "linux", "arm64", "3.11", base_image, _libc_config(),
+            base_image_tag_verified=True,
+        )
+        wheel = (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
+        assert f"Tag: cp311-cp311-{expected}" in wheel
+
+
+def test_codename_tag_keeps_dependency_layer_digest_for_same_wheel(
+    tmp_path, monkeypatch
+):
+    digests = []
+    for base_image in ("python:3.11-slim", "python:3.11-slim-bookworm"):
+        context = tmp_path / base_image.replace(":", "_")
+        context.mkdir()
+        _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_x86_64")
+        (context / "requirements.txt").write_text(
+            "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+        )
+        builder = _builder(
+            tmp_path, monkeypatch, context=context, include_deps=True,
+            base_image=base_image, workdir="/app", reproducible=True,
+        )
+        layers = tmp_path / "layers" / base_image.replace(":", "_")
+        layers.mkdir(parents=True)
+        digests.append(
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG).digest
+        )
+    assert digests[0] == digests[1]
 
 
 def test_requirements_install_rejects_incompatible_cpython_wheel(tmp_path, monkeypatch):

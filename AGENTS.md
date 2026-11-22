@@ -147,9 +147,15 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
-registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
-glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` value (`glibc-2.N`, N 17-99, or `musl-1.N`, N 1-99); pip
+receives every compatible tag newest first (`manylinux_2_N`..`manylinux_2_17`
+plus `manylinux2014`, or `musllinux_1_N`..`musllinux_1_1`). Official `python`
+tag-only registry pulls derive the libc family from the resolved tag (`alpine`
+means musl, otherwise glibc) and the version from mapped Debian/Alpine
+codename tokens (README lists the sourced table); codename-less or unmapped
+tags keep exactly `manylinux2014`/`musllinux_1_2`. The shared
+`_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` floor values that
+`target_wheel_platforms` expands. All digest references, including tag-plus-digest, need supported
 `PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
 Local image names/annotations are not provenance either. The shared
 `target_wheel_platform` helper defaults to requiring explicit metadata;
