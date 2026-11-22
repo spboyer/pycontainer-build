@@ -172,7 +172,7 @@ def test_missing_file_is_not_validated_as_defaults(installed_hook):
 
 
 def test_default_selection_skips_unrelated_pyprojects(installed_hook):
-    project, home, env, _ = installed_hook
+    project, home, env, executable = installed_hook
     path = project / "unrelated project" / "pyproject.toml"
     path.parent.mkdir()
     path.write_text('[project]\nname = "unrelated"\n')
@@ -192,14 +192,29 @@ def test_default_selection_skips_unrelated_pyprojects(installed_hook):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Skipped" in result.stdout
     assert "ok:" not in result.stdout
+    explicit = _run(
+        [str(executable), "validate", "config", "--", str(path.relative_to(project))],
+        project, env,
+    )
+    assert explicit.returncode == 2
+    assert "defines neither [build] nor [tool.pycontainer]" in explicit.stdout + explicit.stderr
     assert (_snapshot(project), _snapshot(home)) == before
 
 
 def test_missing_cli_fails_clearly(installed_hook):
     project, _, env, executable = installed_hook
+    # Remove ambient installs (for example an activated CI venv) from PATH.
+    path = os.pathsep.join(
+        entry for entry in env.get("PATH", "").split(os.pathsep)
+        if entry and shutil.which("pycontainer", path=entry) is None
+    )
+    env = {**env, "PATH": path}
+    env.pop("VIRTUAL_ENV", None)
+    assert shutil.which("git", path=path), "git must remain resolvable"
     hidden = executable.with_name(executable.name + ".hidden")
     executable.rename(hidden)
     try:
+        assert shutil.which("pycontainer", path=path) is None
         result = _run(
             [sys.executable, "-m", "pre_commit", "run", "--all-files"],
             project, env,

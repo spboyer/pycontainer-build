@@ -13,7 +13,7 @@ in your repository's `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/spboyer/pycontainer-build
-    rev: 6c8abab5d0e9d32f4f31a385f469d87646a8df41
+    rev: e65f2f29381e3c7ebaf862e5a03fc4f0bf0b4e5a
     hooks:
       - id: pycontainer-validate-config
 ```
@@ -43,10 +43,10 @@ override the hook's `files` expression:
         files: '(^|/)pycontainer\.toml$|^services/(api|worker)/pyproject\.toml$'
 ```
 
-Use this only for projects with `[tool.pycontainer]` settings. An unrelated
-`pyproject.toml` is not evidence of a build configuration: the shared validator
-currently treats an absent configuration table as defaults. The hook does not
-scan TOML contents to select files or change that validator behavior. `exclude`
+Use this only for projects with `[tool.pycontainer]` settings. A selected file
+that defines neither `[build]` nor `[tool.pycontainer]` fails validation rather
+than falling back to defaults, so do not select unrelated `pyproject.toml`
+files. The hook does not scan TOML contents to select files. `exclude`
 can narrow selection further. Symlinks and deleted files are excluded by
 pre-commit's regular-file filtering.
 
