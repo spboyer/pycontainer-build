@@ -404,7 +404,14 @@ def run_import(
             1,
         )
     if output.exists():
-        content = merge_into_pyproject(output.read_text(encoding="utf-8"), snippet)
+        existing = output.read_text(encoding="utf-8")
+        if "build" in tomllib.loads(existing):
+            raise ValueError(
+                f"{output} already defines [build]; refusing to add [tool.pycontainer] "
+                "because a config file must use exactly one pycontainer table. "
+                "Move the settings by hand or write to a new file."
+            )
+        content = merge_into_pyproject(existing, snippet)
     else:
         content = snippet
     output.write_text(content, encoding="utf-8")

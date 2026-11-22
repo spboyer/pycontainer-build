@@ -267,6 +267,47 @@ def test_cli_reports_invalid_config(tmp_path, monkeypatch, capsys, setting, valu
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ('[build]\ntag = "a:1"\n\n[tool.pycontainer]\ntag = "b:1"\n', "both [build] and [tool.pycontainer]"),
+        ('tool = "bad"\n', "[tool] configuration must be a TOML table"),
+        ('[tool]\npycontainer = "bad"\n', "[tool.pycontainer] configuration must be a TOML table"),
+        ("[tool.pycontainer]\nworkdr = \"/x\"\n", "Unknown [tool.pycontainer] setting(s): 'workdr'"),
+        ("[tool.pycontainer]\nexposed_ports = [\"80\"]\n", "Invalid value for [tool.pycontainer].exposed_ports"),
+        ("[tool.pycontainer]\npush = true\n", "use 'pycontainer build --push'"),
+    ],
+)
+def test_cli_reports_invalid_tool_pycontainer_config(tmp_path, monkeypatch, capsys, content, message):
+    config_path = tmp_path / "pyproject.toml"
+    config_path.write_text(content)
+    monkeypatch.setattr(cli, "ImageBuilder", lambda config: pytest.fail("must not build"))
+
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--config", str(config_path), "--tag", "app:1"])
+
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_cli_reads_tool_pycontainer_table_and_cli_overrides_it(tmp_path, monkeypatch):
+    config_path = tmp_path / "pyproject.toml"
+    config_path.write_text(
+        '[project]\nname = "demo"\n\n[tool.ruff]\nline-length = 99\n\n'
+        '[tool.pycontainer]\nbase-image = "python:3.12-alpine"\nworkdir = "/srv"\n\n'
+        '[tool.pycontainer.env]\nMODE = "production"\n'
+    )
+
+    config = _capture_config(
+        monkeypatch, ["build", "--config", str(config_path), "--platform", "linux/arm64"]
+    )
+
+    assert config.base_image == "python:3.12-alpine"
+    assert config.workdir == "/srv"
+    assert config.env == {"MODE": "production"}
+    assert config.platform == "linux/arm64"
+
+
 def test_cli_status_output_survives_legacy_redirected_encoding(monkeypatch):
     stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
 

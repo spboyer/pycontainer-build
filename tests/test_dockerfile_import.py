@@ -131,3 +131,56 @@ def test_cli_prints_snippet_without_output(tmp_path, monkeypatch, capsys):
         cli.main()
     assert exc.value.code == 0
     assert "[tool.pycontainer]" in capsys.readouterr().out
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr("sys.argv", ["pycontainer", *argv])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    return exc.value.code
+
+
+def test_imported_config_is_consumed_by_build_cli(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12-alpine\nWORKDIR /srv\nENV MODE=production\n"
+        'LABEL org.opencontainers.image.title="demo"\nEXPOSE 8080\n'
+        'CMD ["python", "app.py"]\n'
+    )
+    out = tmp_path / "pyproject.toml"
+    out.write_text('[project]\nname = "keep"\n\n[tool.ruff]\nline-length = 99\n')
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    configs = []
+
+    class FakeImageBuilder:
+        def __init__(self, config):
+            configs.append(config)
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    monkeypatch.setattr("sys.argv", ["pycontainer", "build", "--config", str(out), "--dry-run"])
+    cli.main()
+
+    config = configs[0]
+    assert config.base_image == "python:3.12-alpine"
+    assert config.workdir == "/srv"
+    assert config.env == {"MODE": "production"}
+    assert config.labels == {"org.opencontainers.image.title": "demo"}
+    assert config.exposed_ports == [8080]
+    assert config.cmd == ["python", "app.py"]
+    assert tomllib.loads(out.read_text())["tool"]["ruff"]["line-length"] == 99
+
+
+@pytest.mark.parametrize("existing", ['[build]\ntag = "a:1"\n', 'build = { tag = "a:1" }\n'])
+def test_force_refuses_to_add_tool_table_beside_build(tmp_path, monkeypatch, capsys, existing):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pycontainer.toml"
+    out.write_text(existing)
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 2
+    assert out.read_text() == existing
+    assert "already defines [build]" in capsys.readouterr().err
