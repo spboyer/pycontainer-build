@@ -156,7 +156,8 @@ in `dependencies.py` (keep #143 libc changes in that table), and never falls
 back to source builds; each platform gets its own
 base selection and dependency layer, and tags move only after the whole index
 verifies. A local `oci:` base must keep the same layout `index.json` across
-platforms. Multi-tag registry pushes are not atomic: a later tag failure can
+platforms. Multi-platform builds reject copied virtualenv staging (target
+markers are not re-evaluated; #180) and require a requirements file. Multi-tag registry pushes are not atomic: a later tag failure can
 leave earlier tags moved. Hermetic index tests do not prove per-architecture runtime startup.
 Dependency environment markers (for example `platform_machine`) are still
 evaluated against the build host for any cross-target build; see #142.

@@ -603,6 +603,9 @@ platform is built in isolation: it selects its own base manifest (registry
 builds re-select from the first resolved base-index digest), stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
+Multi-platform dependency staging requires a requirements file; copying a
+host virtualenv is rejected until target-closure checks land in
+[#180](https://github.com/spboyer/pycontainer-build/issues/180).
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
@@ -611,6 +614,10 @@ a change fails the build instead of mixing base versions. Push uploads blobs, th
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.
+On a tag push error, the exception lists confirmed pushes, the failed or
+unknown-outcome reference, and references not attempted, even with
+`--no-progress`. `builder.pushed_refs` contains only confirmed successes from
+the current index push; no rollback is attempted.
 SBOM generation is not yet supported for index builds. A local single-platform
 `docker-archive:` base cannot satisfy an index build. Pip still evaluates
 dependency environment markers such as `platform_machine` against the build
