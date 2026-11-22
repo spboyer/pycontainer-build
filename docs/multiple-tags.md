@@ -54,5 +54,9 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 ## Output
 
 The OCI layout gets one `refs/tags/<tag>` file per tag, all pointing at the
-same manifest digest. After a push, `builder.pushed_refs` lists every pushed
-reference. A single `--tag` behaves exactly as before.
+same manifest or index digest. After a push, `builder.pushed_refs` lists every
+pushed reference. For multi-platform index pushes, it is reset at the start of each
+attempt and records confirmed successes as they happen. If a tag push fails,
+the error reports confirmed pushes, the failed or unknown-outcome reference,
+and references not attempted, regardless of progress output; tags are not
+rolled back. A single `--tag` behaves exactly as before.

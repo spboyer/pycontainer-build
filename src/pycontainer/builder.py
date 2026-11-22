@@ -807,6 +807,9 @@ class ImageBuilder:
         for tag_ref in self.config.all_tags()[1:]:
             extra_tag=parse_image_reference(tag_ref)[2]
             if extra_tag not in push_tags: push_tags.append(extra_tag)
+
+        if getattr(self, "index_digest", None):
+            self.pushed_refs=[]
         
         auth=get_registry_auth(
             registry,
@@ -827,8 +830,7 @@ class ImageBuilder:
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
 
         if getattr(self, "index_digest", None):
-            self._push_image_index(client, layers_dir, push_tags, show_progress)
-            self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
+            self._push_image_index(client, layers_dir, push_tags, f"{registry}/{repo}", show_progress)
             return f"{registry}/{repo}:{tag}"
         
         for i, layer in enumerate(self.layers, 1):
@@ -851,7 +853,7 @@ class ImageBuilder:
 
         return f"{registry}/{repo}:{tag}"
 
-    def _push_image_index(self, client, layers_dir: Path, push_tags: List[str], show_progress: bool) -> None:
+    def _push_image_index(self, client, layers_dir: Path, push_tags: List[str], repository: str, show_progress: bool) -> None:
         """Push blobs, then platform manifests by digest, then the index; tags go last."""
         _verify_image_index(layers_dir, self.index_digest, self.index_size, self.platform_images)
         blobs={}
@@ -870,8 +872,19 @@ class ImageBuilder:
         index_data=(layers_dir/_digest_filename(self.index_digest)).read_bytes()
         if show_progress: print(f"  Pushing image index ({self.index_digest[:19]}...)")
         client.push_index(self.index_digest, index_data)
-        for push_tag in push_tags:
-            client.push_index(push_tag, index_data)
+        for i, push_tag in enumerate(push_tags):
+            ref=f"{repository}:{push_tag}"
+            try:
+                client.push_index(push_tag, index_data)
+            except (RegistryRequestError, OSError) as error:
+                confirmed=", ".join(self.pushed_refs) or "(none)"
+                remaining=", ".join(f"{repository}:{tag}" for tag in push_tags[i+1:]) or "(none)"
+                raise RegistryRequestError(
+                    f"Image index tag publication failed. Confirmed pushed: {confirmed}. "
+                    f"Failed tag write (outcome unknown): {ref}. Not attempted: {remaining}. "
+                    f"Previously pushed tags were not rolled back. Cause: {error}"
+                ) from error
+            self.pushed_refs.append(ref)
             if show_progress: print(f"✓ Pushed index tag {push_tag}")
     
     def _show_build_plan(self):

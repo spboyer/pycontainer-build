@@ -12,6 +12,7 @@ from pycontainer import builder as builder_module
 from pycontainer.auth import RegistryAuth
 from pycontainer.builder import ImageBuilder, LayerIntegrityError, UnsupportedPlatformError
 from pycontainer.config import BuildConfig, normalize_platforms
+from pycontainer.registry_client import RegistryRequestError
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
@@ -335,7 +336,68 @@ def test_failed_index_push_publishes_no_tags(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="simulated"):
         builder.push(show_progress=False)
     assert not any(call[0] == "index" for call in client.calls)
-    assert not hasattr(builder, "pushed_refs")
+    assert builder.pushed_refs == []
+
+
+@pytest.mark.parametrize(
+    ("failure_tag", "timed_out"),
+    [("v2", False), ("stable", False), ("stable", True), ("latest", False)],
+)
+def test_partial_index_tag_push_reports_all_outcomes_without_progress(
+    tmp_path, monkeypatch, capsys, failure_tag, timed_out
+):
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), tags=["stable", "latest"]
+    )
+    builder.build()
+    capsys.readouterr()
+
+    class PartialPushClient(FakePushClient):
+        def push_index(self, reference, data):
+            if reference == failure_tag:
+                if timed_out:
+                    super().push_index(reference, data)
+                    raise TimeoutError("response lost after publication")
+                raise RegistryRequestError("registry rejected tag")
+            super().push_index(reference, data)
+
+    client = PartialPushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+
+    with pytest.raises(RegistryRequestError) as raised:
+        builder.push(registry_url="mirror.example/team/app:v2", show_progress=False)
+
+    tags = ["v2", "stable", "latest"]
+    failure_index = tags.index(failure_tag)
+    refs = [f"mirror.example/team/app:{tag}" for tag in tags]
+    assert builder.pushed_refs == refs[:failure_index]
+    message = str(raised.value)
+    assert f"Confirmed pushed: {', '.join(refs[:failure_index]) or '(none)'}." in message
+    assert f"Failed tag write (outcome unknown): {refs[failure_index]}." in message
+    assert f"Not attempted: {', '.join(refs[failure_index + 1:]) or '(none)'}." in message
+    assert str(raised.value.__cause__) in message
+    assert isinstance(
+        raised.value.__cause__, TimeoutError if timed_out else RegistryRequestError
+    )
+    calls = [call[1] for call in client.calls if call[0] == "index"]
+    assert calls == [builder.index_digest] + tags[:failure_index] + (
+        [failure_tag] if timed_out else []
+    )
+    assert not capsys.readouterr().out
+
+
+def test_index_push_clears_previous_successes_before_a_new_attempt(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), tags=["latest"])
+    builder.build()
+    monkeypatch.setattr(builder_module, "RegistryClient", FakePushClient())
+    builder.push(show_progress=False)
+    assert len(builder.pushed_refs) == 2
+
+    client = FakePushClient(fail_on=lambda call: call[0] == "index")
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    with pytest.raises(RuntimeError, match="simulated"):
+        builder.push(show_progress=False)
+    assert builder.pushed_refs == []
 
 
 def test_push_rejects_layout_mutated_after_build(tmp_path, monkeypatch):

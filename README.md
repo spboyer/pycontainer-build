@@ -603,6 +603,10 @@ a change fails the build instead of mixing base versions. Push uploads blobs, th
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.
+On a tag push error, the exception lists confirmed pushes, the failed or
+unknown-outcome reference, and references not attempted, even with
+`--no-progress`. `builder.pushed_refs` contains only confirmed successes from
+the current index push; no rollback is attempted.
 SBOM generation is not yet supported for index builds. A local single-platform
 `docker-archive:` base cannot satisfy an index build. Pip still evaluates
 dependency environment markers such as `platform_machine` against the build
