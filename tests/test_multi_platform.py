@@ -149,6 +149,38 @@ def _blob(out: Path, digest: str) -> bytes:
     return (out / "blobs" / "sha256" / digest.split(":", 1)[1]).read_bytes()
 
 
+def _record_tag_provenance(monkeypatch):
+    seen = []
+
+    def fake_deps_layer(self, layers_dir, **kwargs):
+        seen.append((kwargs["arch"], self._base_image_tag_verified))
+        return None
+
+    monkeypatch.setattr(ImageBuilder, "_create_deps_layer", fake_deps_layer)
+    return seen
+
+
+@pytest.mark.parametrize("reference, verified", [
+    ("registry.example/library/python:3.11-slim", True),
+    ("registry.example/library/python:3.11-slim@{digest}", False),
+    ("registry.example/library/python@{digest}", False),
+])
+def test_tag_provenance_survives_digest_pinning_only_for_tag_pulls(
+    tmp_path, monkeypatch, reference, verified
+):
+    registry = FakeBaseRegistry()
+    seen = _record_tag_provenance(monkeypatch)
+    builder = _builder(
+        tmp_path, monkeypatch, registry, include_deps=True,
+        base_image=reference.format(digest=registry.index_digest),
+    )
+    builder.build()
+
+    top_level = [ref for ref, _ in registry.manifest_calls if ref in ("3.11-slim", registry.index_digest)]
+    assert top_level[1] == registry.index_digest
+    assert seen == [("amd64", verified), ("arm64", verified)]
+
+
 def test_normalize_platforms_strips_and_dedupes():
     assert normalize_platforms(" linux/amd64 , linux/arm64,linux/amd64") == [
         "linux/amd64",

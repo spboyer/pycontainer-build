@@ -403,6 +403,8 @@ class ImageBuilder:
 
         platforms=self.config.target_platforms()
         self._resolved_base_reference=None
+        self._resolved_base_from_tag=False
+        self._base_image_tag_verified=False
         self._local_base_snapshot=None
         self._app_layer=None
         if len(platforms)>1:
@@ -666,6 +668,21 @@ class ImageBuilder:
             and resolved_digest.startswith("sha256:")
         ):
             self._resolved_base_reference = resolved_digest
+            # Only a registry pull by tag can vouch for the tag; a user-supplied
+            # tag@digest or digest is pulled by digest and never proves its tag.
+            self._resolved_base_from_tag = not reference.startswith("sha256:")
+        if local:
+            self._base_image_tag_verified = False
+        elif pinned is None:
+            self._base_image_tag_verified = (
+                not reference.startswith("sha256:")
+                and isinstance(resolved_digest, str)
+                and resolved_digest.startswith("sha256:")
+            )
+        else:
+            self._base_image_tag_verified = bool(
+                getattr(self, "_resolved_base_from_tag", False)
+            )
 
         selected_variant = None
         selected_from_index = False

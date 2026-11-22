@@ -653,6 +653,23 @@ def test_oci_layout_index_base_builds_each_platform(tmp_path, offline):
     assert refs.read_text() == builder.index_digest
 
 
+def test_local_layout_annotation_never_verifies_base_tag(tmp_path, offline, monkeypatch):
+    layout, _ = _two_platform_layout(tmp_path)
+    layout.descriptors[0]["annotations"]["org.opencontainers.image.ref.name"] = "python:3.11-slim"
+    layout.write_index()
+    seen = []
+
+    def fake_deps_layer(self, layers_dir, **kwargs):
+        seen.append(self._base_image_tag_verified)
+
+    monkeypatch.setattr(ImageBuilder, "_create_deps_layer", fake_deps_layer)
+    builder = _multi_platform_builder(tmp_path, f"oci:{layout.root}:python:3.11-slim")
+    builder.config.include_deps = True
+    builder.build()
+
+    assert seen == [False, False]
+
+
 @pytest.mark.parametrize("change_after_read", [1, 2])
 def test_local_layout_change_during_index_build_fails_before_publication(
     tmp_path, offline, change_after_read
