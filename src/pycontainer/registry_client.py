@@ -30,6 +30,7 @@ MAX_RETRY_DELAY_SECONDS = 5
 RETRY_BACKOFF_SECONDS = 0.25
 TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -47,6 +48,52 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep authorization only when a redirect stays on the same origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.remove_header("Authorization")
+            original = urllib.parse.urlsplit(req.full_url)
+            target = urllib.parse.urlsplit(newurl)
+            if (
+                original.scheme.lower() == target.scheme.lower()
+                and original.netloc.lower() == target.netloc.lower()
+            ):
+                authorization = req.get_header("Authorization")
+                if authorization:
+                    redirected.add_unredirected_header("Authorization", authorization)
+        return redirected
+
+
+def _require_secure_redirect(url: str) -> None:
+    try:
+        target = urllib.parse.urlsplit(url)
+        if (
+            target.scheme.lower() != "https"
+            or not target.hostname
+            or target.username is not None
+            or target.password is not None
+        ):
+            raise ValueError("invalid secure redirect")
+    except ValueError as error:
+        raise RegistryRequestError(
+            "Required trust refuses an insecure registry redirect."
+        ) from error
+
+
+class SecureRegistryRedirect(SameOriginRedirect):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_secure_redirect(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_registry_request(request, timeout, *, strict=False):
+    handler = SecureRegistryRedirect() if strict else SameOriginRedirect()
+    return urllib.request.build_opener(handler).open(request, timeout=timeout)
 
 
 def _safe_url(url: str) -> str:
@@ -99,6 +146,8 @@ class RegistryClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        strict_auth: bool = False,
+        trusted_auth_realm: Optional[str] = None,
     ):
         if timeout <= 0:
             raise ValueError("Registry request timeout must be greater than zero.")
@@ -110,6 +159,8 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
+        self.strict_auth = strict_auth
+        self.trusted_auth_realm = trusted_auth_realm
         self.base_url = f"https://{self.registry}/v2"
         self._bearer_token = None
 
@@ -153,6 +204,27 @@ class RegistryClient:
             )
 
         parsed = urllib.parse.urlsplit(realm)
+        if self.strict_auth:
+            if (
+                parsed.scheme.lower() != "https"
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise RegistryAuthenticationError(
+                    "Required trust only permits HTTPS registry token realms."
+                )
+            has_credentials = bool(self.username or self.password or self.auth_token)
+            if (
+                has_credentials
+                and not self._is_registry_url(realm)
+                and realm != self.trusted_auth_realm
+            ):
+                raise RegistryAuthenticationError(
+                    "Registry requested credentials for an untrusted token realm; "
+                    "configure the exact auth_realm for required trust."
+                )
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
             value = auth_params.get(key)
@@ -172,12 +244,14 @@ class RegistryClient:
         elif self.password:
             headers["Authorization"] = f"Bearer {self.password}"
 
-        request = urllib.request.Request(url, headers=headers)
+        request = urllib.request.Request(url)
+        for key, value in headers.items():
+            request.add_unredirected_header(key, value)
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
+                with _open_registry_request(
+                    request, timeout=self.timeout, strict=self.strict_auth
                 ) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
@@ -236,6 +310,7 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_response_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
         method = method.upper()
         retry_safe = method in {"GET", "HEAD"}
@@ -248,14 +323,41 @@ class RegistryClient:
                 data.seek(body_position)
             request_headers = dict(headers or {})
             request_headers.update(self._authorization_headers(url))
+            authorization = {
+                key: request_headers.pop(key)
+                for key in list(request_headers)
+                if key.lower() == "authorization"
+            }
             request = urllib.request.Request(
                 url, data=data, headers=request_headers, method=method
             )
+            for key, value in authorization.items():
+                request.add_unredirected_header(key, value)
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
+                with _open_registry_request(
+                    request, timeout=self.timeout, strict=self.strict_auth
                 ) as response:
-                    return response.status, response.read(), dict(response.headers)
+                    response_body = response.read(
+                        max_response_bytes + 1 if max_response_bytes is not None else -1
+                    )
+                    if (
+                        max_response_bytes is not None
+                        and len(response_body) > max_response_bytes
+                    ):
+                        raise RegistryRequestError(
+                            f"Registry response exceeded {max_response_bytes} bytes."
+                        )
+                    response_headers = dict(response.headers)
+                    get_all = getattr(response.headers, "get_all", None)
+                    if get_all is not None:
+                        digests = get_all("Docker-Content-Digest", [])
+                        if len(digests) > 1:
+                            response_headers = {
+                                key: value for key, value in response_headers.items()
+                                if key.lower() != "docker-content-digest"
+                            }
+                            response_headers["Docker-Content-Digest"] = ",".join(digests)
+                    return response.status, response_body, response_headers
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 if (
@@ -276,6 +378,7 @@ class RegistryClient:
                             data,
                             headers,
                             retry_auth=False,
+                            max_response_bytes=max_response_bytes,
                         )
                 if (
                     retry_safe
@@ -407,6 +510,29 @@ class RegistryClient:
         expected_size: Optional[int] = None,
     ) -> Tuple[Dict, str]:
         """Pull manifest, returning its decoded JSON and registry digest."""
+        manifest, digest, _ = self._pull_manifest(
+            reference, expected_digest, expected_size, strict_header=False
+        )
+        return manifest, digest
+
+    def pull_manifest_bytes(
+        self,
+        reference: str,
+        expected_digest: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> Tuple[Dict, str, bytes]:
+        """Pull bounded, exact manifest bytes for a required-trust decision."""
+        return self._pull_manifest(
+            reference, expected_digest, expected_size, strict_header=True
+        )
+
+    def _pull_manifest(
+        self,
+        reference: str,
+        expected_digest: Optional[str],
+        expected_size: Optional[int],
+        strict_header: bool,
+    ) -> Tuple[Dict, str, bytes]:
         if expected_digest is not None:
             digest_filename(expected_digest)
         if expected_size is not None and (
@@ -423,9 +549,14 @@ class RegistryClient:
                 "application/vnd.docker.distribution.manifest.list.v2+json"
             )
         }
-        status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
-        )
+        if strict_header:
+            status, body, response_headers = self._make_request(
+                "GET", url, headers=headers, max_response_bytes=MAX_MANIFEST_BYTES
+            )
+        else:
+            status, body, response_headers = self._make_request(
+                "GET", url, headers=headers
+            )
         if status != 200:
             body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
             raise RegistryRequestError(
@@ -457,6 +588,20 @@ class RegistryClient:
             raise RegistryRequestError(
                 f"Registry returned a non-object manifest for {reference}."
             )
+        if strict_header:
+            digest_headers = [
+                value for key, value in response_headers.items()
+                if key.lower() == "docker-content-digest"
+            ]
+            if len(digest_headers) > 1 or (
+                digest_headers and digest_headers[0] != body_digest
+            ):
+                raise BlobIntegrityError(
+                    "Registry manifest digest header is invalid or does not "
+                    f"match the body hash {body_digest}."
+                )
+            return manifest, body_digest, body
+
         digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
             "docker-content-digest"
         )
@@ -465,9 +610,18 @@ class RegistryClient:
                 f"Registry reported manifest digest {digest}, but its body hashes "
                 f"to {body_digest}."
             )
-        return manifest, digest or body_digest
+        return manifest, digest or body_digest, body
 
     def _open_blob_response(self, url: str):
+        def follow_redirect(target):
+            request = urllib.request.Request(target)
+            if self.strict_auth:
+                _require_secure_redirect(target)
+                return urllib.request.build_opener(SecureRegistryRedirect()).open(
+                    request, timeout=self.timeout
+                )
+            return urllib.request.urlopen(request, timeout=self.timeout)
+
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
@@ -484,9 +638,7 @@ class RegistryClient:
                     "Registry blob redirect did not include a Location."
                 ) from error
             target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return follow_redirect(target)
 
         if response.status in REDIRECT_STATUSES:
             location = response.headers.get("Location")
@@ -496,9 +648,7 @@ class RegistryClient:
                     "Registry blob redirect did not include a Location."
                 )
             target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return follow_redirect(target)
         return response
 
     def _download_blob_once(

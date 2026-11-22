@@ -392,6 +392,18 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   `PYTHON_IMPLEMENTATION`, `PYTHON_VERSION`, and `PYTHON_LIBC` in their config
   for `--include-deps`.
 
+### Base image trust
+
+Registry signature verification is **opt-in**. Configure
+`[build.base_image_trust]` to require Cosign or the supported strict Notation
+subset for one exact repository. Verification is bound to the resolved digest
+before base-image config or layer downloads; a required policy rejects local
+OCI and Docker archives. A dry run validates the policy's shape but does not
+verify an image.
+
+See [Base image trust](docs/base-image-trust.md) for configuration, verifier
+and trust-material setup, limitations, and opt-in real-provider checks.
+
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
 - `--exclude PATH` — Exclude a context-root-relative path or glob; repeat to add exclusions

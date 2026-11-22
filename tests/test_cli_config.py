@@ -64,6 +64,25 @@ generate-sbom = true
     assert logging_levels == [logging.DEBUG]
 
 
+def test_cli_preserves_required_base_image_trust(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        '[build]\nbase_image = "registry.example/team/base:v1"\n'
+        '[build.base_image_trust]\nprovider = "cosign"\n'
+        'repository = "registry.example/team/base"\n'
+        'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
+    )
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+
+    assert config.base_image_trust == {
+        "provider": "cosign",
+        "repository": "registry.example/team/base",
+        "identity": "builder@example.com",
+        "issuer": "https://issuer.example",
+    }
+
+
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
