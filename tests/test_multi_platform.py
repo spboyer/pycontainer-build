@@ -294,7 +294,8 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         assert not any("native_" in name and arch not in name for name in names)
 
 
-def test_multi_platform_rejects_virtualenv_staging_before_publication(tmp_path, monkeypatch):
+@pytest.mark.parametrize("platform", [MULTI, "linux/amd64,linux/arm64,linux/arm/v7"])
+def test_multi_platform_rejects_virtualenv_staging_before_publication(tmp_path, monkeypatch, platform):
     ctx = _context(tmp_path)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
     site.mkdir(parents=True)
@@ -304,7 +305,10 @@ def test_multi_platform_rejects_virtualenv_staging_before_publication(tmp_path, 
     out = tmp_path / "out"
     (out / "refs" / "tags").mkdir(parents=True)
     (out / "index.json").write_text("previous")
-    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7")),
+        include_deps=True, ctx=ctx, platform=platform,
+    )
 
     with pytest.raises(ValueError, match="issues/180"):
         builder.build()
