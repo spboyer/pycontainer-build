@@ -383,6 +383,9 @@ exclude-defaults = true
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
