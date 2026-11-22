@@ -41,7 +41,9 @@ def main():
         default=None,
         help="Stage target-compatible dependencies from a venv or requirements file",
     )
-    b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer")
+    b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over lockfiles and venvs)")
+    b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
+    b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
@@ -95,6 +97,8 @@ def main():
         'cache_dir': args.cache_dir,
         'include_deps': args.include_deps,
         'requirements_file': args.requirements_file,
+        'lockfile': args.lockfile,
+        'use_lockfile': args.use_lockfile,
         'verbose': args.verbose,
         'dry_run': args.dry_run,
         'platform': args.platform,

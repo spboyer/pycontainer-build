@@ -1,6 +1,6 @@
 import tomllib, re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from .fs_utils import (
     DEFAULT_CONTEXT_EXCLUDES,
     VIRTUALENV_EXCLUDES,
@@ -59,7 +59,7 @@ def default_include_paths(
 
 def find_dependencies(
     context_dir: Path,
-    requirements_file: str="requirements.txt",
+    requirements_file: Optional[str]="requirements.txt",
     *,
     exclude_paths=None,
     exclude_defaults=True,
@@ -99,7 +99,7 @@ def find_dependencies(
                 break
     
     if not deps:
-        requirements_relative=relative_context_path(requirements_file)
+        requirements_relative=relative_context_path(requirements_file or "requirements.txt")
         req_path=ctx/requirements_relative
         if req_path.exists():
             deps.append((req_path, requirements_relative))

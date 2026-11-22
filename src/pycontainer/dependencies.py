@@ -1,6 +1,7 @@
 """Target-aware staging for Python runtime dependencies."""
 import configparser
 import csv
+import logging
 import os
 import re
 import shlex
@@ -15,6 +16,7 @@ from typing import Iterable, List, Optional, Tuple
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
+logger = logging.getLogger(__name__)
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
 MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
@@ -94,6 +96,14 @@ def target_python_version(base_image: str, base_config: Optional[dict]) -> str:
     )
 
 
+def target_python_full_version(base_config: Optional[dict]) -> Optional[str]:
+    """Return the base image's exact ``PYTHON_VERSION`` when it is a final release."""
+    value = _base_environment(base_config).get("PYTHON_VERSION")
+    if value and re.fullmatch(r"\d+\.\d+\.\d+", value):
+        return value
+    return None
+
+
 def _base_environment(base_config: Optional[dict]) -> dict:
     environment = {}
     if base_config:
@@ -166,10 +176,20 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
+    *,
+    locked: bool = False,
 ) -> None:
-    validate_requirements(requirements, context_dir)
+    """Install requirements for the target; ``locked`` files are generated, hashed and complete."""
+    if not locked and not validate_requirements(requirements, context_dir):
+        logger.warning(
+            "%s is not fully pinned with ==versions and --hash values, so the "
+            "dependency layer is not reproducible. Use a lockfile or "
+            "`pip-compile --generate-hashes`.",
+            requirements.name,
+        )
 
     destination.mkdir(parents=True, exist_ok=True)
+    locked_options = ["--no-deps", "--require-hashes"] if locked else []
     command = [
         sys.executable,
         "-m",
@@ -179,6 +199,7 @@ def install_requirements(
         "--no-input",
         "--no-cache-dir",
         "--no-compile",
+        *locked_options,
         "--target",
         str(destination),
         *_target_options(
@@ -226,10 +247,15 @@ def install_requirements(
             raise
 
     if returncode:
+        hint = (
+            " Locked artifacts must match their recorded hashes."
+            if locked
+            else ""
+        )
         raise RuntimeError(
             "Target dependency installation failed. Only wheels compatible with "
             f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
-            "are supported."
+            f"are supported.{hint}"
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -257,13 +283,15 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def validate_requirements(requirements: Path, context_dir: Path) -> None:
+def validate_requirements(requirements: Path, context_dir: Path) -> bool:
+    """Validate includes and options; return whether every requirement is hash-pinned."""
     context_root = context_dir.resolve()
-    pending = [requirements.resolve(strict=True)]
+    pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     total_bytes = 0
+    hash_pinned = True
     while pending:
-        path = pending.pop()
+        path, is_constraint = pending.pop()
         if path in visited:
             continue
         try:
@@ -299,6 +327,11 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 raise ValueError(f"Invalid requirements syntax in {path}.") from exc
             if not options:
                 continue
+            if not options[0].startswith("-"):
+                if not is_constraint:
+                    hash_pinned = hash_pinned and _is_hash_pinned(options)
+            elif options[0] in {"-e", "--editable"} or options[0].startswith("--editable="):
+                hash_pinned = False
             for option in options:
                 name = option.split("=", 1)[0]
                 if name in _PIP_OVERRIDE_OPTIONS:
@@ -328,7 +361,26 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                         "use a local file inside the build context."
                     )
                 included_path = (path.parent / include).resolve(strict=True)
-                pending.append(included_path)
+                pending.append((included_path, is_constraint or option.startswith(("-c", "--constraint"))))
+    return hash_pinned
+
+
+def _is_hash_pinned(options: List[str]) -> bool:
+    words = []
+    has_hash = False
+    skip_value = False
+    for option in options:
+        if skip_value:
+            skip_value = False
+        elif option == "--hash":
+            has_hash = skip_value = True
+        elif option.startswith("--hash="):
+            has_hash = True
+        elif not option.startswith("-"):
+            words.append(option)
+    specifier = " ".join(words).split(";", 1)[0].strip()
+    exact = re.fullmatch(r"[^=<>!~@,]+===?\s*[^\s,*]+", specifier) is not None
+    return exact and has_hash
 
 
 def stage_virtualenv(

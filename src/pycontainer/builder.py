@@ -18,6 +18,7 @@ from .fs_utils import (
     ensure_dir,
     iter_files,
     output_directory_lock,
+    relative_context_path,
 )
 
 
@@ -192,9 +193,13 @@ from .dependencies import (
     install_requirements,
     staged_packages,
     stage_virtualenv,
+    target_python_full_version,
     target_python_version,
     validate_target_platform,
 )
+from .lockfiles import detect_lockfile, load_lockfile, target_environment
+
+DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
 logger=logging.getLogger(__name__)
 
@@ -263,7 +268,13 @@ class ImageBuilder:
 
         os_name, arch = parse_platform(self.config.platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
-        report_system_packages(self.config, base_layers)
+        locked_names = ()
+        if self.config.include_deps and self._uses_lockfile():
+            locked_names = tuple(
+                package.name
+                for package in self._lock_selection(base_config, os_name, arch).packages
+            )
+        report_system_packages(self.config, base_layers, locked_names)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
@@ -564,9 +575,73 @@ class ImageBuilder:
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
+        if self.config.include_deps:
+            try:
+                kind, value = self._dependency_source()
+            except (OSError, ValueError) as error:
+                print(f"  Dependency Source: unresolved ({error})")
+            else:
+                described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
+                print(f"  Dependency Source: {kind} ({described})")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
+
+    def _uses_lockfile(self) -> bool:
+        if self.config.lockfile:
+            return True
+        if self.config.requirements_file or not self.config.use_lockfile:
+            return False
+        return detect_lockfile(Path(self.config.context_dir)) is not None
+
+    def _dependency_source(self):
+        """Choose the dependency source: lock, requirements file, or virtualenv."""
+        cached = getattr(self, "_dependency_source_cache", None)
+        if cached is not None:
+            return cached
+        ctx = Path(self.config.context_dir)
+        if self.config.lockfile:
+            source = ("lock", relative_context_path(self.config.lockfile))
+        elif self.config.requirements_file:
+            source = ("requirements", relative_context_path(self.config.requirements_file))
+        else:
+            detected = detect_lockfile(ctx) if self.config.use_lockfile else None
+            if detected:
+                print(f"Using lockfile {detected} for dependencies (disable with --no-lockfile).")
+                source = ("lock", Path(detected))
+            else:
+                deps_paths = find_dependencies(
+                    ctx,
+                    DEFAULT_REQUIREMENTS_FILE,
+                    exclude_paths=self.dependency_excludes,
+                    exclude_defaults=False,
+                )
+                if not deps_paths:
+                    raise FileNotFoundError(
+                        "Dependency staging was requested, but no supported lockfile, "
+                        "virtualenv site-packages or requirements.txt was found."
+                    )
+                if any(relative == Path(DEFAULT_REQUIREMENTS_FILE) for _, relative in deps_paths):
+                    source = ("requirements", Path(DEFAULT_REQUIREMENTS_FILE))
+                else:
+                    source = ("venv", deps_paths)
+        self._dependency_source_cache = source
+        return source
+
+    def _lock_selection(self, base_config, os_name, arch):
+        cached = getattr(self, "_lock_selection_cache", None)
+        if cached is not None:
+            return cached
+        _, relative = self._dependency_source()
+        environment = target_environment(
+            os_name,
+            arch,
+            target_python_version(self.config.base_image, base_config),
+            target_python_full_version(base_config),
+        )
+        selection = load_lockfile(Path(self.config.context_dir), relative, environment)
+        self._lock_selection_cache = selection
+        return selection
 
     def _create_deps_layer(
         self,
@@ -576,25 +651,19 @@ class ImageBuilder:
         os_name: Optional[str] = None,
         arch: Optional[str] = None,
     ) -> Optional[OCILayer]:
-        """Create a target-compatible dependency layer from a venv or requirements."""
+        """Create a target-compatible dependency layer from a lock, requirements, or venv."""
         ctx=Path(self.config.context_dir)
-        deps_paths=find_dependencies(
-            ctx,
-            self.config.requirements_file,
-            exclude_paths=self.dependency_excludes,
-            exclude_defaults=False,
-        )
-        requirements_relative = Path(self.config.requirements_file)
-        if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
-            raise ValueError("Requirements path must be relative and stay inside the build context.")
-        is_requirements = any(
-            relative == requirements_relative for _, relative in deps_paths
-        )
-        if not deps_paths:
-            raise FileNotFoundError(
-                "Dependency staging was requested, but no supported virtualenv "
-                f"site-packages or {self.config.requirements_file!r} was found."
-            )
+        source_kind, source_value = self._dependency_source()
+        if source_kind == "venv":
+            deps_paths = source_value
+        elif source_kind == "requirements":
+            requirements_relative = source_value
+            if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
+                raise ValueError("Requirements path must be relative and stay inside the build context.")
+            if not (ctx / requirements_relative).is_file():
+                raise FileNotFoundError(
+                    f"Requirements file not found: {requirements_relative.as_posix()}"
+                )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
         validate_target_platform(os_name, arch)
@@ -611,7 +680,29 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
-            if is_requirements:
+            if source_kind == "lock":
+                selection = self._lock_selection(base_config, os_name, arch)
+                print(
+                    f"Staging {len(selection.packages)} locked packages from "
+                    f"{selection.path.as_posix()}..."
+                )
+                locked_requirements = stage_root / "locked-requirements.txt"
+                locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
+                try:
+                    install_requirements(
+                        locked_requirements,
+                        site_packages,
+                        ctx,
+                        os_name,
+                        arch,
+                        version,
+                        self.config.base_image,
+                        base_config,
+                        locked=True,
+                    )
+                finally:
+                    locked_requirements.unlink(missing_ok=True)
+            elif source_kind == "requirements":
                 install_requirements(
                     ctx / requirements_relative,
                     site_packages,

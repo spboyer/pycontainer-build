@@ -24,7 +24,9 @@ class BuildConfig:
     user: Optional[str] = None
     cmd: Optional[List[str]] = None
     include_deps: bool = False
-    requirements_file: str = "requirements.txt"
+    requirements_file: Optional[str] = None
+    lockfile: Optional[str] = None
+    use_lockfile: bool = True
     verbose: bool = False
     dry_run: bool = False
     platform: str = "linux/amd64"
@@ -48,6 +50,10 @@ class BuildConfig:
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
             )
+        if self.lockfile and self.requirements_file:
+            raise ValueError("lockfile and requirements_file are mutually exclusive.")
+        if self.lockfile and not self.use_lockfile:
+            raise ValueError("lockfile cannot be combined with use_lockfile = false.")
         if self.tags or self.semver_tags or self.latest_tag:
             from .tags import resolve_tags
 

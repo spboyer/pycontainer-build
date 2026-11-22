@@ -518,5 +518,5 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
     context.mkdir()
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
 
-    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+    with pytest.raises(FileNotFoundError, match="no supported lockfile, virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
