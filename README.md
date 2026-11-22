@@ -345,6 +345,18 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to requirements and
+  virtualenv staging alike.
 
 ### Local base images
 
@@ -363,8 +375,10 @@ pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./d
 pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
 ```
 
-- `oci:<path>[:<ref>]` selects an index entry by its
-  `org.opencontainers.image.ref.name` annotation (or `@sha256:<digest>`). The
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). For a single-entry index,
+  either annotation on the index itself can also identify the entry. The
   reference may be omitted when the layout holds one image, or a set of images
   that all carry platform metadata. Nested image indexes use the same exact
   OS/architecture/variant selection as registry pulls.
@@ -386,11 +400,12 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   member sizes are checked before any selected image blobs are staged.
 - Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
   are not supported; extract or decompress them first.
-- Dependency staging recognizes official Python images by name. For OCI layouts
-  the name comes from the `io.containerd.image.name` or ref-name annotation
-  (often only a tag such as `3.11-slim`), so such images need
-  `PYTHON_IMPLEMENTATION`, `PYTHON_VERSION`, and `PYTHON_LIBC` in their config
-  for `--include-deps`.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

@@ -211,6 +211,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 
@@ -405,7 +406,7 @@ class ImageBuilder:
         platforms=self.config.target_platforms()
         self._resolved_base_reference=None
         self._resolved_base_from_tag=False
-        self._base_image_tag_verified=False
+        self._base_image_tag_verified=None
         self._local_base_snapshot=None
         self._app_layer=None
         if len(platforms)>1:
@@ -973,7 +974,25 @@ class ImageBuilder:
                 f"target {os_name}/{arch}" + (f"/{variant}" if variant else "") + "."
             )
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
-        version = target_python_version(base_image_name, base_config)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        # Later platforms are pulled by the pinned index digest; they inherit tag
+        # provenance only when that digest was resolved from the initial tag pull.
+        # None means no registry pull recorded provenance (for example, a stub).
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+            and getattr(self, "_base_image_tag_verified", None) is not False
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+            variant=variant,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
@@ -989,6 +1008,7 @@ class ImageBuilder:
                     base_image_name,
                     base_config,
                     variant=variant,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(

@@ -58,7 +58,7 @@ class FakeBaseRegistry:
                 "os": "linux",
                 "architecture": arch,
                 **({"variant": config_variant} if config_variant else {}),
-                "config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc"], "WorkingDir": "/"},
+                "config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -178,17 +178,69 @@ def _record_tag_provenance(monkeypatch):
 def test_tag_provenance_survives_digest_pinning_only_for_tag_pulls(
     tmp_path, monkeypatch, reference, verified
 ):
-    registry = FakeBaseRegistry()
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"))
     seen = _record_tag_provenance(monkeypatch)
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_image=reference.format(digest=registry.index_digest),
     )
     builder.build()
 
     top_level = [ref for ref, _ in registry.manifest_calls if ref in ("3.11-slim", registry.index_digest)]
-    assert top_level[1] == registry.index_digest
-    assert seen == [("amd64", verified), ("arm64", verified)]
+    assert top_level[1:] == [registry.index_digest] * 2
+    assert seen == [("amd64", verified), ("arm64", verified), ("arm", verified)]
+
+
+@pytest.mark.parametrize("reference, resolve_tag, verified", [
+    ("registry.example/library/python:3.11-slim", True, True),
+    ("registry.example/library/python:3.11-slim", False, False),
+    ("registry.example/library/python:3.11-slim@{digest}", True, False),
+])
+def test_staging_abi_checks_receive_per_platform_tag_provenance(
+    tmp_path, monkeypatch, reference, resolve_tag, verified
+):
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"))
+    if not resolve_tag:
+        # The registry did not vouch for the tag with a digest.
+        client_factory = registry.client
+
+        def unresolved_client(*args, **kwargs):
+            client = client_factory()
+            pull = client.pull_manifest
+
+            def pull_manifest(ref, **expected):
+                manifest, digest = pull(ref, **expected)
+                return manifest, None if ref == "3.11-slim" else digest
+
+            client.pull_manifest = pull_manifest
+            return client
+
+        registry.client = unresolved_client
+    seen = []
+
+    def record(name):
+        def fake(*args, base_image_tag_verified=False, variant=None, **kwargs):
+            seen.append((name, base_image_tag_verified, variant))
+            return "3.11"
+        return fake
+
+    monkeypatch.setattr(builder_module, "target_python_version", record("version"))
+    monkeypatch.setattr(builder_module, "target_wheel_platform", record("wheel"))
+    monkeypatch.setattr(builder_module, "install_requirements", record("install"))
+    builder = _builder(
+        tmp_path, monkeypatch, registry, include_deps=True,
+        ctx=_context(tmp_path, requirements=True),
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+        base_image=reference.format(digest=registry.index_digest),
+    )
+    builder.build()
+
+    assert seen == [
+        (name, verified, None if name == "version" else variant)
+        for variant in (None, None, "v7")
+        for name in ("version", "wheel", "install")
+    ]
 
 
 def test_normalize_platforms_strips_and_dedupes():
@@ -270,7 +322,7 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
     registry = FakeBaseRegistry()
     installs = []
 
-    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, variant=None):
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
         installs.append((os_name, arch, base_config["architecture"]))
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
@@ -327,7 +379,7 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
     (site / "demo.py").write_text("X = 1\n")
     installs = []
 
-    def fake_install(requirements, site_packages, context, os_name, arch, version, base_image, base_config, variant=None):
+    def fake_install(requirements, site_packages, context, os_name, arch, version, base_image, base_config, **kwargs):
         installs.append(arch)
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
@@ -523,8 +575,8 @@ def test_arm_v7_index_selects_exact_variant_and_round_trips_it(tmp_path, monkeyp
     registry = FakeBaseRegistry(platforms=ARM_SET)
     installs = []
 
-    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, variant=None):
-        installs.append((arch, variant, base_config.get("variant")))
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
+        installs.append((arch, kwargs.get("variant"), base_config.get("variant")))
         (site_packages / f"native_{arch}").mkdir(parents=True)
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
