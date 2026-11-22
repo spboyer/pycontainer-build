@@ -37,6 +37,10 @@ jobs:
             sudo apt-get install -y -q skopeo
           fi
           skopeo --version
+      - name: Check Skopeo OCI reference selection
+        env:
+          PYTHONPATH: src
+        run: python tests/test_skopeo_tag_refs.py
       - name: Record an incomplete check until the script finishes
         env:
           TARGET_PLATFORM: ${{ matrix.platform }}
@@ -86,6 +90,8 @@ jobs:
           --require linux/amd64
           --require linux/arm64
           --commit ${{ github.sha }}
+          --run-id ${{ github.run_id }}
+          --run-attempt ${{ github.run_attempt }}
           --summary runtime-evidence-summary.md
           ${{ steps.download.outcome != 'success' && '--error "evidence download did not succeed"' || '' }}
           ${{ needs.startup.result != 'success' && format('--error "startup jobs in this attempt reported {0}"', needs.startup.result) || '' }}

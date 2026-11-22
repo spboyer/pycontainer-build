@@ -9,6 +9,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 COMMIT = "a" * 40
+RUN_ID = "12345"
+RUN_ATTEMPT = "2"
 
 
 def load_script(name):
@@ -30,9 +32,17 @@ def passing_record(target):
         "target_platform": target,
         "base_image": "python:3.11-slim",
         "commit": COMMIT,
+        "run_id": RUN_ID,
+        "run_attempt": RUN_ATTEMPT,
+        "started_at": "2026-11-22T14:40:00+00:00",
+        "finished_at": "2026-11-22T14:41:00+00:00",
         "daemon_platform": target,
         "image_platform": target,
-        "image": {"manifest_digest": "sha256:" + "b" * 64},
+        "image": {
+            "manifest_digest": "sha256:" + "b" * 64,
+            "config_digest": "sha256:" + "c" * 64,
+            "layer_digests": ["sha256:" + "d" * 64],
+        },
         "container_stdout": "pycontainer-runtime-dependency-ok\n",
         "docker_version": "28.0.0",
         "skopeo_version": "skopeo version 1.13.3",
@@ -57,6 +67,8 @@ def run_verifier(tmp_path, records):
         "--require", "linux/amd64",
         "--require", "linux/arm64",
         "--commit", COMMIT,
+        "--run-id", RUN_ID,
+        "--run-attempt", RUN_ATTEMPT,
         "--summary", str(summary),
     ])
     return code, summary.read_text()
@@ -93,6 +105,38 @@ def _no_digest(record):
     del record["image"]
 
 
+def _stale_attempt(record):
+    record["run_attempt"] = "1"
+
+
+def _stale_run(record):
+    record["run_id"] = "54321"
+
+
+def _malformed_digest(record):
+    record["image"]["manifest_digest"] = "sha256:not-a-digest"
+
+
+def _missing_config(record):
+    del record["image"]["config_digest"]
+
+
+def _missing_layers(record):
+    record["image"]["layer_digests"] = []
+
+
+def _missing_time(record):
+    del record["finished_at"]
+
+
+def _invalid_image(record):
+    record["image"] = "not an image object"
+
+
+def _reversed_time(record):
+    record["finished_at"] = "2026-11-22T14:39:00+00:00"
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -100,7 +144,15 @@ def _no_digest(record):
         (_partial, "is not a full OCI import and startup"),
         (_emulated, "daemon_platform 'linux/amd64' does not match linux/arm64"),
         (_stale, "expected " + COMMIT),
-        (_no_digest, "lacks the image manifest digest"),
+        (_no_digest, "image digest"),
+        (_stale_attempt, "run_attempt"),
+        (_stale_run, "run_id"),
+        (_malformed_digest, "image digest"),
+        (_missing_config, "image digest"),
+        (_missing_layers, "layer digests"),
+        (_missing_time, "timestamps"),
+        (_invalid_image, "image digest"),
+        (_reversed_time, "timestamps"),
     ],
 )
 def test_gate_rejects_unproven_target_and_separates_it_from_passing(tmp_path, mutate, reason):
@@ -175,6 +227,8 @@ def test_gate_fails_on_unreadable_evidence(tmp_path):
 
 def test_runtime_check_records_failure_when_docker_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_check.shutil, "which", lambda name: None)
+    monkeypatch.setenv("GITHUB_RUN_ID", RUN_ID)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT)
     evidence = tmp_path / "evidence.json"
 
     with pytest.raises(SystemExit, match="docker"):
@@ -183,6 +237,8 @@ def test_runtime_check_records_failure_when_docker_is_missing(tmp_path, monkeypa
     record = json.loads(evidence.read_text())
     assert record["status"] == "failed"
     assert record["target_platform"] == "linux/arm64"
+    assert record["run_id"] == RUN_ID
+    assert record["run_attempt"] == RUN_ATTEMPT
     assert "required executable not found: docker" in record["error"]
 
 
@@ -223,7 +279,11 @@ def test_release_is_blocked_by_the_runtime_gate():
     assert "continue-on-error" not in runtime
     assert "needs: [build, runtime]" in release
     assert not re.search(r"^    if:", release, re.M)
-    assert "name: runtime-evidence-summary" in release
+    assert "pattern: runtime-evidence-linux-*" in release
+    assert "python3 scripts/verify_runtime_evidence.py" in release
+    assert "--commit ${{ github.sha }}" in release
+    assert "--run-id ${{ github.run_id }}" in release
+    assert "--run-attempt ${{ github.run_attempt }}" in release
     assert "cat runtime-evidence/runtime-evidence-summary.md >> changelog.txt" in release
 
 
@@ -245,6 +305,8 @@ def test_runtime_workflow_requires_native_evidence_for_each_target():
     assert "--require linux/amd64" in gate
     assert "--require linux/arm64" in gate
     assert "--commit ${{ github.sha }}" in gate
+    assert "--run-id ${{ github.run_id }}" in gate
+    assert "--run-attempt ${{ github.run_attempt }}" in gate
 
 
 def test_pull_request_ci_runs_the_real_runtime_check():

@@ -61,12 +61,14 @@ The `Runtime image check` workflow runs it natively for `linux/amd64` and
 `linux/arm64` on same-repository pull requests, pushes to main and release
 tags. Its gate runs `scripts/verify_runtime_evidence.py`, which passes only
 when every required target has exactly one passing full import/startup record
-for the current commit and every startup job in the current workflow attempt
+for the current commit, workflow run and attempt, and every startup job
 succeeded. Missing (runner unavailable, skipped or cancelled), failed,
-incomplete, emulated, dependency-layer-only or duplicate evidence, or a failed
-evidence download, fails the gate and
-is listed under "Not validated" in the summary. A release cannot be created
-unless the gate passes, and the release notes include the validated targets.
+incomplete, emulated, dependency-layer-only, stale or duplicate evidence, or a
+failed evidence download, fails the gate and is listed under "Not validated"
+in the summary. Re-run all jobs rather than only failed jobs so every target
+produces evidence in the same attempt. A release cannot be created unless the
+gate passes and the release job re-verifies evidence for its own attempt. The
+release notes include the validated targets.
 Licensing and PyPI publication remain separate owner decisions (#79).
 
 ## Overview

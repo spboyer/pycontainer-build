@@ -98,10 +98,12 @@ It is not part of default pytest.
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
 same-repository PRs, pushes to main and release tags.
 `scripts/verify_runtime_evidence.py` then requires exactly one passing full
-record per target for the current commit; missing, skipped, failed, emulated,
-partial or duplicate evidence fails the gate and is listed separately as not
-validated. The release job depends on this gate and appends its summary to the
-release notes. Only targets listed as validated have runtime evidence.
+record per target for the current commit, workflow run and attempt; missing,
+skipped, failed, emulated, partial, stale or duplicate evidence fails the gate
+and is listed separately as not validated. Re-run all jobs, not just failed
+jobs, to produce fresh evidence for every target. The release job depends on
+this gate, re-verifies evidence for its own attempt and appends the summary to
+the release notes. Only targets listed as validated have runtime evidence.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark

@@ -120,6 +120,8 @@ def main(argv=None):
         "target_platform": args.platform,
         "base_image": args.base_image,
         "commit": os.environ.get("GITHUB_SHA"),
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
         "run_url": run_url(),
         "runner": {
             "os": platform_module.system(),

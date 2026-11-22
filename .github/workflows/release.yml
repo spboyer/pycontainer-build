@@ -84,11 +84,22 @@ jobs:
           name: dist
           path: dist/
       
-      - name: Download runtime evidence summary
+      - name: Download runtime evidence
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: runtime-evidence-summary
+          pattern: runtime-evidence-linux-*
           path: runtime-evidence/
+
+      - name: Verify release-attempt runtime evidence
+        run: >-
+          python3 scripts/verify_runtime_evidence.py
+          --evidence-dir runtime-evidence
+          --require linux/amd64
+          --require linux/arm64
+          --commit ${{ github.sha }}
+          --run-id ${{ github.run_id }}
+          --run-attempt ${{ github.run_attempt }}
+          --summary runtime-evidence/runtime-evidence-summary.md
       
       - name: Extract version from tag
         id: version

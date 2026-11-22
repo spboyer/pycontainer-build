@@ -8,13 +8,16 @@ duplicate or partial records are reported as not validated, never as passing.
 import argparse
 import json
 import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 EVIDENCE_SCHEMA = 1
 FULL_MODE = "oci-import-startup"
 RUNTIME_MARKER = "pycontainer-runtime-dependency-ok"
 MISSING_REASON = "no evidence recorded (runner unavailable, skipped or cancelled)"
+SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def os_arch(platform):
@@ -38,7 +41,11 @@ def load_records(evidence_dir):
     return records, errors
 
 
-def rejection_reason(record, target, commit):
+def valid_digest(value):
+    return isinstance(value, str) and SHA256.fullmatch(value) is not None
+
+
+def rejection_reason(record, target, commit, run_id, run_attempt):
     if record.get("schema") != EVIDENCE_SCHEMA:
         return f"unsupported evidence schema {record.get('schema')!r}"
     if record.get("status") != "passed":
@@ -47,22 +54,38 @@ def rejection_reason(record, target, commit):
         return f"mode {record.get('mode')!r} is not a full OCI import and startup"
     if commit and record.get("commit") != commit:
         return f"evidence is for commit {record.get('commit')!r}, expected {commit}"
+    for field, expected_value in (("run_id", run_id), ("run_attempt", run_attempt)):
+        if expected_value is not None and record.get(field) != expected_value:
+            return f"{field} {record.get(field)!r} does not match {expected_value}"
     expected = os_arch(target)
     for field in ("daemon_platform", "image_platform"):
         if record.get(field) != expected:
             return f"{field} {record.get(field)!r} does not match {expected}"
-    if RUNTIME_MARKER not in str(record.get("container_stdout", "")):
+    stdout = record.get("container_stdout")
+    if not isinstance(stdout, str) or RUNTIME_MARKER not in stdout:
         return "container output lacks the runtime dependency marker"
-    manifest = (record.get("image") or {}).get("manifest_digest")
-    if not (isinstance(manifest, str) and manifest.startswith("sha256:")):
-        return "evidence lacks the image manifest digest"
+    image = record.get("image")
+    if not isinstance(image, dict) or not all(
+        valid_digest(image.get(field)) for field in ("manifest_digest", "config_digest")
+    ):
+        return "evidence lacks valid image digests"
+    layers = image.get("layer_digests")
+    if not isinstance(layers, list) or not layers or not all(valid_digest(layer) for layer in layers):
+        return "evidence lacks valid layer digests"
+    try:
+        started = datetime.fromisoformat(record["started_at"])
+        finished = datetime.fromisoformat(record["finished_at"])
+        if started.utcoffset() is None or finished.utcoffset() is None or finished < started:
+            return "evidence has invalid timestamps"
+    except (KeyError, TypeError, ValueError):
+        return "evidence has invalid timestamps"
     for field in ("docker_version", "skopeo_version", "base_image"):
-        if not (isinstance(record.get(field), str) and record[field]):
+        if not (isinstance(record.get(field), str) and record[field].strip()):
             return f"evidence lacks {field}"
     return None
 
 
-def evaluate(records, required, commit):
+def evaluate(records, required, commit, run_id, run_attempt):
     by_target = {}
     for record in records:
         by_target.setdefault(record["target_platform"], []).append(record)
@@ -74,7 +97,7 @@ def evaluate(records, required, commit):
         elif len(matches) > 1:
             not_validated.append((target, f"{len(matches)} conflicting evidence records"))
         else:
-            reason = rejection_reason(matches[0], target, commit)
+            reason = rejection_reason(matches[0], target, commit, run_id, run_attempt)
             if reason:
                 not_validated.append((target, reason))
             else:
@@ -127,6 +150,8 @@ def main(argv=None):
         help="target platform that must pass, for example linux/amd64 (repeatable)",
     )
     parser.add_argument("--commit", help="commit SHA every record must match")
+    parser.add_argument("--run-id", help="workflow run ID every record must match")
+    parser.add_argument("--run-attempt", help="workflow attempt every record must match")
     parser.add_argument("--summary", type=Path, help="write the markdown summary here")
     parser.add_argument(
         "--error",
@@ -135,13 +160,17 @@ def main(argv=None):
         help="external failure that must fail the gate, such as an artifact download (repeatable)",
     )
     args = parser.parse_args(argv)
+    if (args.run_id is None) != (args.run_attempt is None):
+        parser.error("--run-id and --run-attempt must be supplied together")
 
     records, errors = load_records(args.evidence_dir)
     errors = args.error + errors
-    validated, not_validated, extra = evaluate(records, args.require, args.commit)
+    validated, not_validated, extra = evaluate(
+        records, args.require, args.commit, args.run_id, args.run_attempt
+    )
     if args.error:
         validated, not_validated = [], not_validated + [
-            (record["target_platform"], "evidence transfer was not verified") for record in validated
+            (record["target_platform"], "workflow check did not succeed") for record in validated
         ]
     summary = render_summary(validated, not_validated, extra, errors, args.commit)
     print(summary, end="")
