@@ -205,6 +205,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 
@@ -686,7 +687,20 @@ class ImageBuilder:
                 f"target {os_name}/{arch}."
             )
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
-        version = target_python_version(base_image_name, base_config)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
@@ -701,6 +715,7 @@ class ImageBuilder:
                     version,
                     base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(
