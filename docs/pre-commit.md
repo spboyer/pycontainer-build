@@ -13,7 +13,7 @@ in your repository's `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/spboyer/pycontainer-build
-    rev: e65f2f29381e3c7ebaf862e5a03fc4f0bf0b4e5a
+    rev: db07f36ef9e33f8cb6a3d5b87add1ee952cefae0
     hooks:
       - id: pycontainer-validate-config
 ```
