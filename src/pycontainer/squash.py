@@ -18,6 +18,8 @@ _FORBIDDEN_XATTR_PREFIXES = ("trusted.overlay.",)
 _FIELD_PAX_KEYS = {
     "path", "linkpath", "size", "uid", "gid", "uname", "gname", "mtime", "atime", "ctime",
 }
+# Not TarInfo fields, so they are copied through explicitly.
+_PRESERVED_TIME_KEYS = ("atime", "ctime")
 
 _ENTRY, _WHITEOUT, _OPAQUE = "entry", "whiteout", "opaque"
 
@@ -32,12 +34,11 @@ class SquashStats:
 
     source_layers: int = 0
     source_bytes: int = 0
-    source_member_bytes: int = 0
     output_bytes: int = 0
     output_members: int = 0
     dropped_entries: int = 0
     dropped_file_bytes: int = 0
-    dropped_tar_bytes: int = 0
+    predicted_bytes: int = 0
 
 
 @dataclass(eq=False)
@@ -143,7 +144,6 @@ class _Squasher:
         if record.kind == _ENTRY:
             info = record.info
             self.stats.dropped_entries += 1
-            self.stats.dropped_tar_bytes += info.offset_data - info.offset + _padded(info.size)
             if info.isreg():
                 self.stats.dropped_file_bytes += info.size
 
@@ -261,7 +261,7 @@ def _output_info(record: _Record) -> tarfile.TarInfo:
     info.type = source.type
     info.pax_headers = {
         key: value for key, value in source.pax_headers.items()
-        if key.startswith(_XATTR_PREFIX)
+        if key.startswith(_XATTR_PREFIX) or key in _PRESERVED_TIME_KEYS
     }
     if source.isreg():
         info.type = tarfile.REGTYPE
@@ -271,6 +271,16 @@ def _output_info(record: _Record) -> tarfile.TarInfo:
     elif source.islnk():
         info.linkname = record.link_target.path
     return info
+
+
+def _predicted_size(records) -> int:
+    """Size of the squashed tar computed from regenerated headers, without copying data."""
+    total = 2 * TAR_BLOCK_SIZE
+    for record in records:
+        info = _output_info(record)
+        total += len(info.tobuf(tarfile.PAX_FORMAT, tarfile.ENCODING, "surrogateescape"))
+        total += _padded(info.size)
+    return -(-total // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
 
 
 def _read_members(path: Path, layer: int, tar: tarfile.TarFile):
@@ -318,9 +328,9 @@ def squash_layers(layer_paths: Sequence[Path], destination: Optional[BinaryIO]) 
             tar = tarfile.open(path, mode="r:")
             sources.append(tar)
             squasher.apply_layer(layer, _read_members(path, layer, tar))
-            squasher.stats.source_member_bytes += tar.offset
         squasher.stats.source_layers = len(sources)
         squasher.validate()
+        squasher.stats.predicted_bytes = _predicted_size(squasher.state.values())
 
         writer = _CountingWriter(destination)
         emitted = set()

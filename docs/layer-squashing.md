@@ -40,8 +40,8 @@ on top of the base image, written as one OCI layer:
 - **Opaque directories:** `.wh..wh..opq` markers are kept. A squashed layer
   hides base-image content when a directory replaces a deleted or non-directory
   path, so pycontainer adds an opaque marker in that case.
-- **Metadata:** mode, uid/gid, user and group names, mtime, PAX path fields and
-  extended attributes are kept from the entry that wins. If a directory appears
+- **Metadata:** mode, uid/gid, user and group names, mtime, PAX `atime`/`ctime`
+  and extended attributes are kept from the entry that wins. If a directory appears
   in several layers, its metadata comes from the last one.
 - **Links:** symlinks are copied verbatim. Hard links must point at a regular
   file that the squashed layers themselves create. A link whose target a later
@@ -56,7 +56,9 @@ The build fails with `pycontainer.squash.SquashError` (a `ValueError`) and
 leaves any existing tags untouched if the builder layers contain something
 squashing cannot reproduce exactly:
 
-- absolute or `..` traversal paths, or entries naming the layer root
+- `..` traversal paths, entries naming the layer root, or names containing
+  control characters or backslashes (leading `/` and `.` components are
+  normalized, not rejected)
 - device, FIFO, contiguous or sparse entries, or non-regular entries that carry data
 - global PAX headers, unknown PAX keys, or `trusted.overlay.*` xattrs
 - whiteout markers that are not empty regular files, sit in a parent path
@@ -103,9 +105,12 @@ not referenced by any manifest, and there is no layout garbage collection yet.
   `measured_savings_bytes`, or `unsquashable` with the reason squashing would fail
 - `shared_blobs` (top level): layer blobs referenced by more than one platform
 
-The prediction is exact for the uncompressed tar: it is the live member bytes,
-plus the end-of-archive marker, rounded up to the 10 KiB tar record size. It
-matches the measured size in tests. In practice pycontainer's own layers rarely
+The prediction is computed from the regenerated headers and padded file sizes
+of the entries that will actually be written, plus the end-of-archive marker,
+rounded up to the 10 KiB tar record size, without copying file data. It matches
+the measured size in tests, including superseded directory headers and
+synthesized opaque markers; `measured_bytes` remains authoritative. In practice
+pycontainer's own layers rarely
 shadow each other, so the measured saving is usually only the record padding
 and end-of-archive overhead of the removed layer (a few KiB). Real savings need
 an application layer that overwrites or deletes dependency files.

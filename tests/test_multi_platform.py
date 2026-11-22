@@ -590,6 +590,24 @@ def test_squash_failure_keeps_existing_tags(tmp_path, monkeypatch):
     assert not list((out / "blobs" / "sha256").glob(".squash-layer-*"))
 
 
+@pytest.mark.parametrize("platform", [MULTI, "linux/amd64"])
+def test_layer_analysis_failure_keeps_existing_tags(tmp_path, monkeypatch, platform):
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+    (out / "refs" / "tags" / "v1").write_text("previous")
+
+    def failing_write(self, output, images):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(builder_module.ImageBuilder, "_write_layer_analysis", failing_write)
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), analyze_layers=True, platform=platform)
+    with pytest.raises(OSError, match="disk full"):
+        builder.build()
+    assert (out / "index.json").read_text() == "previous"
+    assert (out / "refs" / "tags" / "v1").read_text() == "previous"
+
+
 def test_layer_analysis_reports_prediction_and_shared_blobs(tmp_path, monkeypatch):
     _install_fake_deps(monkeypatch)
     builder = _builder(

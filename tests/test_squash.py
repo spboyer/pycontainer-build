@@ -211,3 +211,22 @@ def test_analysis_prediction_matches_measured_size_for_shadowed_layers(tmp_path)
     assert summary["dropped_file_bytes"] == 50000
     assert summary["predicted_bytes"] == summary["measured_bytes"]
     assert summary["measured_savings_bytes"] >= 50000
+
+@pytest.mark.parametrize("layers", [
+    # Directories repeated in every layer: only the last header is emitted.
+    [[_entry(f"app/d{i}", kind="dir") for i in range(20)] for _ in range(2)],
+    # Synthesized opaque marker and a whiteout consumed by a replacement directory.
+    [[_entry("app/x", data=b"x")], [_entry("app/.wh.x"), _entry("app/y", data=b"y")],
+     [_entry("app/x", kind="dir"), _entry("app/x/z", data=b"z")]],
+])
+def test_prediction_matches_written_size(tmp_path, layers):
+    _, _, stats, data = _squash(tmp_path, *layers)
+    assert stats.predicted_bytes == stats.output_bytes == len(data)
+
+
+def test_pax_access_and_change_times_are_preserved(tmp_path):
+    info, data = _entry("app/t", data=b"t")
+    info.pax_headers = {"atime": "12.5", "ctime": "34.25"}
+    members, _, _, _ = _squash(tmp_path, [_entry("app/other", data=b"o")], [(info, data)])
+    headers = members["app/t"][0].pax_headers
+    assert (headers["atime"], headers["ctime"]) == ("12.5", "34.25")

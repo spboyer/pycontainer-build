@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from .blob_store import HASH_CHUNK_SIZE
-from .squash import SquashError, SquashStats, TAR_BLOCK_SIZE, squash_layers
+from .squash import SquashError, SquashStats, squash_layers
 
 UNCOMPRESSED_TYPES = {
     "application/vnd.oci.image.layer.v1.tar",
@@ -78,14 +78,11 @@ def _squash_summary(source_layers: Sequence, stats: Optional[SquashStats], squas
         except SquashError as error:
             summary["unsquashable"] = str(error)
             return summary
-    # Live member bytes plus one end-of-archive marker, padded to whole tar records.
-    live = stats.source_member_bytes - stats.dropped_tar_bytes + 2 * TAR_BLOCK_SIZE
-    predicted = -(-live // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
     summary.update(
         source_bytes=stats.source_bytes,
         dropped_entries=stats.dropped_entries,
         dropped_file_bytes=stats.dropped_file_bytes,
-        predicted_bytes=predicted,
+        predicted_bytes=stats.predicted_bytes,
         measured_bytes=squashed.size if squashed is not None else stats.output_bytes,
     )
     summary["measured_savings_bytes"] = stats.source_bytes - summary["measured_bytes"]

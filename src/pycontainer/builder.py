@@ -430,6 +430,8 @@ class ImageBuilder:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
 
         image=self._build_platform_image(layers_dir, platforms[0])
+        if self.config.analyze_layers:
+            self._write_layer_analysis(output, [image])
 
         oci_layout=build_oci_layout()
         _atomic_write_bytes(
@@ -459,8 +461,6 @@ class ImageBuilder:
         self.layers=image.layers
         self.index_digest=None
         self.platform_images=[image]
-        if self.config.analyze_layers:
-            self._write_layer_analysis(output, [image])
         
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
@@ -489,6 +489,8 @@ class ImageBuilder:
         index_digest, index_size=self._write_image_index(layers_dir, images)
         _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
         self._verify_local_base_unchanged(layers_dir)
+        if self.config.analyze_layers:
+            self._write_layer_analysis(output, images)
 
         _atomic_write_bytes(
             output/'oci-layout',
@@ -509,8 +511,6 @@ class ImageBuilder:
         self.config_digest=None
         self.platform_images=images
         self.layers=list({layer.digest: layer for image in images for layer in image.layers}.values())
-        if self.config.analyze_layers:
-            self._write_layer_analysis(output, images)
         print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
         return self.config.tag
 
