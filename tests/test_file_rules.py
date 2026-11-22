@@ -11,6 +11,7 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 from pycontainer.file_rules import evaluate_condition, evaluate_file_rules
+from pycontainer.project import find_dependencies
 
 
 def _context(tmp_path):
@@ -303,6 +304,46 @@ def test_dry_run_tar_and_discovery_share_one_selection(tmp_path, capsys):
     layers.mkdir()
     with tarfile.open(builder._create_app_layer(layers).tar_path) as archive:
         assert sorted(archive.getnames()) == [f"app/{name}" for name in expected]
+
+
+def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys):
+    context = _context(tmp_path)
+    for name, text in {
+        "conda_env/conda-meta/history": "",
+        "conda_env/lib/site-packages/fastapi_shim.py": "from fastapi import FastAPI\napp = FastAPI()\n",
+        "debug_tools/deep/conda/conda-meta/history": "",
+        "debug_tools/deep/conda/bin/python.py": "native",
+        "requirements.txt": "flask\n",
+    }.items():
+        path = context / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    rules = [{"when": 'BUILD_MODE == "dev"', "include": "**"}]
+    config = _config(context, tmp_path, rules, build_args={"BUILD_MODE": "dev"},
+                     exclude_defaults=False, verbose=True, dry_run=True)
+    builder = ImageBuilder(config)
+    selected = [relative.as_posix() for _, relative in builder.context_files]
+    assert not any(name.startswith(("conda_env/", "debug_tools/deep/")) for name in selected)
+    assert "debug_tools/nested/trace.py" in selected
+    builder.build()
+    plan_lines = [line.strip() for line in capsys.readouterr().out.splitlines()]
+    assert not any(line.startswith(("conda_env", "debug_tools/deep")) for line in plan_lines)
+    assert "debug_tools/nested/trace.py" in plan_lines
+    assert "fastapi_shim" not in " ".join(config.entrypoint or [])
+
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    with tarfile.open(builder._create_app_layer(layers).tar_path) as archive:
+        assert sorted(archive.getnames()) == sorted(f"app/{name}" for name in selected)
+
+    assert [rel.as_posix() for _, rel in find_dependencies(context)] == ["requirements.txt"]
+
+    explicit = [{"when": 'BUILD_MODE == "dev"', "include": "conda_env/lib/**"}]
+    with pytest.raises(ValueError, match="Conda environment"):
+        _selected(_config(context, tmp_path, [], include_paths=["conda_env"]))
+    with pytest.raises(ValueError, match="Conda environment"):
+        _selected(_config(context, tmp_path, explicit,
+                          build_args={"BUILD_MODE": "dev"}))
 
 
 def test_same_size_same_time_edit_changes_cached_layer(tmp_path):

@@ -163,6 +163,24 @@ def _check_selected_link(base, path, relative):
         )
 
 
+def is_conda_prefix(path):
+    """Return whether a directory is a Conda environment prefix."""
+    return (Path(path) / "conda-meta").is_dir()
+
+
+def _check_conda_root(base, relative):
+    """Reject an include path at or inside a Conda environment prefix."""
+    current = Path(base)
+    for part in ("", *relative.parts):
+        current = current / part
+        if is_conda_prefix(current):
+            raise ValueError(
+                f"Include path {relative.as_posix()!r} is inside a Conda "
+                "environment; host Conda environments are never copied into "
+                "the image."
+            )
+
+
 def glob_root(pattern):
     """Return the literal leading directory a context glob can match beneath."""
     parts = []
@@ -205,6 +223,7 @@ def iter_files(
         relative = relative_context_path(relative_path)
         absolute = base / relative
         _check_root_links(base, relative)
+        _check_conda_root(base, relative)
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
                 absolute, topdown=True, onerror=_raise_walk_error
@@ -215,6 +234,7 @@ def iter_files(
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
+                    and not is_conda_prefix(root_path / directory)
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename

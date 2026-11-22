@@ -4,6 +4,7 @@ from typing import List, Tuple
 from .fs_utils import (
     DEFAULT_CONTEXT_EXCLUDES,
     VIRTUALENV_EXCLUDES,
+    is_conda_prefix,
     iter_files,
     path_is_excluded,
     relative_context_path,
@@ -81,7 +82,7 @@ def find_dependencies(
     venv_dirs=['venv','.venv','env']
     for venv in venv_dirs:
         venv_path=ctx/venv
-        if venv_path.exists():
+        if venv_path.exists() and not is_conda_prefix(venv_path):
             for item, relative in iter_files(
                 ctx,
                 [venv],
