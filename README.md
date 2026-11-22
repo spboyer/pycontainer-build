@@ -305,7 +305,8 @@ By default, `pycontainer` auto-detects:
 
 [Framework detection](docs/framework-detection.md) documents commands,
 precedence, ambiguous projects, explicit overrides, and Jupyter authentication.
-Detection does not install dependencies or execute application code.
+Detection does not install dependencies or execute application code. For a root
+image user, the generated Jupyter command permits root; prefer a non-root user.
 
 ### Explicit Configuration
 

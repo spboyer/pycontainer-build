@@ -23,6 +23,7 @@ DEFAULT_CONTEXT_EXCLUDES = (
     "**/.pycontainer",
     "**/.cache",
     "**/.hypothesis",
+    "**/.ipynb_checkpoints",
     "**/build",
     "**/dist",
     "**/tests",

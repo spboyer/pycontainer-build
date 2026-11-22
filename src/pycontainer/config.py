@@ -4,6 +4,35 @@ from typing import Dict, List, Optional, Union
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
 
+def _track_port_mutation(method):
+    def tracked(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        self.specified = True
+        return result
+    return tracked
+
+
+class _DefaultPorts(list):
+    """Keep the mutable list API while distinguishing an untouched default."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.specified = bool(self)
+
+    append = _track_port_mutation(list.append)
+    clear = _track_port_mutation(list.clear)
+    extend = _track_port_mutation(list.extend)
+    insert = _track_port_mutation(list.insert)
+    pop = _track_port_mutation(list.pop)
+    remove = _track_port_mutation(list.remove)
+    reverse = _track_port_mutation(list.reverse)
+    sort = _track_port_mutation(list.sort)
+    __delitem__ = _track_port_mutation(list.__delitem__)
+    __iadd__ = _track_port_mutation(list.__iadd__)
+    __imul__ = _track_port_mutation(list.__imul__)
+    __setitem__ = _track_port_mutation(list.__setitem__)
+
+
 @dataclass
 class BuildConfig:
     tag: str = "local/test:latest"
@@ -12,7 +41,7 @@ class BuildConfig:
     workdir: str = "/app"
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = field(default_factory=dict)
-    exposed_ports: Optional[List[int]] = None
+    exposed_ports: List[int] = field(default_factory=_DefaultPorts)
     include_paths: Optional[List[str]] = None
     exclude_paths: List[str] = field(default_factory=list)
     exclude_defaults: bool = True
@@ -58,3 +87,10 @@ class BuildConfig:
         from .tags import resolve_tags
 
         return resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def has_exposed_ports(self) -> bool:
+        """Return whether ports were explicitly configured or detected."""
+        return self.exposed_ports is not None and (
+            not isinstance(self.exposed_ports, _DefaultPorts)
+            or self.exposed_ports.specified
+        )

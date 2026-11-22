@@ -25,6 +25,7 @@ _PIP_PLATFORMS = {
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
+_REQUIREMENT_VARIABLE = re.compile(r"\$\{([A-Z0-9_]+)\}")
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
     "--build",
@@ -257,11 +258,23 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def _logical_requirement_lines(path):
+def _logical_requirement_lines(path, *, display=None):
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAX_REQUIREMENTS_BYTES + 1)
+    except OSError as exc:
+        if display is not None and display != path:
+            raise OSError(f"Cannot read requirements file: {display}") from exc
+        raise
+    if len(data) > MAX_REQUIREMENTS_BYTES:
+        raise ValueError(
+            "Requirements files exceed the combined "
+            f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+        )
     continuation = ""
     start_line = 1
     for line_number, raw_line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
+        data.decode("utf-8").splitlines(), start=1
     ):
         if not continuation:
             start_line = line_number
@@ -271,23 +284,33 @@ def _logical_requirement_lines(path):
             yield start_line, continuation + raw_line
             continuation = ""
     if continuation:
-        raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
+        raise ValueError(
+            f"Requirements file has an incomplete line continuation: {display or path}"
+        )
+
+
+def _expand_requirement_variables(line):
+    def expand(match):
+        return os.environ.get(match.group(1)) or match.group(0)
+
+    return _REQUIREMENT_VARIABLE.sub(expand, line)
 
 
 def validate_requirements(requirements: Path, context_dir: Path) -> None:
     context_root = context_dir.resolve()
-    pending = [requirements.resolve(strict=True)]
+    pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     total_bytes = 0
     while pending:
-        path = pending.pop()
+        path, environment_path = pending.pop()
         if path in visited:
             continue
         try:
             path.relative_to(context_root)
         except ValueError as exc:
+            display = "<environment-based requirements file>" if environment_path else path
             raise ValueError(
-                f"Requirements include must stay inside the build context: {path}"
+                f"Requirements include must stay inside the build context: {display}"
             ) from exc
         visited.add(path)
         size = path.stat().st_size
@@ -298,11 +321,13 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
 
-        for _, line in _logical_requirement_lines(path):
+        display = "<environment-based requirements file>" if environment_path else path
+        for _, line in _logical_requirement_lines(path, display=display):
+            expanded = _expand_requirement_variables(line)
             try:
-                options = shlex.split(line, comments=True)
+                options = shlex.split(expanded, comments=True)
             except ValueError as exc:
-                raise ValueError(f"Invalid requirements syntax in {path}.") from exc
+                raise ValueError(f"Invalid requirements syntax in {display}.") from exc
             if not options:
                 continue
             for option in options:
@@ -316,7 +341,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
             option = options[0]
             if option in {"-r", "--requirement", "-c", "--constraint"}:
                 if len(options) != 2:
-                    raise ValueError(f"Invalid requirements include in {path}.")
+                    raise ValueError(f"Invalid requirements include in {display}.")
                 include = options[1]
             elif option.startswith("--requirement="):
                 include = option.split("=", 1)[1]
@@ -328,13 +353,21 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 include = option[2:]
 
             if include is not None:
+                if _REQUIREMENT_VARIABLE.search(include):
+                    raise ValueError("Requirements include contains an unset environment variable.")
                 if include.startswith(("http://", "https://", "file://")):
                     raise ValueError(
                         "Remote and file-URL requirements includes are unsupported; "
                         "use a local file inside the build context."
                     )
-                included_path = (path.parent / include).resolve(strict=True)
-                pending.append(included_path)
+                environment_include = environment_path or expanded != line
+                try:
+                    included_path = (path.parent / include).resolve(strict=True)
+                except OSError as exc:
+                    if environment_include:
+                        raise OSError("Cannot access an environment-based requirements include.") from exc
+                    raise
+                pending.append((included_path, environment_include))
 
 
 def stage_virtualenv(

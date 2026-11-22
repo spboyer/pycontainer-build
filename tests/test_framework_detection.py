@@ -9,7 +9,10 @@ import pytest
 from pycontainer.builder import ImageBuilder
 from pycontainer import cli
 from pycontainer.config import BuildConfig
+from pycontainer.dependencies import MAX_REQUIREMENTS_BYTES
 from pycontainer.framework import apply_framework_defaults, detect_framework
+from pycontainer.fs_utils import iter_files
+from pycontainer.project import default_include_paths
 
 
 def write_file(context, name, content):
@@ -221,11 +224,12 @@ def test_gradio_without_matching_launch_requires_an_explicit_entrypoint(tmp_path
         detect_framework(tmp_path)
 
 
-def test_gradio_unlaunched_component_does_not_hide_the_unique_app(tmp_path):
+def test_gradio_unlaunched_component_does_not_hide_the_unique_app(tmp_path, caplog):
     write_file(tmp_path, "requirements.txt", "gradio\n")
     write_file(tmp_path, "components.py", "import gradio as gr\ncomponent = gr.Interface()\n")
     write_file(tmp_path, "app.py", "import gradio as gr\napp = gr.Blocks()\napp.launch()\n")
     assert detect_framework(tmp_path) == ("Gradio", ["python", "app.py"], [7860])
+    assert "no matching launch" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -344,6 +348,216 @@ def test_detector_accepts_preselected_files_and_never_executes_them(tmp_path):
     assert not marker.exists()
 
 
+def test_selected_files_accept_an_alias_for_the_context_root(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    alias = tmp_path / "context-alias"
+    write_file(context, "requirements.txt", "streamlit\n")
+    write_file(context, "app.py", "import streamlit\n")
+    original_resolve = Path.resolve
+
+    def resolve_alias(path, *args, **kwargs):
+        if path == alias or alias in path.parents:
+            path = context / path.relative_to(alias)
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_alias)
+    assert detect_framework(alias, files=[alias / "app.py"])[0] == "Streamlit"
+
+
+def test_selected_files_still_reject_a_resolved_path_outside_context(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    source = write_file(context, "app.py", "import streamlit\n")
+    outside = write_file(tmp_path, "outside.py", "import streamlit\n")
+    original_resolve = Path.resolve
+
+    def resolve_source(path, *args, **kwargs):
+        if path == source:
+            path = outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_source)
+    with pytest.raises(ValueError, match="outside the build context"):
+        detect_framework(context, files=[source])
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [
+        ("FastAPI", "from fastapi import FastAPI\napp = FastAPI()\n"),
+        ("Flask", "from flask import Flask\napp = Flask(__name__)\n"),
+    ],
+)
+def test_multiple_legacy_web_apps_require_explicit_selection(tmp_path, name, source):
+    write_file(tmp_path, "first.py", source)
+    write_file(tmp_path, "second.py", source)
+    with pytest.raises(ValueError, match=f"Multiple {name}"):
+        detect_framework(tmp_path)
+
+
+def test_unmounted_gradio_with_fastapi_is_not_silently_ignored(tmp_path, caplog):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\n")
+
+    assert detect_framework(tmp_path)[0] == "FastAPI"
+    assert "gradio" in caplog.text.lower()
+    assert "launch" in caplog.text.lower()
+
+
+def test_ambiguous_web_app_still_reports_the_separate_celery_worker(tmp_path, caplog):
+    write_file(tmp_path, "requirements.txt", "streamlit\ncelery\n")
+    write_file(tmp_path, "first.py", "import streamlit\n")
+    write_file(tmp_path, "second.py", "import streamlit\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+
+    with pytest.raises(ValueError, match="Multiple Streamlit"):
+        detect_framework(tmp_path)
+    assert "separate" in caplog.text.lower()
+
+
+def test_ambiguous_celery_with_explicit_command_clears_default_ports(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    for name in ("first.py", "second.py"):
+        write_file(tmp_path, name, "from celery import Celery\napp = Celery()\n")
+
+    config = BuildConfig(entrypoint=["celery", "-A", "first:app", "worker"])
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == ["celery", "-A", "first:app", "worker"]
+    assert config.exposed_ports == []
+    assert config.labels["framework"] == "celery"
+
+
+def test_default_ports_remain_mutable_and_mutations_are_overrides(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+
+    config = BuildConfig()
+    assert config.exposed_ports == []
+    config.exposed_ports.append(9000)
+    apply_framework_defaults(config, tmp_path)
+    assert config.exposed_ports == [9000]
+
+    cleared = BuildConfig()
+    cleared.exposed_ports.append(9000)
+    cleared.exposed_ports.clear()
+    apply_framework_defaults(cleared, tmp_path)
+    assert cleared.exposed_ports == []
+
+
+def test_jupyter_checkpoints_are_excluded_unless_default_excludes_are_disabled(tmp_path):
+    write_file(tmp_path, "requirements.txt", "jupyterlab\n")
+    write_file(tmp_path, "notebooks/research.ipynb", "{}")
+    write_file(tmp_path, "notebooks/.ipynb_checkpoints/research-checkpoint.ipynb", "{}")
+
+    defaults = default_include_paths(tmp_path)
+    names = {relative.as_posix() for _, relative in iter_files(tmp_path, defaults)}
+    assert "notebooks/research.ipynb" in names
+    assert "notebooks/.ipynb_checkpoints/research-checkpoint.ipynb" not in names
+
+    defaults = default_include_paths(tmp_path, exclude_defaults=False)
+    names = {
+        relative.as_posix()
+        for _, relative in iter_files(tmp_path, defaults, exclude_defaults=False)
+    }
+    assert "notebooks/.ipynb_checkpoints/research-checkpoint.ipynb" in names
+
+
+def test_notebook_selection_preserves_the_existing_context_fallback(tmp_path):
+    write_file(tmp_path, "requirements/custom.txt", "jupyterlab\n")
+    write_file(tmp_path, "notebooks/research.ipynb", "{}")
+    write_file(tmp_path, "data/input.csv", "value\n1\n")
+
+    paths = default_include_paths(tmp_path, requirements_file="requirements/custom.txt")
+    names = {relative.as_posix() for _, relative in iter_files(tmp_path, paths)}
+    assert "data/input.csv" in names
+
+
+def test_jupyter_default_allows_root_only_for_root_images(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "jupyterlab\n")
+    write_file(context, "analysis.ipynb", "{}")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "root-image"), use_cache=False
+    )
+    command = image_config_from_build(tmp_path, monkeypatch, config)["Entrypoint"]
+    assert "--allow-root" in command
+    assert not any("token" in arg.lower() or "password" in arg.lower() for arg in command)
+
+    non_root = BuildConfig(
+        context_dir=str(context),
+        output_dir=str(tmp_path / "user-image"),
+        use_cache=False,
+        user="1000",
+    )
+    command = image_config_from_build(tmp_path, monkeypatch, non_root)["Entrypoint"]
+    assert "--allow-root" not in command
+
+
+def test_src_layout_celery_uses_its_import_root(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "celery\n")
+    write_file(context, "src/proj/__init__.py", "")
+    write_file(
+        context, "src/proj/celery.py",
+        "from celery import Celery\napp = Celery('proj', include=['proj.tasks'])\n",
+    )
+    write_file(context, "src/proj/tasks.py", "")
+    assert detect_framework(context)[1][2] == "proj.celery:app"
+
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False
+    )
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["PYTHONPATH=/base/packages"]
+    )
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert image["Entrypoint"][2] == "proj.celery:app"
+    assert env["PYTHONPATH"] == "/app/src:/base/packages"
+
+
+def test_environment_requirements_includes_and_vcs_names_are_recognized(tmp_path, monkeypatch):
+    write_file(tmp_path, "requirements.txt", "-r ${PROJECT_REQUIREMENTS}\n")
+    write_file(tmp_path, "requirements/worker.txt", "git+https://example.invalid/repo.git#egg=celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    monkeypatch.setenv("PROJECT_REQUIREMENTS", "requirements/worker.txt")
+
+    assert detect_framework(tmp_path)[0] == "Celery"
+
+
+def test_unresolved_requirements_include_warns_without_disclosing_values(tmp_path, monkeypatch, caplog):
+    write_file(tmp_path, "requirements.txt", "-r ${UNSET_REQUIREMENTS_FILE}\n")
+    write_file(tmp_path, "app.py", "print('not a framework')\n")
+    monkeypatch.delenv("UNSET_REQUIREMENTS_FILE", raising=False)
+
+    assert detect_framework(tmp_path) is None
+    assert "requirements" in caplog.text.lower()
+
+
+def test_missing_environment_requirements_path_is_not_disclosed(tmp_path, monkeypatch):
+    write_file(tmp_path, "requirements.txt", "-r ${PROJECT_REQUIREMENTS}\n")
+    monkeypatch.setenv("PROJECT_REQUIREMENTS", "sensitive-private-name.txt")
+    with pytest.raises(FileNotFoundError) as error:
+        detect_framework(tmp_path)
+    assert "sensitive-private-name" not in str(error.value)
+
+
+def test_framework_dependency_discovery_rejects_oversized_requirements(tmp_path):
+    write_file(tmp_path, "requirements.txt", "-r nested.txt\n")
+    (tmp_path / "nested.txt").write_bytes(b"#" * MAX_REQUIREMENTS_BYTES)
+    with pytest.raises(ValueError, match="combined.*limit"):
+        detect_framework(tmp_path)
+
+
+def test_unparseable_source_does_not_silently_choose_a_fallback(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\nthis is not valid Python !!!\n")
+
+    with pytest.raises(ValueError, match="explicit entrypoint"):
+        detect_framework(tmp_path)
+    config = BuildConfig(entrypoint=["python", "app.py"])
+    assert apply_framework_defaults(config, tmp_path).entrypoint == ["python", "app.py"]
+
+
 @pytest.mark.parametrize("ports", [[9000], []])
 def test_user_command_entrypoint_and_ports_override_detection(tmp_path, ports):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
@@ -424,12 +638,12 @@ def test_cli_configured_command_is_shown_without_auto_entrypoint(tmp_path, monke
     assert "Exposed Ports: <cleared>" in stdout
 
 
-def image_config_from_build(tmp_path, monkeypatch, config):
+def image_config_from_build(tmp_path, monkeypatch, config, base_env=None):
     base = {
         "architecture": "amd64",
         "os": "linux",
         "config": {
-            "Env": [],
+            "Env": base_env or [],
             "WorkingDir": "/",
             "Entrypoint": ["base-entrypoint"],
             "Cmd": ["python3"],
@@ -448,6 +662,158 @@ def image_config_from_build(tmp_path, monkeypatch, config):
 
     manifest = blob(index["manifests"][0]["digest"])
     return blob(manifest["config"]["digest"])["config"]
+
+
+def test_gradio_default_preserves_an_inherited_bind_address(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "gradio\n")
+    write_file(context, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False
+    )
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["GRADIO_SERVER_NAME=127.0.0.1"]
+    )
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert env["GRADIO_SERVER_NAME"] == "127.0.0.1"
+
+
+def test_explicit_gradio_script_selects_its_defaults_over_fastapi(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "gradio\n")
+    write_file(context, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(context, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(
+        context_dir=str(context),
+        output_dir=str(tmp_path / "image"),
+        use_cache=False,
+        entrypoint=["python", "demo.py"],
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert image["Entrypoint"] == ["python", "demo.py"]
+    assert image["ExposedPorts"] == {"7860/tcp": {}}
+    assert env["GRADIO_SERVER_NAME"] == "0.0.0.0"
+
+
+def test_explicit_gradio_script_resolves_ambiguous_candidates(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "gradio\n")
+    for name in ("first.py", "second.py"):
+        write_file(context, name, "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=["python", "first.py"],
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert image["Entrypoint"] == ["python", "first.py"]
+    assert image["ExposedPorts"] == {"7860/tcp": {}}
+    assert env["GRADIO_SERVER_NAME"] == "0.0.0.0"
+
+
+def test_explicit_command_disambiguates_frameworks_in_one_script(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\ngradio\n")
+    write_file(
+        tmp_path, "app.py",
+        "import streamlit\nimport gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n",
+    )
+    config = BuildConfig(entrypoint=["python", "app.py"])
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == ["python", "app.py"]
+    assert config.labels["framework"] == "gradio"
+    assert config.exposed_ports == [7860]
+
+
+def test_multiple_gradio_listener_ports_require_explicit_ports(tmp_path):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(
+        tmp_path, "app.py",
+        "import gradio as gr\ndemo = gr.Blocks()\n"
+        "demo.launch(server_port=8123)\ndemo.launch(server_port=8124)\n",
+    )
+    with pytest.raises(ValueError, match="exposed ports"):
+        apply_framework_defaults(BuildConfig(entrypoint=["python", "app.py"]), tmp_path)
+    config = BuildConfig(exposed_ports=[8124])
+    apply_framework_defaults(config, tmp_path)
+    assert config.exposed_ports == [8124]
+
+
+@pytest.mark.parametrize(
+    ("requirements", "source", "variable", "expected"),
+    [
+        ("streamlit", "import streamlit\n", "STREAMLIT_SERVER_PORT", 9100),
+        ("gradio", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n", "GRADIO_SERVER_PORT", 9200),
+    ],
+)
+def test_framework_defaults_honor_inherited_listener_ports(
+    tmp_path, monkeypatch, requirements, source, variable, expected
+):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", requirements + "\n")
+    write_file(context, "app.py", source)
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False
+    )
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=[f"{variable}={expected}"]
+    )
+    assert image["ExposedPorts"] == {f"{expected}/tcp": {}}
+    if requirements == "streamlit":
+        assert f"--server.port={expected}" in image["Entrypoint"]
+
+
+@pytest.mark.parametrize(
+    ("env", "ports", "expected"),
+    [
+        ({"STREAMLIT_SERVER_PORT": "9000"}, None, 9000),
+        ({}, [9001], 9001),
+    ],
+)
+def test_streamlit_generated_command_honors_configured_port(tmp_path, env, ports, expected):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = BuildConfig(env=env, **({"exposed_ports": ports} if ports is not None else {}))
+    apply_framework_defaults(config, tmp_path)
+    assert f"--server.port={expected}" in config.entrypoint
+    assert config.exposed_ports == [expected]
+
+
+def test_streamlit_rejects_conflicting_user_configured_ports(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = BuildConfig(env={"STREAMLIT_SERVER_PORT": "9000"}, exposed_ports=[9001])
+    with pytest.raises(ValueError, match="conflicts"):
+        apply_framework_defaults(config, tmp_path)
+    assert config.env["STREAMLIT_SERVER_PORT"] == "9000"
+    assert config.exposed_ports == [9001]
+
+
+def test_streamlit_does_not_change_explicit_command_or_ports_on_conflict(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = BuildConfig(
+        entrypoint=["custom"], env={"STREAMLIT_SERVER_PORT": "9000"},
+        exposed_ports=[9001],
+    )
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == ["custom"]
+    assert config.env["STREAMLIT_SERVER_PORT"] == "9000"
+    assert config.exposed_ports == [9001]
+
+
+@pytest.mark.parametrize(
+    ("source", "env", "expected"),
+    [
+        ("demo.launch(server_port=8123)\n", {}, 8123),
+        ("demo.launch()\n", {"GRADIO_SERVER_PORT": "9876"}, 9876),
+    ],
+)
+def test_gradio_configured_listener_port_is_exposed(tmp_path, source, env, expected):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(tmp_path, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\n" + source)
+    config = apply_framework_defaults(BuildConfig(env=env), tmp_path)
+    assert config.exposed_ports == [expected]
 
 
 def test_generated_celery_image_does_not_inherit_base_command_or_ports(tmp_path, monkeypatch):

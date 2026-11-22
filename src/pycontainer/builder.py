@@ -178,7 +178,7 @@ def _select_index_descriptor(
     )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
-from .framework import apply_framework_defaults
+from .framework import _environment_port, apply_framework_defaults
 from .registry_client import (
     RegistryClient,
     RegistryRequestError,
@@ -296,30 +296,100 @@ class ImageBuilder:
         all_layers=base_layers+app_layers
 
         image_env = dict(self.config.env)
-        if getattr(self, "_dependency_site_packages", False):
-            base_env = {
-                item.split("=", 1)[0]: item.split("=", 1)[1]
-                for item in base_config.get("config", {}).get("Env", [])
-                if "=" in item
-            }
+        base_env = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in (base_config or {}).get("config", {}).get("Env", [])
+            if "=" in item
+        }
+        detection = getattr(self.config, "_framework_detection", None)
+        if detection and detection.name == "Gradio":
+            for name, value in getattr(self.config, "_framework_default_env", {}).items():
+                if name in base_env and image_env.get(name) == value:
+                    image_env.pop(name)
+
+        exposed_ports = (
+            self.config.exposed_ports if self.config.has_exposed_ports() else None
+        )
+        generated_entrypoint = (
+            getattr(self.config, "_framework_entrypoint_generated", False)
+            and entry is getattr(self.config, "_framework_generated_entrypoint", None)
+            and tuple(entry) == getattr(self.config, "_framework_entrypoint_snapshot", ())
+        )
+        generated_ports = (
+            getattr(self.config, "_framework_ports_generated", False)
+            and exposed_ports is getattr(self.config, "_framework_generated_ports", None)
+            and tuple(exposed_ports) == getattr(self.config, "_framework_ports_snapshot", ())
+        )
+        if (
+            detection and detection.name == "Jupyter" and entry
+            and generated_entrypoint
+        ):
+            image_user = self.config.user or (base_config or {}).get("config", {}).get("User", "")
+            if image_user.partition(":")[0] in ("", "0", "root"):
+                entry = [*entry, "--allow-root"]
+        if detection and detection.name == "Streamlit" and entry:
+            if generated_entrypoint:
+                entry = list(entry)
+                if (
+                    "STREAMLIT_SERVER_PORT" not in self.config.env
+                    and "STREAMLIT_SERVER_PORT" in base_env
+                    and generated_ports
+                ):
+                    port = _environment_port(base_env["STREAMLIT_SERVER_PORT"], "STREAMLIT_SERVER_PORT")
+                    entry[-1] = f"--server.port={port}"
+                    exposed_ports = [port]
+                if (
+                    "STREAMLIT_SERVER_ADDRESS" not in self.config.env
+                    and "STREAMLIT_SERVER_ADDRESS" in base_env
+                ):
+                    entry[-2] = f"--server.address={base_env['STREAMLIT_SERVER_ADDRESS']}"
+        if (
+            detection and detection.name == "Gradio"
+            and not detection.port_from_source
+            and generated_ports
+            and "GRADIO_SERVER_PORT" not in self.config.env
+            and "GRADIO_SERVER_PORT" in base_env
+        ):
+            exposed_ports = [_environment_port(base_env["GRADIO_SERVER_PORT"], "GRADIO_SERVER_PORT")]
+
+        dependency_site = getattr(self, "_dependency_site_packages", False)
+        source_root = detection.source_root if detection and detection.name == "Celery" else None
+        if dependency_site or source_root:
             prefix = self.config.workdir.rstrip("/") + "/.python"
             site_path = f"{prefix}/site-packages"
             bin_path = f"{prefix}/bin"
             current_pythonpath = image_env.get(
                 "PYTHONPATH", base_env.get("PYTHONPATH", "")
             )
-            current_path = image_env.get(
-                "PATH",
-                base_env.get(
-                    "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                ),
-            )
             image_env["PYTHONPATH"] = ":".join(
-                part for part in (site_path, current_pythonpath) if part
+                part for part in (
+                    site_path if dependency_site else None,
+                    f"{self.config.workdir.rstrip('/')}/{source_root}" if source_root else None,
+                    current_pythonpath,
+                ) if part
             )
-            image_env["PATH"] = f"{bin_path}:{current_path}"
+            if dependency_site:
+                current_path = image_env.get(
+                    "PATH",
+                    base_env.get(
+                        "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                    ),
+                )
+                image_env["PATH"] = f"{bin_path}:{current_path}"
+                if detection and detection.name == "Jupyter":
+                    for name, present, relative in (
+                        ("JUPYTER_PATH", self._staged_jupyter_data, "share/jupyter"),
+                        ("JUPYTER_CONFIG_PATH", self._staged_jupyter_config, "etc/jupyter"),
+                    ):
+                        if present:
+                            current = image_env.get(name, base_env.get(name, ""))
+                            image_env[name] = ":".join(
+                                part for part in (current, f"{site_path}/{relative}") if part
+                            )
+                    if self._staged_jupyter_lab and "JUPYTERLAB_DIR" not in base_env:
+                        image_env.setdefault("JUPYTERLAB_DIR", f"{site_path}/share/jupyter/lab")
 
-        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
+        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers])
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
@@ -577,7 +647,7 @@ class ImageBuilder:
         print(f"  Entrypoint: {entrypoint}")
         if self.config.cmd is not None:
             print(f"  Command: {' '.join(self.config.cmd) or '<cleared>'}")
-        if self.config.exposed_ports is not None:
+        if self.config.has_exposed_ports():
             ports = ", ".join(map(str, self.config.exposed_ports)) or "<cleared>"
             print(f"  Exposed Ports: {ports}")
         if self.config.env:
@@ -658,6 +728,11 @@ class ImageBuilder:
                 key=lambda path: path.relative_to(stage_root).as_posix(),
             )
             self._dependency_site_packages = bool(files)
+            self._staged_jupyter_data = (site_packages / "share" / "jupyter").is_dir()
+            self._staged_jupyter_config = (site_packages / "etc" / "jupyter").is_dir()
+            self._staged_jupyter_lab = (
+                site_packages / "share" / "jupyter" / "lab" / "static" / "index.html"
+            ).is_file()
             if not files:
                 return None
 

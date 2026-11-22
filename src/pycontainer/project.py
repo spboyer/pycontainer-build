@@ -1,6 +1,7 @@
 import configparser, logging, shlex, tomllib, re
 from pathlib import Path, PureWindowsPath
 from typing import List, Tuple
+from urllib.parse import unquote
 from .fs_utils import (
     DEFAULT_CONTEXT_EXCLUDES,
     VIRTUALENV_EXCLUDES,
@@ -11,10 +12,17 @@ from .fs_utils import (
 
 logger = logging.getLogger(__name__)
 _REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+_VCS_REQUIREMENT = re.compile(r"^(?:git|hg|svn|bzr)\+")
 
 
 def requirement_name(requirement):
-    match = _REQUIREMENT_NAME.match(requirement.strip())
+    requirement = requirement.strip()
+    if _VCS_REQUIREMENT.match(requirement):
+        egg = re.search(r"[#&]egg=([^&\s]+)", requirement)
+        if not egg:
+            return None
+        requirement = unquote(egg.group(1))
+    match = _REQUIREMENT_NAME.match(requirement)
     return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else None
 
 
@@ -26,7 +34,12 @@ def declared_dependency_names(
     exclude_defaults=True,
 ):
     """Read declared runtime dependency names without resolving or installing them."""
-    from .dependencies import _logical_requirement_lines
+    from .dependencies import (
+        MAX_REQUIREMENTS_BYTES,
+        _REQUIREMENT_VARIABLE,
+        _expand_requirement_variables,
+        _logical_requirement_lines,
+    )
 
     ctx = Path(context_dir)
     root = ctx.resolve()
@@ -35,8 +48,9 @@ def declared_dependency_names(
         excludes.extend(exclude_paths)
     names = set()
     visited = set()
+    total_bytes = 0
 
-    def selected_file(relative):
+    def selected_file(relative, *, display=None):
         relative = relative_context_path(relative)
         if path_is_excluded(relative, excludes):
             return None
@@ -44,26 +58,35 @@ def declared_dependency_names(
         if not path.is_file():
             return None
         if not path.resolve().is_relative_to(root):
-            raise ValueError(f"Dependency file is outside the build context: {relative}")
+            raise ValueError(f"Dependency file is outside the build context: {display or relative}")
         return path
 
-    def read_requirements(relative, *, required=False):
+    def read_requirements(relative, *, required=False, environment_path=False):
+        nonlocal total_bytes
         relative = relative_context_path(relative)
-        path = selected_file(relative)
+        display = "<environment-based requirements file>" if environment_path else relative
+        path = selected_file(relative, display=display)
         if path is None:
             if required and not path_is_excluded(relative, excludes):
-                raise FileNotFoundError(f"Requirements file not found: {relative}")
+                raise FileNotFoundError(f"Requirements file not found: {display}")
             return
         resolved = path.resolve()
         if resolved in visited:
             return
         visited.add(resolved)
-        for line_number, line in _logical_requirement_lines(path):
+        total_bytes += path.stat().st_size
+        if total_bytes > MAX_REQUIREMENTS_BYTES:
+            raise ValueError(
+                "Requirements files exceed the combined "
+                f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+            )
+        for line_number, line in _logical_requirement_lines(path, display=display):
+            expanded = _expand_requirement_variables(line)
             try:
-                parts = shlex.split(line, comments=True)
+                parts = shlex.split(expanded, comments=True)
             except ValueError as error:
                 raise ValueError(
-                    f"Invalid requirement syntax in {relative} at line {line_number}"
+                    f"Invalid requirement syntax in {display} at line {line_number}"
                 ) from error
             if not parts:
                 continue
@@ -72,7 +95,7 @@ def declared_dependency_names(
             if first in ("-r", "--requirement"):
                 if len(parts) != 2:
                     raise ValueError(
-                        f"Invalid requirements include in {relative} at line {line_number}"
+                        f"Invalid requirements include in {display} at line {line_number}"
                     )
                 nested = parts[1]
             elif first.startswith("--requirement="):
@@ -80,8 +103,14 @@ def declared_dependency_names(
             elif first.startswith("-r") and len(first) > 2:
                 nested = first[2:]
             if nested is not None:
+                if _REQUIREMENT_VARIABLE.search(nested):
+                    logger.warning(
+                        "Cannot inspect an unresolved requirements include in %s at line %s",
+                        display, line_number,
+                    )
+                    continue
                 if "://" in nested:
-                    logger.warning("Cannot inspect a remote requirements include in %s", relative)
+                    logger.warning("Cannot inspect a remote requirements include in %s", display)
                 else:
                     nested_path = Path(nested)
                     windows_path = PureWindowsPath(nested)
@@ -92,16 +121,23 @@ def declared_dependency_names(
                         or windows_path.root
                     ):
                         raise ValueError(
-                            f"Invalid requirements include in {relative} at line {line_number}"
+                            f"Invalid requirements include in {display} at line {line_number}"
                         )
                     resolved = (ctx / relative.parent / nested_path).resolve()
                     if not resolved.is_relative_to(root):
                         raise ValueError(
-                            f"Requirements include in {relative} escapes the build context"
+                            f"Requirements include in {display} escapes the build context"
                         )
-                    read_requirements(resolved.relative_to(root), required=True)
-            elif not first.startswith("-"):
-                name = requirement_name(line)
+                    read_requirements(
+                        resolved.relative_to(root),
+                        required=True,
+                        environment_path=environment_path or expanded != line,
+                    )
+            elif not first.startswith("-") or first in ("-e", "--editable"):
+                declaration = expanded
+                if first in ("-e", "--editable"):
+                    declaration = expanded.strip()[len(first):].strip()
+                name = requirement_name(declaration)
                 if name:
                     names.add(name)
 
@@ -187,6 +223,8 @@ def default_include_paths(
     for f in ("pyproject.toml","requirements.txt","setup.cfg"):
         if (ctx/f).exists() and not path_is_excluded(f, excludes):
             c.append(f)
+    if not c:
+        c.append(".")
     dependencies = declared_dependency_names(
         ctx, requirements_file, exclude_paths=excludes, exclude_defaults=False
     )
@@ -197,14 +235,13 @@ def default_include_paths(
         ):
             if path.suffix != ".ipynb":
                 continue
-            if include_notebooks:
+            if include_notebooks and c != ["."]:
                 c.append(relative.as_posix())
-            else:
+            elif not include_notebooks:
                 logger.debug(
                     "Notebooks found but no jupyterlab or notebook dependency is declared."
                 )
                 break
-    if not c: c.append(".")
     return c
 
 def find_dependencies(

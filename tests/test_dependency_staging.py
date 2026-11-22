@@ -38,7 +38,7 @@ BASE_CONFIG = {
 }
 
 
-def _write_wheel(wheelhouse: Path, tag: str = "py3-none-any") -> Path:
+def _write_wheel(wheelhouse: Path, tag: str = "py3-none-any", data_files=None) -> Path:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     wheel_path = wheelhouse / f"fixture_dep-1.0-{tag}.whl"
     files = {
@@ -57,6 +57,8 @@ def _write_wheel(wheelhouse: Path, tag: str = "py3-none-any") -> Path:
             "[console_scripts]\nfixture-dep = fixture_dep:main\n"
         ).encode(),
     }
+    for name, content in (data_files or {}).items():
+        files[f"fixture_dep-1.0.data/data/{name}"] = content
     record = io.StringIO()
     writer = csv.writer(record, lineterminator="\n")
     for name, content in files.items():
@@ -171,6 +173,70 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
     assert [(package["name"], package["versionInfo"]) for package in sbom["packages"]] == [
         ("fixture-dep", "1.0")
     ]
+
+
+def test_staged_jupyter_data_paths_are_added_without_replacing_user_paths(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "analysis.ipynb").write_text("{}")
+    (context / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["jupyterlab"]\n'
+    )
+    _write_wheel(
+        context / "wheelhouse",
+        data_files={
+            "share/jupyter/lab/static/index.html": b"fixture",
+            "etc/jupyter/jupyter_server_config.d/fixture.json": b"{}",
+        },
+    )
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        env={"JUPYTER_PATH": "/custom/data", "JUPYTER_CONFIG_PATH": "/custom/config"},
+    )
+    builder.build()
+    config_path = (
+        Path(builder.config.output_dir)
+        / "blobs"
+        / "sha256"
+        / builder.config_digest.split(":", 1)[1]
+    )
+    image = json.loads(config_path.read_text())["config"]
+    environment = dict(item.split("=", 1) for item in image["Env"])
+    assert environment["JUPYTERLAB_DIR"] == "/app/.python/site-packages/share/jupyter/lab"
+    assert environment["JUPYTER_PATH"] == "/custom/data:/app/.python/site-packages/share/jupyter"
+    assert environment["JUPYTER_CONFIG_PATH"] == "/custom/config:/app/.python/site-packages/etc/jupyter"
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/share/jupyter/lab/static/index.html" in archive.getnames()
+
+
+def test_dependency_staging_expands_environment_requirements_includes(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(context / "wheelhouse")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n-r ${NESTED_REQUIREMENTS}\n"
+    )
+    (context / "nested.txt").write_text("fixture-dep==1.0\n")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", "nested.txt")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    builder.build()
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+
+
+def test_environment_expansion_cannot_override_pip_target_options(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("${PIP_OVERRIDE}\n")
+    monkeypatch.setenv("PIP_OVERRIDE", "--target outside")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
 
 
 def test_excluded_explicit_requirements_still_install_dependencies(
@@ -365,15 +431,16 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
     requirements = context / "requirements.txt"
     requirements.write_bytes(b"#" * (MAX_REQUIREMENTS_BYTES + 1))
     (context / "app.py").write_text("print('app')\n")
-    builder = ImageBuilder(
-        BuildConfig(
-            context_dir=str(context),
-            include_deps=True,
-            use_cache=False,
-        )
-    )
     with pytest.raises(ValueError, match="Requirements files exceed"):
-        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+        ImageBuilder(
+            BuildConfig(
+                context_dir=str(context),
+                include_deps=True,
+                use_cache=False,
+            )
+        )
+    with pytest.raises(ValueError, match="Requirements files exceed"):
+        validate_requirements(requirements, context)
 
 
 def test_requirements_install_rejects_incompatible_cpython_wheel(tmp_path, monkeypatch):
