@@ -99,6 +99,8 @@ builder's supported credential providers.
 
 ## Development
 
+Use Node.js 22.13 or later in the Node.js 22 line for the lint and packaging tools.
+
 From the repository root, install the core into the selected Python
 environment, then run the extension checks:
 
