@@ -35,6 +35,9 @@ def main():
     b.add_argument("--sign-timestamp-url",help="Notation timestamp authority URL (without credentials)")
     b.add_argument("--sign-timestamp-root-cert",help="Notation timestamp authority root certificate path")
     b.add_argument("--sign-signature-format",choices=NOTATION_SIGNATURE_FORMATS,help="Notation signature envelope format")
+    b.add_argument("--sign-verify-key",help="Cosign public key reference used to verify a key-signed image before tagging")
+    b.add_argument("--sign-certificate-identity",help="Expected Cosign keyless certificate identity, verified before tagging")
+    b.add_argument("--sign-certificate-oidc-issuer",help="Expected Cosign keyless OIDC issuer, verified before tagging")
     b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
     b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
@@ -118,6 +121,9 @@ def main():
         'sign_timestamp_url': args.sign_timestamp_url,
         'sign_timestamp_root_cert': args.sign_timestamp_root_cert,
         'sign_signature_format': args.sign_signature_format,
+        'sign_verify_key': args.sign_verify_key,
+        'sign_certificate_identity': args.sign_certificate_identity,
+        'sign_certificate_oidc_issuer': args.sign_certificate_oidc_issuer,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 

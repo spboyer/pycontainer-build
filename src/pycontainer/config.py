@@ -67,6 +67,9 @@ class BuildConfig:
     sign_timestamp_url: Optional[str] = None
     sign_timestamp_root_cert: Optional[str] = None
     sign_signature_format: Optional[str] = None
+    sign_verify_key: Optional[str] = None
+    sign_certificate_identity: Optional[str] = None
+    sign_certificate_oidc_issuer: Optional[str] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -113,6 +116,7 @@ class BuildConfig:
         for name in (
             "sign_key", "sign_plugin", "sign_key_id",
             "sign_timestamp_url", "sign_timestamp_root_cert", "sign_signature_format",
+            "sign_verify_key", "sign_certificate_identity", "sign_certificate_oidc_issuer",
         ):
             value = getattr(self, name)
             if value is None:
@@ -144,6 +148,29 @@ class BuildConfig:
                 )
             ):
                 raise ValueError("Cosign does not use Notation plugin, timestamp, or format options.")
+            keyless_trust = (self.sign_certificate_identity, self.sign_certificate_oidc_issuer)
+            if self.sign_key is not None:
+                if self.sign_verify_key is None or any(keyless_trust):
+                    raise ValueError(
+                        "Cosign key signing requires sign_verify_key, the public key used to "
+                        "verify the signature, and no keyless certificate options."
+                    )
+            elif self.sign_verify_key is not None or not all(keyless_trust):
+                raise ValueError(
+                    "Cosign keyless signing requires sign_certificate_identity and "
+                    "sign_certificate_oidc_issuer for verification."
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.sign_verify_key, self.sign_certificate_identity,
+                self.sign_certificate_oidc_issuer,
+            )
+        ):
+            raise ValueError(
+                "Notation verification uses its trust policy; Cosign verification "
+                "options are not supported."
+            )
         elif (
             (self.sign_key is None) == (self.sign_plugin is None)
             or (self.sign_plugin is None) != (self.sign_key_id is None)

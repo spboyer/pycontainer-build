@@ -971,6 +971,15 @@ class ImageBuilder:
             ) from None
 
         try:
+            signer.verify(subject)
+        except SigningError as error:
+            raise SigningError(
+                f"Verifying the signature of {subject} failed: {error} "
+                f"{publication_details()} Signature artifacts may remain. "
+                f"Requested image tags not attempted: {', '.join(tag_refs)}."
+            ) from None
+
+        try:
             self._verify_published_manifest(client, digest, digest, size, media_type)
         except (RegistryRequestError, BlobIntegrityError, OSError):
             raise RegistryRequestError(
