@@ -248,8 +248,9 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
 
 
 @pytest.mark.parametrize("by_digest", [False, True])
+@pytest.mark.parametrize("arm_first", [False, True])
 def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
-    tmp_path, monkeypatch, by_digest
+    tmp_path, monkeypatch, by_digest, arm_first
 ):
     registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"), base_env=[])
     installs = []
@@ -262,10 +263,13 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     base_image = "python:3.11-slim"
     if by_digest:
         base_image += "@" + registry.index_digest
+    platforms = ["linux/amd64", "linux/arm64", "linux/arm/v7"]
+    if arm_first:
+        platforms = ["linux/arm/v7", "linux/amd64", "linux/arm64"]
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
         ctx=_context(tmp_path, requirements=True), base_image=base_image,
-        platform="linux/amd64,linux/arm64,linux/arm/v7",
+        platform=",".join(platforms),
     )
 
     if by_digest:
@@ -275,11 +279,14 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
         assert not (tmp_path / "out" / "index.json").exists()
     else:
         builder.build()
-        assert installs == [
+        expected = [
             ("amd64", None, "3.11", True),
             ("arm64", None, "3.11", True),
             ("arm", "v7", "3.11", True),
         ]
+        if arm_first:
+            expected = expected[-1:] + expected[:-1]
+        assert installs == expected
 
 
 def test_normalize_platforms_strips_and_dedupes():

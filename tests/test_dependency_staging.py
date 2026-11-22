@@ -91,7 +91,10 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
 
 
 @pytest.mark.parametrize("arch, variant", [("amd64", None), ("arm", "v7")])
-def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypatch, arch, variant):
+@pytest.mark.parametrize("implementation", [False, True])
+def test_staging_rejects_tag_without_recorded_pull_provenance(
+    tmp_path, monkeypatch, arch, variant, implementation
+):
     context = tmp_path / "context"
     context.mkdir()
     (context / "requirements.txt").write_text("fixture-dep==1.0\n")
@@ -103,7 +106,10 @@ def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypa
         "os": "linux",
         "architecture": arch,
         **({"variant": variant} if variant else {}),
-        "config": {"Env": ["PYTHON_VERSION=3.11.8"]},
+        "config": {"Env": [
+            "PYTHON_VERSION=3.11.8",
+            *(["PYTHON_IMPLEMENTATION=CPython"] if implementation else []),
+        ]},
     }
 
     with pytest.raises(ValueError, match="unverified or custom base image"):
