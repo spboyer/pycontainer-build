@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
@@ -56,6 +56,12 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    tag_from_git: bool = False
+    git_fallback: Optional[str] = None
+    allow_dirty: bool = False
+    _git_tag_snapshot: Optional[Tuple[str, str, str, bool]] = field(
+        init=False, default=None, repr=False, compare=False
+    )
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -69,6 +75,19 @@ class BuildConfig:
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
             )
+        if not isinstance(self.tag_from_git, bool) or not isinstance(self.allow_dirty, bool):
+            raise ValueError("tag_from_git and allow_dirty must be booleans.")
+        if self.git_fallback not in (None, "sha"):
+            raise ValueError("git_fallback must be 'sha' when specified.")
+        if not self.tag_from_git and (self.git_fallback is not None or self.allow_dirty):
+            raise ValueError("--git-fallback and --allow-dirty require --tag-from-git.")
+        if self.tag_from_git:
+            from .tags import git_tag_snapshot, replace_primary_tag
+
+            self._git_tag_snapshot = git_tag_snapshot(
+                self.context_dir, self.git_fallback, self.allow_dirty
+            )
+            self.tag = replace_primary_tag(self.tag, self._git_tag_snapshot[2])
         if self.tags or self.semver_tags or self.latest_tag:
             from .tags import resolve_tags
 
@@ -98,3 +117,31 @@ class BuildConfig:
         from .tags import resolve_tags
 
         return resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def validate_git_tag(self) -> None:
+        """Check that the Git state used to configure this build has not changed."""
+        if not self.tag_from_git:
+            return
+        from .registry_client import parse_image_reference
+        from .tags import GitTagError, git_tag_snapshot
+
+        snapshot = git_tag_snapshot(self.context_dir, self.git_fallback, self.allow_dirty)
+        if snapshot != self._git_tag_snapshot:
+            raise GitTagError(
+                "Git context, HEAD or exact tag changed after configuration; "
+                "create a fresh build configuration."
+            )
+        if parse_image_reference(self.tag)[2] != snapshot[2]:
+            raise GitTagError("The Git-derived primary image tag changed after configuration.")
+
+    def validate_git_tag_reference(self, *, check_head: bool) -> None:
+        """Check the build's selected Git tag before publishing its image."""
+        if not self.tag_from_git:
+            return
+        from .registry_client import parse_image_reference
+        from .tags import GitTagError, validate_git_tag_reference
+
+        snapshot = self._git_tag_snapshot
+        if snapshot is None or parse_image_reference(self.tag)[2] != snapshot[2]:
+            raise GitTagError("The Git-derived primary image tag changed after configuration.")
+        validate_git_tag_reference(snapshot, check_head=check_head)

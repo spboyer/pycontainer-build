@@ -4,6 +4,7 @@ from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
+from .tags import GitTagError
 
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
@@ -23,6 +24,9 @@ def main():
     b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
     b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
     b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
+    b.add_argument("--tag-from-git",action="store_true",default=None,help="Use the exact Git tag on HEAD as the primary image tag")
+    b.add_argument("--git-fallback",choices=("sha",),help="Use sha-<12 chars> if HEAD has no exact Git tag")
+    b.add_argument("--allow-dirty",action="store_true",default=None,help="Allow Git-derived tags with a dirty worktree")
     b.add_argument("--base-image",help="Base image to layer on: a registry reference, oci:<path>[:<ref>|@sha256:<digest>], or docker-archive:<path>[:<repo-tag>] (auto-detected from requires-python if not specified)")
     b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
@@ -86,6 +90,9 @@ def main():
         'tags': args.tag[1:] if args.tag else None,
         'semver_tags': args.semver_tags,
         'latest_tag': args.latest_tag,
+        'tag_from_git': args.tag_from_git,
+        'git_fallback': args.git_fallback,
+        'allow_dirty': args.allow_dirty,
         'base_image': args.base_image,
         'context_dir': args.context_dir,
         'include_paths': args.include_paths,
@@ -121,20 +128,26 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    builder=ImageBuilder(cfg)
-    out=builder.build()
+    try:
+        builder=ImageBuilder(cfg)
+        out=builder.build()
+    except GitTagError as exc:
+        parser.error(str(exc))
     print("Built:", out)
     
     if args.push:
         password=args.password
         if args.username and not password:
             password=os.getenv('REGISTRY_PASSWORD')
-        builder.push(
-            registry_url=args.registry,
-            username=args.username,
-            password=password,
-            show_progress=not args.no_progress,
-        )
+        try:
+            builder.push(
+                registry_url=args.registry,
+                username=args.username,
+                password=password,
+                show_progress=not args.no_progress,
+            )
+        except GitTagError as exc:
+            parser.error(str(exc))
 
 if __name__=="__main__":
     main()

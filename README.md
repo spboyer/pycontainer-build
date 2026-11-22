@@ -75,6 +75,19 @@ pycontainer build --tag myapp:latest --platform linux/amd64
 pycontainer build --tag test:latest --dry-run --verbose
 ```
 
+### Git-derived image tags
+
+Use an exact Git tag on the build context's HEAD as the primary image version:
+
+```bash
+pycontainer build --tag ghcr.io/me/app --tag-from-git --semver-tags --latest
+```
+
+Git is required only for this opt-in. Untagged commits fail unless
+`--git-fallback sha` is specified; dirty worktrees require `--allow-dirty`.
+See [multiple tags](docs/multiple-tags.md#git-derived-versions) for configuration
+and limitations.
+
 ### Output
 
 Creates a complete OCI image layout at `dist/image/`:

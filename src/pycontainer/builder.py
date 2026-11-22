@@ -388,6 +388,7 @@ class ImageBuilder:
             self.cache=None
 
     def build(self):
+        self.config.validate_git_tag()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -412,6 +413,7 @@ class ImageBuilder:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
 
         image=self._build_platform_image(layers_dir, platforms[0])
+        self.config.validate_git_tag_reference(check_head=True)
 
         oci_layout=build_oci_layout()
         _atomic_write_bytes(
@@ -469,6 +471,7 @@ class ImageBuilder:
         index_digest, index_size=self._write_image_index(layers_dir, images)
         _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
         self._verify_local_base_unchanged(layers_dir)
+        self.config.validate_git_tag_reference(check_head=True)
 
         _atomic_write_bytes(
             output/'oci-layout',
@@ -801,17 +804,31 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
+        if getattr(self, "index_digest", None):
+            self.pushed_refs=[]
+        self.config.validate_git_tag_reference(check_head=False)
         
         target=registry_url or self.config.tag
+        if registry_url and self.config.tag_from_git:
+            from .tags import GitTagError, replace_primary_tag
+
+            version=parse_image_reference(self.config.tag)[2]
+            if "@" in registry_url:
+                raise GitTagError("--registry cannot use a digest with --tag-from-git.")
+            if (
+                ":" in registry_url.rsplit("/", 1)[-1]
+                and parse_image_reference(registry_url)[2] != version
+            ):
+                raise GitTagError(
+                    f"--registry tag must match the Git-derived version {version!r}."
+                )
+            target=replace_primary_tag(registry_url, version)
         registry, repo, tag=parse_image_reference(target)
         push_tags=[tag]
         for tag_ref in self.config.all_tags()[1:]:
             extra_tag=parse_image_reference(tag_ref)[2]
             if extra_tag not in push_tags: push_tags.append(extra_tag)
 
-        if getattr(self, "index_digest", None):
-            self.pushed_refs=[]
-        
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
