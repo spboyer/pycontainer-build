@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -665,3 +666,239 @@ def test_requirements_install_fails_closed_for_unknown_target_marker_values(
 
     with pytest.raises(ValueError, match=f"refusing to stage.*{variable}"):
         _install_marker_fixture(tmp_path, [requirement], "arm64", "3.11", full_version)
+
+
+def _write_venv(context, dists, pyvenv="version = 3.11.7\n"):
+    site_packages = context / ".venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (context / ".venv" / "pyvenv.cfg").write_text(pyvenv)
+    for name, headers in dists.items():
+        metadata = site_packages / f"{name.replace('-', '_')}-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+            + "".join(f"{header}\n" for header in headers)
+            + "\n"
+        )
+        (metadata / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+
+
+def _stage_venv(tmp_path, monkeypatch, context, arch="amd64"):
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    layer_dir = tmp_path / f"layers-{arch}"
+    layer_dir.mkdir(exist_ok=True)
+    return builder._create_deps_layer(
+        layer_dir,
+        base_config={**BASE_CONFIG, "architecture": arch},
+        os_name="linux",
+        arch=arch,
+    )
+
+
+def test_virtualenv_transitive_markers_are_verified_for_each_target(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(
+        context,
+        {"venv-root": ['Requires-Dist: venv-arm-helper; platform_machine == "aarch64"']},
+    )
+
+    assert _stage_venv(tmp_path, monkeypatch, context, "amd64") is not None
+    with pytest.raises(ValueError, match="refusing to stage.*venv-arm-helper"):
+        _stage_venv(tmp_path, monkeypatch, context, "arm64")
+
+    _write_venv(context, {"venv-arm-helper": []})
+    assert _stage_venv(tmp_path, monkeypatch, context, "arm64") is not None
+
+
+def test_virtualenv_root_markers_are_verified_for_the_target(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text(
+        "venv-root\n"
+        "venv-windows-only; sys_platform == 'win32'\n"
+        "venv-linux-only; sys_platform == 'linux'  # comment\n"
+    )
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+    _write_venv(context, {"venv-linux-only": []})
+    assert _stage_venv(tmp_path, monkeypatch, context) is not None
+
+
+def test_virtualenv_project_dependency_markers_are_verified(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "app"\n'
+        "dependencies = [\"venv-linux-only; sys_platform == 'linux'\"]\n"
+    )
+
+    with pytest.raises(ValueError, match="dependencies requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "headers, root, error",
+    [
+        (
+            [
+                "Provides-Extra: speed",
+                'Requires-Dist: venv-fast; extra == "speed"',
+                'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
+            ],
+            "",
+            None,
+        ),
+        (
+            [
+                "Provides-Extra: broker",
+                'Requires-Dist: venv-broker; platform_system == "Windows" and extra == "broker"',
+                'Requires-Dist: venv-broker; platform_system == "Darwin" and extra == "broker"',
+                'Requires-Dist: venv-broker; platform_system == "Linux" and extra == "broker"',
+            ],
+            "",
+            None,
+        ),
+        (
+            [
+                "Provides-Extra: gpu",
+                'Requires-Dist: venv-gpu; platform_machine == "x86_64" and extra == "gpu"',
+            ],
+            "",
+            "cannot tell whether extra 'gpu'",
+        ),
+        (
+            [
+                "Provides-Extra: speed",
+                'Requires-Dist: venv-fast; extra == "speed"',
+                'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
+            ],
+            "venv-root[speed]\n",
+            "venv-root requires venv-fast",
+        ),
+    ],
+)
+def test_virtualenv_extras_fail_only_when_their_request_cannot_be_ruled_out(
+    tmp_path, monkeypatch, headers, root, error
+):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": headers})
+    (context / "requirements.txt").write_text(root)
+
+    if error is None:
+        assert _stage_venv(tmp_path, monkeypatch, context) is not None
+    else:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_unknown_target_marker_values_fail_closed_when_missing(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(
+        context, {"venv-root": ['Requires-Dist: venv-kernel; platform_release >= "5"']}
+    )
+
+    with pytest.raises(ValueError, match="venv-kernel.*unknown for the target"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+    _write_venv(context, {"venv-kernel": []})
+    assert _stage_venv(tmp_path, monkeypatch, context) is not None
+
+
+def test_virtualenv_egg_info_requires_sections_are_verified(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {})
+    egg_info = context / ".venv" / "Lib" / "site-packages" / "venv_egg.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 1.1\nName: venv-egg\nVersion: 1.0\n")
+    (egg_info / "requires.txt").write_text('[:sys_platform == "linux"]\nvenv-linux-only\n')
+
+    with pytest.raises(ValueError, match="venv-egg requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_unparsed_root_markers_fail_closed(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": ['Requires-Dist: venv-any; python_version >= "3"']})
+    (context / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\nvenv-linux-only = { version = "*", platform = "linux" }\n'
+    )
+
+    with pytest.raises(ValueError, match=r"\[tool.poetry\] may declare environment markers"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_uv_virtualenv_version_info_must_match_image(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []}, pyvenv="implementation = CPython\nversion_info = 3.14\n")
+
+    with pytest.raises(ValueError, match="targets Python 3.14"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+def test_virtualenv_roots_include_files_seen_first_as_constraints(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text("-r base.txt\n-c constraints.txt\nvenv-root\n")
+    (context / "constraints.txt").write_text("-r base.txt\n")
+    (context / "base.txt").write_text("venv-linux-only; sys_platform != 'win32'\n")
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"Pipfile": "[packages]\nvenv-linux-only = {version = \"*\", markers = \"sys_platform != 'win32'\"}\n"},
+        {
+            "pyproject.toml": (
+                '[project]\nname = "app"\ndynamic = ["dependencies"]\n'
+                '[tool.setuptools.dynamic]\ndependencies = {file = ["deps.txt"]}\n'
+            ),
+            "deps.txt": "venv-linux-only; sys_platform != 'win32'\n",
+        },
+        {"pyproject.toml": '[project]\nname = "app"\ndynamic = ["dependencies"]\n'},
+    ],
+)
+def test_virtualenv_unparsed_dependency_sources_fail_closed(tmp_path, monkeypatch, files):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": ['Requires-Dist: venv-any; python_version >= "3"']})
+    for name, text in files.items():
+        (context / name).write_text(text)
+
+    with pytest.raises(ValueError, match="may declare environment markers|cannot be read"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_reads_roots_from_install_option_and_utf16_requirements(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text(
+        "--only-binary=:all:\nvenv-root\nvenv-linux-only; sys_platform == 'linux'\n",
+        encoding="utf-16",
+    )
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(context, {})
+    egg_info = context / ".venv" / "Lib" / "site-packages" / "venv_egg.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 1.1\nName: venv-egg\nVersion: 1.0\n")
+    (egg_info / "requires.txt").write_text("[Speed_Ups]\nvenv-fast\n")
+    (context / "requirements.txt").write_text("venv-egg[speed-ups]\n")
+
+    with pytest.raises(ValueError, match="venv-egg requires venv-fast"):
+        _stage_venv(tmp_path, monkeypatch, context)

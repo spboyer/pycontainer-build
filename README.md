@@ -349,7 +349,20 @@ pycontainer build \
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  is copied as resolved on its host, so its markers are not re-evaluated.
+  cannot be re-resolved, so it is verified instead: root requirements (the
+  requirements file and pyproject `[project]` dependencies, optional
+  dependencies and dependency groups) and every installed `Requires-Dist` are
+  re-evaluated for each target, and the build fails if a requirement the
+  target needs is missing, uses an unknown marker value, or belongs to an extra
+  or group whose request cannot be ruled out. An extra or group counts as not
+  requested only when it is missing a requirement that any Windows, Linux or
+  macOS CPython host of the venv's Python version would have installed. Only
+  package presence is checked, not versions; extra host-only packages are
+  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
+  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
+  also fail the build, as do dynamic dependencies that cannot be read. Use a
+  requirements file, which pip resolves for the target, when verification
+  fails.
   Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
   `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
   placeholders in the requirements file. Literal credentials in requirements
