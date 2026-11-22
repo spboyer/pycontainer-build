@@ -202,12 +202,19 @@ jobs:
             mkdir -p "$ov/l/d" "$ov/u" "$ov/w" "$ov/m"
             echo base >"$ov/l/f"
             echo keep >"$ov/l/d/x"
-            local script='mount -t overlay overlay -o lowerdir=/ov/l,upperdir=/ov/u,workdir=/ov/w,userxattr /ov/m || exit 1
-          echo overlay-userxattr-ok
-          rm /ov/m/f && rm -r /ov/m/d && mkdir /ov/m/d && echo whiteout-and-opaque-ok
-          umount /ov/m
-          ls -la /ov/u
-          python3 -c "import os, sys; [print(p, {n: os.getxattr(p, n, follow_symlinks=False) for n in os.listxattr(p, follow_symlinks=False)}) for p in sys.argv[1:]]" /ov/u/f /ov/u/d'
+            local script='grep CapEff /proc/self/status
+          python3 -c "import ctypes, os, sys; libc = ctypes.CDLL(None, use_errno=True); a = [s.encode() for s in sys.argv[1:]]; r = libc.mount(a[0], a[1], a[2], 0, a[3]); print(r, os.strerror(ctypes.get_errno()))" overlay /ov/m overlay lowerdir=/ov/l,upperdir=/ov/u,workdir=/ov/w,userxattr
+          umount /ov/m 2>/dev/null
+          mount -t tmpfs t /tmp && mkdir -p /tmp/l/d /tmp/u /tmp/w /tmp/m && echo base >/tmp/l/f && echo keep >/tmp/l/d/x && echo tmpfs-ok
+          for base in /ov /tmp; do
+            echo "== upper on $base"
+            mount -t overlay overlay -o lowerdir=$base/l,upperdir=$base/u,workdir=$base/w,userxattr $base/m || continue
+            echo overlay-userxattr-ok
+            rm $base/m/f && rm -r $base/m/d && mkdir $base/m/d && echo whiteout-and-opaque-ok
+            umount $base/m
+            ls -la $base/u
+            python3 -c "import os, sys; [print(p, {n: os.getxattr(p, n, follow_symlinks=False) for n in os.listxattr(p, follow_symlinks=False)}) for p in sys.argv[1:]]" $base/u/f $base/u/d
+          done'
             make_bundle crun "$tmp/ovb" \
               '.process.args = ["/usr/bin/sh", "-c", $script]
                | .process.capabilities.bounding += ["CAP_SYS_ADMIN"]
@@ -220,6 +227,9 @@ jobs:
             crun --root "$tmp/state-ov" delete --force probe-ov >/dev/null 2>&1
             echo "host view of upper dir:"
             ls -la "$ov/u"
+            echo "filesystem of upper dir: $(stat -fc %T "$ov/u")"
+            echo "kernel log:"
+            journalctl -k --since "-3 min" --no-pager 2>&1 | grep -iE 'overlay|apparmor' | tail -n 20
           }
 
           crun_cgroup_limits() {
