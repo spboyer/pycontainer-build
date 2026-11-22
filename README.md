@@ -147,10 +147,10 @@ pycontainer build --scan --scan-threshold critical --scan-unknown ignore
 JSON/SARIF reports include image digest, scanner version, database content
 digest/build time, policy and coverage limits, and are retained on findings
 failures. Database freshness is enforced even offline. **The adapter is
-experimental: fake-scanner tests pass; a real native-Windows run exposed an
-upstream `oci-dir:` cache-path failure, so that scanner host is rejected.
-Non-Windows compatibility and controlled-database/whiteout acceptance remain
-unverified.**
+experimental: a real Grype 0.119.0 acceptance run passed on linux/amd64 with
+a pinned database (OS and staged Python findings, whiteouts, JSON and SARIF);
+native Windows is rejected because of an upstream `oci-dir:` cache-path
+failure, and macOS/arm64 scanner hosts are unvalidated.**
 See [Vulnerability scanning](docs/vulnerability-scanning.md) for prerequisites,
 offline preparation, error behavior and the opt-in acceptance test.
 

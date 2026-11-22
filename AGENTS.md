@@ -80,7 +80,9 @@ Real scanner checks are separately marked `scanner_integration` and excluded
 by default. They require an explicitly selected Grype executable and controlled
 database digest; see [vulnerability scanning](docs/vulnerability-scanning.md)
 for the opt-in command and coverage limits. Fake-executable tests do not prove
-real Grype compatibility or OS/Python whiteout handling.
+real Grype compatibility or OS/Python whiteout handling. A real Grype 0.119.0
+`linux/amd64` acceptance run passed on 2026-11-22; native Windows is rejected
+and macOS/arm64 scanner hosts remain unvalidated.
 
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
