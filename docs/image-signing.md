@@ -151,11 +151,11 @@ notation verify ghcr.io/example/app@sha256:<digest>
 Notation verification uses its configured trust policy and trust store.
 Build-time verification uses the trust configuration supplied to the build; it
 is not independent verification by the consumer. A separate `cosign verify`
-with a public key succeeded against `ttl.sh` using v3.1.4 with the transparency
-log disabled. Keyless Cosign and Notation verification have not been exercised
-against real providers or registries. A valid signature authenticates an
-artifact only under the verifier's policy; it does not establish that an image
-is free of vulnerabilities or safe to run.
+with a public key succeeded against `ttl.sh` using v2.6.1 and v3.1.4 with
+default transparency settings; a wrong key failed. Keyless Cosign and Notation
+verification have not been exercised against real providers or registries. A
+valid signature authenticates an artifact only under the verifier's policy;
+it does not establish that an image is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
