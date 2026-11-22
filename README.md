@@ -363,7 +363,8 @@ pycontainer build \
   a retained distribution are preserved. A malformed `RECORD`, a stub
   distribution without a `RECORD`, or any `RECORD` path outside
   site-packages fails the build before anything is changed. The only outside
-  entries accepted are virtualenv launchers in retained distributions
+  entries accepted are virtualenv launchers in retained distributions,
+  including stub-named packages with runtime files
   (`../../Scripts/<name>` or `../../../bin/<name>`, not `.pyi`); they are never
   deleted and stay byte-identical in the rewritten `RECORD`.
   Identical inputs still give

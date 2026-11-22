@@ -120,12 +120,44 @@ def test_strip_type_stubs_normalizes_shared_paths_and_keeps_external_launchers(t
 
 
 @pytest.mark.parametrize(
+    "launcher",
+    ["../../Scripts/plugin.exe", "../../../bin/plugin", "..\\..\\Scripts\\plugin.exe"],
+)
+def test_strip_type_stubs_keeps_stub_named_distribution_with_runtime_launcher(tmp_path, launcher):
+    site = tmp_path / "site-packages"
+    _distribution(
+        site,
+        "plugin_stubs-1.0.dist-info",
+        "plugin-stubs",
+        {"plugin/__init__.py": "value = 1\n", "plugin/__init__.pyi": "value: int\n"},
+        record_lines=[
+            f"{launcher},sha256=x,1\r\n",
+            "plugin/__init__.py,sha256=x,1\n",
+            "plugin/__init__.pyi,sha256=x,1\n",
+            "plugin_stubs-1.0.dist-info/METADATA,sha256=x,1\n",
+            "plugin_stubs-1.0.dist-info/RECORD,,\n",
+        ],
+    )
+    record = site / "plugin_stubs-1.0.dist-info" / "RECORD"
+
+    assert strip_type_stubs(site) == []
+
+    assert (site / "plugin" / "__init__.py").is_file()
+    assert not (site / "plugin" / "__init__.pyi").exists()
+    assert record.read_bytes().startswith(f"{launcher},sha256=x,1\r\n".encode())
+    assert b".pyi" not in record.read_bytes()
+    assert staged_packages(site) == [("plugin-stubs", "1.0")]
+
+
+@pytest.mark.parametrize(
     ("info_name", "name", "record_lines", "message"),
     [
         ("runtime-1.0.dist-info", "runtime", ["runtime.py,sha256=x\n"], "Malformed RECORD"),
         ("runtime-1.0.dist-info", "runtime", ['runtime.py,sha256=x,"1\n'], "Malformed RECORD"),
+        ("runtime-1.0.dist-info", "runtime", ["runtime\0.py,,\n"], "Malformed RECORD"),
         ("runtime-1.0.dist-info", "runtime", ["../../outside.pyi,,\n"], "escapes"),
         ("runtime-1.0.dist-info", "runtime", ["../../Scripts/x.pyi,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["../../Scripts/x.PYI,,\n"], "escapes"),
         ("runtime-1.0.dist-info", "runtime", ["../../../share/x/data.txt,,\n"], "escapes"),
         ("runtime-1.0.dist-info", "runtime", ["../../Scripts/../../x.exe,,\n"], "escapes"),
         ("runtime-1.0.dist-info", "runtime", ["/etc/runtime.conf,,\n"], "escapes"),

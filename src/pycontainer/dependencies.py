@@ -561,7 +561,10 @@ def strip_type_stubs(site_packages: Path) -> List[str]:
                 f"Cannot strip type stub distribution without a RECORD: {info_dir.name}"
             )
         paths = record_paths[info_dir]
-        escaping = [path for path in paths if _is_escaping_record_path(path)]
+        escaping = [
+            path for path in paths
+            if _is_escaping_record_path(path) and not _is_launcher_record_path(path)
+        ]
         if escaping:
             raise ValueError(
                 f"RECORD path escapes site-packages in {info_dir.name}: {escaping[0]}"
@@ -658,7 +661,7 @@ def _read_record(record: Path) -> List[Tuple[bytes, Optional[str]]]:
         if fields is None:
             rows.append((line, None))
             continue
-        if len(fields) != 3 or not fields[0]:
+        if len(fields) != 3 or not fields[0] or "\0" in fields[0]:
             raise ValueError(f"Malformed RECORD {record} line {number}")
         rows.append((line, fields[0]))
     return rows
@@ -687,7 +690,7 @@ def _is_escaping_record_path(path: str) -> bool:
 def _is_launcher_record_path(path: str) -> bool:
     # Venv launchers: Lib/site-packages -> ../../Scripts, lib/pythonX.Y/site-packages -> ../../../bin.
     match = _LAUNCHER_RECORD_PATH.fullmatch(path.replace("\\", "/"))
-    return bool(match) and match.group(1) not in {".", ".."} and not path.endswith(".pyi")
+    return bool(match) and match.group(1) not in {".", ".."} and not path.lower().endswith(".pyi")
 
 
 def _is_stub_record_path(path: str, info_name: str) -> bool:
