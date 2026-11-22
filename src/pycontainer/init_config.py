@@ -1,0 +1,425 @@
+"""Generate build configuration files from templates or an interactive wizard.
+
+Generation is offline: it reads local project metadata only, never contacts a
+registry, daemon or network, and validates the result with the same resolver
+``pycontainer build --config`` uses before publishing it.
+"""
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
+
+from .config_loader import BUILD_TABLE
+from .effective_config import resolve_build_config, resolve_settings
+from .project import detect_python_version
+
+DEFAULT_OUTPUT = "pycontainer.toml"
+MAX_ATTEMPTS = 3
+EXIT_OK, EXIT_REFUSED, EXIT_INVALID, EXIT_INTERRUPTED = 0, 1, 2, 130
+
+TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "fastapi": {
+        "description": "FastAPI app served by uvicorn",
+        "app": "main:app",
+        "port": 8000,
+        "include_deps": True,
+    },
+    "flask": {
+        "description": "Flask app served by the flask CLI",
+        "app": "app:app",
+        "port": 5000,
+        "include_deps": True,
+    },
+    "generic": {
+        "description": "Any Python app; entrypoint optional (auto-detected when omitted)",
+        "app": None,
+        "port": None,
+        "include_deps": False,
+    },
+}
+
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_MODULE = re.compile(rf"{_IDENT}(\.{_IDENT})*")
+_APP_TARGET = re.compile(rf"{_IDENT}(\.{_IDENT})*:{_IDENT}")
+_SAFE_COMPONENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+_TAG_NAME = re.compile(r"[^a-z0-9]+")
+_WINDOWS_DEVICES = re.compile(r"(con|prn|aux|nul|clock\$|(com|lpt)[0-9¹²³])", re.IGNORECASE)
+
+
+class InitError(ValueError):
+    """An invalid template option, answer or output path."""
+
+
+class OutputExistsError(InitError):
+    """The output file already exists and overwriting was not explicitly allowed."""
+
+
+def validate_app(template: str, app: str) -> str:
+    pattern, example = (_MODULE, "package.module") if template == "generic" else (_APP_TARGET, "module:app")
+    if not pattern.fullmatch(app):
+        raise InitError(f"invalid application target {app!r} for the {template} template; expected {example}")
+    return app
+
+
+def validate_port(port: Any) -> int:
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        raise InitError(f"invalid port {port!r}; expected an integer from 1 to 65535") from None
+    if not 1 <= value <= 65535 or isinstance(port, bool):
+        raise InitError(f"invalid port {port!r}; expected an integer from 1 to 65535")
+    return value
+
+
+def default_tag(context_dir: str) -> str:
+    name = _TAG_NAME.sub("-", Path(context_dir).resolve().name.lower()).strip("-")
+    return f"local/{name or 'app'}:latest"
+
+
+def default_base_image(context_dir: str) -> str:
+    try:
+        return f"python:{detect_python_version(context_dir)}-slim"
+    except (OSError, TypeError, ValueError) as exc:
+        raise InitError(f"cannot detect the Python version from {context_dir}: {exc}") from None
+
+
+def build_settings(
+    template: str,
+    *,
+    context_dir: str = ".",
+    tag: Optional[str] = None,
+    base_image: Optional[str] = None,
+    app: Optional[str] = None,
+    port: Optional[int] = None,
+    include_deps: Optional[bool] = None,
+    platform: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the ordered [build] settings a template produces; no files are touched."""
+    if template not in TEMPLATES:
+        raise InitError(f"unknown template {template!r}; choose from: {', '.join(TEMPLATES)}")
+    spec = TEMPLATES[template]
+    app = validate_app(template, app) if app else spec["app"]
+    port = validate_port(port) if port is not None else spec["port"]
+    settings: Dict[str, Any] = {
+        "tag": tag or default_tag(context_dir),
+        "base_image": base_image or default_base_image(context_dir),
+        "context_dir": context_dir,
+    }
+    if platform:
+        settings["platform"] = platform
+    deps = spec["include_deps"] if include_deps is None else include_deps
+    if deps:
+        settings["include_deps"] = True
+    if template == "fastapi":
+        settings["entrypoint"] = ["python", "-m", "uvicorn", app, "--host", "0.0.0.0", "--port", str(port)]
+    elif template == "flask":
+        settings["entrypoint"] = ["python", "-m", "flask", "--app", app, "run", "--host=0.0.0.0", f"--port={port}"]
+    elif app:
+        settings["entrypoint"] = ["python", "-m", app]
+    if port is not None:
+        settings["exposed_ports"] = [port]
+    return settings
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def render_build_toml(settings: Dict[str, Any], template: str) -> str:
+    lines = [
+        f"# Generated by 'pycontainer init' ({template} template). Edit freely.",
+        "# Build from this directory with: pycontainer build --config <this file>",
+        BUILD_TABLE,
+    ]
+    lines += [f"{key} = {_toml_value(value)}" for key, value in settings.items()]
+    return "\n".join(lines) + "\n"
+
+
+def resolve_output_path(raw: str, cwd: Optional[Path] = None) -> Path:
+    """Return a safe output path inside cwd or raise InitError."""
+    cwd = Path.cwd() if cwd is None else cwd
+    if not raw or raw != raw.strip():
+        raise InitError("output path must be a non-empty relative path without surrounding spaces")
+    if PureWindowsPath(raw).drive or PureWindowsPath(raw).root or PurePosixPath(raw).root:
+        raise InitError(f"output path {raw!r} must be relative to the current directory")
+    parts = [part for part in re.split(r"[\\/]", raw) if part not in ("", ".")]
+    if not parts:
+        raise InitError(f"output path {raw!r} does not name a file")
+    for part in parts:
+        if part == "..":
+            raise InitError(f"output path {raw!r} must not leave the current directory")
+        if not _SAFE_COMPONENT.fullmatch(part) or part.endswith("."):
+            raise InitError(f"output path component {part!r} contains unsupported characters")
+        if _WINDOWS_DEVICES.fullmatch(part.split(".")[0]):
+            raise InitError(f"output path component {part!r} is a reserved device name")
+    name = parts[-1].lower()
+    if name == "pyproject.toml":
+        raise InitError("refusing to write pyproject.toml; init creates a separate [build] file and never edits project metadata")
+    if not name.endswith(".toml"):
+        raise InitError(f"output path {raw!r} must end with .toml")
+    target = cwd.joinpath(*parts)
+    parent = target.parent
+    if not parent.is_dir():
+        raise InitError(f"output directory {parent} does not exist; create it first")
+    expected = cwd.resolve().joinpath(*parts[:-1])
+    if os.path.normcase(str(parent.resolve())) != os.path.normcase(str(expected)):
+        raise InitError(f"output directory {parent} is a link; write to a real directory")
+    target = expected / parts[-1]
+    _check_target(target)
+    return target
+
+
+def _check_target(target: Path) -> None:
+    """Reject a target whose (already resolved) parent became a link, or a link/directory target."""
+    if os.path.normcase(str(target.parent.resolve())) != os.path.normcase(str(target.parent)):
+        raise InitError(f"output directory {target.parent} is a link; write to a real directory")
+    if target.is_symlink() or target.is_dir():
+        raise InitError(f"output path {target} is a link or directory")
+
+
+def _write_fd(fd: int, content: bytes) -> None:
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_new(target: Path, content: bytes) -> None:
+    """Create target exclusively; remove it again if writing fails."""
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+    except FileExistsError:
+        raise OutputExistsError(f"refusing to overwrite existing {target}") from None
+    try:
+        _write_fd(fd, content)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def publish(content: str, target: Path, force: bool = False) -> None:
+    """Validate content with the real loader, then atomically publish it.
+
+    Without force an existing file is never replaced. The staging file is always
+    removed, so cancellation or failure leaves no partial output.
+    """
+    _check_target(target)
+    fd, staged_name = tempfile.mkstemp(prefix=".pycontainer-init-", suffix=".tmp", dir=target.parent)
+    staged = Path(staged_name)
+    data = content.encode("utf-8")
+    try:
+        _write_fd(fd, data)
+        try:
+            resolve_build_config(staged, {})
+        except (OSError, ValueError) as exc:
+            raise InitError(str(exc).replace(str(staged), str(target))) from None
+        _check_target(target)
+        if force:
+            os.chmod(staged, 0o644)
+            os.replace(staged, target)
+            return
+        if os.path.lexists(target):
+            raise OutputExistsError(f"refusing to overwrite existing {target}")
+        _write_new(target, data)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def advisories(settings: Dict[str, Any]) -> List[str]:
+    """Return notes about local project state the user should know; never fatal."""
+    ctx = Path(settings["context_dir"])
+    notes = []
+    if settings.get("include_deps"):
+        venv = any((ctx / name).is_dir() for name in ("venv", ".venv", "env"))
+        if not venv and not (ctx / "requirements.txt").is_file():
+            notes.append(
+                f"include_deps is enabled but {ctx / 'requirements.txt'} and a venv were not found; "
+                "add one before building."
+            )
+    pyproject = ctx / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            import tomllib
+
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data.get("tool"), dict) and "pycontainer" in data["tool"]:
+            notes.append(
+                f"{pyproject} [tool.pycontainer] was not changed or merged; "
+                "'build --config' reads only the generated file."
+            )
+    return notes
+
+
+def _finish(settings: Dict[str, Any], target: Path, template: str, out: TextIO) -> None:
+    for note in advisories(settings):
+        print(f"note: {note}", file=out)
+    shown = os.path.relpath(target)
+    print(f"Wrote {shown} ({template} template). Build with: pycontainer build --config {shown}", file=out)
+
+
+def run_template(
+    template: str,
+    output: str,
+    force: bool,
+    options: Dict[str, Any],
+    out: Optional[TextIO] = None,
+    err: Optional[TextIO] = None,
+) -> int:
+    """Generate a template configuration noninteractively; return an exit code."""
+    out, err = out or sys.stdout, err or sys.stderr
+    try:
+        target = resolve_output_path(output)
+        if os.path.lexists(target) and not force:
+            raise OutputExistsError(f"refusing to overwrite existing {target}; pass --force to replace it")
+        settings = build_settings(template, **options)
+        publish(render_build_toml(settings, template), target, force)
+    except OutputExistsError as exc:
+        print(f"error: {exc}", file=err)
+        return EXIT_REFUSED
+    except InitError as exc:
+        for line in str(exc).splitlines():
+            print(f"error: {line}", file=err)
+        return EXIT_INVALID
+    _finish(settings, target, template, out)
+    return EXIT_OK
+
+
+class _Wizard:
+    def __init__(self, input_fn: Callable[[str], str], out: TextIO):
+        self.input_fn, self.out = input_fn, out
+        self.answers: Dict[str, Any] = {}
+
+    def ask(self, label: str, default: Optional[str], parse: Callable[[str], Any]) -> Any:
+        suffix = f" [{default}]" if default else ""
+        for _ in range(MAX_ATTEMPTS):
+            raw = self.input_fn(f"{label}{suffix}: ").strip()
+            try:
+                return parse(raw or (default or ""))
+            except InitError as exc:
+                for line in str(exc).splitlines():
+                    print(f"  invalid: {line}", file=self.out)
+        raise InitError(f"too many invalid answers for {label!r}")
+
+    def check(self, **values: Any) -> Dict[str, Any]:
+        """Validate the answers so far with the real resolver."""
+        candidate = {**self.answers, **{k: v for k, v in values.items() if v is not None}}
+        try:
+            resolve_settings(candidate, {}, BUILD_TABLE)
+        except ValueError as exc:
+            raise InitError(str(exc)) from None
+        self.answers = candidate
+        return candidate
+
+
+def _yes_no(raw: str) -> bool:
+    value = raw.lower()
+    if value in ("y", "yes"):
+        return True
+    if value in ("n", "no"):
+        return False
+    raise InitError(f"answer {raw!r} is not y or n")
+
+
+def _collect(w: _Wizard) -> Tuple[str, Dict[str, Any], Path]:
+    names = ", ".join(TEMPLATES)
+    for name, spec in TEMPLATES.items():
+        print(f"  {name}: {spec['description']}", file=w.out)
+
+    def template_choice(raw: str) -> str:
+        if raw not in TEMPLATES:
+            raise InitError(f"unknown template {raw!r}; choose from: {names}")
+        return raw
+
+    template = w.ask(f"Template ({names})", "generic", template_choice)
+    spec = TEMPLATES[template]
+    context = w.ask("Build context directory", ".", lambda v: w.check(context_dir=v)["context_dir"])
+    tag = w.ask("Image tag", default_tag(context), lambda v: w.check(tag=v)["tag"])
+    base = w.ask("Base image", default_base_image(context), lambda v: w.check(base_image=v)["base_image"])
+
+    def app_answer(raw: str) -> Optional[str]:
+        return validate_app(template, raw) if raw else None
+
+    app_label = "Application module (blank: auto-detect)" if template == "generic" else "Application (module:app)"
+    app = w.ask(app_label, spec["app"], app_answer)
+    port_default = str(spec["port"]) if spec["port"] else None
+    port_label = "Exposed port" if spec["port"] else "Exposed port (blank: none)"
+    def port_answer(raw: str) -> Optional[int]:
+        port = validate_port(raw) if raw else None
+        partial = build_settings(template, context_dir=context, tag=tag, base_image=base, app=app, port=port)
+        w.check(entrypoint=partial.get("entrypoint"), exposed_ports=partial.get("exposed_ports"))
+        return port
+
+    port = w.ask(port_label, port_default, port_answer)
+    deps = w.ask("Stage dependencies (y/n)", "y" if spec["include_deps"] else "n", _yes_no)
+    platform = w.ask("Target platform", "linux/amd64",
+                     lambda v: w.check(platform=v, include_deps=deps or None)["platform"])
+
+    def output_answer(raw: str) -> Path:
+        target = resolve_output_path(raw)
+        if os.path.lexists(target):
+            raise InitError(f"{target} already exists; the wizard never overwrites files, choose another path")
+        return target
+
+    target = w.ask("Output file", DEFAULT_OUTPUT, output_answer)
+    settings = build_settings(
+        template, context_dir=context, tag=tag, base_image=base, app=app, port=port,
+        include_deps=deps, platform=platform,
+    )
+    return template, settings, target
+
+
+def run_wizard(
+    input_fn: Callable[[str], str] = input,
+    out: Optional[TextIO] = None,
+    err: Optional[TextIO] = None,
+    is_tty: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Run the interactive wizard; return an exit code. Never overwrites files."""
+    out, err = out or sys.stdout, err or sys.stderr
+    tty = is_tty() if is_tty else (sys.stdin.isatty() and sys.stdout.isatty())
+    if not tty:
+        print("error: 'pycontainer init --interactive' requires an interactive terminal; "
+              "use 'pycontainer init --template NAME' in scripts.", file=err)
+        return EXIT_INVALID
+    w = _Wizard(input_fn, out)
+    print("pycontainer init: answer each prompt; press Enter for the default, Ctrl+C to cancel.", file=out)
+    print("No credentials are requested; registry login stays with 'build --push'.", file=out)
+    try:
+        template, settings, target = _collect(w)
+        content = render_build_toml(settings, template)
+        print(f"\n{content}", file=out)
+        if not w.ask(f"Write {os.path.relpath(target)}? (y/n)", "n", _yes_no):
+            print("Cancelled; no file written.", file=out)
+            return EXIT_REFUSED
+        publish(content, target, force=False)
+    except EOFError:
+        print("\nCancelled (end of input); no file written.", file=err)
+        return EXIT_REFUSED
+    except KeyboardInterrupt:
+        print("\nCancelled; no file written.", file=err)
+        return EXIT_INTERRUPTED
+    except OutputExistsError as exc:
+        print(f"error: {exc}", file=err)
+        return EXIT_REFUSED
+    except InitError as exc:
+        for line in str(exc).splitlines():
+            print(f"error: {line}", file=err)
+        return EXIT_INVALID
+    _finish(settings, target, template, out)
+    return EXIT_OK
