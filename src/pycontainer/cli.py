@@ -1,11 +1,21 @@
-import argparse, os, logging
+import argparse, os, logging, sys
 from pathlib import Path
 from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
 
+def _tolerate_unencodable_output():
+    # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
+    for stream in (sys.stdout, sys.stderr):
+        encoding=getattr(stream,"encoding",None)
+        reconfigure=getattr(stream,"reconfigure",None)
+        if not encoding or reconfigure is None: continue
+        try: "\u2713".encode(encoding)
+        except (UnicodeEncodeError, LookupError): reconfigure(errors="replace")
+
 def main():
+    _tolerate_unencodable_output()
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")

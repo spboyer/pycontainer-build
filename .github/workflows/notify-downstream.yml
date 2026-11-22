@@ -1,0 +1,35 @@
+name: Notify downstream integrations
+
+# Asks spboyer/PyContainer.Aspire.Hosting to re-test against this commit.
+# Requires the DOWNSTREAM_DISPATCH_TOKEN secret: a fine-grained token with
+# Contents read/write on that repository. Without it, this job is a no-op and
+# the downstream repository still checks pycontainer main on a daily schedule.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  aspire-hosting:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch pycontainer-updated
+        env:
+          GH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "DOWNSTREAM_DISPATCH_TOKEN is not set; skipping."
+            exit 0
+          fi
+          gh api repos/spboyer/PyContainer.Aspire.Hosting/dispatches \
+            -f event_type=pycontainer-updated \
+            -f "client_payload[sha]=$SHA"

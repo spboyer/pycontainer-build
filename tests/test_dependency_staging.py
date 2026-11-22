@@ -150,6 +150,12 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         env=environment,
     )
     assert result.stdout.strip() == "fixture-dependency-import-ok"
+    record = (
+        staged / "site-packages" / "fixture_dep-1.0.dist-info" / "RECORD"
+    ).read_text()
+    record_paths = [line.split(",", 1)[0] for line in record.splitlines() if line]
+    assert "fixture_dep/__init__.py" in record_paths
+    assert not [path for path in record_paths if ".." in path.replace("\\", "/")]
 
     config_path = (
         Path(builder.config.output_dir)
@@ -165,6 +171,37 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
     assert [(package["name"], package["versionInfo"]) for package in sbom["packages"]] == [
         ("fixture-dep", "1.0")
     ]
+
+
+def test_excluded_explicit_requirements_still_install_dependencies(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    generated = context / "gen"
+    generated.mkdir(parents=True)
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(generated / "wheelhouse")
+    (generated / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _builder(
+        tmp_path,
+        monkeypatch,
+        context=context,
+        include_deps=True,
+        requirements_file="gen/requirements.txt",
+        exclude_paths=["gen"],
+    )
+
+    builder.build()
+
+    dependency_layer, app_layer = builder.layers
+    with tarfile.open(dependency_layer.tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+    with tarfile.open(app_layer.tar_path) as archive:
+        app_names = archive.getnames()
+    assert "app/app.py" in app_names
+    assert not [name for name in app_names if name.startswith("app/gen")]
 
 
 def test_builder_selects_cyclonedx_for_staged_inventory(tmp_path, monkeypatch):
@@ -423,6 +460,57 @@ def test_requirements_install_terminates_when_staging_limit_is_exceeded(
             BASE_CONFIG,
         )
     assert process_state["terminated"]
+
+
+def test_requirements_install_tolerates_files_pip_moves_during_limit_check(
+    tmp_path, monkeypatch
+):
+    import pycontainer.dependencies as dependencies
+
+    context = tmp_path / "context"
+    context.mkdir()
+    requirements = context / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0\n")
+    destination = tmp_path / "stage" / "site-packages"
+    destination.parent.mkdir()
+    waits = []
+    moving = destination.parent / "pip-target-x" / "lib" / "moved-by-pip.py"
+    moving.parent.mkdir(parents=True)
+    moving.write_text("x = 1\n")
+    real_stat = Path.stat
+    moving_stats = []
+
+    # Reproduces the observed window: the file passes the type checks, then pip
+    # moves it before its size is read.
+    def stat_then_move(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        if self == moving:
+            moving_stats.append(True)
+            if len(moving_stats) == 2:
+                self.unlink()
+        return result
+
+    class Process:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("pip", timeout)
+            return 0
+
+    monkeypatch.setattr(dependencies.subprocess, "Popen", lambda *a, **k: Process())
+    monkeypatch.setattr(Path, "stat", stat_then_move)
+
+    install_requirements(
+        requirements,
+        destination,
+        context,
+        "linux",
+        "amd64",
+        "3.11",
+        "python:3.11-slim",
+        BASE_CONFIG,
+    )
+    assert len(waits) == 2
 
 
 def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monkeypatch):

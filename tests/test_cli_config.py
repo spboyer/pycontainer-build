@@ -1,3 +1,4 @@
+import io
 import logging
 import sys
 
@@ -264,3 +265,22 @@ def test_cli_reports_invalid_config(tmp_path, monkeypatch, capsys, setting, valu
 
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def test_cli_status_output_survives_legacy_redirected_encoding(monkeypatch):
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+
+    class FakeImageBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            print("\u2713 Dependency layer created")
+            return "layout"
+
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    _run_cli(monkeypatch, ["build", "--tag", "app:test"])
+
+    stdout.flush()
+    assert b"? Dependency layer created" in stdout.buffer.getvalue()
