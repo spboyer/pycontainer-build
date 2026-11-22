@@ -53,13 +53,30 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 
 ## Output
 
-The OCI layout gets one `refs/tags/<tag>` file per tag, all pointing at the
-same manifest digest. After a push, `builder.pushed_refs` lists every pushed
-reference.
+The layout's `index.json` has one manifest descriptor per tag. Every
+descriptor has the same manifest digest, size and platform, and its
+`org.opencontainers.image.ref.name` annotation is the reference to select.
+The primary keeps the spelling you gave; additional tags use the primary's
+repository spelling. For example, `--tag myapp:v1.2.3 --tag stable` produces
+`myapp:v1.2.3` and `myapp:stable`, and `--tag ghcr.io/me/app:v1.2.3
+--semver-tags` produces `ghcr.io/me/app:v1.2.3`, `ghcr.io/me/app:v1.2` and
+`ghcr.io/me/app:v1`. The index-level annotation still names the primary.
 
-The layout's index currently has only the primary reference on its manifest
-descriptor. Skopeo does not use `refs/tags` to select an additional tag, so
-`oci:<layout>:<additional-tag>` cannot select it. Use the complete primary
-reference (`oci:<layout>:ghcr.io/me/app:v1.2.3`) or omit the reference
-(`oci:<layout>`) when the index has one manifest. Registry pushes still publish
-each tag separately.
+Standard OCI tools select an image by that annotation:
+
+```bash
+skopeo inspect oci:dist/image:ghcr.io/me/app:v1.2.3
+skopeo copy oci:dist/image:ghcr.io/me/app:v1 docker-daemon:ghcr.io/me/app:v1
+```
+
+With a single tag, `oci:dist/image` without a reference also works. With
+several tags, standard tools such as Skopeo require an explicit reference,
+even though every descriptor points to the same image. Bare tag names such as
+`oci:dist/image:stable` are not descriptor references. Skopeo also rejects
+references outside the OCI annotation grammar, such as tags that begin or end
+with `_`, `.` or `-` (`myapp:_dev`); use such tags only for registry pushes.
+
+The layout also gets one `refs/tags/<tag>` file per tag, all pointing at the
+same manifest digest; standard tools do not read these files. After a push,
+`builder.pushed_refs` lists every pushed reference. Registry pushes publish
+each tag separately and are unaffected by the layout index.

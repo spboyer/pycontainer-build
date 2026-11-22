@@ -6,7 +6,7 @@ from pycontainer import cli
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
-from pycontainer.tags import resolve_tags
+from pycontainer.tags import local_reference_names, resolve_tags
 
 
 def test_single_tag_unchanged():
@@ -142,3 +142,65 @@ def test_push_uploads_blobs_once_and_manifest_per_tag(monkeypatch, tmp_path):
     assert calls["manifests"] == ["v1.2.3", "stable"]
     assert len(calls["blobs"]) == len(set(calls["blobs"])) == len(b.layers) + 1
     assert b.pushed_refs == ["reg.io/u/app:v1.2.3", "reg.io/u/app:stable"]
+
+REF_NAME = "org.opencontainers.image.ref.name"
+
+
+def _select(index, reference=None):
+    """Resolve a layout reference the way the OCI image-layout spec and Skopeo do."""
+    descriptors = index["manifests"]
+    if reference is None:
+        if len(descriptors) != 1:
+            raise LookupError("more than one image; select a reference")
+        return descriptors[0]
+    matches = [d for d in descriptors if d.get("annotations", {}).get(REF_NAME) == reference]
+    if len(matches) != 1:
+        raise LookupError(f"no single descriptor for {reference!r}")
+    return matches[0]
+
+
+@pytest.mark.parametrize(
+    "primary, extra, expected",
+    [
+        ("myapp:latest", ["stable"], ["myapp:latest", "myapp:stable"]),
+        ("myapp", ["v1"], ["myapp", "myapp:v1"]),
+        ("localhost:5000/u/app:v1", ["v2", "localhost:5000/u/app:v3"],
+         ["localhost:5000/u/app:v1", "localhost:5000/u/app:v2", "localhost:5000/u/app:v3"]),
+        ("ghcr.io/u/app:v1", ["ghcr.io/u/app:v1"], ["ghcr.io/u/app:v1"]),
+    ],
+)
+def test_local_reference_names_follow_primary_spelling(primary, extra, expected):
+    assert local_reference_names(primary, resolve_tags(primary, extra)) == expected
+
+
+def test_every_tag_selectable_from_layout_index(monkeypatch, tmp_path):
+    import json
+
+    b = _fake_build(
+        monkeypatch, tmp_path, tag="myapp:v1.2.3", tags=["stable"], semver_tags=True
+    )
+    out = tmp_path / "out"
+    index = json.loads((out / "index.json").read_text())
+    blob = out / "blobs" / "sha256" / b.manifest_digest.split(":", 1)[1]
+    names = ["myapp:v1.2.3", "myapp:stable", "myapp:v1.2", "myapp:v1"]
+
+    assert [d["annotations"][REF_NAME] for d in index["manifests"]] == names
+    assert index["annotations"] == {REF_NAME: "myapp:v1.2.3"}
+    for name in names:
+        descriptor = _select(index, name)
+        assert descriptor["digest"] == b.manifest_digest
+        assert descriptor["size"] == blob.stat().st_size
+        assert descriptor["platform"] == {"architecture": "amd64", "os": "linux"}
+        tag = name.rsplit(":", 1)[1]
+        assert (out / "refs" / "tags" / tag).read_text() == b.manifest_digest
+    with pytest.raises(LookupError, match="more than one"):
+        _select(index)
+
+
+def test_single_tag_layout_keeps_unqualified_selection(monkeypatch, tmp_path):
+    import json
+
+    b = _fake_build(monkeypatch, tmp_path, tag="myapp:latest")
+    index = json.loads((tmp_path / "out" / "index.json").read_text())
+    assert len(index["manifests"]) == 1
+    assert _select(index)["digest"] == _select(index, "myapp:latest")["digest"] == b.manifest_digest

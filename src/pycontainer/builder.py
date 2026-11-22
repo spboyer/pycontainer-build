@@ -187,6 +187,7 @@ from .registry_client import (
 from .auth import get_registry_auth
 from .cache import LayerCache
 from .sbom import generate_sbom
+from .tags import local_reference_names
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -334,6 +335,7 @@ class ImageBuilder:
             arch,
             os_name,
             variant=variant,
+            ref_names=local_reference_names(self.config.tag, self.config.all_tags()),
         )
         _atomic_write_bytes(
             output/'index.json',

@@ -72,3 +72,18 @@ def resolve_tags(
 
     ordered = list(dict.fromkeys(names))
     return [f"{base}:{name}" for name in ordered]
+
+
+def local_reference_names(primary: str, all_tags: List[str]) -> List[str]:
+    """Return OCI layout ``ref.name`` values for a build's resolved tags.
+
+    The primary is kept exactly as written; each additional tag uses the
+    primary's repository spelling, so ``myapp:latest`` plus ``stable`` yields
+    ``myapp:stable`` rather than ``docker.io/library/myapp:stable``.
+    """
+    last_segment = primary.rsplit("/", 1)[-1]
+    repository = primary.rsplit(":", 1)[0] if ":" in last_segment else primary
+    names = [primary] + [
+        f"{repository}:{parse_image_reference(ref)[2]}" for ref in all_tags[1:]
+    ]
+    return list(dict.fromkeys(names))
