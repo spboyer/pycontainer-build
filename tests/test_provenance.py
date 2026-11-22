@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from pycontainer import builder as builder_module
-from pycontainer import cli, provenance
+from pycontainer import artifact, cli, provenance
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import _hash_wheelhouse, _verify_installed_wheels, install_requirements
@@ -206,6 +206,12 @@ def test_verified_output_accepts_v1_envelopes_and_bundles():
     (json.dumps({"payloadType": provenance.DSSE_PAYLOAD_TYPE, "payload": "%%%"}).encode(), "malformed"),
     (_envelope(_statement(), payload_type="text/plain"), "DSSE"),
     (_envelope(_statement(digest="b" * 64)), "subject"),
+    (_envelope(_statement(subject=[{"digest": {"sha256": "a" * 64}}])), "named subject"),
+    (_envelope(_statement(subject=[{"name": "", "digest": {"sha256": "a" * 64}}])), "named subject"),
+    (_envelope(_statement(subject=[
+        {"name": "registry.example/app", "digest": {"sha256": "a" * 64}},
+        {"name": "registry.example/other", "digest": {"sha256": "a" * 64}},
+    ])), "named subject"),
     (_envelope(_statement(predicateType="https://slsa.dev/provenance/v0.2")), "SLSA provenance v1"),
     (_envelope(_statement(_type="https://example.com/Statement")), "_type"),
     (_envelope(_statement(statement_type="https://in-toto.io/Statement/v0.1")), "_type"),
@@ -230,6 +236,15 @@ def test_require_complete_rejects_any_incomplete_matching_attestation():
     assert len(parse_verified_attestations(output, DIGEST)) == 2
     with pytest.raises(IncompleteProvenanceError):
         parse_verified_attestations(output, DIGEST, require_complete_evidence=True)
+
+
+def test_verified_statement_must_match_repository(monkeypatch):
+    wrong = _statement(subject=[{"name": "registry.example/other", "digest": {"sha256": "a" * 64}}])
+    monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_output=_envelope(wrong)))
+    with pytest.raises(ProvenanceError, match="image repository"):
+        _attestor().verify(SUBJECT)
+    with pytest.raises(ProvenanceError, match="image repository"):
+        _attestor().attest_and_verify(SUBJECT, wrong, lambda _: None)
 
 
 class FakeCosign:
@@ -339,6 +354,8 @@ def test_attestor_rejects_other_statements_tampered_bundles_and_failures(monkeyp
     monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_output=b"x" * 5))
     with pytest.raises(ProvenanceError, match="size limit"):
         _attestor().verify(SUBJECT)
+    with pytest.raises(ProvenanceError, match="bundle exceeds"):
+        _attestor().sign_statement(STATEMENT)
     with pytest.raises(ProvenanceError, match="immutable"):
         _attestor().verify("registry.example/app:v1")
 
@@ -361,6 +378,82 @@ def test_referrer_manifest_matches_cosign_bundle_layout():
     }
 
 
+class ProvenanceRegistry(FakeRegistry):
+    def __init__(self, failure=None):
+        super().__init__()
+        self.failure = failure
+        self.blobs = {}
+        self.referrer = None
+        self.referrer_requests = 0
+
+    def __call__(self, registry, repository, **kwargs):
+        super().__call__(registry, repository, **kwargs)
+        self.base_url = f"https://{registry}/v2"
+        return self
+
+    def verify_manifest_descriptor(self, reference, expected_digest, expected_size, expected_media_type):
+        if self.failure == "subject" and self.events and self.events[-1][0] == "attest":
+            raise builder_module.BlobIntegrityError("subject mismatch")
+        return super().verify_manifest_descriptor(reference, expected_digest, expected_size, expected_media_type)
+
+    def blob_descriptor_matches(self, digest, size):
+        return digest in self.blobs and len(self.blobs[digest]) == size
+
+    def upload_blob_monolithic(self, digest, path):
+        if self.failure == "blob":
+            raise builder_module.RegistryRequestError("sensitive registry detail")
+        data = Path(path).read_bytes()
+        assert "sha256:" + hashlib.sha256(data).hexdigest() == digest
+        self.events.append(("artifact-blob", digest))
+        self.blobs[digest] = data
+
+    def put_manifest(self, reference, data, media_type):
+        if self.failure == "manifest-put":
+            raise builder_module.RegistryRequestError("sensitive registry detail")
+        self._put("manifest", reference, data)
+        self.referrer = reference
+        return {"OCI-Subject": "sha256:" + "f" * 64} if self.failure == "subject-header" else {}
+
+    def fetch_manifest_bytes(self, reference, accept, max_size, expected_digest=None):
+        self.events.append(("artifact-read", reference))
+        data = self.manifests[reference]
+        if self.failure == "manifest-read":
+            data += b" "
+        content_type = "application/json" if self.failure == "manifest-type" else artifact.OCI_MANIFEST_MEDIA_TYPE
+        return data, reference, content_type
+
+    def pull_blob(self, digest, path, expected_size):
+        self.events.append(("artifact-blob-read", digest))
+        data = self.blobs[digest]
+        if self.failure == "blob-read":
+            data += b" "
+        Path(path).write_bytes(data)
+        return True
+
+    def get_referrers(self, url, max_size):
+        self.referrer_requests += 1
+        self.events.append(("referrers", url))
+        if self.failure == "referrers-404":
+            return 404, b"", {}
+        headers = {"Content-Type": artifact.OCI_INDEX_MEDIA_TYPE}
+        if self.failure == "referrers-malformed":
+            return 200, b"not-json", headers
+        data = self.manifests[self.referrer]
+        manifests = [{
+            "mediaType": artifact.OCI_MANIFEST_MEDIA_TYPE,
+            "digest": "sha256:" + "f" * 64 if self.failure == "referrers-digest" else self.referrer,
+            "size": len(data) + (1 if self.failure == "referrers-wrong" else 0),
+        }]
+        if self.failure == "referrers-type":
+            manifests[0]["artifactType"] = "application/example"
+        if self.failure == "referrers-missing" or (
+            self.failure == "referrers-delayed" and self.referrer_requests == 1
+        ):
+            manifests = []
+        index = {"schemaVersion": 2, "mediaType": artifact.OCI_INDEX_MEDIA_TYPE, "manifests": manifests}
+        return 200, json.dumps(index).encode(), headers
+
+
 class FakeAttestor:
     def __init__(self, registry, fail=False):
         self.registry = registry
@@ -371,6 +464,7 @@ class FakeAttestor:
         self.registry.events.append(("attest", subject))
         self.statements.append(statement)
         publish(b'{"bundle": true}')
+        self.registry.events.append(("attestation-verify", subject))
         if self.fail:
             raise ProvenanceError("verification rejected")
 
@@ -378,19 +472,26 @@ def _signed_builder(tmp_path, monkeypatch, registry, attestor, platform="linux/a
     context = _context(tmp_path, requirements=False)
     monkeypatch.setattr(ImageBuilder, "_pull_base_image", _observed_base)
     builder = ImageBuilder(_config(
-        tmp_path, context, include_paths=["app.py"], platform=platform, sign=True,
+        tmp_path, context, include_paths=["app.py"], platform=platform, sign=True, tags=["stable"],
         sign_provider="cosign", sign_key="cosign.key", sign_verify_key="cosign.pub",
         attest_provenance=True,
     ))
     builder.build()
     _use_registry(monkeypatch, registry)
     monkeypatch.setattr(provenance, "create_attestor", lambda config: attestor)
+    require_referrer = artifact.require_referrer
+    monkeypatch.setattr(
+        artifact, "require_referrer",
+        lambda client, subject, descriptor: require_referrer(
+            client, subject, descriptor, sleep=lambda _: None
+        ),
+    )
     return builder
 
 
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_signed_push_attests_published_digest_before_tags(tmp_path, monkeypatch, platform):
-    registry = FakeRegistry()
+    registry = ProvenanceRegistry()
     attestor = FakeAttestor(registry)
     builder = _signed_builder(tmp_path, monkeypatch, registry, attestor, platform)
 
@@ -413,12 +514,68 @@ def test_signed_push_attests_published_digest_before_tags(tmp_path, monkeypatch,
     assert reference == "sha256:" + hashlib.sha256(registry.manifests[reference]).hexdigest()
     assert manifest["subject"]["digest"] == digest
     assert manifest["subject"]["mediaType"].endswith(f"image.{kind}.v1+json")
-    assert registry.events.index(("manifest", reference)) < registry.events.index((kind, "v1"))
+    assert manifest["annotations"] == {
+        "dev.sigstore.bundle.content": "dsse-envelope",
+        "dev.sigstore.bundle.predicateType": provenance.SLSA_PROVENANCE_V1,
+    }
+    bundle_digest = manifest["layers"][0]["digest"]
+    assert registry.blobs[bundle_digest] == b'{"bundle": true}'
+    assert registry.events.index(("manifest", reference)) < registry.events.index(("artifact-read", reference))
+    assert registry.events.index(("artifact-blob-read", bundle_digest)) < next(
+        i for i, event in enumerate(registry.events) if event[0] == "referrers"
+    ) < registry.events.index(("attestation-verify", subject)) < registry.events.index((kind, "v1"))
     assert builder.attested_ref == subject
 
 
+@pytest.mark.parametrize("failure", [
+    "subject", "blob", "manifest-put", "subject-header", "manifest-read", "manifest-type",
+    "blob-read", "referrers-404", "referrers-malformed", "referrers-missing",
+    "referrers-wrong", "referrers-digest", "referrers-type",
+])
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_referrer_publication_failures_leave_image_tags_untouched(tmp_path, monkeypatch, failure, platform):
+    registry = ProvenanceRegistry(failure)
+    builder = _signed_builder(tmp_path, monkeypatch, registry, FakeAttestor(registry), platform)
+
+    with pytest.raises(ProvenanceError, match="tags not attempted") as error:
+        builder.push(show_progress=False)
+
+    assert "sensitive registry detail" not in str(error.value)
+    assert "v1" not in registry.manifests and "stable" not in registry.manifests
+    assert builder.pushed_refs == []
+    if failure in ("referrers-404", "referrers-malformed"):
+        assert registry.referrer_requests == 1
+
+
+def test_referrer_discovery_retries_before_tags(tmp_path, monkeypatch):
+    registry = ProvenanceRegistry("referrers-delayed")
+    builder = _signed_builder(tmp_path, monkeypatch, registry, FakeAttestor(registry))
+
+    builder.push(show_progress=False)
+
+    assert registry.referrer_requests == 2
+    assert "v1" in registry.manifests
+
+
+def test_corrupt_staged_bundle_leaves_image_tags_untouched(tmp_path, monkeypatch):
+    registry = ProvenanceRegistry()
+    builder = _signed_builder(tmp_path, monkeypatch, registry, FakeAttestor(registry))
+    write_bytes = Path.write_bytes
+
+    def corrupt_bundle(path, data):
+        if path.parent.name.startswith("pycontainer-referrer-") and data != artifact.EMPTY_CONFIG:
+            data = b"corrupted"
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", corrupt_bundle)
+    with pytest.raises(ProvenanceError, match="tags not attempted"):
+        builder.push(show_progress=False)
+    assert "v1" not in registry.manifests and "stable" not in registry.manifests
+    assert registry.referrer is None
+
+
 def test_attestation_failure_writes_no_tags(tmp_path, monkeypatch):
-    registry = FakeRegistry()
+    registry = ProvenanceRegistry()
     builder = _signed_builder(tmp_path, monkeypatch, registry, FakeAttestor(registry, fail=True))
 
     with pytest.raises(ProvenanceError, match="tags not attempted: registry.example/team/app:v1"):
@@ -427,8 +584,23 @@ def test_attestation_failure_writes_no_tags(tmp_path, monkeypatch):
     assert builder.pushed_refs == []
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_subject_rechecked_after_attestation_before_tags(tmp_path, monkeypatch, platform):
+    registry = ProvenanceRegistry()
+
+    class MutatingAttestor(FakeAttestor):
+        def attest_and_verify(self, subject, statement, publish, require_complete_evidence=False):
+            super().attest_and_verify(subject, statement, publish, require_complete_evidence)
+            self.registry.manifests[subject.rsplit("@", 1)[1]] = b"modified"
+
+    builder = _signed_builder(tmp_path, monkeypatch, registry, MutatingAttestor(registry), platform)
+    with pytest.raises(builder_module.RegistryRequestError, match="tags not attempted"):
+        builder.push(show_progress=False)
+    assert "v1" not in registry.manifests and "stable" not in registry.manifests
+
+
 def test_attestation_rejects_statement_for_a_different_digest(tmp_path, monkeypatch):
-    registry = FakeRegistry()
+    registry = ProvenanceRegistry()
     attestor = FakeAttestor(registry)
     builder = _signed_builder(tmp_path, monkeypatch, registry, attestor)
     builder.provenance_statement["subject"][0]["digest"]["sha256"] = "f" * 64
@@ -439,7 +611,7 @@ def test_attestation_rejects_statement_for_a_different_digest(tmp_path, monkeypa
 
 
 def test_attestation_rejects_push_to_a_different_repository(tmp_path, monkeypatch):
-    registry = FakeRegistry()
+    registry = ProvenanceRegistry()
     attestor = FakeAttestor(registry)
     builder = _signed_builder(tmp_path, monkeypatch, registry, attestor)
 

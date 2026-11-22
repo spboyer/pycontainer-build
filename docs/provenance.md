@@ -62,16 +62,19 @@ Sigstore bundle (`application/vnd.dev.sigstore.bundle.v0.3+json`) signs those
 exact bytes, and pushes the bundle itself as an OCI 1.1 referrer of the image
 digest, in the layout cosign uses: an empty `{}` config, one bundle layer, and
 `dev.sigstore.bundle.content=dsse-envelope` and
-`dev.sigstore.bundle.predicateType` annotations. `cosign verify-attestation
---new-bundle-format` then verifies an attestation containing those exact
-statement bytes under the configured policy.
+`dev.sigstore.bundle.predicateType` annotations. The manifest and bundle are
+read back and checked against the exact published bytes, and the OCI Referrers
+API must list the new manifest descriptor before verification or image tags
+are attempted. Missing entries are retried briefly; a 404, malformed response,
+or a descriptor that does not appear fails closed. No referrers tag-schema
+fallback (`sha256-<digest>`) is written.
 
-The referrers tag-schema fallback (`sha256-<digest>`) is not written.
-pycontainer does not independently confirm that the newly published referrer
-appears in the registry's Referrers API. cosign may verify an existing matching
-attestation instead, so successful verification does not prove that the new
-referrer is discoverable. cosign v2 only discovers bundle referrers with
-`--new-bundle-format`; v3 discovers them by default.
+`cosign verify-attestation --new-bundle-format` must then verify an attestation
+containing the exact statement bytes under the configured policy. Cosign may
+select an existing matching attestation rather than the newly published bundle;
+the discovery and readback checks do not prove which one cosign verified.
+Cosign v2 only discovers bundle referrers with `--new-bundle-format`; v3
+discovers them by default.
 
 ## Build type v1
 
@@ -132,9 +135,10 @@ paths and any value derived from them are not recorded.
 --new-bundle-format --type slsaprovenance1` with your policy, then rejects any
 pycontainer envelope that is not an in-toto DSSE payload, is not an in-toto
 Statement v1, is not SLSA provenance v1, has a subject that does not
-match the requested digest, or has malformed completeness fields. Non-pycontainer
-SLSA attestations are ignored; at least one pycontainer attestation must match.
-Verification uses cosign's transparency log defaults.
+match the requested repository and digest, or has malformed completeness
+fields. Exactly one named subject is required. Non-pycontainer SLSA attestations
+are ignored; at least one pycontainer attestation must match. Verification uses
+cosign's transparency log defaults.
 
 ## Status and limitations
 
@@ -148,8 +152,9 @@ Verification uses cosign's transparency log defaults.
 - The opt-in real-registry test also passed with cosign v2.6.1 and v3.1.4 and
   their default transparency settings on `ttl.sh`, using a synthetic app
   without dependencies, for manifest and index subjects. One v3 index signing
-  attempt failed before tagging with an unknown cause; a fresh index run and a
-  separate signing attempt on the failed digest later succeeded. Published
+  attempt and a separate v3 manifest attestation-verification attempt failed
+  before tagging with unknown causes; subsequent independent verification and
+  fresh runs succeeded. Published
   attestations included transparency-log inclusion proofs; the log key matched
   `rekor.sigstore.dev`, and cosign verified the log entry and exact statement
   bytes. Independent signature and attestation verification both rejected a

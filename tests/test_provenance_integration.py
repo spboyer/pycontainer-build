@@ -82,7 +82,7 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path, pla
     assert _verify(executable, wrong_key, subject, attestation=False).returncode != 0
     result = _verify(executable, public_key, subject, attestation=True)
     assert result.returncode == 0, "Independent cosign attestation verification failed."
-    statements = parse_verified_attestations(result.stdout, digest)
+    statements = parse_verified_attestations(result.stdout, digest, expected_name=f"{registry}/{repo}")
     assert builder.provenance_statement in statements
     assert all(s["_type"] == STATEMENT_V1 and s["predicateType"] == SLSA_PROVENANCE_V1 for s in statements)
     envelopes = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]

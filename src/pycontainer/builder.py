@@ -198,6 +198,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .signing import SigningError, create_signer
+from . import artifact
 from . import provenance as slsa
 from .local_image import (
     LocalImageError,
@@ -1119,19 +1120,40 @@ class ImageBuilder:
 
         if attestor is not None:
             def publish_attestation(bundle: bytes) -> None:
-                manifest, referrer_blobs=slsa.referrer_manifest(
-                    bundle, {"mediaType": media_type, "size": size, "digest": digest}
-                )
                 try:
+                    if len(bundle) > slsa.MAX_VERIFY_OUTPUT_BYTES:
+                        raise slsa.ProvenanceError("Attestation bundle exceeds the size limit.")
+                    manifest, referrer_blobs=slsa.referrer_manifest(
+                        bundle, {"mediaType": media_type, "size": size, "digest": digest}
+                    )
+                    bundle_digest=f"sha256:{hashlib.sha256(bundle).hexdigest()}"
                     with tempfile.TemporaryDirectory(prefix="pycontainer-referrer-") as workdir:
+                        staged=[]
                         for blob_digest, blob in referrer_blobs.items():
                             blob_path=Path(workdir)/_digest_filename(blob_digest)
                             blob_path.write_bytes(blob)
-                            client.push_blob(blob_digest, blob_path, check_exists=True)
-                    client.push_manifest(f"sha256:{hashlib.sha256(manifest).hexdigest()}", manifest)
-                except (RegistryRequestError, BlobIntegrityError, OSError) as error:
+                            if not _blob_matches(blob_path, blob_digest, len(blob)):
+                                raise BlobIntegrityError("Staged attestation blob is corrupt.")
+                            staged.append((blob_digest, len(blob), blob_path))
+                        published=artifact.publish_artifact_manifest(client, manifest, staged)
+                        actual, _, content_type=client.fetch_manifest_bytes(
+                            published.descriptor.digest, artifact.OCI_MANIFEST_MEDIA_TYPE,
+                            len(manifest), expected_digest=published.descriptor.digest,
+                        )
+                        if actual != manifest or content_type != artifact.OCI_MANIFEST_MEDIA_TYPE:
+                            raise BlobIntegrityError("Attestation manifest readback did not match.")
+                        downloaded=Path(workdir)/"verified-bundle"
+                        client.pull_blob(bundle_digest, downloaded, len(bundle))
+                        if downloaded.read_bytes() != bundle:
+                            raise BlobIntegrityError("Attestation bundle readback did not match.")
+                        artifact.require_referrer(client, digest, published.descriptor)
+                except (
+                    artifact.ArtifactPublicationError, artifact.InvalidArtifactError,
+                    RegistryRequestError, BlobIntegrityError, OSError,
+                ) as error:
+                    stage=getattr(error, "stage", None) or type(error).__name__
                     raise slsa.ProvenanceError(
-                        f"unable to publish the attestation referrer ({type(error).__name__})."
+                        f"unable to publish or discover the attestation referrer ({stage})."
                     ) from None
 
             try:

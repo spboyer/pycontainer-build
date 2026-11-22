@@ -19,6 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from .artifact import (
+    Descriptor, EMPTY_CONFIG as OCI_EMPTY_DATA, EMPTY_DIGEST,
+    EMPTY_MEDIA_TYPE as OCI_EMPTY_MEDIA_TYPE, build_artifact_manifest,
+)
 from .signing import SigningError, _check_version, _find_executable
 
 if TYPE_CHECKING:
@@ -32,8 +36,6 @@ DSSE_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 # (v2.6.1, v3.1.4), so the exact v1 statement is signed with attest-blob and published as
 # an OCI 1.1 referrer in the layout cosign verify-attestation --new-bundle-format discovers.
 SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
-OCI_EMPTY_MEDIA_TYPE = "application/vnd.oci.empty.v1+json"
-OCI_EMPTY_DATA = b"{}"
 BUILD_TYPE = (
     "https://github.com/spboyer/pycontainer-build/blob/main/docs/provenance.md#build-type-v1"
 )
@@ -134,6 +136,7 @@ def validate_statement(
     statement: object,
     expected_digest: str,
     *,
+    expected_name: Optional[str] = None,
     require_complete_evidence: bool = False,
 ) -> Dict:
     """Check structure and subject only; this does not authenticate anything."""
@@ -145,12 +148,18 @@ def validate_statement(
         raise ProvenanceError("Provenance statement is not SLSA provenance v1.")
     subjects = statement.get("subject")
     expected = _hex(expected_digest)
-    if not isinstance(subjects, list) or not subjects or not all(
-        isinstance(item, dict) and isinstance(item.get("digest"), dict) for item in subjects
+    if (
+        not isinstance(subjects, list) or len(subjects) != 1
+        or not isinstance(subjects[0], dict)
+        or not isinstance(subjects[0].get("name"), str)
+        or not subjects[0]["name"]
+        or not isinstance(subjects[0].get("digest"), dict)
     ):
-        raise ProvenanceError("Provenance statement has no valid subject.")
-    if any(item["digest"].get("sha256") != expected for item in subjects):
+        raise ProvenanceError("Provenance statement must have one named subject.")
+    if subjects[0]["digest"].get("sha256") != expected:
         raise ProvenanceError("Provenance statement subject does not match the image digest.")
+    if expected_name is not None and subjects[0]["name"] != expected_name:
+        raise ProvenanceError("Provenance statement subject does not match the image repository.")
     predicate = statement.get("predicate")
     definition = predicate.get("buildDefinition") if isinstance(predicate, dict) else None
     if not isinstance(definition, dict) or definition.get("buildType") != BUILD_TYPE:
@@ -175,18 +184,21 @@ def validate_statement(
 
 
 def parse_verified_attestations(
-    output: bytes, expected_digest: str, *, require_complete_evidence: bool = False
+    output: bytes, expected_digest: str, *, expected_name: Optional[str] = None,
+    require_complete_evidence: bool = False,
 ) -> List[Dict]:
     """Apply payload policy to DSSE envelopes printed by cosign verify-attestation."""
     return [
         statement for _, statement in _verified_payloads(
-            output, expected_digest, require_complete_evidence=require_complete_evidence,
+            output, expected_digest, expected_name=expected_name,
+            require_complete_evidence=require_complete_evidence,
         )
     ]
 
 
 def _verified_payloads(
-    output: bytes, expected_digest: str, *, require_complete_evidence: bool
+    output: bytes, expected_digest: str, *, expected_name: Optional[str],
+    require_complete_evidence: bool,
 ) -> List[Tuple[bytes, Dict]]:
     statements = []
     for line in output.splitlines():
@@ -212,7 +224,8 @@ def _verified_payloads(
                 raise ProvenanceError("Verified attestation is not SLSA provenance v1.")
             continue
         validate_statement(
-            statement, expected_digest, require_complete_evidence=require_complete_evidence,
+            statement, expected_digest, expected_name=expected_name,
+            require_complete_evidence=require_complete_evidence,
         )
         statements.append((payload, statement))
     if not statements:
@@ -261,17 +274,20 @@ class CosignAttestor:
                     "signing configuration."
                 )
             try:
-                if bundle_path.stat().st_size > MAX_VERIFY_OUTPUT_BYTES:
+                with bundle_path.open("rb") as stream:
+                    bundle = stream.read(MAX_VERIFY_OUTPUT_BYTES + 1)
+                if len(bundle) > MAX_VERIFY_OUTPUT_BYTES:
                     raise ProvenanceError("cosign attestation bundle exceeds the size limit.")
-                bundle = bundle_path.read_bytes()
             except OSError:
                 raise ProvenanceError("cosign did not write an attestation bundle.") from None
         check_bundle(bundle, payload)
         return bundle
 
     def verify(self, subject: str, *, require_complete_evidence: bool = False) -> List[Dict]:
+        _require_subject(subject)
+        name, digest = subject.rsplit("@", 1)
         return parse_verified_attestations(
-            self._verify_output(subject), subject.rsplit("@", 1)[1],
+            self._verify_output(subject), digest, expected_name=name,
             require_complete_evidence=require_complete_evidence,
         )
 
@@ -308,11 +324,13 @@ class CosignAttestor:
         _require_subject(subject)
         validate_statement(
             statement, subject.rsplit("@", 1)[1],
+            expected_name=subject.rsplit("@", 1)[0],
             require_complete_evidence=require_complete_evidence,
         )
         publish(self.sign_statement(statement))
         payloads = _verified_payloads(
             self._verify_output(subject), subject.rsplit("@", 1)[1],
+            expected_name=subject.rsplit("@", 1)[0],
             require_complete_evidence=require_complete_evidence,
         )
         # Compare the signed bytes, not decoded JSON values.
@@ -344,37 +362,19 @@ def check_bundle(bundle: bytes, payload: bytes) -> None:
         )
 
 
-def _blob_descriptor(media_type: str, data: bytes) -> Dict:
-    return {
-        "mediaType": media_type,
-        "size": len(data),
-        "digest": f"sha256:{hashlib.sha256(data).hexdigest()}",
-    }
-
-
 def referrer_manifest(bundle: bytes, subject: Dict) -> Tuple[bytes, Dict[str, bytes]]:
     """Return an OCI 1.1 referrer manifest for a Sigstore bundle and the blobs it needs."""
-    _hex(subject["digest"])
-    manifest = {
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "artifactType": SIGSTORE_BUNDLE_MEDIA_TYPE,
-        "config": _blob_descriptor(OCI_EMPTY_MEDIA_TYPE, OCI_EMPTY_DATA),
-        "layers": [_blob_descriptor(SIGSTORE_BUNDLE_MEDIA_TYPE, bundle)],
-        "annotations": {
+    digest = f"sha256:{hashlib.sha256(bundle).hexdigest()}"
+    manifest = build_artifact_manifest(
+        SIGSTORE_BUNDLE_MEDIA_TYPE,
+        Descriptor(SIGSTORE_BUNDLE_MEDIA_TYPE, digest, len(bundle)),
+        subject,
+        annotations={
             "dev.sigstore.bundle.content": "dsse-envelope",
             "dev.sigstore.bundle.predicateType": SLSA_PROVENANCE_V1,
         },
-        "subject": {
-            "mediaType": subject["mediaType"], "size": subject["size"],
-            "digest": subject["digest"],
-        },
-    }
-    blobs = {
-        manifest["config"]["digest"]: OCI_EMPTY_DATA,
-        manifest["layers"][0]["digest"]: bundle,
-    }
-    return json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode(), blobs
+    )
+    return manifest, {EMPTY_DIGEST: OCI_EMPTY_DATA, digest: bundle}
 
 
 def _require_subject(subject: str) -> None:
