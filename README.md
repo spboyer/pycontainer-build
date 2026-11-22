@@ -153,6 +153,9 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - **Experimental SLSA provenance** — Opt-in in-toto/SLSA v1 statement of
   observed base and installed-wheel evidence, optionally attested with cosign;
   unsigned statements are unauthenticated. See [provenance](docs/provenance.md)
+- **Experimental generic OCI artifacts** — Python API for non-runnable OCI 1.1
+  artifacts with an optional subject and referrers discovery; see
+  [the artifact contract](docs/oci-artifacts.md)
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars

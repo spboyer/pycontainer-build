@@ -574,6 +574,67 @@ def test_blob_download_rejects_insecure_redirect(monkeypatch):
         client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["http://storage.example/blob", "https://user:secret@storage.example/blob"],
+)
+def test_blob_response_redirect_rejects_unsafe_target(monkeypatch, target):
+    class Opener:
+        def open(self, request, timeout):
+            return _Response(status=302, headers={"Location": target})
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda *args, **kwargs: pytest.fail("unsafe redirect must not be followed"),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("unsafe redirect must not be followed"),
+    )
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
+
+
+def test_blob_response_redirect_strips_registry_authorization(monkeypatch):
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            requests.append(request)
+            return _Response(
+                status=302, headers={"Location": "https://storage.example/blob"}
+            )
+
+    def follow_redirect(request, timeout):
+        requests.append(request)
+        return _Response(b"blob")
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request", follow_redirect
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("redirect bypassed the safe opener"),
+    )
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    assert client._open_blob_response(
+        "https://registry.example/v2/team/app/blobs/sha256:abc"
+    ).read() == b"blob"
+    assert requests[0].get_header("Authorization") == "Bearer secret"
+    assert requests[1].get_header("Authorization") is None
+
+
 def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
     tmp_path, monkeypatch
 ):
