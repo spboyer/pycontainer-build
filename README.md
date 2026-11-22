@@ -351,6 +351,23 @@ pycontainer build \
 - `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
   `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
   (`use-lockfile = false`) ignores auto-detected lockfiles.
+- `--strip-type-stubs` — Opt in (`[build] strip-type-stubs = true`) to drop
+  typing-only files from the dependency layer. Off by default; the default
+  layer is unchanged. It deletes every staged `*.pyi` file and removes
+  stub-only distributions (canonical names `types-*` or `*-stubs`) with their
+  `.dist-info`, rewrites each affected `RECORD`, and leaves them out of the
+  SBOM. A stub-named distribution is removed only if its `RECORD` lists
+  nothing but `.pyi`, `py.typed`, `*-stubs/METADATA.toml` and its own
+  metadata; one that also ships runtime code (for example `django-stubs`
+  with its mypy plugin) is kept, minus its `.pyi` files. Files also listed by
+  a retained distribution are preserved. A malformed `RECORD`, a stub
+  distribution without a `RECORD`, or a `RECORD` path outside site-packages
+  that names a `.pyi` file or belongs to a stub distribution fails the build
+  before anything is changed; other outside entries in retained
+  distributions, such as virtualenv launcher scripts, are left as they are.
+  Identical inputs still give
+  identical layer digests. Leave it off if a dependency reads `.pyi` files
+  at runtime; there are no per-package exceptions.
 
 **Lockfiles**: With `--include-deps`, the dependency source is chosen in this
 order: `--lockfile`, then `--requirements`, then a single lockfile at the

@@ -193,6 +193,7 @@ from .dependencies import (
     install_requirements,
     staged_packages,
     stage_virtualenv,
+    strip_type_stubs,
     target_python_full_version,
     target_python_version,
     validate_target_platform,
@@ -587,6 +588,8 @@ class ImageBuilder:
                 print(f"  Dependency Source: {kind} ({described})")
                 if kind == "lock":
                     print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
+            if self.config.strip_type_stubs:
+                print("  Strip Type Stubs: True")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
@@ -722,6 +725,10 @@ class ImageBuilder:
                     deps_paths, site_packages, version, os_name, arch
                 )
 
+            if self.config.strip_type_stubs:
+                removed = strip_type_stubs(site_packages)
+                if removed:
+                    print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
