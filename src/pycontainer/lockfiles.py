@@ -110,6 +110,23 @@ def load_lockfile(
     context_dir: Path, relative: Path, environment: Dict[str, Optional[str]]
 ) -> LockSelection:
     """Validate a lock against its manifest and select the target's packages."""
+    path, kind, reader = _lock_reader(context_dir, relative)
+    if environment.get("python_full_version") is None:
+        raise LockfileError(
+            "Lockfile staging needs the full target Python version; use a base image "
+            "with PYTHON_VERSION=<major>.<minor>.<patch> metadata."
+        )
+    packages, indexes = reader(path, environment)
+    return LockSelection(kind, Path(relative), _finalize(packages, path.name), tuple(indexes))
+
+
+def preflight_lockfile(context_dir: Path, relative: Path) -> None:
+    """Check locally verifiable freshness before a dry run, without a target image."""
+    path, _, reader = _lock_reader(context_dir, relative)
+    reader(path, None)
+
+
+def _lock_reader(context_dir: Path, relative: Path):
     path = Path(context_dir) / relative
     kind = LOCKFILE_KINDS.get(path.name)
     if kind is None:
@@ -123,16 +140,10 @@ def load_lockfile(
         raise LockfileError(f"Lockfile must be inside the build context: {relative.as_posix()}")
     if path.stat().st_size > MAX_LOCKFILE_BYTES:
         raise LockfileError(f"Lockfile exceeds the {MAX_LOCKFILE_BYTES}-byte limit: {path.name}")
-    if environment.get("python_full_version") is None:
-        raise LockfileError(
-            "Lockfile staging needs the full target Python version; use a base image "
-            "with PYTHON_VERSION=<major>.<minor>.<patch> metadata."
-        )
     if Marker is None:
         raise LockfileError("Lockfile staging requires pip in the Python interpreter running pycontainer.")
     reader = {"poetry": _load_poetry, "pipenv": _load_pipenv, "pdm": _load_pdm, "uv": _load_uv}[kind]
-    packages, indexes = reader(path, environment)
-    return LockSelection(kind, Path(relative), _finalize(packages, path.name), tuple(indexes))
+    return path, kind, reader
 
 
 def _finalize(packages: Iterable[LockedPackage], source: str) -> Tuple[LockedPackage, ...]:
@@ -303,12 +314,14 @@ def _load_poetry(path: Path, environment):
             fresh = expected == poetry_content_hash(pyproject, with_dependency_groups=False)
     if not fresh:
         raise _stale("poetry.lock", "poetry lock")
+    if environment is None:
+        return [], []
     _require_python(pyproject.get("project", {}).get("requires-python"), environment, "pyproject.toml")
 
     packages, indexes = [], []
     for entry in lock.get("package", []):
         name = entry.get("name", "<unnamed>")
-        if entry.get("optional") or "main" not in entry.get("groups", []):
+        if "main" not in entry.get("groups", []):
             continue
         markers = entry.get("markers")
         marker = markers.get("main") if isinstance(markers, dict) else markers
@@ -358,6 +371,8 @@ def _load_pipenv(path: Path, environment):
         raise LockfileError("Pipfile.lock pipfile-spec is unsupported; relock with a current Pipenv.")
     if meta.get("hash", {}).get("sha256") != pipfile_hash(pipfile):
         raise _stale("Pipfile.lock", "pipenv lock")
+    if environment is None:
+        return [], []
     requires = meta.get("requires", {})
     if requires.get("python_version") and requires["python_version"] != environment["python_version"]:
         raise LockfileError(
@@ -431,10 +446,12 @@ def _load_pdm(path: Path, environment):
     algorithm, _, expected = str(metadata.get("content_hash", "")).partition(":")
     if algorithm != "sha256" or expected != pdm_content_hash(pyproject):
         raise _stale("pdm.lock", "pdm lock")
-    _require_python(pyproject.get("project", {}).get("requires-python"), environment, "pyproject.toml")
     targets = metadata.get("targets", [])
     if any(set(target) - {"requires_python"} for target in targets):
         raise LockfileError("pdm.lock platform-specific targets are unsupported; lock for requires-python only.")
+    if environment is None:
+        return [], []
+    _require_python(pyproject.get("project", {}).get("requires-python"), environment, "pyproject.toml")
     if targets and not any(
         SpecifierSet(target.get("requires_python", "")).contains(
             environment["python_full_version"], prereleases=True
@@ -481,7 +498,9 @@ def _requirement_key(
         specifiers = SpecifierSet(specifier or "")
     except InvalidSpecifier as exc:
         raise LockfileError(f"Invalid version specifier in {source}: {specifier!r}") from exc
-    applies = tuple(_marker_applies(marker, environment, source, extra) for extra in scenarios)
+    applies = () if environment is None else tuple(
+        _marker_applies(marker, environment, source, extra) for extra in scenarios
+    )
     return (canonical_name(name), tuple(sorted(canonical_name(extra) for extra in extras)), specifiers, applies)
 
 
@@ -579,6 +598,23 @@ def _check_uv_complete(pyproject: dict, environment, selected, visited) -> None:
             )
 
 
+def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
+    if (path.parent / "uv.toml").exists() or {"index-url", "extra-index-url", "find-links"} & settings.keys():
+        raise LockfileError("uv.lock staging requires project indexes to use [[tool.uv.index]] in pyproject.toml.")
+    indexes = settings.get("index", [])
+    allowed = {
+        _index_url(index.get("url", ""), "tool.uv.index")
+        for index in indexes
+        if not index.get("explicit")
+    }
+    if not any(index.get("default") for index in indexes):
+        allowed.add(None)  # uv's implicit PyPI index
+    for entry in lock.get("package", []):
+        registry = entry.get("source", {}).get("registry")
+        if registry and _index_url(registry, "uv.lock package registry") not in allowed:
+            raise _stale("uv.lock", "uv lock")
+
+
 def _load_uv(path: Path, environment):
     lock = _read_toml(path)
     pyproject = _read_toml(_manifest(path, "pyproject.toml"))
@@ -592,7 +628,7 @@ def _load_uv(path: Path, environment):
     )
     if unsupported:
         raise LockfileError(f"uv tool.uv.{unsupported[0]} is unsupported for lockfile staging.")
-    _require_python(lock.get("requires-python"), environment, "uv.lock")
+    _check_uv_indexes(path, lock, uv_settings)
 
     by_name: Dict[str, List[dict]] = {}
     roots = []
@@ -608,6 +644,9 @@ def _load_uv(path: Path, environment):
     if not project_name or canonical_name(project_name) != canonical_name(root.get("name", "")):
         raise _stale("uv.lock", "uv lock")
     _check_uv_fresh(lock, root, pyproject, environment)
+    if environment is None:
+        return [], []
+    _require_python(lock.get("requires-python"), environment, "uv.lock")
 
     selected: Dict[Tuple[str, str], dict] = {}
     pending = [(dependency, root.get("name")) for dependency in root.get("dependencies", [])]

@@ -197,7 +197,7 @@ from .dependencies import (
     target_python_version,
     validate_target_platform,
 )
-from .lockfiles import detect_lockfile, load_lockfile, target_environment
+from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
 
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
@@ -576,13 +576,13 @@ class ImageBuilder:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.include_deps:
-            try:
-                kind, value = self._dependency_source()
-            except (OSError, ValueError) as error:
-                print(f"  Dependency Source: unresolved ({error})")
-            else:
-                described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
-                print(f"  Dependency Source: {kind} ({described})")
+            kind, value = self._dependency_source()
+            if kind == "lock":
+                preflight_lockfile(Path(self.config.context_dir), value)
+            described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
+            print(f"  Dependency Source: {kind} ({described})")
+            if kind == "lock":
+                print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")

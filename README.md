@@ -368,15 +368,24 @@ none is added as a dependency:
 3. The exact locked versions and their recorded hashes are installed with
    `pip --no-deps --require-hashes` as target wheels and included in the SBOM.
 
+`--dry-run` checks lockfile selection and locally verifiable freshness
+without pulling the base image. Target markers (including uv marker
+freshness), Python compatibility and wheel availability are checked during
+the build, not the dry run.
+
 Only the default/main dependencies are staged; dev groups and project extras
 are not. Supported formats: Poetry lock-version 2.1+, Pipenv pipfile-spec 6,
 PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+uv registry URLs must match the current `[[tool.uv.index]]` declarations
+or the implicit PyPI index; settings from `uv.toml` and legacy index options
+are not supported.
 Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
 PyPI itself is left to your pip configuration so mirrors keep working, and
-hashes still pin each artifact. Index credentials must be `${VARIABLE}`
+pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
+Hashes verify the bytes, not which server supplied them. Index credentials must be `${VARIABLE}`
 placeholders, never literal secrets.
 
 **Context Selection**:

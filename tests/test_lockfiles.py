@@ -77,6 +77,21 @@ def test_python_version_forks_resolve_for_target(tmp_path, kind):
     assert _selected(selection)["iniconfig"] == "2.1.0"
 
 
+@pytest.mark.parametrize("root_extra", [False, True])
+def test_poetry_package_optional_flag_does_not_override_main_marker(tmp_path, root_extra):
+    context = _copy(tmp_path, "poetry")
+    lock = context / "poetry.lock"
+    text = lock.read_text(encoding="utf-8")
+    before, socksio = text.split('name = "socksio"', 1)
+    socksio = socksio.replace("optional = false", "optional = true", 1)
+    if root_extra:
+        socksio = socksio.replace('groups = ["main"]', 'groups = ["main"]\nmarkers = "extra == \'proxy\'"', 1)
+    lock.write_text(before + 'name = "socksio"' + socksio, encoding="utf-8")
+
+    selection = load_lockfile(context, Path("poetry.lock"), PY311)
+    assert ("socksio" in _selected(selection)) is not root_extra
+
+
 def test_pipenv_lock_rejects_target_python_mismatch(tmp_path):
     context = _copy(tmp_path, "pipenv")
 
@@ -104,6 +119,25 @@ def test_uv_freshness_compares_markers_semantically(tmp_path):
     manifest.write_text(text.replace("sys_platform == 'win32'", "sys_platform == 'linux'"), encoding="utf-8")
 
     with pytest.raises(LockfileError, match="out of date"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+@pytest.mark.parametrize("manifest_index", ["https://new.example.invalid/simple", None])
+def test_uv_lock_rejects_replaced_or_removed_index(tmp_path, manifest_index):
+    old = "https://old.example.invalid/simple"
+    context = _write_uv_project(tmp_path / "uv", registry=old, declare_index=False)
+    manifest = context / "pyproject.toml"
+    original = manifest.read_text()
+    manifest.write_text(
+        original + f'\n[[tool.uv.index]]\nurl = "{old}/"\n'
+    )
+    assert load_lockfile(context, Path("uv.lock"), PY311).index_urls == (old,)
+    if manifest_index:
+        manifest.write_text(manifest.read_text().replace(old, manifest_index))
+    else:
+        manifest.write_text(original)
+
+    with pytest.raises(LockfileError, match="out of date.*uv lock"):
         load_lockfile(context, Path("uv.lock"), PY311)
 
 
@@ -153,12 +187,15 @@ def test_unsupported_or_unverifiable_lock_entries_fail(tmp_path, entry, message)
         load_lockfile(context, Path("Pipfile.lock"), PY311)
 
 
-def _write_uv_project(context, wheel=None, *, registry="https://pypi.org/simple", digest=None):
+def _write_uv_project(
+    context, wheel=None, *, registry="https://pypi.org/simple", digest=None, declare_index=True
+):
     context.mkdir(parents=True, exist_ok=True)
     (context / "app.py").write_text("print('app')\n")
     (context / "pyproject.toml").write_text(
         '[project]\nname = "demo"\nversion = "0.1.0"\nrequires-python = ">=3.10"\n'
         'dependencies = ["fixture-dep==1.0", "colorama>=0.4; sys_platform == \'win32\'"]\n'
+        + (f'\n[[tool.uv.index]]\nurl = "{registry}"\n' if declare_index else "")
     )
     if digest is None:
         digest = hashlib.sha256(wheel.read_bytes()).hexdigest() if wheel else "0" * 64
@@ -334,7 +371,37 @@ def test_dry_run_reports_dependency_source(tmp_path, capsys):
 
     builder.build()
 
-    assert "Dependency Source: lock (uv.lock)" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Dependency Source: lock (uv.lock)" in output
+    assert "including uv marker freshness" in output
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_dry_run_rejects_stale_lock_offline(tmp_path, kind, monkeypatch):
+    context = _copy(tmp_path, kind)
+    _, manifest_name = FORMATS[kind]
+    manifest = context / manifest_name
+    manifest.write_text(manifest.read_text().replace("8.1", "8.2"))
+    output = tmp_path / "out"
+    builder = ImageBuilder(
+        BuildConfig(context_dir=str(context), output_dir=str(output), include_deps=True, dry_run=True)
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("dry-run pulled the base"))
+
+    with pytest.raises(LockfileError, match="out of date"):
+        builder.build()
+    assert not output.exists()
+
+
+def test_dry_run_rejects_ambiguous_lockfiles(tmp_path):
+    context = _copy(tmp_path, "uv")
+    (context / "poetry.lock").touch()
+    builder = ImageBuilder(
+        BuildConfig(context_dir=str(context), output_dir=str(tmp_path / "out"), include_deps=True, dry_run=True)
+    )
+
+    with pytest.raises(LockfileError, match="Multiple lockfiles found"):
+        builder.build()
 
 
 def test_cli_and_toml_select_lockfile_options(tmp_path, monkeypatch):
