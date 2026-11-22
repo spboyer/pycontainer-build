@@ -188,6 +188,16 @@ def test_build_and_validate_share_checks(offline, monkeypatch, capsys, content, 
     assert message in capsys.readouterr().err
 
 
+def test_directory_config_path_reports_an_error_in_build_and_validate(offline, monkeypatch, capsys):
+    path = str(offline)
+
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, command) == 2
+        err = capsys.readouterr().err
+        assert path in err or repr(path) in err
+        assert "Traceback" not in err
+
+
 @pytest.mark.parametrize(
     "content",
     ['[project]\nname = "demo"\n', "[biuld]\ntag = \"app:1\"\n", '[tool.pycontiner]\ntag = "app:1"\n', ""],
