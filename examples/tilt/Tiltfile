@@ -2,6 +2,9 @@
 # pycontainer never writes to the local Docker image store, so
 # skips_local_docker=True is required and the command pushes the image itself.
 
+# Tilt's background pruner can otherwise alter the local Docker cache.
+docker_prune_settings(disable=True)
+
 registry = os.getenv('PYCONTAINER_TILT_REGISTRY', '')
 if registry:
     default_registry(registry)

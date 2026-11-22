@@ -20,10 +20,12 @@ import textwrap
 import threading
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from scripts import check_devloop_tools as real_check
 from pycontainer import cli
 from pycontainer.devloop import (
     DevLoopError,
@@ -67,7 +69,7 @@ SITECUSTOMIZE = textwrap.dedent(
 class FakeRegistry:
     """Minimal Registry v2 push endpoint that records manifests and requests."""
 
-    def __init__(self, root: Path, fail_manifests: bool = False):
+    def __init__(self, root: Path, fail_manifests: bool = False, fail_auth: bool = False):
         self.blobs = {}
         self.manifests = {}
         self.requests = []
@@ -92,7 +94,7 @@ class FakeRegistry:
             def do_HEAD(self):
                 registry.requests.append(("HEAD", self.path))
                 digest = urlsplit(self.path).path.rsplit("/", 1)[-1]
-                self._reply(200 if digest in registry.blobs else 404)
+                self._reply(401 if fail_auth else 200 if digest in registry.blobs else 404)
 
             def do_POST(self):
                 registry.requests.append(("POST", self.path))
@@ -362,6 +364,25 @@ def test_tilt_push_failure_leaves_no_output_ref(project, tool_env):
         assert not ref_file.exists()
 
 
+@pytest.mark.parametrize("tool", ["skaffold", "tilt"])
+def test_devloop_auth_failure_is_propagated_without_credentials(project, tool_env, tool):
+    workspace = project(tool)
+    env = dict(tool_env, REGISTRY_USERNAME="test-user", REGISTRY_PASSWORD="test-secret")
+    with FakeRegistry(workspace, fail_auth=True) as registry:
+        ref_file = workspace / "dist" / "tilt-image-ref.txt"
+        if tool == "skaffold":
+            result = run_skaffold(workspace, env, image=f"{registry.host}/demo:x")
+        else:
+            argv = tilt_command(workspace) + [
+                "--image", f"{registry.host}/demo", "--output-ref", str(ref_file),
+            ]
+            result = run_tilt(workspace, env, argv, output_ref=ref_file)
+        assert result.returncode != 0
+        assert "HTTP 401" in result.stderr
+        assert "test-secret" not in result.stdout + result.stderr
+        assert not ref_file.exists()
+
+
 def test_tilt_rejects_registryless_tag_mode_ref(project, tool_env):
     workspace = project("tilt")
     result = run_tilt(workspace, tool_env, tilt_command(workspace), expected_ref="pycontainer-demo:dev")
@@ -487,3 +508,254 @@ def test_devloop_commands_do_not_accept_credentials_or_tags(monkeypatch, recordi
             run_cli(monkeypatch, *argv)
         assert exit_info.value.code == 2
     assert recording == []
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_build_failure_stops_before_push(tmp_path, monkeypatch, recording, command):
+    def fail_build(_self):
+        raise RuntimeError("synthetic build failure")
+
+    monkeypatch.setattr(RecordingBuilder, "build", fail_build)
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        argv = [command]
+    else:
+        argv = [command, "--image", "localhost:5000/a", "--output-ref", str(tmp_path / "ref")]
+
+    with pytest.raises(RuntimeError, match="synthetic build failure"):
+        run_cli(monkeypatch, *argv)
+    assert recording[0].pushes == []
+    assert not (tmp_path / "ref").exists()
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("linux/amd64, linux/amd64", "linux/amd64"), ("  ", None)],
+)
+def test_devloop_normalizes_or_rejects_configured_platform(
+    tmp_path, monkeypatch, recording, command, configured, expected
+):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(f'[build]\nplatform = "{configured}"\n')
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    if expected is None:
+        with pytest.raises(SystemExit) as error:
+            run_cli(monkeypatch, command, "--config", str(config))
+        assert error.value.code == 2
+        assert recording == []
+    else:
+        run_cli(monkeypatch, command, "--config", str(config))
+        assert recording[0].config.platform == expected
+
+
+def test_tilt_example_disables_background_docker_pruning():
+    tiltfile = (EXAMPLES / "tilt" / "Tiltfile").read_text()
+    assert re.search(r"^docker_prune_settings\(disable\s*=\s*True\)", tiltfile, re.M)
+
+
+@pytest.mark.parametrize(
+    ("deployed", "matches"),
+    [
+        ("registry.test/team/pycontainer-demo:built", True),
+        ("registry.test/team/pycontainer-demo:built@" + DIGEST, True),
+        ("registry.test/team/pycontainer-demo-other:built", False),
+        ("registry.test/team/pycontainer-demo:different", False),
+        ("registry.test/team/pycontainer-demo:built@sha256:" + "b" * 64, False),
+    ],
+)
+def test_real_check_compares_exact_deployed_reference(
+    tmp_path, monkeypatch, deployed, matches
+):
+    monkeypatch.setattr(real_check, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        real_check, "deployed_image", lambda *args, **kwargs: deployed
+    )
+    kwargs = dict(
+        cwd=tmp_path,
+        registry="registry.test/team",
+        context="test-context",
+        namespace="test-namespace",
+        reference="registry.test/team/pycontainer-demo:built",
+        digest=DIGEST,
+    )
+    if matches:
+        real_check.verify_rollout(**kwargs)
+    else:
+        with pytest.raises(SystemExit, match="reference|digest"):
+            real_check.verify_rollout(**kwargs)
+
+
+def test_real_check_accepts_docker_hub_familiar_reference(tmp_path, monkeypatch):
+    monkeypatch.setattr(real_check, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        real_check, "deployed_image", lambda *args, **kwargs: "team/pycontainer-demo:built"
+    )
+    real_check.verify_rollout(
+        tmp_path, "docker.io/team", "test-context", "test-namespace",
+        "docker.io/team/pycontainer-demo:built", DIGEST,
+    )
+
+
+def test_real_check_pins_rollout_and_deployment_to_context_and_namespace(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_subprocess_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0, stdout="registry.test/team/pycontainer-demo:built"
+        )
+
+    monkeypatch.setattr(real_check.subprocess, "run", fake_subprocess_run)
+    real_check.verify_rollout(
+        tmp_path, "registry.test/team", "test-context", "test-namespace",
+        "registry.test/team/pycontainer-demo:built", DIGEST,
+    )
+    assert len(calls) == 2
+    for command in calls:
+        assert command[command.index("--context") + 1] == "test-context"
+        assert command[command.index("--namespace") + 1] == "test-namespace"
+
+
+def test_real_check_rejects_build_outside_requested_repository(tmp_path, monkeypatch):
+    monkeypatch.setattr(real_check, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        real_check, "deployed_image", lambda *args, **kwargs: "other.test/team/pycontainer-demo:built"
+    )
+    with pytest.raises(SystemExit, match="reference"):
+        real_check.verify_rollout(
+            tmp_path, "registry.test/team", "test-context", "test-namespace",
+            "other.test/team/pycontainer-demo:built", DIGEST,
+        )
+
+
+def test_real_check_rejects_wrong_content_tag(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, cwd, env=None):
+        calls.append(argv)
+        if argv[:2] == ["tilt", "ci"]:
+            layout = cwd / "dist" / "image"
+            layout.mkdir(parents=True)
+            (layout / "index.json").write_text(json.dumps({
+                "annotations": {
+                    "org.opencontainers.image.ref.name":
+                    "registry.test/team/pycontainer-demo:tilt-pending"
+                },
+                "manifests": [{"digest": DIGEST}],
+            }))
+            (cwd / "dist" / "tilt-image-ref.txt").write_text(
+                "registry.test/team/pycontainer-demo:tilt-" + "b" * 64
+            )
+
+    monkeypatch.setattr(real_check, "run", fake_run)
+    with pytest.raises(SystemExit, match="content tag|digest"):
+        real_check.check_tilt(
+            tmp_path, "registry.test/team", "output-ref", "test-context", "test-namespace"
+        )
+    for action in ("ci", "down"):
+        command = next(argv for argv in calls if argv[:2] == ["tilt", action])
+        assert command[command.index("--context") + 1] == "test-context"
+        assert command[command.index("--namespace") + 1] == "test-namespace"
+
+
+def test_real_skaffold_check_uses_unique_tag_and_scoped_commands(tmp_path, monkeypatch):
+    calls = []
+    checked = []
+    reference = "registry.test/team/pycontainer-demo:test-namespace"
+
+    def fake_run(argv, cwd, env=None):
+        calls.append(argv)
+        if argv[:2] == ["skaffold", "run"]:
+            layout = cwd / "dist" / "image"
+            layout.mkdir(parents=True)
+            (layout / "index.json").write_text(json.dumps({
+                "annotations": {"org.opencontainers.image.ref.name": reference},
+                "manifests": [{"digest": DIGEST}],
+            }))
+
+    monkeypatch.setattr(real_check, "run", fake_run)
+    monkeypatch.setattr(real_check, "verify_rollout", lambda *args: checked.append(args))
+    real_check.check_skaffold(
+        tmp_path, "registry.test/team", False, "test-context", "test-namespace"
+    )
+
+    build = next(argv for argv in calls if argv[:2] == ["skaffold", "run"])
+    assert build[build.index("--tag") + 1] == "test-namespace"
+    for action in ("run", "delete"):
+        command = next(argv for argv in calls if argv[:2] == ["skaffold", action])
+        assert command[command.index("--kube-context") + 1] == "test-context"
+        assert command[command.index("--namespace") + 1] == "test-namespace"
+    assert checked == [
+        (tmp_path / "skaffold", "registry.test/team", "test-context",
+         "test-namespace", reference, DIGEST)
+    ]
+
+
+def test_real_check_isolates_resources_in_a_new_namespace(monkeypatch):
+    calls = []
+    projects = []
+    monkeypatch.setattr(sys, "argv", [
+        "check_devloop_tools", "--registry", "registry.test/team", "--tool", "skaffold"
+    ])
+    monkeypatch.setattr(real_check.shutil, "which", lambda tool: tool)
+    monkeypatch.setattr(real_check, "current_context", lambda: "test-context")
+    monkeypatch.setattr(real_check, "run", lambda argv, cwd, env=None: calls.append(argv))
+    monkeypatch.setattr(
+        real_check, "check_skaffold",
+        lambda workdir, registry, insecure, context, namespace: projects.append(
+            (registry, context, namespace)
+        ),
+    )
+
+    real_check.main()
+
+    create = next(argv for argv in calls if "create" in argv)
+    delete = next(argv for argv in calls if "delete" in argv)
+    namespace = create[-1]
+    assert namespace.startswith("pycontainer-devloop-")
+    assert delete[delete.index("namespace") + 1] == namespace
+    assert projects == [("registry.test/team", "test-context", namespace)]
+    assert all("test-context" in argv for argv in (create, delete))
+
+
+def test_real_check_does_not_delete_namespace_when_creation_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys, "argv", [
+        "check_devloop_tools", "--registry", "registry.test/team", "--tool", "skaffold"
+    ])
+    monkeypatch.setattr(real_check.shutil, "which", lambda tool: tool)
+    monkeypatch.setattr(real_check, "current_context", lambda: "test-context")
+
+    def fake_run(argv, cwd, env=None):
+        calls.append(argv)
+        if "create" in argv:
+            raise SystemExit("namespace already exists")
+
+    monkeypatch.setattr(real_check, "run", fake_run)
+    with pytest.raises(SystemExit, match="namespace already exists"):
+        real_check.main()
+    assert not any("delete" in argv for argv in calls)
+
+
+def test_real_check_reports_cleanup_failure_without_masking_original(tmp_path, monkeypatch, capsys):
+    def fail_cleanup(*args, **kwargs):
+        raise SystemExit("cleanup failed")
+
+    monkeypatch.setattr(real_check, "run", fail_cleanup)
+    with pytest.raises(ValueError, match="build failed"):
+        try:
+            raise ValueError("build failed")
+        finally:
+            real_check.cleanup(["tilt", "down"], tmp_path)
+    assert "cleanup failed" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="cleanup failed"):
+        real_check.cleanup(["tilt", "down"], tmp_path)

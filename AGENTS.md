@@ -99,7 +99,8 @@ part of the default test suite or CI.
 fake tool launchers against a loopback registry. Real interoperability is
 opt-in: `python scripts/check_devloop_tools.py --registry <https-registry>/ns`
 needs `skaffold`, `tilt`, `kubectl`, a current cluster context and an HTTPS
-registry the cluster can pull from. It is not part of CI.
+registry the cluster can pull from, plus permission to create and delete a
+test namespace. It is not part of CI.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark

@@ -85,6 +85,7 @@ skaffold run --default-repo example.azurecr.io/dev
 ## Tilt
 
 ```python
+docker_prune_settings(disable=True)
 default_registry('example.azurecr.io/dev')
 custom_build(
     'pycontainer-demo',
@@ -97,7 +98,9 @@ custom_build(
 Use the list (argv) form of the command so no shell is involved. Tilt sets
 `EXPECTED_REF` to the registry-qualified ref; pycontainer pushes exactly that
 reference, and Tilt deploys it (rewriting the host when the cluster pulls from
-a different registry address).
+a different registry address). The example also sets
+`docker_prune_settings(disable=True)` to prevent Tilt's background pruner
+from modifying the local Docker cache.
 
 `custom_build(tag=...)` is **not supported**: in that mode Tilt strips the
 registry from `EXPECTED_REF` and expects a local daemon image, so the command
@@ -135,8 +138,11 @@ this mode because the content tag is only known after the manifest is built.
 - `scripts/check_devloop_tools.py` is an **opt-in** real check: with
   `skaffold`, `tilt`, `kubectl`, a current Kubernetes context and an HTTPS
   registry the cluster can pull from, it deploys both examples (Tilt in both
-  modes), waits for the rollouts and confirms the running image came from the
-  registry. It is not part of CI.
+  modes), waits for the rollouts and compares each deployed reference with the
+  built or reported reference. It creates and removes a unique namespace, so
+  the current Kubernetes identity must have permission to create and delete
+  namespaces. It pushes image tags to the supplied registry; use a test
+  registry or namespace. It is not part of CI.
 
 ```bash
 python scripts/check_devloop_tools.py --registry example.azurecr.io/dev

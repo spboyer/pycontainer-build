@@ -159,7 +159,10 @@ def main():
             if 'base_image' not in cli_overrides:
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"
-        if devloop: single_platform(cfg.platform,"platform")
+        if devloop:
+            platform=single_platform(cfg.platform,"platform")
+            if not platform: raise DevLoopError("platform must specify a single target platform.")
+            cfg.platform=platform
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 

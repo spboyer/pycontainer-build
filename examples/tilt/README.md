@@ -20,6 +20,7 @@ PYCONTAINER_TILT_MODE=output-ref tilt up
 `custom_build(tag=...)` is not supported, and the registry must be explicit:
 without `default_registry()` (or a cluster-advertised registry) Tilt passes a
 registry-less `EXPECTED_REF`, which pycontainer rejects. A plain-HTTP local
-registry cannot be used because the registry client requires HTTPS.
+registry cannot be used because the registry client requires HTTPS. The
+example disables Tilt's background Docker pruner to preserve the local cache.
 
 See [docs/skaffold-tilt.md](../../docs/skaffold-tilt.md) for the full contract.
