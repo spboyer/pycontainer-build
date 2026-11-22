@@ -37,6 +37,13 @@ jobs:
             sudo apt-get install -y -q skopeo
           fi
           skopeo --version
+      - name: Record an incomplete check until the script finishes
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p runtime-evidence
+          printf '{"schema": 1, "status": "failed", "target_platform": "%s", "error": "check did not complete"}\n' \
+            "$TARGET_PLATFORM" > runtime-evidence/${{ matrix.slug }}.json
       - name: Build, import and start the image
         env:
           PYTHONPATH: src
@@ -52,7 +59,7 @@ jobs:
         with:
           name: runtime-evidence-${{ matrix.slug }}
           path: runtime-evidence/${{ matrix.slug }}.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           overwrite: true
           retention-days: 90
 
@@ -65,6 +72,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download evidence
+        id: download
+        # A failed download is reported by the verifier rather than skipping it.
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -78,6 +87,8 @@ jobs:
           --require linux/arm64
           --commit ${{ github.sha }}
           --summary runtime-evidence-summary.md
+          ${{ steps.download.outcome != 'success' && '--error "evidence download did not succeed"' || '' }}
+          ${{ needs.startup.result != 'success' && format('--error "startup jobs in this attempt reported {0}"', needs.startup.result) || '' }}
       - name: Upload summary
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -89,6 +89,10 @@ def _stale(record):
     record["commit"] = "c" * 40
 
 
+def _no_digest(record):
+    del record["image"]
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -96,6 +100,7 @@ def _stale(record):
         (_partial, "is not a full OCI import and startup"),
         (_emulated, "daemon_platform 'linux/amd64' does not match linux/arm64"),
         (_stale, "expected " + COMMIT),
+        (_no_digest, "lacks the image manifest digest"),
     ],
 )
 def test_gate_rejects_unproven_target_and_separates_it_from_passing(tmp_path, mutate, reason):
@@ -134,6 +139,23 @@ def test_gate_fails_without_any_evidence_directory(tmp_path):
     ])
 
     assert code == 1
+
+
+def test_gate_fails_on_unverified_evidence_transfer(tmp_path):
+    evidence = tmp_path / "evidence"
+    write_records(evidence, [passing_record("linux/amd64")])
+    summary = tmp_path / "summary.md"
+
+    code = verifier.main([
+        "--evidence-dir", str(evidence),
+        "--require", "linux/amd64",
+        "--error", "evidence download did not succeed",
+        "--summary", str(summary),
+    ])
+
+    assert code == 1
+    assert "No target passed runtime verification." in summary.read_text()
+    assert "evidence download did not succeed" in summary.read_text()
 
 
 def test_gate_fails_on_unreadable_evidence(tmp_path):
@@ -214,8 +236,12 @@ def test_runtime_workflow_requires_native_evidence_for_each_target():
     assert "platform: linux/arm64\n            runner: ubuntu-24.04-arm\n" in startup
     assert "--platform ${{ matrix.platform }}" in startup
     assert "name: runtime-evidence-${{ matrix.slug }}" in startup
+    assert '"status": "failed"' in startup
+    assert "if-no-files-found: error" in startup
     assert "continue-on-error" not in startup
     assert "if: always()" in gate
+    assert "steps.download.outcome != 'success'" in gate
+    assert "needs.startup.result != 'success'" in gate
     assert "--require linux/amd64" in gate
     assert "--require linux/arm64" in gate
     assert "--commit ${{ github.sha }}" in gate

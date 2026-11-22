@@ -53,6 +53,12 @@ def rejection_reason(record, target, commit):
             return f"{field} {record.get(field)!r} does not match {expected}"
     if RUNTIME_MARKER not in str(record.get("container_stdout", "")):
         return "container output lacks the runtime dependency marker"
+    manifest = (record.get("image") or {}).get("manifest_digest")
+    if not (isinstance(manifest, str) and manifest.startswith("sha256:")):
+        return "evidence lacks the image manifest digest"
+    for field in ("docker_version", "skopeo_version", "base_image"):
+        if not (isinstance(record.get(field), str) and record[field]):
+            return f"evidence lacks {field}"
     return None
 
 
@@ -122,10 +128,21 @@ def main(argv=None):
     )
     parser.add_argument("--commit", help="commit SHA every record must match")
     parser.add_argument("--summary", type=Path, help="write the markdown summary here")
+    parser.add_argument(
+        "--error",
+        action="append",
+        default=[],
+        help="external failure that must fail the gate, such as an artifact download (repeatable)",
+    )
     args = parser.parse_args(argv)
 
     records, errors = load_records(args.evidence_dir)
+    errors = args.error + errors
     validated, not_validated, extra = evaluate(records, args.require, args.commit)
+    if args.error:
+        validated, not_validated = [], not_validated + [
+            (record["target_platform"], "evidence transfer was not verified") for record in validated
+        ]
     summary = render_summary(validated, not_validated, extra, errors, args.commit)
     print(summary, end="")
     if args.summary:
