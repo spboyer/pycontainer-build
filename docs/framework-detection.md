@@ -7,8 +7,8 @@ provide the packages in the base image.
 
 | Framework | Evidence | Default entrypoint | Ports |
 |---|---|---|---|
-| FastAPI | Assignment to `FastAPI(...)` | `uvicorn <module>:<variable> --host 0.0.0.0 --port 8000` | 8000 |
-| Flask | Assignment to `Flask(...)` | `flask run --host=0.0.0.0 --port=5000` | 5000 |
+| FastAPI | Module-level assignment to `FastAPI(...)`, including imported aliases | `uvicorn <module>:<variable> --host 0.0.0.0 --port 8000` | 8000 |
+| Flask | Module-level assignment to `Flask(...)`, including imported aliases | `flask run --host=0.0.0.0 --port=5000` | 5000 |
 | Django | Root `manage.py` referring to Django | `python manage.py runserver 0.0.0.0:8000` | 8000 |
 | Streamlit | A script importing Streamlit and the `streamlit` dependency | `streamlit run <file> --server.address=0.0.0.0 --server.port=8501` | 8501 |
 | Gradio | A script creating and launching `Blocks` or `Interface`, and the `gradio` dependency | `python <file>` | 7860 |
@@ -22,9 +22,9 @@ explicitly when the listener port cannot be inferred. For Streamlit, a single
 explicitly exposed port or `STREAMLIT_SERVER_PORT` changes the generated
 listener port. When no listener is specified by the build, an inherited
 `STREAMLIT_SERVER_PORT` is honored even if exposed-port metadata is explicitly
-cleared. An explicit command's `--server.port` takes precedence. Conflicting
-explicit values for a generated command are rejected. JupyterLab wins when both
-Jupyter dependencies are declared.
+cleared. An explicit command's `--server.port` before `--` takes precedence.
+Conflicting explicit values for a generated command are rejected. JupyterLab
+wins when both Jupyter dependencies are declared.
 
 ## Precedence and ambiguity
 
@@ -65,6 +65,8 @@ preselected file iterable. Test, virtualenv, and
 `.ipynb_checkpoints` paths are excluded by default; `--no-default-excludes`
 opts out. With automatic file selection, notebook files outside excluded paths
 are included when Jupyter is declared; explicit includes remain authoritative.
+Source and notebook symlinks are skipped with a warning unless every target in
+the link chain is selected, not excluded, and a relative POSIX-style path.
 Notebooks without a declared Jupyter dependency do not trigger detection, and
 `--verbose` reports why. Include any accompanying data files explicitly when
 they are outside the other automatically selected paths.

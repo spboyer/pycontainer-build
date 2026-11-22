@@ -57,13 +57,13 @@ def declared_dependency_names(
         if path_is_excluded(relative, excludes):
             return None
         path = ctx / relative
-        if not path.is_file():
-            return None
         try:
+            if not path.is_file():
+                return None
             contained = path.resolve().is_relative_to(root)
         except (OSError, RuntimeError):
             if display is not None and display != relative:
-                raise ValueError("Cannot access an environment-based requirements file.") from None
+                raise OSError("Cannot access an environment-based requirements file.") from None
             raise
         if not contained:
             raise ValueError(f"Dependency file is outside the build context: {display or relative}")

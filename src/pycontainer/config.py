@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
@@ -16,6 +17,13 @@ class _TrackedList(list):
     def __init__(self, values=()):
         super().__init__(values)
         self.specified = False
+
+    def __deepcopy__(self, memo):
+        copied = type(self)()
+        memo[id(self)] = copied
+        list.extend(copied, (deepcopy(value, memo) for value in self))
+        copied.__dict__.update(deepcopy(self.__dict__, memo))
+        return copied
 
     append = _track_list_mutation(list.append)
     clear = _track_list_mutation(list.clear)
@@ -40,7 +48,14 @@ class _DefaultPorts(_TrackedList):
 
 
 class _GeneratedList(_TrackedList):
-    pass
+    def __init__(self, values=(), *, generated=False):
+        super().__init__(values)
+        self.generated = generated
+        self.snapshot = tuple(self)
+
+    @property
+    def untouched(self):
+        return self.generated and not self.specified and tuple(self) == self.snapshot
 
 
 class _PortState:

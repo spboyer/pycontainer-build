@@ -202,6 +202,8 @@ logger=logging.getLogger(__name__)
 def _configured_streamlit_port(arguments):
     port = None
     for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
         if argument.startswith("--server.port="):
             port = _environment_port(argument.partition("=")[2], "--server.port")
         elif argument == "--server.port":

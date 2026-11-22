@@ -265,6 +265,28 @@ def test_fastapi_wins_for_mounted_gradio_without_a_standalone_launch(tmp_path):
     assert detect_framework(tmp_path)[0] == "FastAPI"
 
 
+def test_fastapi_alias_wins_for_mounted_gradio(tmp_path):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(
+        tmp_path, "api.py",
+        "from fastapi import FastAPI as API\nimport gradio as gr\n"
+        "app = API()\ndemo = gr.Blocks()\n"
+        "app = gr.mount_gradio_app(app, demo, path='/ui')\n",
+    )
+    assert detect_framework(tmp_path)[0] == "FastAPI"
+
+
+def test_function_local_web_apps_do_not_create_importable_candidates(tmp_path):
+    write_file(
+        tmp_path, "api.py",
+        "from fastapi import FastAPI\napp = FastAPI()\n"
+        "def factory():\n    inner = FastAPI()\n    return inner\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "FastAPI"
+    assert entrypoint[1] == "api:app"
+
+
 def test_framework_precedence_reports_coexisting_candidates(tmp_path, caplog):
     write_file(tmp_path, "requirements.txt", "streamlit\ngradio\njupyterlab\ncelery\n")
     write_file(tmp_path, "a.py", "import streamlit\n")
@@ -498,6 +520,31 @@ def test_dataclass_replace_preserves_explicit_empty_port_override(tmp_path):
     assert apply_framework_defaults(config, tmp_path).exposed_ports == []
 
 
+@pytest.mark.parametrize("copy_config", [replace, deepcopy])
+def test_config_copies_preserve_generated_defaults_for_redetection(tmp_path, copy_config):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    original = apply_framework_defaults(BuildConfig(), tmp_path)
+    copied = copy_config(original)
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+
+    apply_framework_defaults(copied, tmp_path)
+    assert copied.entrypoint[0] == "uvicorn"
+    assert copied.exposed_ports == [8000]
+    assert copied.labels["framework"] == "fastapi"
+    assert original.labels["framework"] == "celery"
+
+
+def test_replacing_generated_entrypoint_restores_inherited_command(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    config = apply_framework_defaults(BuildConfig(), tmp_path)
+    config.entrypoint = ["custom"]
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == ["custom"]
+    assert config.cmd is None
+
+
 def test_jupyter_checkpoints_are_excluded_unless_default_excludes_are_disabled(tmp_path):
     write_file(tmp_path, "requirements.txt", "jupyterlab\n")
     write_file(tmp_path, "notebooks/research.ipynb", "{}")
@@ -589,6 +636,80 @@ def test_setup_cfg_file_requirements_are_recognized(tmp_path):
     write_file(tmp_path, "deps.txt", "streamlit\n")
     write_file(tmp_path, "app.py", "import streamlit\n")
     assert detect_framework(tmp_path)[0] == "Streamlit"
+
+
+def test_utf8_bom_requirements_are_recognized(tmp_path):
+    (tmp_path / "requirements.txt").write_bytes(b"\xef\xbb\xbfstreamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    assert detect_framework(tmp_path)[0] == "Streamlit"
+
+
+@pytest.mark.parametrize("exclude_paths", [[], ["hidden"]])
+def test_unselected_source_symlink_target_is_not_detected(tmp_path, caplog, exclude_paths):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    target = write_file(tmp_path, "hidden/app.py", "import streamlit\n")
+    shortcut = tmp_path / "shortcut.py"
+    try:
+        shortcut.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    assert detect_framework(tmp_path, files=[shortcut], exclude_paths=exclude_paths) is None
+    assert "symlink" in caplog.text.lower()
+
+
+def test_selected_source_symlink_target_can_be_detected(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    target = write_file(tmp_path, "source.txt", "import streamlit\n")
+    shortcut = tmp_path / "shortcut.py"
+    try:
+        shortcut.symlink_to(target.name)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    assert detect_framework(tmp_path, files=[shortcut, target])[0] == "Streamlit"
+
+
+def test_source_symlink_requires_every_link_in_the_selected_chain(tmp_path, caplog):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    target = write_file(tmp_path, "source.txt", "import streamlit\n")
+    intermediate = tmp_path / "intermediate.txt"
+    shortcut = tmp_path / "shortcut.py"
+    try:
+        intermediate.symlink_to(target.name)
+        shortcut.symlink_to(intermediate.name)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    assert detect_framework(tmp_path, files=[shortcut, target]) is None
+    assert "symlink" in caplog.text.lower()
+    assert detect_framework(tmp_path, files=[shortcut, intermediate, target])[0] == "Streamlit"
+
+
+def test_source_symlink_with_absolute_target_is_not_detected(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    target = write_file(tmp_path, "source.txt", "import streamlit\n")
+    shortcut = tmp_path / "shortcut.py"
+    try:
+        shortcut.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    assert detect_framework(tmp_path, files=[shortcut, target]) is None
+
+
+def test_environment_requirement_permission_error_is_redacted(tmp_path, monkeypatch):
+    write_file(tmp_path, "requirements.txt", "-r ${PROJECT_REQUIREMENTS}\n")
+    target = write_file(tmp_path, "private-credential-filename.txt", "streamlit\n")
+    monkeypatch.setenv("PROJECT_REQUIREMENTS", target.name)
+    original_is_file = Path.is_file
+
+    def is_file(path):
+        if path == target:
+            raise PermissionError(f"Access denied: {path}")
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    with pytest.raises(OSError) as error:
+        detect_framework(tmp_path)
+    assert target.name not in "".join(traceback.format_exception(error.value))
 
 
 @pytest.mark.parametrize(
@@ -977,6 +1098,48 @@ def test_unselected_gradio_port_ambiguity_does_not_block_selected_script(tmp_pat
     assert config.exposed_ports == [7860]
 
 
+def test_unrelated_explicit_command_is_not_blocked_by_gradio_port(tmp_path):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(
+        tmp_path, "demo.py",
+        "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch(server_port=get_port())\n",
+    )
+    config = BuildConfig(cmd=["python", "manual.py"])
+    apply_framework_defaults(config, tmp_path)
+    assert config.cmd == ["python", "manual.py"]
+    assert not config.has_exposed_ports()
+
+
+@pytest.mark.parametrize("command", [
+    ["python", "-m", "demo"],
+    ["python", "-u", "-m", "demo", "api.py"],
+])
+def test_python_module_command_selects_gradio_over_fastapi(tmp_path, command):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(
+        tmp_path, "demo.py",
+        "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n",
+    )
+    config = BuildConfig(entrypoint=command)
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == command
+    assert config.labels["framework"] == "gradio"
+    assert config.exposed_ports == [7860]
+
+
+def test_python_command_does_not_treat_script_arguments_as_candidates(tmp_path):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    for name, port in (("a.py", 8123), ("b.py", 8124)):
+        write_file(
+            tmp_path, name,
+            f"import gradio as gr\ndemo = gr.Blocks()\ndemo.launch(server_port={port})\n",
+        )
+    config = BuildConfig(entrypoint=["python", "b.py", "a.py"])
+    apply_framework_defaults(config, tmp_path)
+    assert config.exposed_ports == [8124]
+
+
 def test_explicit_command_disambiguates_frameworks_in_one_script(tmp_path):
     write_file(tmp_path, "requirements.txt", "streamlit\ngradio\n")
     write_file(
@@ -1154,6 +1317,22 @@ def test_streamlit_explicit_listener_port_ignores_invalid_inherited_port(tmp_pat
     )
     assert "--server.port=9200" in image["Entrypoint"]
     assert image["ExposedPorts"] == {"9200/tcp": {}}
+
+
+def test_streamlit_script_arguments_do_not_override_listener_port(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "streamlit\n")
+    write_file(context, "app.py", "import streamlit\n")
+    command = ["streamlit", "run", "app.py", "--", "--server.port=9999"]
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"),
+        use_cache=False, entrypoint=command,
+    )
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["STREAMLIT_SERVER_PORT=9100"]
+    )
+    assert image["Entrypoint"] == command
+    assert image["ExposedPorts"] == {"9100/tcp": {}}
 
 
 @pytest.mark.parametrize(

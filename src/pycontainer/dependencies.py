@@ -275,7 +275,7 @@ def _logical_requirement_lines(path, *, display=None):
     continuation = ""
     start_line = 1
     for line_number, raw_line in enumerate(
-        data.decode("utf-8").splitlines(), start=1
+        data.decode("utf-8-sig").splitlines(), start=1
     ):
         if not continuation:
             start_line = line_number

@@ -2,6 +2,7 @@
 import ast
 import keyword
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -107,12 +108,19 @@ def _detect_framework(
             )
         )
     selected = {}
+    available = set()
     for item in files:
         path = Path(item)
         if not path.is_absolute():
             absolute = path.absolute()
             path = absolute if absolute.is_relative_to(context_path) else context_path / path
         if path.suffix not in (".py", ".ipynb"):
+            try:
+                relative = path.relative_to(context_path)
+            except ValueError:
+                continue
+            if ".." not in relative.parts and not path_is_excluded(relative, excludes):
+                available.add(relative)
             continue
         try:
             relative = path.relative_to(context_path)
@@ -130,8 +138,18 @@ def _detect_framework(
             raise ValueError(f"Selected source is outside the build context: {path}")
         if not selected_path.is_file():
             raise FileNotFoundError(f"Selected source file not found: {path}")
+        available.add(relative)
         selected[relative.as_posix()] = selected_path
-    selected_files = [selected[name] for name in sorted(selected)]
+    selected_files = []
+    for name in sorted(selected):
+        path = selected[name]
+        if not _selected_symlink_chain(path, ctx, available):
+            logger.warning(
+                "Skipping source symlink %s: its target chain is not included in the selected files.",
+                name,
+            )
+            continue
+        selected_files.append(path)
     python_files = [path for path in selected_files if path.suffix == ".py"]
     notebooks = [path for path in selected_files if path.suffix == ".ipynb"]
 
@@ -311,6 +329,15 @@ def _detect_framework(
     for name in present:
         if name != chosen and name in problems:
             logger.warning("%s", problems[name])
+    if (
+        chosen == "Gradio" and configured and not selected_match
+        and any(candidate.port_problem for candidate in candidates["Gradio"])
+    ):
+        logger.warning(
+            "The configured command does not identify a Gradio app; "
+            "its listener defaults will not be applied."
+        )
+        return None
     if chosen == "Gradio" and not configured_ports:
         relevant = [selected_match] if selected_match else candidates["Gradio"]
         port_problem = next(
@@ -328,18 +355,103 @@ def _detect_framework(
     return selected_match or candidates[chosen][0]
 
 
+def _selected_symlink_chain(path, context_dir, available):
+    seen = set()
+    while path.is_symlink():
+        if path in seen:
+            return False
+        seen.add(path)
+        link = os.readlink(path)
+        if "\\" in link:
+            return False
+        target = Path(link)
+        if target.is_absolute() or target.drive or target.root:
+            return False
+        path = Path(os.path.abspath(path.parent / target))
+        if not path.is_relative_to(context_dir) or path.relative_to(context_dir) not in available:
+            return False
+    return True
+
+
+def _configured_executable(arguments):
+    if not arguments:
+        return None, 0
+    index = 0
+    executable = arguments[index].rsplit("/", 1)[-1].removesuffix(".exe")
+    if executable == "env":
+        index += 1
+        while index < len(arguments):
+            option = arguments[index]
+            if option in ("-u", "--unset"):
+                index += 2
+            elif option.startswith("-") or "=" in option:
+                index += 1
+            else:
+                break
+        if index >= len(arguments):
+            return None, index
+        executable = arguments[index].rsplit("/", 1)[-1].removesuffix(".exe")
+    return executable, index + 1
+
+
+def _configured_python_target(arguments):
+    executable, index = _configured_executable(arguments)
+    if not executable or not executable.startswith("python"):
+        return None
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in ("-V", "--version", "-h", "--help", "-"):
+            return None
+        if argument.startswith("-m") and len(argument) > 2:
+            return "module", argument[2:], index + 1
+        if argument.startswith("-c") and len(argument) > 2:
+            return None
+        if argument in ("-m", "-c"):
+            if argument == "-c" or index + 1 >= len(arguments):
+                return None
+            return "module", arguments[index + 1], index + 2
+        if argument == "--":
+            index += 1
+            break
+        if argument in ("-W", "-X", "--check-hash-based-pycs"):
+            index += 2
+        elif argument.startswith("-"):
+            index += 1
+        else:
+            break
+    if index < len(arguments):
+        return "script", arguments[index], index + 1
+    return None
+
+
 def _matches_configured_command(detection, arguments):
     if not detection.entrypoint:
         return False
-    args = {str(arg).replace("\\", "/").removeprefix("./") for arg in arguments}
+    arguments = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+    args = set(arguments)
     executables = {arg.rsplit("/", 1)[-1] for arg in args}
     executables = {name.removesuffix(".exe") for name in executables}
     if detection.name == "Streamlit":
-        return detection.entrypoint[2] in args and "streamlit" in executables
-    if detection.name == "Gradio":
-        return detection.entrypoint[1] in args and any(
-            executable.startswith("python") for executable in executables
+        executable, index = _configured_executable(arguments)
+        if executable and executable.startswith("python"):
+            target = _configured_python_target(arguments)
+            if not target or target[:2] != ("module", "streamlit"):
+                return False
+            index = target[2]
+        elif executable != "streamlit":
+            return False
+        return (
+            index + 1 < len(arguments)
+            and arguments[index] == "run"
+            and arguments[index + 1] == detection.entrypoint[2]
         )
+    if detection.name == "Gradio":
+        target = _configured_python_target(arguments)
+        if not target:
+            return False
+        script = detection.entrypoint[1]
+        module = script.removesuffix(".py").replace("/", ".")
+        return target[:2] in (("script", script), ("module", module))
     if detection.name in ("FastAPI", "Celery"):
         reference = detection.entrypoint[1 if detection.name == "FastAPI" else 2]
         executors = {"uvicorn", "gunicorn", "hypercorn"} if detection.name == "FastAPI" else {"celery"}
@@ -408,15 +520,38 @@ def _parse_source(path, context_dir, dependencies):
         return None, hints
 
 
+def _module_scope_nodes(tree):
+    pending = list(reversed(tree.body))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        yield node
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
 def _web_app_variables(tree, constructor):
-    for node in ast.walk(tree):
+    package = constructor.lower()
+    modules = set()
+    classes = {constructor}
+    nodes = list(_module_scope_nodes(tree))
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == package:
+                    modules.add(alias.asname or package)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == package:
+            for alias in node.names:
+                if alias.name == constructor:
+                    classes.add(alias.asname or alias.name)
+    for node in nodes:
         if isinstance(node, ast.Assign):
             targets = node.targets
         elif isinstance(node, ast.AnnAssign):
             targets = [node.target]
         else:
             continue
-        if not _is_constructor(node.value, set(), {constructor}, set()):
+        if not _is_constructor(node.value, modules, classes, {constructor}):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
@@ -615,32 +750,23 @@ def apply_framework_defaults(
     files=None,
 ):
     """Apply framework-specific defaults to build config."""
-    previous_entrypoint = getattr(config, "_framework_generated_entrypoint", None)
-    previous_cmd = getattr(config, "_framework_generated_cmd", None)
-    previous_ports = getattr(config, "_framework_generated_ports", None)
     generated_entrypoint = (
-        previous_entrypoint is not None
-        and config.entrypoint is previous_entrypoint
-        and not getattr(previous_entrypoint, "specified", False)
-        and tuple(previous_entrypoint) == getattr(config, "_framework_entrypoint_snapshot", ())
+        isinstance(config.entrypoint, _GeneratedList) and config.entrypoint.untouched
     )
     generated_ports = (
-        previous_ports is not None
-        and config.exposed_ports is previous_ports
-        and not getattr(previous_ports, "specified", False)
-        and tuple(previous_ports) == getattr(config, "_framework_ports_snapshot", ())
+        isinstance(config.exposed_ports, _GeneratedList) and config.exposed_ports.untouched
     )
     generated_cmd = (
-        previous_cmd is not None
-        and config.cmd is previous_cmd
-        and not getattr(previous_cmd, "specified", False)
-        and tuple(previous_cmd) == getattr(config, "_framework_cmd_snapshot", ())
+        isinstance(config.cmd, _GeneratedList) and config.cmd.untouched
     )
     configured_entrypoint = None if generated_entrypoint else config.entrypoint
     configured_cmd = None if generated_cmd else config.cmd
     if generated_entrypoint and configured_cmd is not None:
         config.entrypoint = None
         generated_entrypoint = False
+    elif configured_entrypoint is not None and generated_cmd:
+        config.cmd = None
+        generated_cmd = False
     try:
         detection = _detect_framework(
             context_dir,
@@ -669,6 +795,7 @@ def apply_framework_defaults(
             config.exposed_ports = _DefaultPorts()
         previous_detection = getattr(config, "_framework_detection", None)
         if previous_detection and config.labels and config.labels.get("framework") == previous_detection.name.lower():
+            config.labels = dict(config.labels)
             del config.labels["framework"]
         config._framework_detection = None
         return config
@@ -704,9 +831,9 @@ def apply_framework_defaults(
             ports = [_environment_port(env_port, "GRADIO_SERVER_PORT")]
 
     if generated_entrypoint or (config.entrypoint is None and configured_cmd is None):
-        config.entrypoint = _GeneratedList(entrypoint)
+        config.entrypoint = _GeneratedList(entrypoint, generated=True)
         if config.cmd is None or generated_cmd:
-            config.cmd = _GeneratedList()
+            config.cmd = _GeneratedList(generated=True)
             config._framework_generated_cmd = config.cmd
             config._framework_cmd_snapshot = tuple(config.cmd)
         generated_entrypoint = True
@@ -714,7 +841,7 @@ def apply_framework_defaults(
         config._framework_entrypoint_snapshot = tuple(config.entrypoint)
 
     if generated_ports or not config.has_exposed_ports():
-        config.exposed_ports = _GeneratedList(ports)
+        config.exposed_ports = _GeneratedList(ports, generated=True)
         generated_ports = True
         config._framework_generated_ports = config.exposed_ports
         config._framework_ports_snapshot = tuple(config.exposed_ports)
@@ -731,8 +858,7 @@ def apply_framework_defaults(
     config._framework_entrypoint_generated = generated_entrypoint
     config._framework_ports_generated = generated_ports
     
-    if not config.labels:
-        config.labels={}
+    config.labels = dict(config.labels or {})
     config.labels["framework"]=framework.lower()
     logger.info("Detected framework: %s", framework.lower())
     
