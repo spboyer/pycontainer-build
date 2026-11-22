@@ -17,6 +17,8 @@ from typing import Iterable, List, Optional, Tuple
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
+MAX_METADATA_BYTES = 1024 * 1024
+CLOSURE_TIMEOUT_SECONDS = 120
 MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
 INSTALL_TIMEOUT_SECONDS = 300
@@ -27,6 +29,8 @@ _PIP_PLATFORMS = {
 }
 _MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
 _PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
+_VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
+_CLOSURE_HEADERS = ("Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
 _MARKER_ERROR_EXIT = 86
 _PATCH_ERROR_EXIT = 87
 _MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
@@ -397,6 +401,7 @@ def stage_virtualenv(
     python_version: str,
     os_name: str,
     arch: str,
+    base_config: Optional[dict] = None,
 ) -> None:
     validate_target_platform(os_name, arch)
     files = list(dependencies)
@@ -432,6 +437,109 @@ def stage_virtualenv(
         shutil.copy2(source, target)
     _check_stage_limits(destination)
     _validate_wheel_metadata(destination, python_version)
+    _verify_target_closure(destination, os_name, arch, python_version, base_config)
+
+
+def _verify_target_closure(
+    site_packages: Path,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_config: Optional[dict],
+) -> None:
+    """Reject staged packages whose target-active requirements are not installed."""
+    legacy = sorted(
+        path.name
+        for pattern in ("*.egg-info", "*.egg", "*.egg-link")
+        for path in site_packages.glob(pattern)
+    )
+    if legacy:
+        raise ValueError(
+            "Cannot verify the target dependency closure of egg distributions: "
+            f"{', '.join(legacy)}. Reinstall them as wheels or use a requirements file."
+        )
+    distributions = []
+    for dist_info in sorted(site_packages.glob("*.dist-info")):
+        metadata = dist_info / "METADATA"
+        if not metadata.is_file() or metadata.is_symlink():
+            raise ValueError(f"Virtualenv package is missing METADATA: {dist_info.name}")
+        if metadata.stat().st_size > MAX_METADATA_BYTES:
+            raise ValueError(
+                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
+                f"{dist_info.name}"
+            )
+        try:
+            text = metadata.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
+        message = Parser().parsestr(text, headersonly=True)
+        headers = {
+            name: [str(value) for value in message.get_all(name, [])]
+            for name in _CLOSURE_HEADERS
+        }
+        distributions.append(
+            {
+                "path": f"{dist_info.name}/METADATA",
+                "directory": dist_info.name[: -len(".dist-info")],
+                "headers": headers,
+            }
+        )
+    if not distributions:
+        return
+
+    request = {
+        "environment": _target_marker_environment(
+            os_name, arch, python_version, base_config
+        ),
+        "distributions": distributions,
+    }
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-P",
+                "-c",
+                _VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8"),
+            ],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=site_packages.parent,
+            timeout=CLOSURE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Virtualenv dependency verification exceeded {CLOSURE_TIMEOUT_SECONDS} seconds."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError("Unable to start virtualenv dependency verification.") from exc
+    try:
+        outcome = json.loads(result.stdout)
+    except ValueError:
+        outcome = None
+    problems = outcome.get("problems", []) if isinstance(outcome, dict) else None
+    if (
+        not isinstance(outcome, dict)
+        or "fatal" in outcome
+        or result.returncode
+        or not isinstance(problems, list)
+        or not all(isinstance(problem, str) for problem in problems)
+    ):
+        details = outcome.get("fatal", "") if isinstance(outcome, dict) else ""
+        raise RuntimeError(
+            "Virtualenv dependency verification needs pip's packaging library in the "
+            "builder interpreter and could not evaluate target markers; refusing to "
+            f"stage an unverified dependency set. {details}".rstrip()
+        )
+    if problems:
+        raise ValueError(
+            f"Virtualenv dependencies are incomplete or unverifiable for target "
+            f"{os_name}/{arch}, CPython {python_version}: "
+            + "; ".join(problems)
+            + ". Use a requirements file so pip resolves dependencies for the target."
+        )
 
 
 def _validate_virtualenv_version(

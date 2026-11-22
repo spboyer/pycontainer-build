@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from pycontainer import dependencies
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import (
@@ -665,3 +667,243 @@ def test_requirements_install_fails_closed_for_unknown_target_marker_values(
 
     with pytest.raises(ValueError, match=f"refusing to stage.*{variable}"):
         _install_marker_fixture(tmp_path, [requirement], "arm64", "3.11", full_version)
+
+def _target_config(arch, python_version="3.11.8"):
+    return {
+        **BASE_CONFIG,
+        "architecture": arch,
+        "config": {"Env": [f"PYTHON_VERSION={python_version}"], "WorkingDir": "/"},
+    }
+
+
+def _write_venv(context, distributions, extra_dirs=()):
+    site_packages = context / ".venv" / "lib" / "python3.11" / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    for name, version, headers in distributions:
+        module = name.replace("-", "_")
+        dist_info = site_packages / f"{module}-{version}.dist-info"
+        dist_info.mkdir()
+        (site_packages / f"{module.lower()}.py").write_text("value = 1\n")
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"{header}\n" for header in headers)
+            + "\n"
+        )
+        (dist_info / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+    for directory in extra_dirs:
+        (site_packages / directory).mkdir()
+    return site_packages
+
+
+def _stage_venv(tmp_path, monkeypatch, distributions, arch="arm64", config=None):
+    context = tmp_path / "context"
+    _write_venv(context, distributions)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    layers = tmp_path / "layers"
+    layers.mkdir(exist_ok=True)
+    builder._create_deps_layer(
+        layers, base_config=config or _target_config(arch), os_name="linux", arch=arch
+    )
+    return {name for name, _ in builder._staged_packages}
+
+
+@pytest.mark.parametrize("arch", ["amd64", "arm64"])
+def test_virtualenv_rejects_missing_target_only_dependency(tmp_path, monkeypatch, arch):
+    root = ("app-lib", "1.0", ['Requires-Dist: linux-only; sys_platform == "linux"'])
+
+    with pytest.raises(ValueError, match=f"linux/{arch}.*'linux-only.*not installed"):
+        _stage_venv(tmp_path, monkeypatch, [root], arch=arch)
+
+
+@pytest.mark.parametrize(("arch", "error"), [("amd64", None), ("arm64", "arm-only")])
+def test_virtualenv_closure_evaluates_markers_for_each_target(
+    tmp_path, monkeypatch, arch, error
+):
+    distributions = [
+        (
+            "app-lib",
+            "1.0",
+            [
+                "Requires-Python: >=3.8",
+                'Requires-Dist: arm-only; platform_machine == "aarch64"',
+                'Requires-Dist: amd-only; platform_machine == "x86_64"',
+                'Requires-Dist: win-only; sys_platform == "win32"',
+                'Requires-Dist: old-only; python_version < "3.10"',
+                'Requires-Dist: linux-dep>=1.0; platform_system == "Linux" and os_name == "posix"',
+            ],
+        ),
+        ("amd-only", "1.0", []),
+        ("Linux_Dep", "1.2", []),
+    ]
+
+    if error:
+        with pytest.raises(ValueError, match=f"{error}.*not installed"):
+            _stage_venv(tmp_path, monkeypatch, distributions, arch=arch)
+    else:
+        assert _stage_venv(tmp_path, monkeypatch, distributions, arch=arch) == {
+            "app-lib", "amd-only", "Linux_Dep"
+        }
+
+
+@pytest.mark.parametrize(
+    ("distributions", "error"),
+    [
+        (
+            [
+                ("app-lib", "1.0", ["Requires-Dist: middle"]),
+                ("middle", "1.0", ['Requires-Dist: leaf; sys_platform == "linux"']),
+            ],
+            "middle 1.0 requires 'leaf",
+        ),
+        (
+            [("app-lib", "1.0", ["Requires-Dist: middle>=2"]), ("middle", "1.0", [])],
+            "middle 1.0 is installed",
+        ),
+        (
+            [
+                ("app-lib", "1.0", ["Requires-Dist: Middle[Fast_Mode]"]),
+                (
+                    "middle",
+                    "1.0",
+                    [
+                        "Provides-Extra: fast-mode",
+                        'Requires-Dist: speedup; extra == "fast-mode" and sys_platform == "linux"',
+                    ],
+                ),
+            ],
+            r"middle 1.0 \[fast-mode\] requires 'speedup",
+        ),
+        (
+            [
+                (
+                    "app-lib",
+                    "1.0",
+                    [
+                        "Provides-Extra: linux",
+                        'Requires-Dist: linux-extra; extra == "linux" and sys_platform == "linux"',
+                    ],
+                )
+            ],
+            r"Cannot determine whether extra \[linux\] of app-lib was selected",
+        ),
+        (
+            [
+                (
+                    "app-lib",
+                    "1.0",
+                    [
+                        "Provides-Extra: linux",
+                        'Requires-Dist: present; extra == "linux"',
+                        'Requires-Dist: linux-extra; extra == "linux" and sys_platform == "linux"',
+                    ],
+                ),
+                ("present", "1.0", []),
+            ],
+            r"Cannot determine whether extra \[linux\]",
+        ),
+    ],
+)
+def test_virtualenv_rejects_incomplete_transitive_versions_and_extras(
+    tmp_path, monkeypatch, distributions, error
+):
+    with pytest.raises(ValueError, match=error):
+        _stage_venv(tmp_path, monkeypatch, distributions)
+
+
+def test_virtualenv_accepts_complete_closure_and_unselected_extras(tmp_path, monkeypatch):
+    distributions = [
+        (
+            "App_Lib",
+            "1.0",
+            [
+                "Requires-Dist: Middle[Fast_Mode]>=1.0",
+                "Provides-Extra: socks",
+                'Requires-Dist: pysocks; extra == "socks"',
+                'Requires-Dist: linux-socks; extra == "socks" and sys_platform == "linux"',
+                "Provides-Extra: test",
+                'Requires-Dist: pytest; extra == "test"',
+            ],
+        ),
+        (
+            "middle",
+            "1.1rc1",
+            [
+                "Provides-Extra: fast-mode",
+                'Requires-Dist: speedup; extra == "fast-mode" and sys_platform == "linux"',
+            ],
+        ),
+        ("speedup", "1.0", []),
+    ]
+
+    assert _stage_venv(tmp_path, monkeypatch, distributions) == {
+        "App_Lib", "middle", "speedup"
+    }
+
+
+@pytest.mark.parametrize(
+    ("headers", "error", "python_version"),
+    [
+        (["Requires-Dist: bad requirement ;;"], "malformed Requires-Dist", "3.11.8"),
+        (["Version: 2.0"], "exactly one Version", "3.11.8"),
+        (['Requires-Dist: kernel; platform_release >= "5"'], "platform_release without", "3.11.8"),
+        (['Requires-Dist: full; python_full_version >= "3.11.1"'], "python_full_version without", "3.11"),
+        (["Requires-Python: >=3.12"], r"requires Python >=3\.12", "3.11.8"),
+        (["Requires-Python: ==3.11.5"], r"requires Python ==3\.11\.5.*3\.11\.8", "3.11.8"),
+        (["Requires-Python: >=3.11.2"], "depends on the target patch", "3.11"),
+        (["Requires-Dist: direct @ https://example.invalid/direct.whl"], "direct URL", "3.11.8"),
+    ],
+)
+def test_virtualenv_rejects_malformed_or_unverifiable_metadata(
+    tmp_path, monkeypatch, headers, error, python_version
+):
+    with pytest.raises(ValueError, match=error):
+        _stage_venv(
+            tmp_path,
+            monkeypatch,
+            [("app-lib", "1.0", headers), ("direct", "1.0", [])],
+            config=_target_config("arm64", python_version),
+        )
+
+
+def test_virtualenv_rejects_unreadable_package_metadata(tmp_path, monkeypatch):
+    site_packages = _write_venv(tmp_path / "context", [("good", "1.0", [])])
+    (site_packages / "good-1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: other\nVersion: 1.0\n\n"
+    )
+    builder = _builder(tmp_path, monkeypatch, context=tmp_path / "context", include_deps=True)
+    with pytest.raises(ValueError, match="does not match its metadata"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+    (site_packages / "good-1.0.dist-info" / "METADATA").unlink()
+    with pytest.raises(ValueError, match="missing METADATA"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+    (site_packages / "good-1.0.dist-info" / "METADATA").write_bytes(
+        b"Name: good\nVersion: 1.0\nSummary: \xff\n\n"
+    )
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+    shutil.rmtree(site_packages / "good-1.0.dist-info")
+    (site_packages / "legacy-1.0.egg-info").mkdir()
+    (site_packages / "legacy-1.0.egg-info" / "PKG-INFO").write_text("Name: legacy\n")
+    with pytest.raises(ValueError, match="egg-info"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+    shutil.rmtree(site_packages / "legacy-1.0.egg-info")
+    (site_packages / "develop.egg-link").write_text("/src/develop\n.\n")
+    with pytest.raises(ValueError, match="egg distributions: develop.egg-link"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+
+def test_virtualenv_closure_fails_closed_without_target_marker_support(
+    tmp_path, monkeypatch
+):
+    broken = tmp_path / "broken_closure.py"
+    broken.write_text("import sys\nsys.exit(3)\n")
+    monkeypatch.setattr(dependencies, "_VENV_CLOSURE_SCRIPT", broken)
+
+    with pytest.raises(RuntimeError, match="refusing to stage an unverified"):
+        _stage_venv(tmp_path, monkeypatch, [("app-lib", "1.0", [])])

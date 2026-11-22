@@ -349,7 +349,19 @@ pycontainer build \
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  is copied as resolved on its host, so its markers are not re-evaluated.
+  is copied as resolved on its host, then its dependency closure is verified
+  for the target: every installed `.dist-info` must have readable `METADATA`,
+  and each `Requires-Dist` that is active on the target (including transitive
+  requirements, version specifiers, requested extras and `Requires-Python`)
+  must be satisfied by an installed package, or the build fails. Virtualenvs do
+  not record which top-level extras were selected, so an extra whose target-only
+  requirement is missing fails unless another of its marker-independent
+  requirements is also missing (proof that it was not installed). Direct URL
+  requirements, `.egg-info`/`.egg`/`.egg-link` distributions, and markers or
+  `Requires-Python` patch constraints whose target value is unknown also fail. Loose modules
+  without package metadata are copied unverified, and host-only packages
+  present in the virtualenv are still copied. Use a requirements file when a
+  virtualenv cannot be verified.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
