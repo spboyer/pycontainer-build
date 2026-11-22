@@ -382,8 +382,32 @@ inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
-- Invalidates on file content changes (mtime + size checks)
+- Invalidates when file contents, relative paths, permission bits, the
+  workdir or reproducibility settings change (mtime is ignored for
+  reproducible builds)
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Saving and restoring the cache (offline export/import):** the `--cache-dir`
+directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only
+relative source paths, so it can be archived or saved by CI (for example with
+`actions/cache`) and restored to a different absolute path and checkout
+location. A restored cache produces cache hits and an identical OCI manifest,
+config and layers. Partial restores are handled as follows:
+
+- Blobs without `index.json`: a clean miss; the layer is rebuilt and indexed.
+- `index.json` with missing or corrupt blobs: those entries are discarded and
+  rebuilt.
+- Malformed `index.json`: the build fails with `CacheIndexError`; delete the
+  reported `index.json` (cached layers are rebuilt) or rerun with `--no-cache`.
+- Concurrent builds may share a restored directory; index updates are locked.
+
+Caches are portable between machines of the same OS, not across operating
+systems: Windows reports source files as mode `0o666`, Linux checkouts as
+`0o644`/`0o755`, and the mode is recorded in the layer, so a cache saved on
+Windows misses on Linux (and vice versa) by design. Windows checkouts with
+`core.autocrlf` also change file content. Key saved caches on the OS. Blobs
+left without an index entry are not counted or evicted; delete the directory to
+reclaim them. See [GitHub Actions](docs/github-actions.md#caching-application-layers).
 
 ### Python API
 
