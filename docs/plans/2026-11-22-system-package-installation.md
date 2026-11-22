@@ -16,9 +16,9 @@ delivered so far, and the blockers. Verification-only mode
 - **Untrusted:** every byte fetched from a repository, until the package
   manager has verified it offline inside the sandbox, and all maintainer
   scripts.
-- The builder acts as transport only. It never decides authenticity. It
-  enforces bounds: allowed hosts, HTTPS, no credentials, size, and when
-  available a hash.
+- The planned builder transport must never decide authenticity. It must enforce
+  allowed hosts, HTTPS, no credentials, size and time bounds, and when
+  available a hash. This transport is not yet implemented.
 
 ## Planned flow
 
@@ -35,8 +35,8 @@ Every step that runs a package manager or a maintainer script goes through the
 
 1. **Index transport (builder).** Fetch `InRelease` plus per-architecture
    `Packages.xz` for apt, or `APKINDEX.tar.gz` for apk, from the declared
-   HTTPS repository hosts with `fetch_untrusted`. Write them into a mirror
-   tree with the upstream layout.
+   HTTPS repository hosts using a future bounded transport. Write them into a
+   mirror tree with the upstream layout.
 2. **Configuration check (sandbox, offline).** Run `apt-config dump` and pass
    its output to `check_apt_config`. Generated sources use a `file:` mirror
    with `Signed-By=<pinned keyring>`. The base image's sources are disabled
@@ -96,19 +96,13 @@ uses the standard library only and has no callers yet:
   integer forms such as `00` and `0x0`. Values that apt does not treat as
   false count as enabled. Unknown output lines fail.
 - The apt and apk parsers accept only canonical mirror-relative paths: no
-  `..`, no `:` (so no Windows drive prefix), no encoded separators, no
-  foreign hosts or URLs, no duplicates, and positive bounded sizes. Lines they
-  do not recognize, and malformed URIs, fail.
-- `select_apk_downloads` rejects upgrades, downgrades and removals of
-  base-image packages for now. It also rejects any simulated package that is
-  missing from the fetch closure.
-- `fetch_untrusted` accepts HTTPS on port 443 to exact lowercase allowed DNS
-  hosts only. It rejects userinfo, queries, fragments and IP literals. It
-  inherits no proxy, authorization or cookies. It follows up to 3 redirects,
-  checking each one again. Each socket operation has a timeout and the whole
-  download has a total deadline (600 seconds by default). Downloads are
-  streamed with size caps and checked against an optional size or SHA-256,
-  then published atomically. Partial files are removed.
+  `..`, no `:` (so no Windows drive prefix), no encoded separators, and no
+  foreign hosts or URLs. The apt parser rejects duplicates and requires
+  positive bounded sizes; the apk fetch parser deduplicates paths, but its
+  output provides no sizes. Unrecognized lines and malformed URIs fail.
+- `parse_apk_simulate` rejects upgrades, downgrades, removals and incomplete
+  output. `select_apk_downloads` rejects any simulated package missing from the
+  fetch closure.
 
 ## Blockers and open questions
 
@@ -132,8 +126,13 @@ uses the standard library only and has no callers yet:
   configuration override, a postinst that needs the network, and rollback.
   Keys are generated during the test and never committed. They must run
   through the executor.
-- **Environment proxies.** They are refused rather than inherited. Proxy
-  support would need explicit, credential-free configuration.
+- **Bounded transport.** No download implementation is currently provided.
+  A prior prototype checked its deadline only after a buffered read, which
+  does not bound a slow peer, DNS, TLS, redirects, or headers; it was removed.
+  Future transport must enforce an overall deadline as well as size limits,
+  recheck redirects, avoid inherited credentials and proxies, and remove
+  partial files. Proxy support would need explicit, credential-free
+  configuration.
 - **Upgrades of base packages.** apk upgrades currently fail closed. The
   equivalent apt check, parsing `apt-get -s` `Inst` lines, is not implemented.
 - **Reproducibility.** apt can pin `snapshot.debian.org` or

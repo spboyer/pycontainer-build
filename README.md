@@ -533,6 +533,8 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;

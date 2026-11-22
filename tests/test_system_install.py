@@ -1,14 +1,11 @@
-import io
 from pathlib import Path
 
 import pytest
 
-from pycontainer import system_install
 from pycontainer.system_install import (
     MirrorFile,
     SystemInstallError,
     check_apt_config,
-    fetch_untrusted,
     parse_apk_fetch_urls,
     parse_apk_simulate,
     parse_apt_print_uris,
@@ -19,7 +16,6 @@ from pycontainer.system_install import (
 # ubuntu:24.04 (apt 2.8.4) and alpine:3.23 (apk-tools 3.0.9) containers with
 # --network none against a local copy of the signed upstream indexes.
 FIXTURES = Path(__file__).parent / "fixtures" / "system_install"
-HOST = "deb.debian.org"
 
 
 def _fixture(name):
@@ -125,6 +121,25 @@ def test_apk_selects_only_packages_add_would_install():
 @pytest.mark.parametrize(
     "output",
     [
+        "",
+        "(1/1) Installing libpq (18.7-r0)\n",
+        "(1/2) Installing libpq (18.7-r0)\nOK: 1 KiB in 1 packages\n",
+        "(2/2) Installing libpq (18.7-r0)\nOK: 1 KiB in 1 packages\n",
+        "OK: 1 KiB in 1 packages\n(1/1) Installing libpq (18.7-r0)\n",
+    ],
+)
+def test_apk_simulate_rejects_incomplete_output(output):
+    with pytest.raises(SystemInstallError):
+        parse_apk_simulate(output)
+
+
+def test_apk_simulate_accepts_no_new_packages():
+    assert parse_apk_simulate("OK: 8558 KiB in 17 packages\n") == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
         # apk only warns and skips an index with an untrusted signature.
         "WARNING: opening /m/main/x86_64/APKINDEX.tar.gz: UNTRUSTED signature\n",
         "(1/1) Upgrading musl (1.2.5-r13 -> 1.2.5-r24)\n",
@@ -152,112 +167,3 @@ def test_apk_fetch_rejects_non_mirror_paths(output):
 def test_apk_selection_requires_every_simulated_package():
     with pytest.raises(SystemInstallError, match="no libpq-18.7-r0.apk"):
         select_apk_downloads([("libpq", "18.7-r0")], ["main/x86_64/libpq-18.6-r0.apk"])
-
-
-class _Response:
-    def __init__(self, status=200, body=b"", headers=None):
-        self.status = status
-        self.headers = headers or {}
-        self._body = io.BytesIO(body)
-
-    def read(self, size=-1):
-        return self._body.read(size)
-
-    def close(self):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class _Opener:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.requests = []
-
-    def open(self, request, timeout):
-        self.requests.append(request)
-        return self.responses.pop(0)
-
-
-def _patch_opener(monkeypatch, *responses):
-    opener = _Opener(responses)
-    monkeypatch.setattr(system_install, "_build_opener", lambda: opener)
-    return opener
-
-
-def test_fetch_verifies_and_publishes_without_credentials(monkeypatch, tmp_path):
-    import hashlib
-
-    body = b"package bytes"
-    opener = _patch_opener(monkeypatch, _Response(body=body))
-    target = tmp_path / "pool" / "a.deb"
-    digest, size = fetch_untrusted(
-        f"https://{HOST}/debian/pool/a.deb",
-        target,
-        [HOST],
-        max_bytes=100,
-        expected_size=len(body),
-        expected_sha256=hashlib.sha256(body).hexdigest(),
-    )
-    assert target.read_bytes() == body and size == len(body)
-    assert digest == hashlib.sha256(body).hexdigest()
-    assert "Authorization" not in opener.requests[0].headers
-    assert list(target.parent.iterdir()) == [target]
-
-
-def test_fetch_follows_only_allowed_https_redirects(monkeypatch, tmp_path):
-    _patch_opener(
-        monkeypatch,
-        _Response(status=302, headers={"Location": "https://mirror.example.org/a"}),
-    )
-    with pytest.raises(SystemInstallError, match="outside the allowed"):
-        fetch_untrusted(f"https://{HOST}/a", tmp_path / "a", [HOST], max_bytes=10)
-    assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        f"http://{HOST}/a",
-        f"https://user:pw@{HOST}/a",
-        f"https://{HOST}.evil.example/a",
-        f"https://{HOST}:8443/a",
-        f"https://{HOST}/a?x=1",
-        "https://DEB.debian.org/a",
-        "https://[bad/a",
-    ],
-)
-def test_fetch_rejects_urls_outside_policy(monkeypatch, tmp_path, url):
-    _patch_opener(monkeypatch)
-    with pytest.raises(SystemInstallError):
-        fetch_untrusted(url, tmp_path / "a", [HOST], max_bytes=10)
-
-
-@pytest.mark.parametrize(
-    "response, kwargs",
-    [
-        (_Response(body=b"x" * 11), {}),
-        (_Response(body=b"x", headers={"Content-Length": "11"}), {}),
-        (_Response(body=b"abc"), {"expected_size": 4}),
-        (_Response(body=b"abc"), {"expected_sha256": "0" * 64}),
-        (_Response(status=404), {}),
-    ],
-)
-def test_fetch_fails_closed_and_leaves_no_file(monkeypatch, tmp_path, response, kwargs):
-    _patch_opener(monkeypatch, response)
-    with pytest.raises(SystemInstallError):
-        fetch_untrusted(f"https://{HOST}/a", tmp_path / "a", [HOST], max_bytes=10, **kwargs)
-    assert not list(tmp_path.iterdir())
-
-
-def test_fetch_enforces_total_deadline(monkeypatch, tmp_path):
-    _patch_opener(monkeypatch, _Response(body=b"abc"))
-    clock = iter([0.0, 100.0])
-    monkeypatch.setattr(system_install.time, "monotonic", lambda: next(clock))
-    with pytest.raises(SystemInstallError, match="deadline"):
-        fetch_untrusted(f"https://{HOST}/a", tmp_path / "a", [HOST], max_bytes=10, deadline=5)
-    assert not list(tmp_path.iterdir())

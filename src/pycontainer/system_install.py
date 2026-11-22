@@ -7,35 +7,20 @@ from #22 exists. These helpers cover the parts that run in the builder:
 * checking the effective package-manager configuration printed inside the
   sandbox for settings that weaken signature verification;
 * turning offline resolution output into a bounded download list relative to
-  a local mirror; and
-* fetching untrusted repository bytes from explicitly allowed hosts.
+  a local mirror.
 
-The builder is untrusted transport. It never treats downloaded bytes as
-authentic: apt verifies ``InRelease`` with the pinned ``Signed-By`` keyring and
-checks every ``.deb`` against the signed index, and apk verifies the signed
-``APKINDEX`` and package signatures, both offline inside the sandbox.
+Transport and installation are not implemented. Eventually apt must verify
+``InRelease`` with the pinned ``Signed-By`` keyring and check every ``.deb``
+against the signed index, and apk must verify the signed ``APKINDEX`` and
+package signatures, both offline inside the sandbox.
 """
-import hashlib
-import http.client
-import os
 import posixpath
 import re
-import tempfile
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-DEFAULT_FETCH_TIMEOUT_SECONDS = 30
-MAX_FETCH_REDIRECTS = 3
-FETCH_CHUNK_SIZE = 1024 * 1024
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
-REDIRECT_STATUSES = {301, 302, 303, 307, 308}
-
-DEFAULT_FETCH_DEADLINE_SECONDS = 600
 
 APT_SANDBOX_USER = "_apt"
 # apt's StringToBool false spellings; any other value counts as enabled.
@@ -67,10 +52,9 @@ _APT_FIXED_PATHS = {"dir": "/", "dir::bin": "", "dir::bin::methods": "/usr/lib/a
 _APT_DUMP_LINE = re.compile(r'^([^\s"]+) "((?:[^"\\]|\\.)*)";$')
 _APT_URI_LINE = re.compile(r"^'([^']+)' (\S+) (\d+) ?(\S*)$")
 _APK_INSTALL_LINE = re.compile(
-    r"^\(\d+/\d+\) Installing ([a-z0-9][a-z0-9+._-]*) \(([0-9A-Za-z.+_~-]+)\)$"
+    r"^\((\d+)/(\d+)\) Installing ([a-z0-9][a-z0-9+._-]*) \(([0-9A-Za-z.+_~-]+)\)$"
 )
 _APK_OK_LINE = re.compile(r"^OK: .+$")
-_HOST = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
 class SystemInstallError(RuntimeError):
@@ -244,13 +228,23 @@ def parse_apk_simulate(text: str) -> List[Tuple[str, str]]:
     Only new installs are accepted; upgrades, downgrades, replacements and
     removals of base-image packages fail closed for now.
     """
+    lines = _reject_apk_diagnostics(text, "apk add --simulate")
+    if not lines or not _APK_OK_LINE.fullmatch(lines[-1]):
+        raise SystemInstallError("apk --simulate did not finish with an OK line.")
     packages: List[Tuple[str, str]] = []
-    for line in _reject_apk_diagnostics(text, "apk add --simulate"):
+    total = None
+    for line in lines[:-1]:
         match = _APK_INSTALL_LINE.match(line)
-        if match:
-            packages.append((match.group(1), match.group(2)))
-        elif not _APK_OK_LINE.match(line):
+        if not match:
             raise SystemInstallError(f"Unsupported apk --simulate line: {line[:200]!r}")
+        index, count = int(match.group(1)), int(match.group(2))
+        if total is None:
+            total = count
+        if count != total or index != len(packages) + 1 or index > count:
+            raise SystemInstallError("Incomplete or inconsistent apk --simulate output.")
+        packages.append((match.group(3), match.group(4)))
+    if total is not None and len(packages) != total:
+        raise SystemInstallError("Incomplete apk --simulate output.")
     return packages
 
 
@@ -288,149 +282,3 @@ def select_apk_downloads(
             )
         selected.append(MirrorFile(by_name[filename]))
     return selected
-
-
-def normalize_allowed_hosts(hosts: Iterable[str]) -> Set[str]:
-    allowed = set()
-    for host in hosts:
-        if not isinstance(host, str) or not _HOST.match(host):
-            raise ValueError(f"Allowed repository host must be a lowercase DNS name: {host!r}")
-        allowed.add(host)
-    if not allowed:
-        raise ValueError("At least one allowed repository host is required.")
-    return allowed
-
-
-def _checked_url(url: str, allowed: Set[str]) -> str:
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError as error:
-        raise SystemInstallError(f"Malformed repository URL {url!r}.") from error
-    if (
-        parsed.scheme != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-        or parsed.query
-        or host is None
-        or host != parsed.netloc.split(":")[0]
-        or host not in allowed
-    ):
-        raise SystemInstallError(f"Refusing repository URL outside the allowed HTTPS hosts: {url!r}")
-    if port not in (None, 443):
-        raise SystemInstallError(f"Refusing non-default port in repository URL {url!r}.")
-    return url
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _build_opener():
-    # No proxy, auth or cookie handlers: environment proxies and their
-    # credentials are not inherited by repository transport.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-
-
-def _open_untrusted(url: str, allowed: Set[str], timeout: float):
-    opener = _build_opener()
-    current = _checked_url(url, allowed)
-    for _ in range(MAX_FETCH_REDIRECTS + 1):
-        request = urllib.request.Request(current, headers={"Accept-Encoding": "identity"})
-        try:
-            response = opener.open(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            if error.code not in REDIRECT_STATUSES:
-                error.close()
-                raise SystemInstallError(
-                    f"Repository fetch of {current} failed with HTTP {error.code}."
-                ) from error
-            response = error
-        if response.status in REDIRECT_STATUSES:
-            location = response.headers.get("Location")
-            response.close()
-            if not location:
-                raise SystemInstallError(f"Redirect from {current} has no Location.")
-            current = _checked_url(urllib.parse.urljoin(current, location), allowed)
-            continue
-        if response.status != 200:
-            response.close()
-            raise SystemInstallError(
-                f"Repository fetch of {current} failed with HTTP {response.status}."
-            )
-        return response
-    raise SystemInstallError(f"Too many redirects fetching {url}.")
-
-
-def fetch_untrusted(
-    url: str,
-    destination: Path,
-    allowed_hosts: Iterable[str],
-    max_bytes: int,
-    expected_size: Optional[int] = None,
-    expected_sha256: Optional[str] = None,
-    timeout: float = DEFAULT_FETCH_TIMEOUT_SECONDS,
-    deadline: float = DEFAULT_FETCH_DEADLINE_SECONDS,
-) -> Tuple[str, int]:
-    """Stream ``url`` to ``destination`` within bounds; return (sha256, size).
-
-    ``timeout`` bounds each socket operation and ``deadline`` the whole
-    download. A size or hash match proves transport integrity only.
-    Authenticity is established later by the package manager in the sandbox.
-    """
-    if type(max_bytes) is not int or max_bytes <= 0:
-        raise ValueError("max_bytes must be a positive integer.")
-    if expected_size is not None and (type(expected_size) is not int or not 0 < expected_size <= max_bytes):
-        raise ValueError("expected_size must be a positive integer no larger than max_bytes.")
-    if expected_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
-        raise ValueError("expected_sha256 must be a lowercase hex SHA-256 digest.")
-    if timeout <= 0 or deadline <= 0:
-        raise ValueError("timeout and deadline must be greater than zero.")
-    expires = time.monotonic() + deadline
-    allowed = normalize_allowed_hosts(allowed_hosts)
-    destination = Path(destination)
-    limit = expected_size if expected_size is not None else max_bytes
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, staged_name = tempfile.mkstemp(
-        prefix=f".{destination.name}-", suffix=".tmp", dir=destination.parent
-    )
-    staged = Path(staged_name)
-    hasher = hashlib.sha256()
-    size = 0
-    try:
-        with os.fdopen(descriptor, "wb") as target:
-            with _open_untrusted(url, allowed, timeout) as response:
-                length = response.headers.get("Content-Length")
-                if length is not None and (not length.isdigit() or int(length) > limit):
-                    raise SystemInstallError(
-                        f"{url} declares Content-Length {length}, limit is {limit}."
-                    )
-                while True:
-                    chunk = response.read(FETCH_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > limit:
-                        raise SystemInstallError(f"{url} exceeds the {limit}-byte limit.")
-                    if time.monotonic() > expires:
-                        raise SystemInstallError(f"{url} exceeded the {deadline}-second deadline.")
-                    hasher.update(chunk)
-                    target.write(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-        digest = hasher.hexdigest()
-        if expected_size is not None and size != expected_size:
-            raise SystemInstallError(f"{url} has size {size}, expected {expected_size}.")
-        if expected_sha256 is not None and digest != expected_sha256:
-            raise SystemInstallError(f"{url} hashes to {digest}, expected {expected_sha256}.")
-        os.replace(staged, destination)
-        return digest, size
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
-        raise SystemInstallError(
-            f"Repository fetch of {url} failed: {type(error).__name__}."
-        ) from error
-    finally:
-        staged.unlink(missing_ok=True)
