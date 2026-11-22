@@ -492,13 +492,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                self._print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        self._print(f"✓ Base image pulled ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -532,16 +532,16 @@ class ImageBuilder:
         if show_progress: self._print(f"Pushing to {registry}/{repo}:{tag}")
         
         for i, layer in enumerate(self.layers, 1):
-            if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
+            if show_progress: self._print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
             blob_path=layers_dir/layer.digest.split(":",1)[1]
             skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
-            if show_progress and skipped: print(f"    Layer exists, skipped")
+            if show_progress and skipped: self._print("    Layer exists, skipped")
         
-        if show_progress: print(f"  Pushing config ({self.config_digest[:19]}...)")
+        if show_progress: self._print(f"  Pushing config ({self.config_digest[:19]}...)")
         cfg_path=layers_dir/self.config_digest.split(":",1)[1]
         client.push_blob(self.config_digest, cfg_path, check_exists=True)
         
-        if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
+        if show_progress: self._print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
         manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
         manifest_data=manifest_path.read_bytes()
         for push_tag in push_tags:
@@ -561,15 +561,15 @@ class ImageBuilder:
         self._print(f"  Working Dir: {self.config.workdir}")
         self._print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
         if self.config.exposed_ports:
-            print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
+            self._print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:
             self._print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             self._print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
-        print(f"  Include Dependencies: {self.config.include_deps}")
+        self._print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
-            print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
-        print(f"  Use Cache: {self.config.use_cache}")
+            self._print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        self._print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
         self,
@@ -643,7 +643,7 @@ class ImageBuilder:
             if not files:
                 return None
 
-            print(f"Creating dependency layer ({len(files)} staged files)...")
+            self._print(f"Creating dependency layer ({len(files)} staged files)...")
             tmp=_create_temporary_file(layers_dir,"deps-layer")
             try:
                 with tarfile.open(tmp, "w") as tar:
@@ -673,7 +673,7 @@ class ImageBuilder:
                 digest, size = _hash_file(tmp)
                 final=layers_dir/digest.split(":",1)[1]
                 _publish_content_addressed(tmp, final, digest, size)
-                print(f"✓ Dependency layer created ({digest[:19]}...)")
+                self._print(f"✓ Dependency layer created ({digest[:19]}...)")
                 return OCILayer(
                     "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
                 )

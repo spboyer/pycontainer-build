@@ -122,7 +122,7 @@ def main():
             cfg=config_from_file(Path(args.config), cli_overrides, args.build_arg)
         else:
             resolve_arguments({}, args.build_arg)
-            cfg=BuildConfig(**cli_overrides)
+            cfg=BuildConfig(**cli_overrides, build_args={})
             if 'base_image' not in cli_overrides:
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"

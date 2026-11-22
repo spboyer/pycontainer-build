@@ -15,6 +15,25 @@ from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 
 
+def test_direct_config_without_arguments_preserves_runtime_dollars():
+    config = BuildConfig(cmd=["/bin/sh", "-c", "echo ${PORT} $$"])
+    assert config.cmd == ["/bin/sh", "-c", "echo ${PORT} $$"]
+
+
+def test_explicit_empty_arguments_reject_undeclared_references():
+    with pytest.raises(ValueError, match="Undeclared build argument reference"):
+        BuildConfig(build_args={}, cmd=["echo ${PORT}"])
+
+
+def test_cli_without_config_rejects_undeclared_reference(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--tag", "app:${VERSION}"])
+    monkeypatch.setattr(cli, "ImageBuilder", lambda config: pytest.fail("builder constructed"))
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Undeclared build argument reference" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
 def test_defaults_required_values_and_cli_precedence(tmp_path, table):
     path = tmp_path / "config.toml"
@@ -156,6 +175,18 @@ def test_real_dry_run_redacts_arguments_and_resolves_cli_fields(tmp_path, monkey
     assert "private-version" not in output.out + output.err + caplog.text
     assert "cli:<redacted>" in output.out
     assert not (tmp_path / "dist").exists()
+
+
+def test_dry_run_redacts_values_in_non_expandable_fields(tmp_path, capsys):
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[], dry_run=True,
+        build_args={"PACKAGE": "libpq5", "PORT": "8000"},
+        system_packages=["libpq5"], exposed_ports=[8000],
+    )
+    ImageBuilder(config).build()
+    output = capsys.readouterr().out
+    assert "libpq5" not in output
+    assert "8000" not in output
 
 
 def test_build_cache_identity_and_no_implicit_runtime_leakage(tmp_path, monkeypatch):

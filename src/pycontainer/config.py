@@ -36,13 +36,14 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
-    build_args: Dict[str, BuildArgument] = field(default_factory=dict, repr=False)
+    build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
-        self._resolved_build_args = resolve_arguments(self.build_args)
-        for name in EXPANDABLE_FIELDS:
-            setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
+        if self.build_args is not None:
+            self._resolved_build_args = resolve_arguments(self.build_args)
+            for name in EXPANDABLE_FIELDS:
+                setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
         try:
             self._validate()
         except ValueError as exc:
