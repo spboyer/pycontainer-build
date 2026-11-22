@@ -5,8 +5,9 @@ runtime dependency or daemon: install the optional provider CLI separately.
 Cosign versions `>=2.6.1,<4.0.0` and Notation versions `>=1.3.2,<2.0.0` pass
 the version preflight; this is not a claim that every version or registry has
 been exercised. Cosign key-mode signing and build-time signature verification
-have been exercised against `ttl.sh` with v2.6.1 and v3.1.4; Notation and
-keyless signing have not been validated against a real registry.
+have been exercised against `ttl.sh` with v2.6.1 and v3.1.4 (through the
+stacked provenance test in #219); Notation and keyless signing have not been
+validated against a real registry.
 
 ## Prerequisites and use
 
