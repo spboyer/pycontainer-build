@@ -540,8 +540,10 @@ list). A condition is one or more `NAME == "value"` or `NAME != "value"`
 comparisons joined by `and`; string values use double quotes and support only
 `\"` and `\\` escapes. Names are declared build arguments, `target.os` and
 `target.arch` (from `platform`, including a `--platform` override). The host
-environment is never read and nothing is evaluated as code. Unknown names,
-unknown keys, malformed expressions, and absolute, drive-qualified or `..`
+environment is never read and nothing is evaluated as code.
+File rules currently require a single target platform; comma-separated target
+lists are rejected until per-target selection and application layers are supported.
+Unknown names, unknown keys, malformed expressions, and absolute, drive-qualified or `..`
 patterns fail before building, even for inactive rules. Patterns are literal
 (not `${}`-expanded), relative to the context, case-sensitive, and use `/` or
 `\` interchangeably; a pattern matching a directory matches everything below it.

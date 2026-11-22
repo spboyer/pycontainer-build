@@ -88,6 +88,11 @@ def evaluate_file_rules(
     """Return active (include, exclude) context globs for resolved inputs."""
     if not isinstance(rules, list):
         raise ValueError("file_rules must be a list of tables.")
+    if rules and isinstance(platform, str) and "," in platform:
+        raise ValueError(
+            "file_rules require a single target platform; comma-separated targets "
+            "are unsupported until rules and application layers are evaluated per target."
+        )
     parts = platform.split("/") if isinstance(platform, str) else []
     if len(parts) < 2 or not parts[0] or not parts[1]:
         raise ValueError("file_rules require a target platform of the form os/arch.")

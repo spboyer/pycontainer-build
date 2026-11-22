@@ -153,6 +153,54 @@ def test_target_platform_rules(tmp_path, platform, expected):
     ]
 
 
+@pytest.mark.parametrize("when", ['target.arch == "arm64"', 'BUILD_MODE == "dev"'])
+def test_multi_target_rules_are_rejected_even_when_inactive(when):
+    with pytest.raises(ValueError, match="single target platform"):
+        BuildConfig(
+            platform="linux/amd64,linux/arm64",
+            build_args={"BUILD_MODE": "production"},
+            file_rules=[{"when": when, "include": "native/**"}],
+        )
+
+
+def test_cli_overrides_precede_rules_in_build_and_dry_run(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        '[build]\ninclude-paths = ["app.py"]\nplatform = "linux/amd64"\n'
+        '[build.build-args]\nBUILD_MODE = "production"\n'
+        '[[build.file-rules]]\n'
+        'when = \'BUILD_MODE == "dev" and target.arch == "arm64"\'\n'
+        'include = "debug_tools/**"\n'
+    )
+    resolved = []
+
+    class CapturingBuilder:
+        def __init__(self, config):
+            resolved.append((
+                config._conditional_includes,
+                _selected(config),
+                config.dry_run,
+            ))
+
+        def build(self):
+            return tmp_path / "out"
+
+    monkeypatch.setattr(cli, "ImageBuilder", CapturingBuilder)
+    for operational in ([], ["--dry-run"]):
+        monkeypatch.setattr(sys, "argv", [
+            "pycontainer", "build", "--config", str(path),
+            "--context", str(context), "--platform", "linux/arm64",
+            "--build-arg", "BUILD_MODE=dev", *operational,
+        ])
+        cli.main()
+    expected = (
+        ("debug_tools/**",),
+        ["app.py", "debug_tools/inspect.py", "debug_tools/nested/trace.py"],
+    )
+    assert resolved == [(*expected, False), (*expected, True)]
+
+
 def test_excludes_win_over_overlapping_includes(tmp_path):
     context = _context(tmp_path)
     rules = [
