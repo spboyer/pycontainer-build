@@ -243,6 +243,21 @@ def test_oci_layout_selects_reference_among_many(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}:three")
 
 
+def test_oci_layout_selects_each_tag_for_shared_manifest(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"shared")
+    for tag in ("app:v1", "app:latest"):
+        layout.add(descriptor, ref=tag)
+
+    for tag in ("app:v1", "app:latest"):
+        builder, manifest, _ = build(tmp_path, f"oci:{layout.root}:{tag}")
+        assert manifest["layers"][0] == layer
+        assert builder._base_image_name == tag
+
+    with pytest.raises(LocalImageError, match="multiple images.*app:latest, app:v1"):
+        build(tmp_path, f"oci:{layout.root}")
+
+
 def test_oci_layout_selects_by_digest(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     first, platform, first_layer = layout.image(b"first")
