@@ -374,6 +374,49 @@ def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
     assert len(openers) == 1
 
 
+def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
+    import threading
+
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    both_building = threading.Barrier(2, timeout=0.5)
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[int(request.full_url.endswith(digests[1]))]
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*_handlers):
+        openers.append(Opener())
+        try:
+            both_building.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return openers[-1]
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+    digests = [f"sha256:{hashlib.sha256(c).hexdigest()}" for c in contents]
+    client = RegistryClient("registry.example", "team/app")
+    results = []
+
+    def pull(index):
+        digest, content = digests[index], contents[index]
+        results.append(
+            client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+        )
+
+    threads = [threading.Thread(target=pull, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == [True, True]
+    assert len(openers) == 1
+
+
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(
     tmp_path, monkeypatch
 ):
