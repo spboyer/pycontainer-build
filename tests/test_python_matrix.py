@@ -136,7 +136,8 @@ def test_changing_default_removes_current_local_aliases_from_old_default(tmp_pat
 
 
 @pytest.mark.parametrize("base", ["custom:stable", "python:3.11-slim@" + "sha256:" + "a" * 64,
-                                 "oci:base", "python:latest", "registry.example/python:3.11-slim"])
+                                 "oci:base", "python:latest", "registry.example/python:3.11-slim",
+                                 "python:3.11.9-slim"])
 def test_custom_and_pinned_bases_require_maps(base):
     with pytest.raises(ValueError, match="explicit"):
         BuildConfig(python_versions=["3.11", "3.12"], base_image=base)

@@ -34,7 +34,7 @@ def matrix_targets(config: BuildConfig) -> Dict[str, str]:
     if set(config.python_matrix) - set(versions):
         raise ValueError("python_matrix contains versions not requested in python_versions.")
     repository, tag = _base_image_parts(config.base_image)
-    match = re.fullmatch(r"3\.\d+(?:\.\d+)?(?P<suffix>-[A-Za-z0-9_.-]+)?", tag)
+    match = re.fullmatch(r"3\.\d+(?P<suffix>-[A-Za-z0-9_.-]+)?", tag)
     rewritable = _is_official_python_image(repository) and "@" not in config.base_image and match
     targets = {}
     for version in versions:
