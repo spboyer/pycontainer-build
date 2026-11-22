@@ -194,7 +194,9 @@ UNSCOPED_REGISTRIES=[
     'user@ghcr.io',
     'ghcr.io:444',
     'ghcr.io:80',
-    'ghcr.io:0443',
+    'ghcr.io:00080',
+    'ghcr.io:+443',
+    'ghcr.io:4430',
     'ghcr.io:',
     'ghcr.io.',
     'ghcr..io',
@@ -216,7 +218,9 @@ def test_github_token_is_not_sent_to_non_ghcr_hosts(registry, monkeypatch):
     assert provider.get_token(registry) is None
     assert provider.get_credentials(registry) is None
 
-@pytest.mark.parametrize('registry', ['ghcr.io', 'GHCR.IO', 'Ghcr.Io:443'])
+@pytest.mark.parametrize('registry', [
+    'ghcr.io', 'GHCR.IO', 'Ghcr.Io:443', 'ghcr.io:0443', 'GHCR.IO:000443'
+])
 def test_github_token_is_used_for_ghcr_origin(registry, monkeypatch):
     monkeypatch.setenv('GITHUB_TOKEN', 'synthetic-github-token')
     for name in ('REGISTRY_TOKEN', 'REGISTRY_USERNAME', 'REGISTRY_PASSWORD'):
@@ -225,6 +229,12 @@ def test_github_token_is_used_for_ghcr_origin(registry, monkeypatch):
 
     assert provider.get_token(registry)=='synthetic-github-token'
     assert provider.get_credentials(registry)==('USERNAME', 'synthetic-github-token')
+
+def test_ghcr_default_port_keeps_token_precedence(monkeypatch):
+    monkeypatch.delenv('GITHUB_TOKEN', raising=False)
+    monkeypatch.setenv('REGISTRY_TOKEN', 'synthetic-registry-token')
+
+    assert EnvironmentAuthProvider().get_token('ghcr.io:0443') is None
 
 @pytest.mark.parametrize('registry', ['ghcr.io.example.com', 'registry.example:5000'])
 def test_generic_environment_credentials_still_apply_to_other_hosts(registry, monkeypatch):
@@ -244,9 +254,13 @@ def test_generic_environment_credentials_still_apply_to_other_hosts(registry, mo
     'user@myregistry.azurecr.io',
     'myregistry.azurecr.io@evil.example',
     'myregistry.azurecr.io:444',
-    'myregistry.azurecr.io:0443',
+    'myregistry.azurecr.io:+443',
     'myregistry.azurecr.io.',
     'my-registry.azurecr.io',
+    'abcd-hash.azurecr.io',
+    'myregistry--hash.azurecr.io',
+    'myregistry-.azurecr.io',
+    'myregistry-hash.azurecr.io.example.com',
     'abcd.azurecr.io',
     'a'*51+'.azurecr.io',
     'myregistry.eastus.data.azurecr.io',
@@ -265,16 +279,24 @@ def test_azure_cli_is_not_used_for_non_acr_hosts(registry, monkeypatch):
     assert provider.get_token(registry) is None
     assert calls==[]
 
-@pytest.mark.parametrize('registry', [
-    'myregistry.azurecr.io', 'MyRegistry.AzureCR.io', 'myregistry.azurecr.io:443'
+@pytest.mark.parametrize('registry, login_server', [
+    ('myregistry.azurecr.io', 'myregistry.azurecr.io'),
+    ('MyRegistry.AzureCR.io', 'myregistry.azurecr.io'),
+    ('myregistry.azurecr.io:443', 'MYREGISTRY.AZURECR.IO'),
+    ('myregistry.azurecr.io:0443', 'myregistry.azurecr.io'),
+    ('myregistry-abc123.azurecr.io', 'myregistry-abc123.azurecr.io'),
+    ('MyRegistry-ABC123.AzureCR.io:000443', 'myregistry-abc123.azurecr.io'),
 ])
-def test_azure_cli_is_used_for_acr_login_server(registry, monkeypatch):
+def test_azure_cli_is_used_for_acr_login_server(registry, login_server, monkeypatch):
     calls=[]
 
     def fake_run(args, **kwargs):
         calls.append(args)
         return auth_module.subprocess.CompletedProcess(
-            args, 0, stdout=json.dumps({'accessToken': 'synthetic-acr-token'}), stderr=''
+            args, 0, stdout=json.dumps({
+                'accessToken': 'synthetic-acr-token',
+                'loginServer': login_server,
+            }), stderr=''
         )
 
     monkeypatch.setattr(auth_module.subprocess, 'run', fake_run)
@@ -283,7 +305,51 @@ def test_azure_cli_is_used_for_acr_login_server(registry, monkeypatch):
     assert provider.get_credentials(registry)==(
         '00000000-0000-0000-0000-000000000000', 'synthetic-acr-token'
     )
-    assert calls[0][3:5]==['--name', 'myregistry']
+    assert provider.get_token(registry)=='synthetic-acr-token'
+    assert len(calls)==2
+    assert all(call[3:5]==['--name', 'myregistry'] for call in calls)
+
+@pytest.mark.parametrize('registry, login_server', [
+    ('myregistry.azurecr.io', 'otherregistry.azurecr.io'),
+    ('myregistry.azurecr.io', 'myregistry-abc123.azurecr.io'),
+    ('myregistry.azurecr.io', 'myregistry.azurecr.io:444'),
+    ('myregistry.azurecr.io', None),
+    ('myregistry-abc123.azurecr.io', 'myregistry-def456.azurecr.io'),
+    ('myregistry-abc123.azurecr.io', 'myregistry.azurecr.io'),
+])
+def test_azure_cli_rejects_credentials_for_another_login_server(
+    registry, login_server, monkeypatch, caplog
+):
+    def fake_run(args, **kwargs):
+        return auth_module.subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps({
+                'accessToken': 'synthetic-acr-token',
+                'loginServer': login_server,
+            }), stderr=''
+        )
+
+    monkeypatch.setattr(auth_module.subprocess, 'run', fake_run)
+    provider=AzureCLIAuthProvider()
+
+    assert provider.get_credentials(registry) is None
+    assert provider.get_token(registry) is None
+    assert 'login server' in caplog.text
+
+@pytest.mark.parametrize('stdout', [
+    '{}',
+    '{"loginServer": "myregistry.azurecr.io", "accessToken": null}',
+    '{"loginServer": "myregistry.azurecr.io", "accessToken": 123}',
+    '[]',
+    'not-json',
+])
+def test_azure_cli_rejects_malformed_credentials(stdout, monkeypatch, caplog):
+    def fake_run(args, **kwargs):
+        return auth_module.subprocess.CompletedProcess(args, 0, stdout=stdout, stderr='')
+
+    monkeypatch.setattr(auth_module.subprocess, 'run', fake_run)
+
+    assert AzureCLIAuthProvider().get_credentials('myregistry.azurecr.io') is None
+    assert 'Azure CLI returned' in caplog.text
 
 if __name__=="__main__":
     test_environment_auth_provider()

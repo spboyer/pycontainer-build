@@ -1,23 +1,30 @@
 """Authentication providers for container registries."""
-import json, base64, os, re, subprocess
+import json, base64, logging, os, re, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
 
 GHCR_HOST='ghcr.io'
-HTTPS_PORT='443'
+HTTPS_PORT=443
 _DNS_LABEL=re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
-_ACR_LOGIN_SERVER=re.compile(r'([a-z0-9]{5,50})\.azurecr\.io')
+_ACR_LOGIN_SERVER=re.compile(r'([a-z0-9]{5,50})(?:-[a-z0-9]+)?\.azurecr\.io')
+logger=logging.getLogger(__name__)
 
 
-def _https_registry_host(registry: str) -> Optional[str]:
-    """Return the lowercase hostname of a bare ``host[:443]`` authority, or None."""
+def _https_registry_host(registry: object) -> Optional[str]:
+    """Return the lowercase hostname of a bare HTTPS authority, or None."""
     if not isinstance(registry, str) or not registry.isascii():
         return None
     host, separator, port=registry.partition(':')
-    if separator and port!=HTTPS_PORT:
-        return None
+    if separator:
+        if not port.isdecimal():
+            return None
+        try:
+            if int(port)!=HTTPS_PORT:
+                return None
+        except ValueError:
+            return None
     host=host.lower()
     if len(host)>253 or not all(_DNS_LABEL.fullmatch(label) for label in host.split('.')):
         return None
@@ -136,12 +143,33 @@ class AzureCLIAuthProvider(AuthProvider):
                 ['az', 'acr', 'login', '--name', registry_name, '--expose-token', '--output', 'json'],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode==0:
-                data=json.loads(result.stdout)
-                return ('00000000-0000-0000-0000-000000000000', data['accessToken'])
-        except: pass
-        
-        return None
+        except FileNotFoundError:
+            return None
+        except (OSError, subprocess.SubprocessError) as error:
+            logger.warning("Azure CLI authentication failed for %s: %s", registry, error)
+            return None
+        if result.returncode!=0:
+            logger.warning(
+                "Azure CLI authentication failed for %s (exit code %s).",
+                registry, result.returncode
+            )
+            return None
+        try:
+            data=json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Azure CLI returned invalid credentials for %s.", registry)
+            return None
+        if not isinstance(data, dict):
+            logger.warning("Azure CLI returned invalid credentials for %s.", registry)
+            return None
+        if _https_registry_host(data.get('loginServer'))!=_https_registry_host(registry):
+            logger.warning("Azure CLI returned a different or invalid login server for %s.", registry)
+            return None
+        token=data.get('accessToken')
+        if not isinstance(token, str) or not token:
+            logger.warning("Azure CLI returned an invalid token for %s.", registry)
+            return None
+        return ('00000000-0000-0000-0000-000000000000', token)
     
     def get_token(self, registry: str) -> Optional[str]:
         creds=self.get_credentials(registry)
