@@ -1,6 +1,8 @@
 """Target-aware staging for Python runtime dependencies."""
+import base64
 import configparser
 import csv
+import hashlib
 import os
 import re
 import shlex
@@ -11,7 +13,7 @@ import sys
 import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -166,40 +168,83 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
-) -> None:
+    *,
+    evidence_dir: Optional[Path] = None,
+) -> Optional[List[Dict[str, object]]]:
+    """Install wheels; with ``evidence_dir``, return hashes of the installed wheels.
+
+    Evidence mode downloads into a private wheelhouse, hashes every wheel, then
+    installs exactly those files offline and checks them again afterwards.
+    """
     validate_requirements(requirements, context_dir)
 
     destination.mkdir(parents=True, exist_ok=True)
-    command = [
+    pip = [
         sys.executable,
         "-m",
         "pip",
+    ]
+    common = ["--disable-pip-version-check", "--no-input", "--no-cache-dir"]
+    target = _target_options(os_name, arch, python_version, base_image, base_config)
+    failure = (
+        "Target dependency installation failed. Only wheels compatible with "
+        f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
+        "are supported."
+    )
+    wheels = None
+    if evidence_dir is None:
+        install_inputs = ["-r", str(requirements)]
+    else:
+        wheelhouse = evidence_dir / "wheels"
+        wheelhouse.mkdir(parents=True)
+        _run_pip(
+            [*pip, "download", *common, "--dest", str(wheelhouse), *target,
+             "-r", str(requirements)],
+            context_dir, evidence_dir, failure,
+        )
+        wheels = _hash_wheelhouse(wheelhouse)
+        install_inputs = ["--no-index", "--no-deps", *(str(wheelhouse / w["filename"]) for w in wheels)]
+    command = [
+        *pip,
         "install",
-        "--disable-pip-version-check",
-        "--no-input",
-        "--no-cache-dir",
+        *common,
         "--no-compile",
         "--target",
         str(destination),
-        *_target_options(
-            os_name, arch, python_version, base_image, base_config
-        ),
-        "-r",
-        str(requirements),
+        *target,
+        *install_inputs,
     ]
+    if wheels != []:
+        _run_pip(command, context_dir, destination.parent, failure)
+
+    for scripts_dir in (destination / "bin", destination / "Scripts"):
+        if scripts_dir.exists():
+            shutil.rmtree(scripts_dir)
+    _drop_external_record_entries(destination)
+
+    _check_stage_limits(destination.parent)
+    if wheels is None:
+        return None
+    if _hash_wheelhouse(evidence_dir / "wheels") != wheels:
+        raise RuntimeError("Downloaded wheels changed during dependency installation.")
+    _verify_installed_wheels(destination, wheels)
+    return wheels
+
+
+def _run_pip(command: List[str], cwd: Path, work_dir: Path, failure: str) -> None:
     environment = dict(os.environ)
     environment.update(
         {
-            "TMP": str(destination.parent),
-            "TEMP": str(destination.parent),
-            "TMPDIR": str(destination.parent),
+            "TMP": str(work_dir),
+            "TEMP": str(work_dir),
+            "TMPDIR": str(work_dir),
         }
     )
     with open(os.devnull, "wb") as null_output:
         try:
             process = subprocess.Popen(
                 command,
-                cwd=context_dir,
+                cwd=cwd,
                 env=environment,
                 stdout=null_output,
                 stderr=null_output,
@@ -215,7 +260,7 @@ def install_requirements(
                     returncode = process.wait(timeout=0.5)
                     break
                 except subprocess.TimeoutExpired:
-                    _check_stage_limits(destination.parent)
+                    _check_stage_limits(work_dir)
                     if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
                         raise TimeoutError(
                             f"Target dependency installation exceeded "
@@ -226,18 +271,74 @@ def install_requirements(
             raise
 
     if returncode:
-        raise RuntimeError(
-            "Target dependency installation failed. Only wheels compatible with "
-            f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
-            "are supported."
+        raise RuntimeError(failure)
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _hash_wheelhouse(wheelhouse: Path) -> List[Dict[str, object]]:
+    _check_stage_limits(wheelhouse)
+    wheels = []
+    for path in sorted(wheelhouse.iterdir(), key=lambda item: item.name):
+        match = re.fullmatch(
+            r"([A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?)-([^-]+)(?:-\d[^-]*)?"
+            r"-[^-]+-[^-]+-[^-]+\.whl",
+            path.name,
         )
+        if not path.is_file() or path.is_symlink() or not match:
+            raise RuntimeError(
+                f"Dependency download produced a non-wheel artifact: {path.name}"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        wheels.append({
+            "filename": path.name,
+            "sha256": digest.hexdigest(),
+            "size": path.stat().st_size,
+            "name": _normalize_name(match.group(1)),
+            "version": match.group(2),
+        })
+    return wheels
 
-    for scripts_dir in (destination / "bin", destination / "Scripts"):
-        if scripts_dir.exists():
-            shutil.rmtree(scripts_dir)
-    _drop_external_record_entries(destination)
 
-    _check_stage_limits(destination.parent)
+def _verify_installed_wheels(site_packages: Path, wheels: List[Dict[str, object]]) -> None:
+    installed = {
+        (_normalize_name(name), version.replace("-", "_").lower())
+        for name, version in staged_packages(site_packages, strict=True)
+    }
+    downloaded = {(w["name"], str(w["version"]).lower()) for w in wheels}
+    if installed != downloaded or len(downloaded) != len(wheels):
+        raise RuntimeError(
+            "Installed distributions do not match the downloaded wheels one-to-one."
+        )
+    for record in sorted(site_packages.glob("*.dist-info/RECORD")):
+        for row in csv.reader(record.read_text(encoding="utf-8").splitlines()):
+            if len(row) < 2 or not row[1]:
+                continue
+            relative = row[0].replace("\\", "/")
+            if relative.split("/", 1)[0] in ("bin", "Scripts"):
+                continue
+            algorithm, _, expected = row[1].partition("=")
+            path = site_packages / relative
+            if algorithm != "sha256" or ".." in relative.split("/") or not path.is_file():
+                raise RuntimeError(f"Installed file does not match its RECORD: {relative}")
+            actual = base64.urlsafe_b64encode(
+                hashlib.sha256(path.read_bytes()).digest()
+            ).rstrip(b"=").decode()
+            if actual != expected:
+                raise RuntimeError(f"Installed file does not match its RECORD: {relative}")
 
 
 def _drop_external_record_entries(site_packages: Path) -> None:

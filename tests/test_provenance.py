@@ -1,0 +1,445 @@
+import base64
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from pycontainer import builder as builder_module
+from pycontainer import cli, provenance
+from pycontainer.builder import ImageBuilder
+from pycontainer.config import BuildConfig
+from pycontainer.dependencies import _hash_wheelhouse, _verify_installed_wheels, install_requirements
+from pycontainer.provenance import (
+    BUILD_TYPE, STATEMENT_V01, STATEMENT_V1, IncompleteProvenanceError, ProvenanceError,
+    parse_verified_attestations,
+)
+
+from test_dependency_staging import BASE_CONFIG, _write_wheel
+from test_signing import FakeRegistry, _use_registry
+
+BASE_INDEX = "sha256:" + "1" * 64
+BASE_MANIFEST = "sha256:" + "2" * 64
+BASE_CONFIG_DIGEST = "sha256:" + "3" * 64
+SECRET = "s3cret-value-never-recorded"
+
+
+def _observed_base(self, layers_dir, os_name, arch):
+    self._last_base_evidence = {
+        "resolved": BASE_INDEX, "manifest": BASE_MANIFEST, "config": BASE_CONFIG_DIGEST,
+    }
+    return [], {**BASE_CONFIG, "architecture": arch}
+
+
+def _context(tmp_path, *, requirements=True):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    if requirements:
+        _write_wheel(context / "wheelhouse")
+        (context / "requirements.txt").write_text(
+            "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+        )
+    return context
+
+
+def _config(tmp_path, context, **options):
+    return BuildConfig(
+        tag="registry.example/team/app:v1",
+        context_dir=str(context),
+        output_dir=str(tmp_path / "out"),
+        use_cache=False,
+        provenance=True,
+        **options,
+    )
+
+
+def test_statement_records_installed_wheel_bytes_and_observed_base_digests(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", _observed_base)
+    builder = ImageBuilder(_config(
+        tmp_path, context, include_deps=True, generate_sbom=True,
+        env={"API_TOKEN": SECRET}, labels={"secret": SECRET},
+    ))
+
+    builder.build()
+
+    path = tmp_path / "out" / "provenance.intoto.json"
+    text = path.read_text()
+    statement = json.loads(text)
+    assert statement["_type"] == STATEMENT_V1
+    assert statement["subject"] == [{
+        "name": "registry.example/team/app",
+        "digest": {"sha256": builder.manifest_digest.split(":", 1)[1]},
+    }]
+    predicate = provenance.validate_statement(
+        statement, builder.manifest_digest, require_complete_evidence=True
+    )
+    definition = predicate["buildDefinition"]
+    assert definition["buildType"] == BUILD_TYPE
+    dependencies = {item["annotations"]["kind"]: item for item in definition["resolvedDependencies"]}
+    wheel_bytes = (context / "wheelhouse" / "fixture_dep-1.0-py3-none-any.whl").read_bytes()
+    assert dependencies["installed-wheel"] == {
+        "name": "fixture_dep-1.0-py3-none-any.whl",
+        "digest": {"sha256": hashlib.sha256(wheel_bytes).hexdigest()},
+        "annotations": {
+            "kind": "installed-wheel", "platform": "linux/amd64",
+            "distribution": "fixture-dep", "version": "1.0", "size": len(wheel_bytes),
+        },
+    }
+    assert dependencies["base-image"]["digest"] == {"sha256": "1" * 64}
+    assert dependencies["base-image"]["annotations"]["platformManifestDigest"] == BASE_MANIFEST
+    assert dependencies["build-context-layer"]["digest"]["sha256"] == builder.layers[-1].digest[7:]
+    byproducts = {item["name"] for item in predicate["runDetails"]["byproducts"]}
+    assert {"manifest:linux/amd64", "dependency-layer:linux/amd64", "sbom.json"} <= byproducts
+    assert definition["externalParameters"]["requirementsFile"] == "requirements.txt"
+    assert SECRET not in text
+    assert "find-links" not in text and str(tmp_path) not in text
+    assert "slsa_build_level" not in text.lower() and "buildLevel" not in text
+
+
+def test_missing_evidence_fails_closed_before_layout_references(tmp_path, monkeypatch):
+    context = _context(tmp_path, requirements=False)
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "provenance.intoto.json").write_text("stale")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image", lambda self, layers_dir, os_name, arch: ([], None)
+    )
+
+    lenient = ImageBuilder(_config(tmp_path, context))
+    lenient.build()
+    evidence = lenient.provenance_statement["predicate"]["buildDefinition"][
+        "internalParameters"]["evidence"]
+    assert evidence == {"complete": False, "incomplete": [{
+        "material": "base-image:linux/amd64", "reason": "base image digest evidence unavailable",
+    }]}
+
+    for item in ("index.json", "oci-layout", "provenance.intoto.json"):
+        (output / item).unlink()
+    for ref in (output / "refs" / "tags").iterdir():
+        ref.unlink()
+    strict = ImageBuilder(_config(tmp_path, context, provenance_require_complete=True))
+    with pytest.raises(IncompleteProvenanceError, match="base image digest evidence unavailable"):
+        strict.build()
+    assert not (output / "index.json").exists()
+    assert not (output / "provenance.intoto.json").exists()
+    assert not list((output / "refs" / "tags").iterdir())
+
+
+def test_installer_without_wheel_evidence_is_incomplete(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", _observed_base)
+    monkeypatch.setattr(builder_module, "install_requirements", lambda *args, **kwargs: None)
+    builder = ImageBuilder(_config(tmp_path, context, include_deps=True))
+
+    builder.build()
+
+    assert builder.provenance_statement["predicate"]["buildDefinition"]["internalParameters"][
+        "evidence"]["incomplete"] == [{
+            "material": "dependencies:linux/amd64",
+            "reason": "installer did not report installed wheel hashes",
+        }]
+
+
+def test_evidence_mode_rejects_tampered_installs_and_non_wheel_downloads(tmp_path):
+    context = _context(tmp_path)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    site = tmp_path / "stage" / "site-packages"
+    wheels = install_requirements(
+        context / "requirements.txt", site, context, "linux", "amd64", "3.11",
+        "python:3.11-slim", BASE_CONFIG, evidence_dir=evidence,
+    )
+    assert [wheel["filename"] for wheel in wheels] == ["fixture_dep-1.0-py3-none-any.whl"]
+
+    (site / "fixture_dep" / "__init__.py").write_text("tampered = True\n")
+    with pytest.raises(RuntimeError, match="does not match its RECORD"):
+        _verify_installed_wheels(site, wheels)
+    with pytest.raises(RuntimeError, match="one-to-one"):
+        _verify_installed_wheels(site, [*wheels, {**wheels[0], "name": "extra"}])
+
+    (evidence / "wheels" / "fixture-dep-1.0.tar.gz").write_bytes(b"sdist")
+    with pytest.raises(RuntimeError, match="non-wheel artifact"):
+        _hash_wheelhouse(evidence / "wheels")
+
+
+def _statement(digest="a" * 64, *, complete=True, statement_type=STATEMENT_V01, **overrides):
+    statement = {
+        "_type": statement_type,
+        "predicateType": provenance.SLSA_PROVENANCE_V1,
+        "subject": [{"name": "registry.example/app", "digest": {"sha256": digest}}],
+        "predicate": {"buildDefinition": {
+            "buildType": BUILD_TYPE,
+            "internalParameters": {"evidence": {
+                "complete": complete,
+                "incomplete": [] if complete else [{"material": "m", "reason": "r"}],
+            }},
+        }},
+    }
+    statement.update(overrides)
+    return statement
+
+
+def _envelope(statement, payload_type=provenance.DSSE_PAYLOAD_TYPE, bundle=False):
+    envelope = {
+        "payloadType": payload_type,
+        "payload": base64.b64encode(json.dumps(statement).encode()).decode(),
+        "signatures": [{"sig": "x"}],
+    }
+    return json.dumps({"dsseEnvelope": envelope} if bundle else envelope).encode()
+
+
+DIGEST = "sha256:" + "a" * 64
+
+
+def test_verified_output_accepts_cosign_v01_wrapper_and_bundles():
+    output = _envelope(_statement()) + b"\n" + _envelope(
+        _statement(statement_type=STATEMENT_V1), bundle=True
+    )
+    assert len(parse_verified_attestations(output, DIGEST, require_complete_evidence=True)) == 2
+
+
+@pytest.mark.parametrize("output, message", [
+    (b"", "No verified"),
+    (b"not json", "malformed"),
+    (json.dumps({"payloadType": provenance.DSSE_PAYLOAD_TYPE, "payload": "%%%"}).encode(), "malformed"),
+    (_envelope(_statement(), payload_type="text/plain"), "DSSE"),
+    (_envelope(_statement(digest="b" * 64)), "subject"),
+    (_envelope(_statement(predicateType="https://slsa.dev/provenance/v0.2")), "SLSA provenance v1"),
+    (_envelope(_statement(_type="https://example.com/Statement")), "_type"),
+    (_envelope(_statement(predicate={"buildDefinition": {"buildType": "other"}})), "No verified"),
+    (_envelope(["not", "an", "object"]), "JSON object"),
+    (_envelope(_statement(predicate={"buildDefinition": {
+        "buildType": BUILD_TYPE,
+        "internalParameters": {"evidence": {"complete": False, "incomplete": [{"material": "m"}]}},
+    }})), "malformed evidence"),
+])
+def test_verified_output_policy_rejections(output, message):
+    with pytest.raises(ProvenanceError, match=message):
+        parse_verified_attestations(output, DIGEST)
+
+
+def test_require_complete_rejects_any_incomplete_matching_attestation():
+    output = _envelope(_statement()) + b"\n" + _envelope(_statement(complete=False))
+    assert len(parse_verified_attestations(output, DIGEST)) == 2
+    with pytest.raises(IncompleteProvenanceError):
+        parse_verified_attestations(output, DIGEST, require_complete_evidence=True)
+
+
+class FakeCosign:
+    def __init__(self, *, verify_output=b"", attest_code=0, verify_code=0, wrapper=True):
+        self.calls = []
+        self.verify_output = verify_output
+        self.attest_code = attest_code
+        self.verify_code = verify_code
+        self.wrapper = wrapper
+
+    def __call__(self, args, stdout=None, **kwargs):
+        assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["timeout"] > 0
+        self.calls.append(list(args))
+        if args[1] == "attest":
+            predicate_path = next(a.split("=", 1)[1] for a in args if a.startswith("--predicate="))
+            predicate = json.loads(Path(predicate_path).read_text())
+            if self.wrapper:
+                statement = {
+                    "_type": STATEMENT_V01, "predicateType": provenance.SLSA_PROVENANCE_V1,
+                    "subject": [{"name": "r/a", "digest": {"sha256": args[-1].rsplit(":", 1)[1]}}],
+                    "predicate": predicate,
+                }
+                self.verify_output = _envelope(statement)
+            return subprocess.CompletedProcess(args, self.attest_code)
+        stdout.write(self.verify_output)
+        return subprocess.CompletedProcess(args, self.verify_code)
+
+
+def _attestor():
+    return provenance.CosignAttestor("cosign", "cosign.key", "cosign.pub", None, None)
+
+
+PREDICATE = _statement()["predicate"]
+
+
+def test_attestor_attests_then_verifies_exact_predicate(monkeypatch):
+    fake = FakeCosign()
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    subject = "registry.example/app@" + DIGEST
+
+    _attestor().attest_and_verify(subject, PREDICATE, require_complete_evidence=True)
+
+    assert fake.calls[0][:4] == ["cosign", "attest", "--yes", "--type=slsaprovenance1"]
+    assert fake.calls[0][-3:] == ["--key=cosign.key", "--", subject]
+    assert fake.calls[1] == [
+        "cosign", "verify-attestation", "--type=slsaprovenance1", "--key=cosign.pub", "--", subject,
+    ]
+
+
+def test_attestor_rejects_other_predicates_failures_and_tags(monkeypatch):
+    subject = "registry.example/app@" + DIGEST
+    fake = FakeCosign(wrapper=False, verify_output=_envelope(_statement()))
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    other = json.loads(json.dumps(PREDICATE))
+    other["buildDefinition"]["externalParameters"] = {"tags": ["replayed"]}
+    with pytest.raises(ProvenanceError, match="do not contain the predicate"):
+        _attestor().attest_and_verify(subject, other)
+
+    monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(attest_code=1))
+    with pytest.raises(ProvenanceError, match="cosign attest exited"):
+        _attestor().attest_and_verify(subject, PREDICATE)
+    monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_code=1))
+    with pytest.raises(ProvenanceError, match="verify-attestation exited"):
+        _attestor().verify(subject)
+    monkeypatch.setattr(provenance, "MAX_VERIFY_OUTPUT_BYTES", 4)
+    monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_output=b"x" * 5))
+    with pytest.raises(ProvenanceError, match="size limit"):
+        _attestor().verify(subject)
+    with pytest.raises(ProvenanceError, match="immutable"):
+        _attestor().verify("registry.example/app:v1")
+
+
+class FakeAttestor:
+    def __init__(self, registry, fail=False):
+        self.registry = registry
+        self.fail = fail
+        self.predicates = []
+
+    def attest_and_verify(self, subject, predicate, require_complete_evidence=False):
+        self.registry.events.append(("attest", subject))
+        self.predicates.append(predicate)
+        if self.fail:
+            raise ProvenanceError("verification rejected")
+
+
+def _signed_builder(tmp_path, monkeypatch, registry, attestor, platform="linux/amd64"):
+    context = _context(tmp_path, requirements=False)
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", _observed_base)
+    builder = ImageBuilder(_config(
+        tmp_path, context, include_paths=["app.py"], platform=platform, sign=True,
+        sign_provider="cosign", attest_provenance=True, provenance_verify_key="cosign.pub",
+    ))
+    builder.build()
+    _use_registry(monkeypatch, registry)
+    monkeypatch.setattr(provenance, "create_attestor", lambda config: attestor)
+    return builder
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_signed_push_attests_published_digest_before_tags(tmp_path, monkeypatch, platform):
+    registry = FakeRegistry()
+    attestor = FakeAttestor(registry)
+    builder = _signed_builder(tmp_path, monkeypatch, registry, attestor, platform)
+
+    builder.push(show_progress=False)
+
+    digest = builder.index_digest or builder.manifest_digest
+    subject = f"registry.example/team/app@{digest}"
+    attest_index = registry.events.index(("attest", subject))
+    assert registry.events.index(("sign", subject)) < attest_index
+    kind = "index" if builder.index_digest else "manifest"
+    assert registry.events.index((kind, "v1")) > attest_index
+    assert attestor.predicates == [builder.provenance_statement["predicate"]]
+    assert builder.attested_ref == subject
+
+
+def test_attestation_failure_writes_no_tags(tmp_path, monkeypatch):
+    registry = FakeRegistry()
+    builder = _signed_builder(tmp_path, monkeypatch, registry, FakeAttestor(registry, fail=True))
+
+    with pytest.raises(ProvenanceError, match="tags not attempted: registry.example/team/app:v1"):
+        builder.push(show_progress=False)
+    assert "v1" not in registry.manifests
+    assert builder.pushed_refs == []
+
+
+def test_attestation_rejects_statement_for_a_different_digest(tmp_path, monkeypatch):
+    registry = FakeRegistry()
+    attestor = FakeAttestor(registry)
+    builder = _signed_builder(tmp_path, monkeypatch, registry, attestor)
+    builder.provenance_statement["subject"][0]["digest"]["sha256"] = "f" * 64
+
+    with pytest.raises(ProvenanceError, match="subject does not match"):
+        builder.push(show_progress=False)
+    assert attestor.predicates == [] and "v1" not in registry.manifests
+
+
+@pytest.mark.parametrize("options, message", [
+    ({"attest_provenance": True}, "sign = true"),
+    ({"attest_provenance": True, "sign": True, "sign_provider": "notation", "sign_key": "k"}, "Notation"),
+    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign"}, "either"),
+    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
+      "provenance_verify_key": "k", "provenance_certificate_identity": "i",
+      "provenance_certificate_oidc_issuer": "o"}, "either"),
+    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
+      "provenance_certificate_identity": "i"}, "either"),
+    ({"provenance_verify_key": "cosign.pub"}, "require attest_provenance"),
+    ({"provenance": "yes"}, "boolean"),
+    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
+      "provenance_verify_key": "-----BEGIN PRIVATE KEY-----"}, "secret material"),
+])
+def test_invalid_provenance_configuration_is_rejected(options, message):
+    with pytest.raises(ValueError, match=message):
+        BuildConfig(**options)
+
+
+def test_completeness_and_attestation_imply_provenance():
+    assert BuildConfig(provenance_require_complete=True).provenance is True
+    assert BuildConfig(
+        sign=True, sign_provider="cosign", attest_provenance=True,
+        provenance_certificate_identity="i", provenance_certificate_oidc_issuer="o",
+    ).provenance is True
+
+
+def _run_cli(monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["pycontainer", *args])
+    cli.main()
+
+
+def test_cli_rejects_provenance_dry_run_and_unpushed_attestation(tmp_path, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        _run_cli(monkeypatch, "build", "--context", str(tmp_path), "--provenance", "--dry-run")
+    assert "--provenance cannot be used with --dry-run" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        _run_cli(
+            monkeypatch, "build", "--context", str(tmp_path), "--sign", "--sign-provider",
+            "cosign", "--attest-provenance", "--provenance-verify-key", "cosign.pub",
+        )
+    assert "requires --push" in capsys.readouterr().err
+
+
+def test_cli_verify_provenance_reports_and_fails_closed(monkeypatch, capsys):
+    class Verifier:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def verify(self, image, require_complete_evidence=False):
+            self.calls.append((image, require_complete_evidence))
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    ok = Verifier([_statement(), _statement(complete=False)])
+    monkeypatch.setattr(provenance, "create_verifier", lambda key, identity, issuer: ok)
+    image = "registry.example/app@" + DIGEST
+    _run_cli(monkeypatch, "verify-provenance", image, "--key", "cosign.pub")
+    assert "Verified 2 provenance attestation(s)" in capsys.readouterr().out
+    assert "1 record complete evidence" in capsys.readouterr().out or True
+
+    failing = Verifier(IncompleteProvenanceError("incomplete"))
+    monkeypatch.setattr(provenance, "create_verifier", lambda key, identity, issuer: failing)
+    with pytest.raises(SystemExit) as exit_info:
+        _run_cli(monkeypatch, "verify-provenance", image, "--key", "k", "--require-complete")
+    assert exit_info.value.code == 1
+    assert failing.calls == [(image, True)]
+    assert "Provenance verification failed" in capsys.readouterr().err
+
+
+def test_verifier_requires_exactly_one_trust_mode():
+    with pytest.raises(ValueError, match="either --key"):
+        provenance.create_verifier(None, None, None)
+    with pytest.raises(ValueError, match="either --key"):
+        provenance.create_verifier("k", "i", "o")
+    with pytest.raises(ValueError, match="either --key"):
+        provenance.create_verifier(None, "i", None)

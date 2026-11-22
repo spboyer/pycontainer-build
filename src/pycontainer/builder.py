@@ -198,6 +198,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .signing import SigningError, create_signer
+from . import provenance as slsa
 from .local_image import (
     LocalImageError,
     check_local_image_bounds,
@@ -384,6 +385,10 @@ class ImageBuilder:
         )
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
+        self._base_evidence={}
+        self._wheel_evidence={}
+        self._evidence_incomplete=[]
+        self._evidence_platform=config.platform
         if config.use_cache and not self.dry_run:
             self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
         else:
@@ -410,10 +415,20 @@ class ImageBuilder:
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
         self._app_layer=None
+        self._provenance_started=slsa.utc_now()
+        self._base_evidence={}
+        self._wheel_evidence={}
+        self._evidence_incomplete=[]
+        self.provenance_statement=None
+        self.provenance_path=None
+        (output/slsa.STATEMENT_FILENAME).unlink(missing_ok=True)
         if len(platforms)>1:
-            return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
+            self._build_multi_platform(output, layers_dir, refs_dir, platforms)
+            self._write_provenance(output)
+            return self.config.tag
 
         image=self._build_platform_image(layers_dir, platforms[0])
+        self._check_provenance_complete()
 
         oci_layout=build_oci_layout()
         _atomic_write_bytes(
@@ -459,7 +474,99 @@ class ImageBuilder:
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
         
+        self._write_provenance(output)
         return self.config.tag
+
+    def _check_provenance_complete(self) -> None:
+        """Fail closed before any layout reference or tag is written."""
+        if self.config.provenance and self.config.provenance_require_complete:
+            slsa.require_complete(self._evidence_incomplete)
+
+    def _mark_incomplete(self, material: str, reason: str) -> None:
+        if self.config.provenance:
+            self._evidence_incomplete.append({"material": material, "reason": reason})
+
+    def _provenance_external_parameters(self) -> Dict:
+        local=parse_local_image_reference(self.config.base_image)
+        parameters={
+            "baseImage": f"local:{local.transport}" if local else self.config.base_image,
+            "platforms": self.config.target_platforms(),
+            "tags": self.config.all_tags(),
+            "workdir": self.config.workdir,
+            "includeDependencies": bool(self.config.include_deps),
+            "reproducible": bool(self.config.reproducible),
+        }
+        if self.config.include_deps:
+            parameters["requirementsFile"]=Path(self.config.requirements_file).as_posix()
+        return parameters
+
+    def _write_provenance(self, output: Path) -> None:
+        """Write an unsigned statement of observed inputs for the built subject."""
+        if not self.config.provenance:
+            return
+        local=parse_local_image_reference(self.config.base_image)
+        base_name="local-base-image" if local else self.config.base_image
+        dependencies=[]
+        byproducts=[]
+        for image in self.platform_images:
+            platform="/".join(
+                image.platform[key] for key in ("os","architecture","variant") if key in image.platform
+            )
+            base=self._base_evidence.get(platform)
+            if base:
+                annotations={
+                    "kind": "base-image",
+                    "platform": platform,
+                    "platformManifestDigest": base["manifest"],
+                    "configDigest": base["config"],
+                }
+                if local:
+                    annotations["transport"]=local.transport
+                dependencies.append(slsa.descriptor(base_name, base["resolved"], annotations))
+            for wheel in self._wheel_evidence.get(platform) or []:
+                dependencies.append(slsa.descriptor(
+                    wheel["filename"], f"sha256:{wheel['sha256']}",
+                    {
+                        "kind": "installed-wheel",
+                        "platform": platform,
+                        "distribution": wheel["name"],
+                        "version": wheel["version"],
+                        "size": wheel["size"],
+                    },
+                ))
+            byproducts.append(slsa.descriptor(
+                f"manifest:{platform}", image.manifest_digest, {"configDigest": image.config_digest}
+            ))
+            if image.app_layer_count>1:
+                byproducts.append(slsa.descriptor(
+                    f"dependency-layer:{platform}", image.layers[-2].digest
+                ))
+        if self._app_layer is not None:
+            dependencies.append(slsa.descriptor(
+                "build-context", self._app_layer.digest,
+                {"kind": "build-context-layer", "digestOf": "uncompressed layer tar"},
+            ))
+        sbom_path=output/'sbom.json'
+        if getattr(self.config, 'generate_sbom', False) and sbom_path.is_file():
+            byproducts.append(slsa.descriptor(
+                "sbom.json", "sha256:"+hashlib.sha256(sbom_path.read_bytes()).hexdigest()
+            ))
+        registry, repo, _=parse_image_reference(self.config.tag)
+        statement=slsa.build_statement(
+            subject_name=f"{registry}/{repo}",
+            subject_digest=self.manifest_digest,
+            external_parameters=self._provenance_external_parameters(),
+            resolved_dependencies=dependencies,
+            byproducts=byproducts,
+            incomplete=list(self._evidence_incomplete),
+            started_on=self._provenance_started,
+            finished_on=slsa.utc_now(),
+            version=slsa.builder_version(),
+        )
+        path=output/slsa.STATEMENT_FILENAME
+        _atomic_write_bytes(path, json.dumps(statement, indent=2, sort_keys=True).encode())
+        self.provenance_statement=statement
+        self.provenance_path=path
 
     def _build_multi_platform(self, output: Path, layers_dir: Path, refs_dir: Path, platforms: List[str]):
         """Build every platform in isolation, then publish one index only if all succeed."""
@@ -471,6 +578,7 @@ class ImageBuilder:
         index_digest, index_size=self._write_image_index(layers_dir, images)
         _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
         self._verify_local_base_unchanged(layers_dir)
+        self._check_provenance_complete()
 
         _atomic_write_bytes(
             output/'oci-layout',
@@ -510,11 +618,24 @@ class ImageBuilder:
         self._staged_packages=[]
         self._dependency_site_packages=False
         os_name, arch = parse_platform(platform)
+        self._last_base_evidence=None
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(platform)
+        evidence_platform=f"{os_name}/{arch}"+(f"/{variant}" if variant else "")
+        local_base=parse_local_image_reference(self.config.base_image)
+        if self._last_base_evidence is None:
+            self._mark_incomplete(f"base-image:{evidence_platform}", "base image digest evidence unavailable")
+        elif local_base is not None and local_base.transport != "oci":
+            self._mark_incomplete(
+                f"base-image:{evidence_platform}",
+                "docker-archive manifests are synthesized locally, not observed",
+            )
+        else:
+            self._base_evidence[evidence_platform]=self._last_base_evidence
+        self._evidence_platform=evidence_platform
         
         entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
         include = self.context_include_paths
@@ -797,6 +918,11 @@ class ImageBuilder:
             )
         
         print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
+        self._last_base_evidence={
+            "resolved": resolved_digest,
+            "manifest": manifest_digest if selected_from_index else resolved_digest,
+            "config": config_digest,
+        } if isinstance(resolved_digest, str) and resolved_digest.startswith("sha256:") else None
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -813,11 +939,17 @@ class ImageBuilder:
             if extra_tag not in push_tags: push_tags.append(extra_tag)
 
         signer=None
+        attestor=None
+        self.attested_ref=None
         if self.config.sign:
             self.pushed_refs=[]
             if "@" in target:
                 raise ValueError("A signed push target must specify a tag, not a digest.")
             signer=create_signer(self.config)
+            if self.config.attest_provenance:
+                if getattr(self, "provenance_statement", None) is None:
+                    raise ValueError("Provenance attestation requires a provenance statement from build().")
+                attestor=slsa.create_attestor(self.config)
 
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
@@ -842,7 +974,8 @@ class ImageBuilder:
 
         if signer:
             self._push_signed_image(
-                client, layers_dir, push_tags, f"{registry}/{repo}", signer, show_progress
+                client, layers_dir, push_tags, f"{registry}/{repo}", signer, show_progress,
+                attestor=attestor,
             )
             return f"{registry}/{repo}:{tag}"
 
@@ -881,7 +1014,7 @@ class ImageBuilder:
             )
         client.verify_manifest_descriptor(reference, digest, size, media_type)
 
-    def _push_signed_image(self, client, layers_dir: Path, push_tags: List[str], repository: str, signer, show_progress: bool) -> None:
+    def _push_signed_image(self, client, layers_dir: Path, push_tags: List[str], repository: str, signer, show_progress: bool, attestor=None) -> None:
         is_index=bool(getattr(self, "index_digest", None))
         digest=self.index_digest if is_index else self.manifest_digest
         size=self.index_size if is_index else self.platform_images[0].manifest_size
@@ -969,6 +1102,25 @@ class ImageBuilder:
                 "signature publication may be incomplete. Requested image tags "
                 f"not attempted: {', '.join(tag_refs)}."
             ) from None
+
+        if attestor is not None:
+            try:
+                statement=self.provenance_statement
+                if statement["subject"][0]["digest"]["sha256"] != digest.split(":",1)[1]:
+                    raise slsa.ProvenanceError("Provenance subject does not match the pushed digest.")
+                attestor.attest_and_verify(
+                    subject, statement["predicate"],
+                    require_complete_evidence=self.config.provenance_require_complete,
+                )
+            except slsa.ProvenanceError as error:
+                raise slsa.ProvenanceError(
+                    f"Attesting provenance for {subject} failed: {error} {publication_details()} "
+                    "The signature and any attestation artifacts may remain. Requested image "
+                    f"tags not attempted: {', '.join(tag_refs)}."
+                ) from None
+            self.attested_ref=subject
+            if show_progress:
+                print(f"✓ Attested and verified provenance for {subject}")
 
         try:
             self._verify_published_manifest(client, digest, digest, size, media_type)
@@ -1122,19 +1274,35 @@ class ImageBuilder:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if is_requirements:
-                install_requirements(
-                    ctx / requirements_relative,
-                    site_packages,
-                    ctx,
-                    os_name,
-                    arch,
-                    version,
-                    base_image_name,
-                    base_config,
-                )
+                evidence=tempfile.TemporaryDirectory(prefix="pycontainer-wheels-") if self.config.provenance else None
+                try:
+                    wheels=install_requirements(
+                        ctx / requirements_relative,
+                        site_packages,
+                        ctx,
+                        os_name,
+                        arch,
+                        version,
+                        base_image_name,
+                        base_config,
+                        **({"evidence_dir": Path(evidence.name)} if evidence else {}),
+                    )
+                finally:
+                    if evidence: evidence.cleanup()
+                if evidence and wheels is None:
+                    self._mark_incomplete(
+                        f"dependencies:{self._evidence_platform}",
+                        "installer did not report installed wheel hashes",
+                    )
+                elif evidence:
+                    self._wheel_evidence[self._evidence_platform]=wheels
             else:
                 stage_virtualenv(
                     deps_paths, site_packages, version, os_name, arch
+                )
+                self._mark_incomplete(
+                    f"dependencies:{getattr(self, '_evidence_platform', self.config.platform)}",
+                    "virtualenv staging copies installed files without wheel artifacts",
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")

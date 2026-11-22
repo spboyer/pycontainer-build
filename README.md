@@ -148,6 +148,9 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - **Experimental image signing** — Opt-in Cosign or Notation signing of a
   registry-published digest; see [signing prerequisites and status](docs/image-signing.md)
+- **Experimental SLSA provenance** — Opt-in in-toto/SLSA v1 statement of
+  observed base and installed-wheel evidence, optionally attested with cosign;
+  unsigned statements are unauthenticated. See [provenance](docs/provenance.md)
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
@@ -355,6 +358,12 @@ by digest. The image manifest, or the top-level multi-platform image index, is
 verified and signed before tags are written. See the
 [signing guide](docs/image-signing.md) for keys, OIDC, verification, limitations
 and real-registry test prerequisites.
+
+**Provenance:** `--provenance` writes `dist/image/provenance.intoto.json`;
+`--provenance-require-complete` fails before tags are written if any evidence
+is unavailable; `--attest-provenance` (with cosign signing) attaches and
+verifies it before tags move. `pycontainer verify-provenance` checks it later.
+See the [provenance guide](docs/provenance.md) for the trust model.
 
 ### Local base images
 
@@ -691,6 +700,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[SLSA Provenance](docs/provenance.md)** — Evidence, trust model and verification
 
 ### External References
 

@@ -167,3 +167,6 @@ manifest and a multi-platform index with unique content. Notation tests reject
 skip, audit, permissive or overridden trust policies. Unconfigured modes skip.
 This check is not part of the default suite or CI and should be run with an
 external timeout.
+
+Cosign SLSA provenance attestation (`--attest-provenance`) and its separate
+real-registry test are described in the [provenance guide](provenance.md).

@@ -77,6 +77,7 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 - `tests/test_signing_integration.py::test_real_provider_signs_and_independently_verifies` (eight provider/platform combinations)
+- `tests/test_provenance_integration.py::test_real_cosign_attests_and_independently_verifies_provenance`
 
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
