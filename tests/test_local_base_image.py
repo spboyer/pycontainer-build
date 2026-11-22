@@ -604,3 +604,75 @@ def test_docker_archive_unspecified_target_exposes_platform(tmp_path):
         assert source.platform == {"os": "linux", "architecture": "arm64"}
     with pytest.raises(LocalImageError, match="does not match requested linux/amd64"):
         open_local_image_source(reference, layers, tmp_path / "out", "linux", "amd64")
+
+
+@pytest.mark.parametrize("modern", [False, True])
+@pytest.mark.parametrize("size_delta", [-1, 0, 1])
+def test_docker_layer_size_checked_before_any_staging(tmp_path, monkeypatch, modern, size_delta):
+    from pycontainer import local_image
+
+    archive = tmp_path / "base.tar"
+    first = layer_tar({"first": b"x"})
+    second = layer_tar({"second": b"x" * (12 * 1024)})
+    docker_archive(archive, [(["base:v1"], "amd64", [first, second])], modern=modern)
+    monkeypatch.setattr(
+        local_image, "MAX_LAYER_UNCOMPRESSED_BYTES", len(second) - size_delta
+    )
+    reference = parse_local_image_reference(f"docker-archive:{archive}")
+    layers = tmp_path / "layers"
+    with patch("pycontainer.local_image._stage_stream", wraps=local_image._stage_stream) as stage:
+        if size_delta > 0:
+            with pytest.raises(LocalImageError, match="layer 2 exceeds"):
+                local_image.open_local_image_source(
+                    reference, layers, tmp_path / "out", "linux", "amd64"
+                )
+            stage.assert_not_called()
+            assert not layers.exists()
+        else:
+            with local_image.open_local_image_source(
+                reference, layers, tmp_path / "out", "linux", "amd64"
+            ) as source:
+                manifest, _ = source.pull_manifest(None)
+                assert [layer["size"] for layer in manifest["layers"]] == [
+                    len(first), len(second)
+                ]
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("count", [999, 1000, 1001])
+def test_nested_oci_index_entry_limit(tmp_path, depth, count):
+    from pycontainer.local_image import OCILayoutSource
+
+    layout = Layout(tmp_path / "base")
+    descriptor, platform, _ = layout.image(b"selected")
+    other = {**descriptor, "platform": {"os": "linux", "architecture": "arm64"}}
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {**descriptor, "platform": platform},
+            *[other for _ in range(count - 1)],
+        ],
+    }
+    nested = layout.blob(json.dumps(index).encode(), index["mediaType"])
+    for _ in range(depth - 1):
+        index["manifests"] = [{**nested, "platform": platform}]
+        nested = layout.blob(json.dumps(index).encode(), index["mediaType"])
+    layout.add(nested)
+
+    reference = parse_local_image_reference(f"oci:{layout.root}")
+    with OCILayoutSource(reference) as source:
+        def read_nested_index():
+            manifest, _ = source.pull_manifest(None)
+            for _ in range(depth - 1):
+                child = manifest["manifests"][0]
+                manifest, _ = source.pull_manifest(
+                    child["digest"], child["digest"], child["size"]
+                )
+            return manifest
+
+        if count > 1000:
+            with pytest.raises(LocalImageError, match="more than 1000 manifests"):
+                read_nested_index()
+        else:
+            assert len(read_nested_index()["manifests"]) == count
