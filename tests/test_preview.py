@@ -458,8 +458,55 @@ def test_cli_preview_json(built, tmp_path, monkeypatch, capsys):
     assert result["provenance"]["level"] in ("exact", "positional")
     assert result["components"]["base"]["status"] == "identical"
 
-def test_oversized_sources_are_skipped_by_framework_detection(tmp_path, monkeypatch):
+def test_oversized_sources_fail_framework_detection_explicitly(tmp_path, monkeypatch):
     ctx = context(tmp_path / "ctx", {"main.py": "from flask import Flask\napp = Flask(__name__)\n" + "#" * 256})
     assert detect_framework(ctx)[0] == "Flask"
     monkeypatch.setattr(fs_utils, "MAX_PROJECT_FILE_BYTES", 128)
-    assert detect_framework(ctx) is None
+    with pytest.raises(fs_utils.FileTooLargeError, match="main.py is larger than 128 bytes"):
+        detect_framework(ctx)
+
+
+def test_oversized_docker_credentials_fail_explicitly(tmp_path, monkeypatch):
+    from pycontainer.auth import DockerConfigAuthProvider
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"auths": {"registry.example": {"auth": "dXNlcjpwYXNz"}}, "pad": "x" * 256}))
+    provider = DockerConfigAuthProvider(path)
+    assert provider.get_credentials("registry.example") == ("user", "pass")
+    monkeypatch.setattr(fs_utils, "MAX_PROJECT_FILE_BYTES", 128)
+    with pytest.raises(fs_utils.FileTooLargeError, match="Docker credential file"):
+        provider.get_credentials("registry.example")
+
+
+def test_cache_hardlink_topology_makes_application_unknown(tmp_path):
+    ctx = context(tmp_path / "ctx", {"src/a.py": "SAME = 1\n", "src/b.py": "SAME = 1\n"})
+    cfg = config(tmp_path, use_cache=True)
+    baseline = build(cfg)
+    cache_before = tree(tmp_path / "cache")
+    exact = preview_image(config(tmp_path, use_cache=False), baseline)
+    assert exact["provenance"]["level"] == "exact" and exact["components"]["application"]["status"] == "identical"
+    cached = preview_image(cfg, baseline)
+    assert cached["components"]["application"] == {"status": "unknown", "reason": preview.CACHE_TOPOLOGY_REASON}
+    assert cached["files"] is None and cached["plan"]["appLayerDiffId"] is None
+    (ctx / "src" / "b.py").unlink()
+    try:
+        os.link(ctx / "src" / "a.py", ctx / "src" / "b.py")
+    except OSError:
+        pytest.skip("hardlinks are not supported here")
+    linked = preview_image(cfg, baseline)
+    assert linked["components"]["application"]["status"] == "unknown" and linked["files"] is None
+    fresh = preview_image(config(tmp_path, use_cache=False), baseline)
+    assert fresh["components"]["application"]["status"] == "changed"
+    assert changes(fresh)["/app/src/b.py"]["reasons"][0] == "type"
+    assert tree(tmp_path / "cache") == cache_before
+
+
+def test_cli_preview_no_cache_flag(built, monkeypatch, capsys):
+    cfg, baseline = built
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", "preview", "--baseline", baseline, "--json", "--no-cache", "--context", cfg.context_dir,
+        "--base-image", cfg.base_image, "--tag", "demo:v1",
+    ])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert json.loads(capsys.readouterr().out)["plan"]["useCache"] is False

@@ -205,7 +205,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         return Response(b'{"token":"exchanged-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
 
     status, body, _=client._make_request(
@@ -255,7 +255,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
         raise _http_error(request.full_url, 403)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
 
     with pytest.raises(
@@ -301,7 +301,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
         return _Response(b'{"token":"access-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
@@ -529,7 +529,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
     client = RegistryClient("registry.example", "team/app", auth_token="token")
     monkeypatch.setattr(client, "initiate_blob_upload", lambda: location)
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
 
     assert client.upload_blob_monolithic(digest, source)
@@ -564,7 +564,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
         return _Response(status=201)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
 
     client.upload_blob_monolithic(
@@ -612,7 +612,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
         raise TimeoutError("not included in public error")
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._urlopen", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
@@ -631,3 +631,92 @@ if __name__=="__main__":
     test_registry_client_construction()
     test_registry_url_construction()
     print("✅ All registry client tests passed")
+
+
+class _RedirectServer:
+    """Loopback HTTP server recording the Authorization header per path."""
+
+    def __init__(self, routes):
+        import http.server
+        import threading
+
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                status, headers = routes(self.path, self.headers.get("Authorization"))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                return None
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _loopback_client(origin):
+    client = RegistryClient("127.0.0.1", "team/app", auth_token="synthetic-secret")
+    client.base_url = f"{origin}/v2"
+    return client
+
+
+def test_same_origin_registry_redirect_keeps_credentials():
+    def routes(path, auth):
+        if path == "/v2/start":
+            return 307, {"Location": "/v2/target"}
+        return (200 if auth == "Bearer synthetic-secret" else 401), {}
+
+    with _RedirectServer(routes) as server:
+        client = _loopback_client(server.origin)
+        status, body, _ = client._make_request("GET", f"{server.origin}/v2/start")
+
+    assert (status, body) == (200, b"ok")
+    assert server.seen == [
+        ("/v2/start", "Bearer synthetic-secret"),
+        ("/v2/target", "Bearer synthetic-secret"),
+    ]
+
+
+def test_cross_origin_registry_redirect_strips_credentials():
+    with _RedirectServer(lambda _path, _auth: (200, {})) as other:
+        def routes(_path, _auth):
+            return 302, {"Location": f"{other.origin}/target"}
+
+        with _RedirectServer(routes) as server:
+            client = _loopback_client(server.origin)
+            status, _, _ = client._make_request("GET", f"{server.origin}/v2/start")
+
+    assert status == 200
+    assert server.seen == [("/v2/start", "Bearer synthetic-secret")]
+    assert other.seen == [("/target", None)]
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["http://registry.example/v2/target", "https://registry.example:8443/v2/target"],
+)
+def test_redirect_handler_strips_credentials_on_downgrade_or_port_change(target):
+    from pycontainer.registry_client import SameOriginCredentialRedirect, _request
+
+    request = _request(
+        "https://registry.example/v2/start", {"Authorization": "Bearer secret"}
+    )
+    redirected = SameOriginCredentialRedirect().redirect_request(
+        request, None, 302, "Found", {}, target
+    )
+    assert redirected.get_header("Authorization") is None

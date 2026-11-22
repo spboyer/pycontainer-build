@@ -107,6 +107,7 @@ def main():
     pre=sub.add_parser("preview",help="Compare the planned build with an existing image without building it")
     pre.add_argument("--baseline",required=True,help="Image to compare with: oci:<dir>[:<ref>|@sha256:<digest>], docker-archive:<file>[:<tag>], an OCI layout directory (offline), or docker://<registry>/<repository>[:<tag>|@sha256:<digest>]")
     _add_plan_arguments(pre)
+    pre.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Preview a build run with --no-cache")
     pre.add_argument("--json",action="store_true",help="Emit the report as JSON")
     args=parser.parse_args()
 
@@ -118,7 +119,7 @@ def main():
 
     if args.cmd=="preview":
         from .preview import run_preview
-        cfg=_load_build_config(parser,args,_plan_overrides(args))
+        cfg=_load_build_config(parser,args,{**_plan_overrides(args),'use_cache':args.use_cache})
         output,code=run_preview(cfg,args.baseline,args.json)
         print(output,file=sys.stderr if code else sys.stdout)
         raise SystemExit(code)

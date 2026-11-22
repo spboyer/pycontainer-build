@@ -447,11 +447,15 @@ pycontainer preview --baseline docker://ghcr.io/me/app:v1 --base-image python:3.
 
 It accepts the same content-affecting flags as `build` (`--config`,
 `--base-image`, `--context`, `--include`, `--exclude`, `--include-deps`,
-`--platform`, `--no-reproducible`, ...). The report shows the base,
+`--platform`, `--no-reproducible`, `--no-cache`, ...). The report shows the base,
 dependency and application components, added/modified/deleted application
 files, and image settings. Anything the evidence cannot establish is reported
 as `unknown`, never as unchanged, and environment values are always redacted.
-Baseline and project reads are size-bounded; see
+Because the layer cache ignores hardlink topology (#229), cache-enabled
+previews report the application as `unknown` when files could be hardlinked;
+use `--no-cache` for a cache-free comparison. Baseline and project reads are
+size-bounded (16 MiB per metadata, credential or scanned source file, shared
+with `build`, failing explicitly when exceeded); see
 [Build preview](docs/preview.md) for the limits, how provenance is established
 and the accuracy limits.
 

@@ -25,8 +25,10 @@ A bare name such as `app:v1` is rejected; prefix registry images with
 error.
 
 Registry baselines use the same credential providers as `build --push`.
-Credentials are sent only to the registry origin and are never forwarded on
-redirects. Manifests are capped at 16 MiB and blobs are verified against their
+Credentials are sent only to the registry origin: a redirect keeps them only
+when it stays on the same scheme, host and port, and they are dropped on any
+cross-origin, port-changing or HTTPS-to-HTTP redirect. Blob-storage redirects
+are always followed without credentials. Manifests are capped at 16 MiB and blobs are verified against their
 descriptor digest and size.
 
 ## What is read and written
@@ -43,8 +45,10 @@ is resolved only for a `docker://` baseline.
 Planning reads are bounded as well. Project metadata that is loaded whole into
 memory (`pyproject.toml`, the `--config` file, Python sources scanned for
 framework defaults, and the Docker credential config) is limited to 16 MiB per
-file; an oversized `pyproject.toml` or `--config` file is an error, and an
-oversized source file is skipped by framework detection, as it is in `build`.
+file. This limit is shared with `build`: an oversized file of any of these
+kinds is an explicit error rather than being skipped, so framework detection
+never silently selects a different entrypoint and an oversized credential file
+never falls back to unauthenticated access.
 Application files are streamed through a hash, never held in memory, and the
 planned application layer is limited to 100,000 files and 64 GiB.
 
@@ -82,6 +86,11 @@ only the status reveals that a value changed.
 - Non-reproducible builds (`--no-reproducible`) embed modification times and
   can reuse a cached layer, so provenance is never `exact` and the application
   component is `unknown` unless file changes are found.
+- The layer cache key ignores hardlink topology (#229), so a cache-enabled
+  `build` can reuse a layer whose hardlinks differ from a fresh layer. When
+  caching is enabled and planned files are hardlinked or share content, the
+  application component and file list are `unknown`; preview with
+  `--no-cache` (and build with `--no-cache`) to compare a cache-free layer.
 - Modification times are not compared.
 - The exit code is `0` for a report and `1` for any error; errors never
   produce a partial report.

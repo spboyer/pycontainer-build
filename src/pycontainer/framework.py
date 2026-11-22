@@ -2,7 +2,7 @@
 from pathlib import Path
 from typing import Optional, Tuple, List
 import re
-from .fs_utils import iter_files, read_text_limited
+from .fs_utils import FileTooLargeError, iter_files, read_text_limited
 from .project import default_include_paths
 
 
@@ -59,6 +59,7 @@ def _detect_fastapi(files: List[Path], ctx: Path) -> Optional[Tuple[str, List[st
                 app_module=_find_fastapi_app(py, ctx)
                 if app_module:
                     return ("FastAPI", ["uvicorn", app_module, "--host", "0.0.0.0", "--port", "8000"], [8000])
+        except FileTooLargeError: raise
         except: pass
     return None
 
@@ -72,6 +73,7 @@ def _find_fastapi_app(file_path: Path, ctx: Path) -> Optional[str]:
             rel=file_path.relative_to(ctx)
             module=".".join(rel.with_suffix("").parts)
             return f"{module}:{app_var}"
+    except FileTooLargeError: raise
     except: pass
     return None
 
@@ -84,6 +86,7 @@ def _detect_flask(files: List[Path]) -> Optional[Tuple[str, List[str], List[int]
                 r'^\s*\w+\s*=\s*Flask\s*\(', content, re.MULTILINE
             ):
                 return ("Flask", ["flask", "run", "--host=0.0.0.0", "--port=5000"], [5000])
+        except FileTooLargeError: raise
         except: pass
     return None
 
@@ -98,6 +101,7 @@ def _detect_django(
             content=read_text_limited(manage_py)
             if "django" in content.lower():
                 return ("Django", ["python", "manage.py", "runserver", "0.0.0.0:8000"], [8000])
+        except FileTooLargeError: raise
         except: pass
     return None
 

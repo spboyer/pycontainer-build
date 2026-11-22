@@ -50,12 +50,36 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _origin(url: str) -> Tuple[str, str]:
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme.lower(), parsed.netloc.lower()
+
+
+class SameOriginCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep registry credentials only on redirects to the same scheme and host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and _origin(redirected.full_url) == _origin(
+            req.full_url
+        ):
+            credential = req.get_header("Authorization")
+            if credential is not None:
+                redirected.add_unredirected_header("Authorization", credential)
+        return redirected
+
+
 def _request(url: str, credentials: Dict[str, str], **options) -> urllib.request.Request:
-    """Build a request whose credentials urllib never copies onto a redirect."""
+    """Build a request whose credentials are never copied to another origin."""
     request = urllib.request.Request(url, **options)
     for name, value in credentials.items():
         request.add_unredirected_header(name, value)
     return request
+
+
+def _urlopen(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(SameOriginCredentialRedirect())
+    return opener.open(request, timeout=timeout)
 
 
 def _safe_url(url: str) -> str:
@@ -185,7 +209,7 @@ class RegistryClient:
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with urllib.request.urlopen(
+                with _urlopen(
                     request, timeout=self.timeout
                 ) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
@@ -264,7 +288,7 @@ class RegistryClient:
                 method=method,
             )
             try:
-                with urllib.request.urlopen(
+                with _urlopen(
                     request, timeout=self.timeout
                 ) as response:
                     if max_body_bytes is None:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
-from .fs_utils import read_text_limited
+from .fs_utils import FileTooLargeError, read_text_limited
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,10 @@ class DockerConfigAuthProvider(AuthProvider):
         if not self.config_path.exists(): return None
         try:
             return json.loads(read_text_limited(self.config_path))
+        except FileTooLargeError as error:
+            raise FileTooLargeError(
+                f"Docker credential file is too large to read safely: {error}"
+            ) from error
         except: return None
     
     def _decode_auth(self, auth_str: str) -> Tuple[str, str]:
