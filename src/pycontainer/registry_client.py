@@ -32,6 +32,7 @@ TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 class RegistryRequestError(RuntimeError):
@@ -47,6 +48,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _request(url: str, credentials: Dict[str, str], **options) -> urllib.request.Request:
+    """Build a request whose credentials urllib never copies onto a redirect."""
+    request = urllib.request.Request(url, **options)
+    for name, value in credentials.items():
+        request.add_unredirected_header(name, value)
+    return request
 
 
 def _safe_url(url: str) -> str:
@@ -172,7 +181,7 @@ class RegistryClient:
         elif self.password:
             headers["Authorization"] = f"Bearer {self.password}"
 
-        request = urllib.request.Request(url, headers=headers)
+        request = _request(url, headers)
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
@@ -236,6 +245,7 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_body_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
         method = method.upper()
         retry_safe = method in {"GET", "HEAD"}
@@ -246,16 +256,27 @@ class RegistryClient:
         for attempt in range((MAX_REQUEST_RETRIES + 1) if retry_safe else 1):
             if body_position is not None:
                 data.seek(body_position)
-            request_headers = dict(headers or {})
-            request_headers.update(self._authorization_headers(url))
-            request = urllib.request.Request(
-                url, data=data, headers=request_headers, method=method
+            request = _request(
+                url,
+                self._authorization_headers(url),
+                data=data,
+                headers=dict(headers or {}),
+                method=method,
             )
             try:
                 with urllib.request.urlopen(
                     request, timeout=self.timeout
                 ) as response:
-                    return response.status, response.read(), dict(response.headers)
+                    if max_body_bytes is None:
+                        body = response.read()
+                    else:
+                        body = response.read(max_body_bytes + 1)
+                        if len(body) > max_body_bytes:
+                            raise RegistryRequestError(
+                                f"{method} response from {_safe_url(url)} exceeds "
+                                f"{max_body_bytes} bytes."
+                            )
+                    return response.status, body, dict(response.headers)
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 if (
@@ -276,6 +297,7 @@ class RegistryClient:
                             data,
                             headers,
                             retry_auth=False,
+                            max_body_bytes=max_body_bytes,
                         )
                 if (
                     retry_safe
@@ -424,7 +446,13 @@ class RegistryClient:
             )
         }
         status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
+            "GET",
+            url,
+            headers=headers,
+            max_body_bytes=(
+                MAX_MANIFEST_BYTES if expected_size is None
+                else min(expected_size, MAX_MANIFEST_BYTES)
+            ),
         )
         if status != 200:
             body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
@@ -468,9 +496,7 @@ class RegistryClient:
         return manifest, digest or body_digest
 
     def _open_blob_response(self, url: str):
-        request = urllib.request.Request(
-            url, headers=self._authorization_headers(url)
-        )
+        request = _request(url, self._authorization_headers(url))
         opener = urllib.request.build_opener(NoRedirect())
         try:
             response = opener.open(request, timeout=self.timeout)

@@ -205,6 +205,30 @@ from .dependencies import (
 
 logger=logging.getLogger(__name__)
 
+
+def write_app_files(tar, files, workdir: str, reproducible: bool, opener=None) -> None:
+    """Write application files to ``tar`` exactly as the application layer stores them.
+
+    ``opener`` replaces ``open(path, "rb")`` so callers can observe the content as it is written.
+    """
+    opener = opener or (lambda path, _info: open(path, "rb"))
+    ordered = sorted(files, key=lambda item: item[1].as_posix()) if reproducible else files
+    for abs_path, rel in ordered:
+        info = tar.gettarinfo(abs_path, arcname=f"{workdir.lstrip('/')}/{rel.as_posix()}")
+        if info is None:
+            continue
+        if reproducible:
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+        if info.isreg():
+            with opener(abs_path, info) as source:
+                tar.addfile(info, source)
+        else:
+            tar.addfile(info)
+
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
         context_dir=Path(config.context_dir)
@@ -768,25 +792,9 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
         try:
             with tarfile.open(tmp,'w') as tar:
-                for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
-                    if self.config.reproducible:
-                        tarinfo=tar.gettarinfo(abs_path, arcname=arc)
-                        tarinfo.mtime=0
-                        tarinfo.uid=0
-                        tarinfo.gid=0
-                        tarinfo.uname="root"
-                        tarinfo.gname="root"
-                        if tarinfo.isfile():
-                            with open(abs_path, 'rb') as f:
-                                tar.addfile(tarinfo, f)
-                        else:
-                            tar.addfile(tarinfo)
-                    else:
-                        tar.add(abs_path,arcname=arc)
+                write_app_files(tar, files, self.config.workdir, self.config.reproducible)
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
