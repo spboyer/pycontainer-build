@@ -103,13 +103,17 @@ class Layout:
         (self.root / "index.json").write_text(json.dumps(index))
 
 
-def docker_archive(path: Path, images, *, modern=False, extra_members=None):
+def docker_archive(path: Path, images, *, modern=False, extra_members=None, env=None):
     """Write a docker-save tar. ``images`` is a list of (tags, arch, layer_bytes)."""
     members = {}
     manifest = []
     for tags, arch, layers in images:
         diff_ids = [sha(gzip.decompress(l) if l[:2] == b"\x1f\x8b" else l) for l in layers]
         config = image_config(diff_ids, arch=arch)
+        if env:
+            config_data = json.loads(config)
+            config_data["config"]["Env"].extend(env)
+            config = json.dumps(config_data).encode()
         if modern:
             config_name = f"blobs/sha256/{hashlib.sha256(config).hexdigest()}"
             layer_names = [f"blobs/sha256/{hashlib.sha256(l).hexdigest()}" for l in layers]
@@ -241,6 +245,82 @@ def test_oci_layout_selects_reference_among_many(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
     with pytest.raises(LocalImageError, match="no image matching 'three'"):
         build(tmp_path, f"oci:{layout.root}:three")
+
+
+def test_oci_layout_selects_each_tag_for_shared_manifest(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"shared")
+    for tag in ("app:v1", "app:latest"):
+        layout.add(descriptor, ref=tag)
+
+    for tag in ("app:v1", "app:latest"):
+        builder, manifest, _ = build(tmp_path, f"oci:{layout.root}:{tag}")
+        assert manifest["layers"][0] == layer
+        assert builder._base_image_name == tag
+
+    with pytest.raises(LocalImageError, match="multiple images.*app:latest, app:v1"):
+        build(tmp_path, f"oci:{layout.root}")
+
+
+def test_oci_layout_selects_by_containerd_image_name_alias(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    tagged, _, tagged_layer = layout.image(b"tagged")
+    named, _, named_layer = layout.image(b"named")
+    layout.descriptors.append(
+        {
+            **tagged,
+            "annotations": {
+                "org.opencontainers.image.ref.name": "3.11",
+                "io.containerd.image.name": "docker.io/library/python:3.11",
+            },
+        }
+    )
+    layout.descriptors.append(
+        {**named, "annotations": {"io.containerd.image.name": "example.com/app:v2"}}
+    )
+    layout.write_index()
+
+    for selector, layer in (
+        ("3.11", tagged_layer),
+        ("docker.io/library/python:3.11", tagged_layer),
+        ("example.com/app:v2", named_layer),
+    ):
+        _, manifest, _ = build(tmp_path, f"oci:{layout.root}:{selector}")
+        assert manifest["layers"][0] == layer
+
+    with pytest.raises(
+        LocalImageError,
+        match=r"multiple images.*3\.11, docker\.io/library/python:3\.11, example\.com/app:v2",
+    ):
+        build(tmp_path, f"oci:{layout.root}")
+
+
+@pytest.mark.parametrize("reference", ["v1", "example.com/app:v1"])
+def test_oci_layout_selects_single_entry_by_either_index_annotation(
+    tmp_path, offline, reference
+):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"index")
+    layout.add(descriptor)
+    layout.write_index({
+        "org.opencontainers.image.ref.name": "v1",
+        "io.containerd.image.name": "example.com/app:v1",
+    })
+
+    _, manifest, _ = build(tmp_path, f"oci:{layout.root}:{reference}")
+    assert manifest["layers"][0] == layer
+
+
+def test_oci_layout_does_not_select_multi_entry_by_index_annotation(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    first, _, _ = layout.image(b"first")
+    second, _, _ = layout.image(b"second")
+    layout.add(first, ref="one")
+    layout.add(second, ref="two")
+    layout.write_index({"org.opencontainers.image.ref.name": "index-name"})
+
+    with pytest.raises(LocalImageError, match="has no image matching"):
+        build(tmp_path, f"oci:{layout.root}:index-name")
 
 
 def test_oci_layout_selects_by_digest(tmp_path, offline):
@@ -676,3 +756,120 @@ def test_nested_oci_index_entry_limit(tmp_path, depth, count):
                 read_nested_index()
         else:
             assert len(read_nested_index()["manifests"]) == count
+
+
+def local_source_with_env(tmp_path, transport, name, env):
+    tar = layer_tar({"etc/marker": b"musl"})
+    if transport == "oci":
+        layout = Layout(tmp_path / "base")
+        layer = layout.blob(tar, OCI_TAR_LAYER)
+        config = json.loads(image_config([sha(tar)]))
+        config["config"]["Env"].extend(env)
+        config_descriptor = layout.blob(
+            json.dumps(config).encode(), "application/vnd.oci.image.config.v1+json"
+        )
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": config_descriptor,
+            "layers": [layer],
+        }
+        descriptor = layout.blob(json.dumps(manifest).encode(), manifest["mediaType"])
+        layout.descriptors.append(
+            {**descriptor, "annotations": {"io.containerd.image.name": name}}
+        )
+        layout.write_index()
+        return f"oci:{layout.root}"
+    archive = tmp_path / "base.tar"
+    docker_archive(archive, [([name], "amd64", [tar])], env=env)
+    return f"docker-archive:{archive}"
+
+
+@pytest.mark.parametrize("transport,name", [
+    ("oci", "docker.io/library/python@sha256:" + "b" * 64),
+    ("oci", "docker.io/library/python:3.11-slim"),
+    ("docker", "docker.io/library/python:3.11-slim"),
+])
+@pytest.mark.parametrize("libc,platform", [
+    ("musl-1.2", "musllinux_1_2_x86_64"),
+    ("glibc-2.17", "manylinux_2_17_x86_64"),
+    (None, None),
+    ("unsupported", None),
+])
+@pytest.mark.parametrize("deps_source", ["requirements", "venv"])
+def test_local_source_name_does_not_determine_libc(
+    tmp_path, offline, transport, name, libc, platform, deps_source
+):
+    env = ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"]
+    if libc:
+        env.append(f"PYTHON_LIBC={libc}")
+    base_image = local_source_with_env(tmp_path, transport, name, env)
+
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    if deps_source == "requirements":
+        (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    else:
+        site_packages = context / ".venv" / "lib" / "python3.11" / "site-packages"
+        site_packages.mkdir(parents=True)
+        (site_packages / "fixture_dep.py").write_text("value = 1\n")
+    builder = ImageBuilder(
+        BuildConfig(
+            tag="app:v1",
+            base_image=base_image,
+            context_dir=str(context),
+            output_dir=str(tmp_path / "out"),
+            include_deps=True,
+            use_cache=False,
+        )
+    )
+    with patch("pycontainer.dependencies.subprocess.Popen") as pip:
+        pip.return_value.wait.return_value = 0
+        if platform is None:
+            with pytest.raises(ValueError, match="(?i)libc|digest-only"):
+                builder.build()
+            pip.assert_not_called()
+        else:
+            builder.build()
+            if deps_source == "requirements":
+                command = pip.call_args.args[0]
+                assert command[command.index("--platform") + 1] == platform
+            else:
+                pip.assert_not_called()
+                assert builder._dependency_site_packages
+
+
+@pytest.mark.parametrize("transport", ["oci", "docker"])
+@pytest.mark.parametrize("env,expected", [
+    (["PYTHON_VERSION=3.11.9"], "PYTHON_IMPLEMENTATION"),
+    (["PYTHON_IMPLEMENTATION=PyPy", "PYTHON_VERSION=3.11.9"], "CPython"),
+    (["PYTHON_IMPLEMENTATION=CPython"], "PYTHON_VERSION"),
+    (["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=invalid"], "PYTHON_VERSION"),
+])
+def test_local_source_name_does_not_establish_python_abi(
+    tmp_path, offline, transport, env, expected
+):
+    base_image = local_source_with_env(
+        tmp_path, transport, "docker.io/library/python:3.11-slim",
+        [*env, "PYTHON_LIBC=glibc-2.17"],
+    )
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    builder = ImageBuilder(
+        BuildConfig(
+            tag="app:v1",
+            base_image=base_image,
+            context_dir=str(context),
+            output_dir=str(tmp_path / "out"),
+            include_deps=True,
+            use_cache=False,
+        )
+    )
+    with patch("pycontainer.dependencies.subprocess.Popen") as pip:
+        pip.return_value.wait.return_value = 0
+        with pytest.raises(ValueError, match=expected):
+            builder.build()
+        pip.assert_not_called()
