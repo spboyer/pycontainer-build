@@ -31,7 +31,7 @@ from pycontainer.lockfiles import (
     preflight_lockfile,
     target_environment,
 )
-from test_dependency_staging import _builder, _write_wheel
+from test_dependency_staging import BASE_CONFIG, _builder, _write_wheel
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
 FORMATS = {
@@ -526,13 +526,16 @@ def indexes():
         server.close()
 
 
-def _named_wheel(directory, name):
+def _named_wheel(directory, name, requires=(), extras=()):
     module = name.replace("-", "_")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{module}-1.0-py3-none-any.whl"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
+    metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
     files = {
         f"{module}/__init__.py": b"",
-        f"{module}-1.0.dist-info/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n\n".encode(),
+        f"{module}-1.0.dist-info/METADATA": (metadata + "\n").encode(),
         f"{module}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
     files[f"{module}-1.0.dist-info/RECORD"] = "".join(f"{item},,\n" for item in [*files, f"{module}-1.0.dist-info/RECORD"]).encode()
@@ -637,6 +640,112 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     assert not [path for path in index_b.requests if "fixture" in path]
     assert any("fixture" in path for path in index_a.requests)
     assert any("other" in path for path in index_b.requests)
+
+
+@pytest.mark.parametrize(
+    ("arch", "selected_arch", "excluded_arch"),
+    [
+        ("amd64", "amd-dep", "arm-dep"),
+        ("arm64", "arm-dep", "amd-dep"),
+    ],
+)
+def test_locked_build_selects_target_transitive_markers_across_indexes(
+    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch
+):
+    wheelhouse = tmp_path / "wheels"
+    wheels = {
+        "root-dep": _named_wheel(
+            wheelhouse,
+            "root-dep",
+            requires=[
+                "common-dep==1.0; python_version < '3.12'",
+                "newpy-dep==1.0; python_version >= '3.12'",
+                "amd-dep==1.0; platform_machine == 'x86_64'",
+                "arm-dep==1.0; platform_machine == 'aarch64'",
+                "win-dep==1.0; sys_platform == 'win32'",
+                "feature-dep==1.0; extra == 'feature' and sys_platform == 'linux'",
+            ],
+            extras=["feature"],
+        ),
+    }
+    for name in ("common-dep", "newpy-dep", "amd-dep", "arm-dep", "win-dep", "feature-dep"):
+        wheels[name] = _named_wheel(wheelhouse, name)
+    index_a, index_b, rogue = (indexes(*wheels.values()) for _ in range(3))
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
+
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\nrequires-python = ">=3.10"\n'
+        'dependencies = ["root-dep[feature]==1.0"]\n'
+        f'\n[[tool.uv.index]]\nurl = "{index_a.url}"\n'
+        f'\n[[tool.uv.index]]\nurl = "{index_b.url}"\n'
+    )
+    lock = f"""version = 1
+requires-python = ">=3.10"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = {{ virtual = "." }}
+dependencies = [{{ name = "root-dep", extra = ["feature"] }}]
+
+[package.metadata]
+requires-dist = [{{ name = "root-dep", extras = ["feature"], specifier = "==1.0" }}]
+"""
+    for name, wheel in wheels.items():
+        registry = index_a.url if name in {"root-dep", "common-dep"} else index_b.url
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        lock += f"""
+[[package]]
+name = "{name}"
+version = "1.0"
+source = {{ registry = "{registry}" }}
+wheels = [{{ url = "{registry}/{wheel.name}", hash = "sha256:{digest}" }}]
+"""
+        if name == "root-dep":
+            lock += """
+dependencies = [
+    { name = "common-dep", marker = "python_version < '3.12'" },
+    { name = "newpy-dep", marker = "python_version >= '3.12'" },
+    { name = "amd-dep", marker = "platform_machine == 'x86_64'" },
+    { name = "arm-dep", marker = "platform_machine == 'aarch64'" },
+    { name = "win-dep", marker = "sys_platform == 'win32'" },
+]
+
+[package.optional-dependencies]
+feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
+"""
+    (context / "uv.lock").write_text(lock)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        generate_sbom=True, platform=f"linux/{arch}",
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, target_arch: ([], {**BASE_CONFIG, "architecture": target_arch}),
+    )
+
+    builder.build()
+
+    expected = {"root-dep", "common-dep", "feature-dep", selected_arch}
+    names = _layer_names(builder.layers[0])
+    assert {
+        name for name in wheels
+        if f"app/.python/site-packages/{name.replace('-', '_')}/__init__.py" in names
+    } == expected
+    sbom = json.loads((Path(builder.config.output_dir) / "sbom.json").read_text())
+    assert {(package["name"], package["versionInfo"]) for package in sbom["packages"]} == {
+        (name, "1.0") for name in expected
+    }
+    requested_a = {path.split("/")[2] for path in index_a.requests if path.startswith("/simple/")}
+    requested_b = {path.split("/")[2] for path in index_b.requests if path.startswith("/simple/")}
+    assert requested_a == {"root-dep", "common-dep"}
+    assert requested_b == {"feature-dep", selected_arch}
+    assert excluded_arch not in requested_a | requested_b
+    assert "win-dep" not in requested_a | requested_b
+    assert rogue.requests == []
 
 
 def test_plain_requirements_keep_ambient_pip_configuration(tmp_path, monkeypatch, indexes):
