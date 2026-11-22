@@ -155,7 +155,18 @@ extras, transitive `Requires-Dist`) onto the target environment and fails
 closed on `platform_release`, `platform_version`, unknown variables, or
 `python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
 pip's vendored `packaging`; a self-test refuses to install if that changes.
-Virtualenv staging keeps the host's marker resolution.
+Virtualenv staging cannot re-resolve, so `venv_markers.py` verifies the copied
+closure instead: roots (requirements file, pyproject dependencies, optional
+dependencies, dependency groups) and installed `Requires-Dist`/egg-info
+`requires.txt` are re-evaluated for each target, failing on missing,
+unknown-marker, or possibly-requested extra/group requirements. An extra is
+ruled out only if every Windows/Linux/macOS CPython host of the venv minor
+would have installed one of its missing requirements; `python_version` is
+shared only when the venv minor is established (`python3.X` path or
+`pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
+root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic
+dependency files, Poetry/PDM/Hatch/setuptools/Flit tables) fail closed when they
+mention host markers, and unreadable dynamic dependencies always fail closed.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
