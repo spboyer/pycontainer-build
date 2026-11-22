@@ -15,6 +15,8 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -91,6 +93,13 @@ It pulls the selected base image, imports the generated layout into Docker, and
 starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
 part of the default test suite or CI.
+
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
