@@ -374,6 +374,29 @@ def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
     assert len(openers) == 1
 
 
+def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
+    def unexpected_opener(*_handlers):
+        pytest.fail("Push-only clients must not initialize the blob TLS opener")
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", unexpected_opener
+    )
+    client = RegistryClient("registry.example", "team/app")
+    def make_request(method, *_args, **_kwargs):
+        if method == "POST":
+            return 202, b"", {"Location": "/v2/team/app/blobs/uploads/test"}
+        return 201, b"", {}
+
+    monkeypatch.setattr(
+        client, "_make_request", make_request
+    )
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"push-only")
+    digest = f"sha256:{hashlib.sha256(blob.read_bytes()).hexdigest()}"
+    assert client.push_blob(digest, blob, check_exists=False)
+    assert client.push_manifest("latest", b"{}")
+
+
 def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
     import threading
 

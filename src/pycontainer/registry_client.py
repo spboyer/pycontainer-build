@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -112,10 +113,8 @@ class RegistryClient:
         self.timeout = timeout
         self.base_url = f"https://{self.registry}/v2"
         self._bearer_token = None
-        # Building an opener creates a fresh TLS context and reloads the
-        # system certificate store, so build one eagerly per client; lazy
-        # creation could race on concurrent first blob requests.
-        self._blob_opener = urllib.request.build_opener(NoRedirect())
+        self._blob_opener = None
+        self._blob_opener_lock = threading.Lock()
 
     def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
         """Parse Www-Authenticate header for OAuth2 challenge."""
@@ -475,8 +474,14 @@ class RegistryClient:
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
+        # TLS setup is expensive; reuse one opener without charging push-only
+        # clients or racing concurrent first blob requests.
+        with self._blob_opener_lock:
+            if self._blob_opener is None:
+                self._blob_opener = urllib.request.build_opener(NoRedirect())
+            opener = self._blob_opener
         try:
-            response = self._blob_opener.open(request, timeout=self.timeout)
+            response = opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             if error.code not in REDIRECT_STATUSES:
                 raise

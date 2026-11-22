@@ -57,6 +57,13 @@ not a measured product speedup. The delay approximates one round trip per HTTP
 request; real HTTPS without connection reuse pays several. Pass
 `--layer-layouts` with no value to skip these cases.
 
+Include client construction when comparing push lifecycles: TLS opener setup
+can dominate small or already-present uploads. The blob opener is initialized
+lazily under a per-client lock, so push-only clients avoid that setup while
+concurrent first blob pulls still share one opener. The product-path push
+timings include client construction; the probe push timings reuse a client
+constructed outside the timed region.
+
 For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
 start a Docker daemon, and allow the builder to pull the selected registry base
 image. The script imports the generated OCI layout into Docker and starts a container:
