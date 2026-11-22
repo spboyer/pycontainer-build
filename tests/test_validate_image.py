@@ -1055,3 +1055,239 @@ def test_build_with_validation_does_not_change_layout_bytes(tmp_path, monkeypatc
 def test_usage_errors_exit_two(monkeypatch, capsys, args):
     assert _run(monkeypatch, args) == 2
     assert "usage:" in capsys.readouterr().err.lower()
+
+
+def _port_findings(tmp_path, monkeypatch, capsys, config, *options):
+    descriptor, _, _ = _image(tmp_path, config=config)
+    _layout(tmp_path, [descriptor])
+    code = _validate(monkeypatch, tmp_path, "--format", "json", *options)
+    findings = [item for item in _report(capsys)["findings"] if item["rule_id"] >= "PCB008"]
+    return code, {item["rule_id"]: item for item in findings}
+
+
+UVICORN = ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"Entrypoint": UVICORN, "ExposedPorts": {"8000/tcp": {}}}, set()),
+        ({"Entrypoint": ["/venv/bin/uvicorn", "main:app", "--port=8000"], "ExposedPorts": {"8000": {}}}, set()),
+        ({"Entrypoint": ["python", "-m", "uvicorn"], "Cmd": ["main:app", "--port", "9000"],
+          "ExposedPorts": {"9000/tcp": {}}}, set()),
+        ({"Entrypoint": UVICORN, "ExposedPorts": {"9000/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": UVICORN, "ExposedPorts": None}, {"PCB009"}),
+        ({"Entrypoint": UVICORN, "ExposedPorts": {"8000/tcp": {}, "8001/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": ["uvicorn", "main:app", "--port", "8000", "--port", "9000"],
+          "ExposedPorts": {"8000/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": ["flask", "run", "--host=0.0.0.0", "--port=5000"], "ExposedPorts": {"5000/tcp": {}}}, set()),
+        ({"Entrypoint": ["python", "-m", "flask", "--app", "app", "run", "-p", "5001"],
+          "ExposedPorts": {"5000/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": ["python", "manage.py", "runserver", "0.0.0.0:8000"], "ExposedPorts": {"8000/tcp": {}}}, set()),
+        ({"Entrypoint": ["python3", "manage.py", "runserver", "--noreload", "[::]:8001"],
+          "ExposedPorts": {"8000/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": ["python", "-m", "django", "runserver", "--verbosity", "2", "-v=3", "0.0.0.0:8000"],
+          "ExposedPorts": {"8000/tcp": {}}}, set()),
+        ({"Entrypoint": ["gunicorn", "-b", "0.0.0.0:8000", "--bind", "unix:/tmp/s", "--bind=[::]:8001", "app:app"],
+          "ExposedPorts": {"8000/tcp": {}, "8001/tcp": {}}}, set()),
+        ({"Entrypoint": ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"],
+          "ExposedPorts": {"8501/tcp": {}}}, set()),
+        ({"Entrypoint": ["streamlit", "run", "app.py", "--server.port", "8502"],
+          "ExposedPorts": {"8501/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser"],
+          "ExposedPorts": {"8888/tcp": {}}}, set()),
+        ({"Entrypoint": ["python", "-m", "jupyterlab", "--port", "8889"], "ExposedPorts": {"8888/tcp": {}}}, {"PCB009"}),
+        ({"Entrypoint": UVICORN, "ExposedPorts": {"8000/tcp": {}, "53/udp": {}}}, {"PCB011", "PCB012"}),
+    ],
+)
+def test_listener_and_exposed_port_rules(tmp_path, monkeypatch, capsys, config, expected):
+    code, findings = _port_findings(tmp_path, monkeypatch, capsys, config)
+    assert set(findings) == expected
+    assert code == (1 if expected & {"PCB009", "PCB011"} else 0)
+    if "PCB009" in findings:
+        assert findings["PCB009"]["severity"] == "warning"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"Entrypoint": ["uvicorn", "main:app"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["uvicorn", "main:app", "--uds", "/tmp/s", "--port", "8000"]},
+        {"Entrypoint": ["uvicorn", "main:app", "--port", "0"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["uvicorn", "main:app", "--port", "70000"]},
+        {"Entrypoint": ["uvicorn", "main:app", "--port"]},
+        {"Entrypoint": ["flask", "run"], "ExposedPorts": {"5000/tcp": {}}},
+        {"Entrypoint": ["gunicorn", "app:app"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["gunicorn", "-b", "fd://3", "app:app"]},
+        {"Entrypoint": ["gunicorn", "-b", "localhost", "app:app"]},
+        {"Entrypoint": ["python", "manage.py", "runserver"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["python", "manage.py", "runserver", "--custom", "2", "0.0.0.0:8000"],
+         "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["streamlit", "run", "app.py"], "Env": ["STREAMLIT_SERVER_PORT=9000"],
+         "ExposedPorts": {"8501/tcp": {}}},
+        {"Entrypoint": ["gradio", "app.py"], "ExposedPorts": {"7860/tcp": {}}},
+        {"Entrypoint": ["python", "app.py"], "Env": ["GRADIO_SERVER_PORT=7861"], "ExposedPorts": {"7860/tcp": {}}},
+        {"Entrypoint": ["sh", "-c", "uvicorn main:app --port 9000"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["python", "-u", "-m", "uvicorn", "main:app", "--port", "9000"],
+         "ExposedPorts": {"8000/tcp": {}}},
+    ],
+)
+def test_undeterminable_listener_is_skipped_with_info(tmp_path, monkeypatch, capsys, config):
+    code, findings = _port_findings(tmp_path, monkeypatch, capsys, config)
+    assert set(findings) == {"PCB010"}
+    assert findings["PCB010"]["severity"] == "info"
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"Entrypoint": ["python", "worker.py"]},
+        {"Entrypoint": ["flask", "shell"]},
+        {"Entrypoint": ["python", "manage.py", "migrate"]},
+        {"Entrypoint": None, "Cmd": None, "ExposedPorts": {"8000/tcp": {}}},
+    ],
+)
+def test_unrecognized_command_without_ports_is_not_reported(tmp_path, monkeypatch, capsys, config):
+    _, findings = _port_findings(tmp_path, monkeypatch, capsys, config)
+    assert "PCB009" not in findings and "PCB010" not in findings
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        ["0/tcp"], ["65536/tcp"], ["-1/tcp"], [" 80/tcp"], ["80/"], ["80/icmp"], ["80/tcp/x"],
+        ["8000-8010/tcp"], ["\u0668\u0660/tcp"], ["http/tcp"], ["8000", "8000/tcp"], ["53/udp", "53/UDP"],
+        ["9" * 5000 + "/tcp"], ["080/tcp", "80/tcp"],
+    ],
+)
+def test_invalid_or_duplicate_exposed_port_keys_are_errors(tmp_path, monkeypatch, capsys, keys):
+    config = {"Entrypoint": ["python", "app.py"], "ExposedPorts": {key: {} for key in keys}}
+    code, findings = _port_findings(tmp_path, monkeypatch, capsys, config, "--ignore", "PCB010")
+    assert findings["PCB008"]["severity"] == "error"
+    assert code == 1
+
+
+def test_exposed_port_messages_escape_untrusted_keys(tmp_path, monkeypatch, capsys):
+    key = "\x1b[31mbad" + "x" * 100
+    config = {"Entrypoint": ["python", "app.py"], "ExposedPorts": {key: {}}}
+    _, findings = _port_findings(tmp_path, monkeypatch, capsys, config, "--ignore", "PCB010")
+    message = findings["PCB008"]["message"]
+    assert "\x1b" not in message and "\\u001b" in message and "x" * 40 not in message
+
+
+def test_non_object_exposed_ports_is_a_config_error(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path, config={"ExposedPorts": ["8000/tcp"]})
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path) == 2
+    assert "ExposedPorts" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("user", "ports", "expected"),
+    [
+        ("1000", {"80/tcp": {}}, True),
+        ("app", {"443/tcp": {}}, True),
+        ("app:0", {"80/tcp": {}}, True),
+        ("1000", {"1023/udp": {}}, True),
+        ("1000", {"1024/tcp": {}}, False),
+        ("root", {"80/tcp": {}}, False),
+        ("0:1000", {"80/tcp": {}}, False),
+        (None, {"80/tcp": {}}, False),
+    ],
+)
+def test_privileged_port_with_non_root_user(tmp_path, monkeypatch, capsys, user, ports, expected):
+    config = {"User": user, "Entrypoint": ["python", "app.py"], "ExposedPorts": ports}
+    _, findings = _port_findings(tmp_path, monkeypatch, capsys, config, "--ignore", "PCB010")
+    assert ("PCB011" in findings) is expected
+
+
+def test_non_tcp_ports_are_reported_and_excluded_from_listener_check(tmp_path, monkeypatch, capsys):
+    config = {"Entrypoint": UVICORN, "ExposedPorts": {"8000/tcp": {}, "8000/udp": {}, "9000/sctp": {}}}
+    code, findings = _port_findings(tmp_path, monkeypatch, capsys, config)
+    assert set(findings) == {"PCB012"}
+    assert "8000/udp" in findings["PCB012"]["message"] and "9000/sctp" in findings["PCB012"]["message"]
+    assert code == 0
+
+
+def test_port_rules_can_be_ignored(tmp_path, monkeypatch, capsys):
+    config = {"Entrypoint": UVICORN, "ExposedPorts": {"80/tcp": {}}}
+    code, findings = _port_findings(
+        tmp_path, monkeypatch, capsys, config, "--ignore", "PCB009", "--ignore", "PCB011"
+    )
+    assert findings == {} and code == 0
+
+
+def test_info_findings_are_printed_in_text_without_failing(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path, config={"Entrypoint": ["uvicorn", "main:app"]})
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path, "--fail-on", "warning") == 0
+    assert "info: PCB010:" in capsys.readouterr().out
+
+
+def _port_build(tmp_path, monkeypatch, base_ports, toml=""):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    original = builder.ImageBuilder._pull_base_image
+
+    def pull(self, layers_dir, os_name, arch):
+        layers, base = original(self, layers_dir, os_name, arch)
+        if base_ports is not None:
+            base["config"]["ExposedPorts"] = base_ports
+        return layers, base
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", pull)
+    with config.open("a") as stream:
+        stream.write(toml)
+    return config, pushes
+
+
+def test_build_reports_replaced_base_ports(tmp_path, monkeypatch, capsys):
+    config, pushes = _port_build(
+        tmp_path, monkeypatch, {"8080/tcp": {}, "53/udp": {}, "9000/tcp": {}}, "exposed-ports = [9000]\n"
+    )
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 0
+    out = capsys.readouterr().out
+    assert "info: PCB013:" in out and '"8080/tcp"' in out and '"53/udp"' in out
+    assert '"9000/tcp"' not in out.split("PCB013", 1)[1].splitlines()[0]
+    assert len(pushes) == 1
+
+
+def test_build_inherits_base_ports_without_replacement(tmp_path, monkeypatch, capsys):
+    config, _ = _port_build(tmp_path, monkeypatch, {"8080/tcp": {}, "5353/udp": {}})
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--ignore", "PCB010"]) == 0
+    out = capsys.readouterr().out
+    assert "PCB013" not in out and "info: PCB012:" in out and "5353/udp" in out
+    blobs = Path(tmp_path / "output" / "blobs" / "sha256")
+    configs = [json.loads(p.read_bytes()) for p in blobs.iterdir() if p.read_bytes().startswith(b'{"architecture"')]
+    assert configs[0]["config"]["ExposedPorts"] == {"8080/tcp": {}, "5353/udp": {}}
+
+
+@pytest.mark.parametrize("ports", ["[8000, 8000]", "[0]", "[65536]", "[true]"])
+@pytest.mark.parametrize("command", ["build", "validate"])
+def test_invalid_configured_ports_fail_before_any_blob_is_written(
+    tmp_path, monkeypatch, capsys, ports, command
+):
+    config, pushes = _port_build(tmp_path, monkeypatch, None, f"exposed-ports = {ports}\n")
+    args = ["build", "--config", str(config), "--push"] if command == "build" else ["validate", "config", str(config)]
+    assert _run(monkeypatch, args) == 2
+    assert "exposed_ports" in capsys.readouterr().err
+    assert not (tmp_path / "output").exists()
+    assert not pushes
+
+
+@pytest.mark.parametrize("ports", [[8000, 8000], [0], [65536], ["8000"], [True]])
+def test_builder_rejects_invalid_ports_before_writing(tmp_path, monkeypatch, ports):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    monkeypatch.setattr(
+        builder.ImageBuilder, "_pull_base_image",
+        lambda *args: pytest.fail("ports must be validated before pulling or writing"),
+    )
+    config = builder.BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"), use_cache=False,
+        include_paths=["app.py"], exposed_ports=ports,
+    )
+    with pytest.raises(ValueError, match="exposed port"):
+        builder.ImageBuilder(config).build()
+    assert not (tmp_path / "output").exists()

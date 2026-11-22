@@ -31,6 +31,16 @@ their reachable contents are still verified.
 | PCB003 | error | Neither `Entrypoint` nor `Cmd` is set, leaving no default process. Set at least one. |
 | PCB004 | warning | Missing or empty `org.opencontainers.image.source` or `org.opencontainers.image.version` labels hinder traceability. Set both labels. |
 | PCB005 | error | A non-empty environment variable whose name contains `PASSWORD`, `TOKEN`, or `SECRET` (case-insensitive) persists a likely secret in the image. Supply secrets at runtime instead. |
+| PCB008 | error | An `ExposedPorts` key is not `<1-65535>[/tcp\|udp\|sctp]`, or two keys normalize to the same port and protocol. Fix the image port metadata. |
+| PCB009 | warning | A recognized server's TCP listener ports differ from the exposed TCP ports, in either direction. Align the command and `exposed-ports`. |
+| PCB010 | info | Ports are exposed but the listener cannot be determined: the server has no explicit port, uses a socket or file descriptor, is shell-wrapped, or the command is not recognized. The listener check is skipped rather than guessed. |
+| PCB011 | warning | A port below 1024 is exposed while the user is non-root. Listen on 1024 or higher, or ensure the runtime permits binding it. |
+| PCB012 | info | UDP or SCTP ports are present. They are preserved unchanged and excluded from the listener check. |
+| PCB013 | info | Base-image ports were dropped because configured `exposed-ports` replace `ExposedPorts`. Reported only by `build --validate`. |
+
+PCB006 and PCB007 are reserved for image-size rules. `info` findings are
+reported but never affect the exit code, whatever `--fail-on` threshold is
+used.
 
 Findings contain a rule ID, severity, message and remediation. Environment
 names and values are not printed. Image labels and annotations are claims,
@@ -69,6 +79,31 @@ JSON output contains `image` (selected `digest` and `platform`),
 `provenance.status`, and a `findings` array. Each finding has `rule_id`,
 `severity`, `message` and `remediation`. Usage and validation errors are
 written to stderr with exit 2 and no JSON report on stdout.
+
+## Port rules
+
+Configured `exposed-ports` must be distinct integers from 1 to 65535.
+`build` and `validate config` reject duplicates and out-of-range values with
+exit 2 before the base image is pulled or any layout blob is written.
+
+The listener check reads only the image's `Entrypoint` and `Cmd` argv. It
+recognizes `uvicorn` (`--port`), `gunicorn` (every `-b`/`--bind`; `unix:`
+binds are ignored), `flask run` (`--port`/`-p`), Django `runserver
+[addr:]port`, `streamlit run` (`--server.port`) and Jupyter `lab`, `notebook`
+and `server` (`--port`, `--ServerApp.port`, `--NotebookApp.port`), directly
+or through `python -m` (including `python -m django`). Gradio apps launched as `python app.py`, Celery
+workers and other commands produce PCB010 when ports are exposed. Django
+options other than the standard `runserver` options also make the listener
+unknown.
+
+This check does not guess. Ports set through environment variables
+(`UVICORN_PORT`, `FLASK_RUN_PORT`, `STREAMLIT_SERVER_PORT`,
+`GRADIO_SERVER_PORT`), in application source (for example Gradio
+`launch(server_port=...)`), by a shell wrapper or by runtime command
+overrides are not inferred, and the image config does not record a separately
+resolved listener port. `ExposedPorts` is metadata only and does not prove
+what the process binds. Named users are not resolved against `/etc/passwd`
+for PCB011; non-numeric users other than `root` are treated as non-root.
 
 ## Integrity and limits
 

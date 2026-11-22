@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import posixpath
+import re
 from pathlib import Path
 
 from .blob_store import digest_filename, hash_file
@@ -52,7 +54,52 @@ RULES = {
         "Image contains a non-empty secret-like environment variable.",
         "Supply secrets at runtime rather than embedding them in the image.",
     ),
+    "PCB008": (
+        "error",
+        "Image exposes an invalid or duplicate port.",
+        "Expose each port once as <1-65535>/tcp, /udp or /sctp.",
+    ),
+    "PCB009": (
+        "warning",
+        "The entrypoint listener and the exposed TCP ports differ.",
+        "Expose the port the server listens on, or change the listener to match exposed_ports.",
+    ),
+    "PCB010": (
+        "info",
+        "The listen-port check was skipped because the listener cannot be determined.",
+        "Pass an explicit port option to a recognized server, or ignore PCB010.",
+    ),
+    "PCB011": (
+        "warning",
+        "A privileged port below 1024 is exposed while the image runs as a non-root user.",
+        "Listen on a port of 1024 or higher, or ensure the runtime permits binding it.",
+    ),
+    "PCB012": (
+        "info",
+        "Non-TCP exposed ports are preserved unchanged.",
+        "No action is needed if the protocol is intended; they are excluded from the listener check.",
+    ),
+    "PCB013": (
+        "info",
+        "Configured exposed ports replaced the base image's exposed ports.",
+        "Add base-image ports to exposed_ports if the application still needs them.",
+    ),
 }
+
+PORT_PROTOCOLS = ("tcp", "udp", "sctp")
+PRIVILEGED_PORT_LIMIT = 1024
+MAX_REPORTED_KEYS = 5
+MAX_REPORTED_KEY_LENGTH = 32
+PYTHON_EXECUTABLE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+JUPYTER_SUBCOMMANDS = ("lab", "notebook", "server")
+JUPYTER_MODULES = {"jupyterlab": "lab", "notebook": "notebook", "jupyter_server": "server"}
+MAX_PORT_DIGITS = 5
+RUNSERVER_VALUE_OPTIONS = ("--settings", "--pythonpath", "--verbosity", "-v")
+RUNSERVER_FLAGS = (
+    "--ipv6", "-6", "--nothreading", "--noreload", "--nostatic", "--insecure",
+    "--traceback", "--no-color", "--force-color", "--skip-checks",
+)
+_UNKNOWN = object()
 
 
 class ImageValidationError(ValueError):
@@ -180,6 +227,9 @@ def _image_config(config, layer_count):
         or any(not isinstance(key, str) or not isinstance(value, str) for key, value in labels.items())
     ):
         raise ImageValidationError("Image labels must be strings.")
+    exposed = runtime.get("ExposedPorts")
+    if exposed is not None and not isinstance(exposed, dict):
+        raise ImageValidationError("Image ExposedPorts must be an object.")
     return runtime
 
 
@@ -435,34 +485,242 @@ def _references(descriptor):
     )
 
 
-def _findings(runtime, ignores):
+def _port_number(text):
+    if not text or len(text) > MAX_PORT_DIGITS or not text.isascii() or not text.isdigit():
+        return None
+    value = int(text)
+    return value if 1 <= value <= 65535 else None
+
+
+def _exposed_port(key):
+    """Normalize an ExposedPorts key to (port, protocol); a missing protocol means tcp."""
+    port, slash, protocol = key.partition("/")
+    protocol = protocol.lower() if slash else "tcp"
+    number = _port_number(port)
+    if number is None or protocol not in PORT_PROTOCOLS:
+        return None
+    return number, protocol
+
+
+def _display_keys(keys):
+    shown = [json.dumps(key[:MAX_REPORTED_KEY_LENGTH], ensure_ascii=True) for key in keys[:MAX_REPORTED_KEYS]]
+    if len(keys) > MAX_REPORTED_KEYS:
+        shown.append(f"and {len(keys) - MAX_REPORTED_KEYS} more")
+    return ", ".join(shown)
+
+
+def _ports_text(ports):
+    return ", ".join(f"{port}/{protocol}" for port, protocol in sorted(ports))
+
+
+def _option_values(args, names):
+    """Return values of `--name value`, `-n value` and `--name=value` options, stopping at `--`."""
+    values = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in names:
+            values.append(args[index + 1] if index + 1 < len(args) else None)
+            index += 1
+        else:
+            prefix = next((name for name in names if name.startswith("--") and arg.startswith(name + "=")), None)
+            if prefix is not None:
+                values.append(arg[len(prefix) + 1:])
+        index += 1
+    return values
+
+
+def _last_port(args, names):
+    values = _option_values(args, names)
+    if not values:
+        return _UNKNOWN
+    port = _port_number(values[-1])
+    return _UNKNOWN if port is None else {port}
+
+
+def _address_port(address):
+    """Parse the port of `port`, `host:port` or `[ipv6]:port`."""
+    if address is None:
+        return None
+    if address.startswith("["):
+        host, separator, port = address.partition("]:")
+        return _port_number(port) if separator else None
+    return _port_number(address.rpartition(":")[2])
+
+
+def _server(argv):
+    """Return (server name, arguments) for a recognized server command, else None."""
+    if not argv:
+        return None
+    name, args = posixpath.basename(argv[0]), argv[1:]
+    if PYTHON_EXECUTABLE.fullmatch(name):
+        if len(args) >= 2 and args[0] == "-m":
+            name, args = args[1], args[2:]
+            if name in JUPYTER_MODULES:
+                return "jupyter", args
+            if name == "django":
+                name = "django-admin"
+        elif args and posixpath.basename(args[0]) == "manage.py":
+            name, args = "manage.py", args[1:]
+        else:
+            return None
+    if name.startswith("jupyter-") and name[len("jupyter-"):] in JUPYTER_SUBCOMMANDS:
+        return "jupyter", args
+    if name == "jupyter":
+        return ("jupyter", args[1:]) if args and args[0] in JUPYTER_SUBCOMMANDS else None
+    if name in ("manage.py", "django-admin"):
+        return ("runserver", args[1:]) if args and args[0] == "runserver" else None
+    if name in ("flask", "streamlit"):
+        return (name, args[args.index("run") + 1:]) if "run" in args else None
+    if name in ("uvicorn", "gunicorn", "gradio"):
+        return name, args
+    return None
+
+
+def _runserver_port(args):
+    """Parse Django `runserver [addrport]`; any unrecognized option makes the listener unknown."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in RUNSERVER_VALUE_OPTIONS:
+            index += 2
+            continue
+        if arg.startswith("-"):
+            if arg not in RUNSERVER_FLAGS and arg.split("=", 1)[0] not in RUNSERVER_VALUE_OPTIONS:
+                return _UNKNOWN
+            index += 1
+            continue
+        port = _address_port(arg)
+        return _UNKNOWN if port is None else {port}
+    return _UNKNOWN
+
+
+def _gunicorn_ports(args):
+    binds = _option_values(args, ("-b", "--bind"))
+    if not binds:
+        return _UNKNOWN
+    ports = set()
+    for bind in binds:
+        if bind is not None and bind.startswith("unix:"):
+            continue
+        port = None if bind is None or bind.startswith("fd://") or ":" not in bind else _address_port(bind)
+        if port is None:
+            return _UNKNOWN
+        ports.add(port)
+    return ports
+
+
+def _listeners(argv):
+    """Return None (unrecognized), _UNKNOWN, or the set of TCP ports named in the argv."""
+    server = _server(argv)
+    if server is None:
+        return None
+    name, args = server
+    if name == "uvicorn":
+        if _option_values(args, ("--uds", "--fd")):
+            return _UNKNOWN
+        return _last_port(args, ("--port",))
+    if name == "gunicorn":
+        return _gunicorn_ports(args)
+    if name == "flask":
+        return _last_port(args, ("--port", "-p"))
+    if name == "runserver":
+        return _runserver_port(args)
+    if name == "streamlit":
+        return _last_port(args, ("--server.port",))
+    if name == "jupyter":
+        return _last_port(args, ("--port", "--ServerApp.port", "--NotebookApp.port"))
+    return _UNKNOWN
+
+
+def _port_findings(runtime, non_root, base_exposed_ports):
+    keys = list(runtime.get("ExposedPorts") or {})
+    exposed, invalid, duplicate = set(), [], []
+    for key in keys:
+        port = _exposed_port(key)
+        if port is None:
+            invalid.append(key)
+        elif port in exposed:
+            duplicate.append(key)
+        else:
+            exposed.add(port)
     triggered = []
+    if invalid or duplicate:
+        parts = [f"invalid: {_display_keys(invalid)}" if invalid else "",
+                 f"duplicate: {_display_keys(duplicate)}" if duplicate else ""]
+        triggered.append(("PCB008", "Image ExposedPorts has " + "; ".join(p for p in parts if p) + "."))
+
+    argv = [*(runtime.get("Entrypoint") or []), *(runtime.get("Cmd") or [])]
+    tcp = {port for port, protocol in exposed if protocol == "tcp"}
+    listeners = _listeners(argv)
+    if listeners is _UNKNOWN or (listeners is None and argv and keys):
+        reason = "recognized server without a determinable port" if listeners is _UNKNOWN else "unrecognized command"
+        triggered.append(("PCB010", f"The listen-port check was skipped ({reason}); no listener was guessed."))
+    elif listeners is not None:
+        unexposed, unused = listeners - tcp, tcp - listeners
+        if unexposed or unused:
+            parts = [f"listening on {_ports_text((p, 'tcp') for p in unexposed)} without exposing it" if unexposed else "",
+                     f"exposing {_ports_text((p, 'tcp') for p in unused)} without a listener" if unused else ""]
+            triggered.append(("PCB009", "The entrypoint is " + " and ".join(p for p in parts if p) + "."))
+
+    privileged = {port for port in exposed if port[0] < PRIVILEGED_PORT_LIMIT}
+    if non_root and privileged:
+        triggered.append(("PCB011", f"Privileged port(s) {_ports_text(privileged)} are exposed for a non-root user."))
+    other = {port for port in exposed if port[1] != "tcp"}
+    if other:
+        triggered.append(("PCB012", f"Non-TCP port(s) {_ports_text(other)} are preserved unchanged."))
+
+    if base_exposed_ports:
+        retained = {_exposed_port(key) or key for key in keys}
+        dropped = [key for key in base_exposed_ports if (_exposed_port(key) or key) not in retained]
+        if dropped:
+            triggered.append((
+                "PCB013",
+                f"Configured exposed ports replaced base-image port(s) {_display_keys(dropped)}.",
+            ))
+    return triggered
+
+
+def _is_root(runtime):
     user = (runtime.get("User") or "").split(":", 1)[0]
-    if not user or user == "root" or (user.isascii() and user.isdecimal() and not user.strip("0")):
-        triggered.append("PCB001")
+    return not user or user == "root" or (user.isascii() and user.isdecimal() and not user.strip("0"))
+
+
+def _findings(runtime, ignores, base_exposed_ports=None):
+    triggered = []
+    root = _is_root(runtime)
+    if root:
+        triggered.append(("PCB001", None))
     if not runtime.get("Entrypoint") and not runtime.get("Cmd"):
-        triggered.append("PCB003")
+        triggered.append(("PCB003", None))
     labels = runtime.get("Labels") or {}
     if not labels.get(SOURCE_LABEL, "").strip() or not labels.get(VERSION_LABEL, "").strip():
-        triggered.append("PCB004")
+        triggered.append(("PCB004", None))
     for entry in runtime.get("Env") or []:
         name, value = entry.split("=", 1)
         if value and any(part in name.upper() for part in ("PASSWORD", "TOKEN", "SECRET")):
-            triggered.append("PCB005")
+            triggered.append(("PCB005", None))
             break
+    triggered.extend(_port_findings(runtime, not root, base_exposed_ports))
     findings = []
-    for rule_id in triggered:
+    for rule_id, message in triggered:
         if rule_id in ignores:
             continue
-        severity, message, remediation = RULES[rule_id]
-        findings.append(
-            {"rule_id": rule_id, "severity": severity, "message": message, "remediation": remediation}
-        )
+        severity, default_message, remediation = RULES[rule_id]
+        findings.append({
+            "rule_id": rule_id, "severity": severity,
+            "message": message or default_message, "remediation": remediation,
+        })
     return findings
 
 
-def validate_image(output, tag=None, platform=None, ignores=()):
-    """Verify every reachable blob, then lint one unambiguously selected image."""
+def validate_image(output, tag=None, platform=None, ignores=(), base_exposed_ports=None):
+    """Verify every reachable blob, then lint one unambiguously selected image.
+
+    ``base_exposed_ports`` lists the base image's ExposedPorts keys when known (``build``).
+    """
     validate_ignores(ignores)
     layout = _VerifiedLayout(output)
     index, entries = layout.verify()
@@ -470,7 +728,7 @@ def validate_image(output, tag=None, platform=None, ignores=()):
     return {
         "image": {"digest": digest, "platform": "/".join(part for part in selected_platform if part)},
         "provenance": {"status": "unknown"},
-        "findings": _findings(runtime, set(ignores)),
+        "findings": _findings(runtime, set(ignores), base_exposed_ports),
     }
 
 

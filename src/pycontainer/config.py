@@ -2,6 +2,22 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+MIN_PORT, MAX_PORT = 1, 65535
+
+
+def validate_exposed_ports(ports):
+    """Reject non-integer, out-of-range or duplicate exposed ports."""
+    if not isinstance(ports, list):
+        raise ValueError("exposed_ports must be a list of integers.")
+    seen = set()
+    for port in ports:
+        if type(port) is not int:
+            raise ValueError(f"exposed port {port!r} is not an integer.")
+        if not MIN_PORT <= port <= MAX_PORT:
+            raise ValueError(f"exposed port {port} is outside {MIN_PORT}-{MAX_PORT}.")
+        if port in seen:
+            raise ValueError(f"exposed port {port} is listed more than once.")
+        seen.add(port)
 
 
 @dataclass

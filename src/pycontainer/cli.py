@@ -81,9 +81,9 @@ def _validate_config_command(parser, args):
         print(f"{invalid} of {len(sources)} configuration(s) invalid.", file=sys.stderr)
         raise SystemExit(2)
 
-def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None):
+def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None, base_exposed_ports=None):
     try:
-        report=validate_image(output, tag=tag, platform=platform, ignores=ignores)
+        report=validate_image(output, tag=tag, platform=platform, ignores=ignores, base_exposed_ports=base_exposed_ports)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -250,6 +250,7 @@ def main():
             code=_image_validation(
                 Path(builder.config.output_dir), builder.config.tag, builder.config.platform,
                 ignores, "text", "warning", expected_digest=builder.manifest_digest,
+                base_exposed_ports=builder.base_exposed_ports,
             )
             if code:
                 raise SystemExit(code)

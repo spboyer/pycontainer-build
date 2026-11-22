@@ -1,7 +1,7 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig
+from .config import BuildConfig, validate_exposed_ports
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -247,6 +247,7 @@ class ImageBuilder:
             self.cache=None
 
     def build(self):
+        validate_exposed_ports(self.config.exposed_ports)
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -264,6 +265,8 @@ class ImageBuilder:
         os_name, arch = parse_platform(self.config.platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
+        base_exposed = ((base_config or {}).get("config") or {}).get("ExposedPorts")
+        self.base_exposed_ports = list(base_exposed) if isinstance(base_exposed, dict) else []
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
