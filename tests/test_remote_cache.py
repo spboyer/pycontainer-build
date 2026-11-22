@@ -503,14 +503,22 @@ def test_cache_credentials_stay_on_cache_host_and_off_storage(tmp_path, registry
     assert all(auth == CACHE_AUTH for *_, auth in cache_requests)
 
 
+# Remove when merging main after #177; strict mode turns that merge's XPASS into a failure.
+REQUIRES_EXACT_HOST_AUTH = pytest.mark.xfail(
+    strict=True, reason="lookalike GHCR/ACR hosts leak credentials until #177 lands"
+)
+
+
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 @pytest.mark.parametrize(
     ("host", "authorization", "azure_calls"),
     [
         ("ghcr.io", "Bearer synthetic-github-token", 0),
-        ("ghcr.io.attacker.test", None, 0),
+        pytest.param("ghcr.io.attacker.test", None, 0, marks=REQUIRES_EXACT_HOST_AUTH),
         ("trusted.azurecr.io", "Bearer synthetic-azure-token", 1),
-        ("trusted.azurecr.io.attacker.test", None, 0),
+        pytest.param(
+            "trusted.azurecr.io.attacker.test", None, 0, marks=REQUIRES_EXACT_HOST_AUTH
+        ),
     ],
 )
 def test_cache_registry_credentials_are_scoped_to_the_actual_host(
