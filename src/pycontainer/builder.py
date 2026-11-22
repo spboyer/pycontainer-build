@@ -387,6 +387,11 @@ class ImageBuilder:
             self.cache=None
 
     def build(self):
+        if self.config.python_versions:
+            from .python_matrix import PythonMatrixBuilder
+
+            self._python_matrix=PythonMatrixBuilder(self.config)
+            return self._python_matrix.build()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -426,6 +431,14 @@ class ImageBuilder:
             image.platform["os"],
             variant=image.platform.get("variant"),
         )
+        if hasattr(self, "expected_python_version"):
+            index["manifests"] = [
+                {
+                    **index["manifests"][0],
+                    "annotations": {"org.opencontainers.image.ref.name": tag_ref},
+                }
+                for tag_ref in self.config.all_tags()
+            ]
         _atomic_write_bytes(
             output/'index.json',
             json.dumps(index,separators=(',',':')).encode(),
@@ -508,6 +521,12 @@ class ImageBuilder:
         self._dependency_site_packages=False
         os_name, arch = parse_platform(platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        if hasattr(self, "expected_python_version"):
+            from .python_matrix import verify_python_version
+
+            verify_python_version(
+                self.config.base_image, base_config, self.expected_python_version, platform
+            )
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
@@ -798,6 +817,10 @@ class ImageBuilder:
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
         """Push built image to registry."""
+        if hasattr(self, "_python_matrix"):
+            return self._python_matrix.push(
+                registry_url, auth_token, username, password, show_progress
+            )
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
         

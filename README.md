@@ -489,6 +489,59 @@ the wrong TOML type are reported as configuration errors.
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
 
+### Python version matrix
+
+`python -m pycontainer.cli build --python-version 3.11,3.12 --tag myapp:v1.2.3`
+builds **separate images**, not an OCI index combining Python versions. Layouts
+are written to `dist/image/py3.11` and `dist/image/py3.12`; `--output` changes
+their parent directory. Each version can independently contain an architecture
+index with `--platform linux/amd64,linux/arm64` (the existing cross-target
+dependency-marker limitation in #142 still applies).
+
+Every explicit tag gets a `-pyX.Y` suffix. Unsuffixed explicit tags and aliases
+from `--latest`/`--semver-tags` belong only to the first requested version, or
+the version selected by `--default-python-version`. For example, the command
+above gives both `v1.2.3-py3.11` and `v1.2.3-py3.12`, with `v1.2.3` on 3.11.
+Version order is explicit; versions are not sorted or silently dropped.
+
+Unpinned official `python:<minor>` bases are rewritten while preserving their
+tag suffix (`python:3.11-slim` becomes `python:3.12-slim`). Custom, local,
+digest-pinned and non-minor official bases require explicit mappings:
+
+```toml
+[build]
+tag = "ghcr.io/myorg/myapp:v1.2.3"
+python_versions = ["3.11", "3.12"]
+default_python_version = "3.12"
+platform = "linux/amd64,linux/arm64"
+output_dir = "dist/image"
+latest_tag = true
+semver_tags = true
+
+[build.python_matrix]
+"3.11" = "ghcr.io/myorg/python-base:eleven"
+"3.12" = "ghcr.io/myorg/python-base:twelve"
+```
+
+Each pulled base must provide the requested minor in `PYTHON_VERSION`; custom
+bases must also declare `PYTHON_IMPLEMENTATION=CPython`. This is checked for
+every architecture even without dependencies. Application environment
+overrides and unverified tag names are not proof of the base's Python version.
+Dependency staging retains the existing wheel-only/virtualenv compatibility
+checks; a missing wheel fails that version rather than dropping it.
+
+With `--push`, **all versions build and validate locally before any registry
+publication**. Blobs and manifests/indexes publish by digest first, then all
+version-specific tags, then default-version aliases. Generic registries cannot
+atomically update multiple tags. A later failure may leave earlier tags moved
+or uploaded untagged content behind; the command exits nonzero and reports
+each operation as `confirmed`, `failed`, `unknown` or `unattempted`. A timeout
+or ambiguous server outcome is not reported as success or unchanged. No tags
+are deleted, rolled back, restored or automatically retry-overwritten, since
+another writer may have changed them. Completed local version layouts may
+remain after another version fails. Local output locks protect builds and
+publication from other cooperating builders; remote tags are not locked.
+
 ---
 
 ## 🗺️ Roadmap

@@ -38,6 +38,14 @@ class RegistryRequestError(RuntimeError):
     """Raised when a registry request fails operationally."""
 
 
+class RegistryHTTPError(RegistryRequestError):
+    """A registry returned an explicit unsuccessful HTTP response."""
+
+    def __init__(self, status: int, message: str):
+        self.status = status
+        super().__init__(message)
+
+
 class RegistryAuthenticationError(RegistryRequestError):
     """Raised when registry credentials cannot be exchanged or applied."""
 
@@ -314,7 +322,7 @@ class RegistryClient:
         if status == 404:
             return False
         detail = body.decode("utf-8", errors="replace")
-        raise RegistryRequestError(
+        raise RegistryHTTPError(status,
             f"Registry blob HEAD failed with HTTP {status}: {detail or '(empty response)'}"
         )
 
@@ -324,7 +332,7 @@ class RegistryClient:
         status, body, headers = self._make_request("POST", url, data=b"")
         if status not in (200, 202):
             detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
+            raise RegistryHTTPError(status,
                 f"Failed to initiate blob upload (HTTP {status}): "
                 f"{detail or '(empty response)'}"
             )
@@ -357,7 +365,7 @@ class RegistryClient:
             )
         if status not in (201, 202):
             detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
+            raise RegistryHTTPError(status,
                 f"Blob upload failed with HTTP {status}: "
                 f"{detail or '(empty response)'}"
             )
@@ -379,7 +387,7 @@ class RegistryClient:
         )
         if status not in (200, 201):
             detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
+            raise RegistryHTTPError(status,
                 f"Manifest push failed with HTTP {status}: "
                 f"{detail or '(empty response)'}"
             )
@@ -394,7 +402,7 @@ class RegistryClient:
         )
         if status not in (200, 201):
             detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
+            raise RegistryHTTPError(status,
                 f"Index push failed with HTTP {status}: "
                 f"{detail or '(empty response)'}"
             )

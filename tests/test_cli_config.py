@@ -64,6 +64,25 @@ generate-sbom = true
     assert logging_levels == [logging.DEBUG]
 
 
+def test_cli_matrix_overrides_toml_and_does_not_detect_host_python(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text("""
+[build]
+python_versions = ["3.11"]
+output_dir = "from-file"
+""")
+    config = _capture_config(monkeypatch, [
+        "build", "--config", str(config_path), "--python-version", "3.11,3.12",
+        "--default-python-version", "3.12", "--output", "matrix-out",
+    ])
+    assert config.python_versions == ["3.11", "3.12"]
+    assert config.default_python_version == "3.12"
+    assert config.output_dir == "matrix-out"
+    monkeypatch.setattr(cli, "detect_python_version", lambda *a: pytest.fail("host inference"))
+    config = _capture_config(monkeypatch, ["build", "--python-version", "3.11,3.12"])
+    assert config.base_image == "python:3.11-slim"
+
+
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(

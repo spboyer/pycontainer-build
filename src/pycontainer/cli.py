@@ -45,6 +45,9 @@ def main():
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list (linux/amd64,linux/arm64) to build an OCI image index")
+    b.add_argument("--python-version",help="Comma-separated CPython minors, each built in a separate pyX.Y layout")
+    b.add_argument("--default-python-version",help="Matrix version receiving unsuffixed aliases (default: first requested version)")
+    b.add_argument("--output",dest="output_dir",help="OCI output directory (matrix layouts use pyX.Y subdirectories)")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
     b.add_argument(
         "--sbom",
@@ -98,6 +101,9 @@ def main():
         'verbose': args.verbose,
         'dry_run': args.dry_run,
         'platform': args.platform,
+        'python_versions': args.python_version.split(",") if args.python_version is not None else None,
+        'default_python_version': args.default_python_version,
+        'output_dir': args.output_dir,
         'reproducible': args.reproducible,
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
@@ -110,7 +116,7 @@ def main():
             cfg=config_from_file(Path(args.config), cli_overrides)
         else:
             cfg=BuildConfig(**cli_overrides)
-            if 'base_image' not in cli_overrides:
+            if 'base_image' not in cli_overrides and not cfg.python_versions:
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"
     except (FileNotFoundError, ValueError) as exc:
@@ -125,7 +131,7 @@ def main():
     out=builder.build()
     print("Built:", out)
     
-    if args.push:
+    if args.push and not cfg.dry_run:
         password=args.password
         if args.username and not password:
             password=os.getenv('REGISTRY_PASSWORD')

@@ -17,6 +17,7 @@ from pycontainer.registry_client import (
     TRANSFER_CHUNK_SIZE,
     RegistryAuthenticationError,
     RegistryClient,
+    RegistryHTTPError,
     RegistryRequestError,
     _retry_delay,
     parse_image_reference,
@@ -73,6 +74,33 @@ def test_parse_image_reference():
         "team/app",
         digest,
     )
+
+
+@pytest.mark.parametrize("method", ["push_manifest", "push_index"])
+def test_publication_rejections_preserve_http_status_and_never_retry(monkeypatch, method):
+    calls = []
+
+    def reject(request, timeout):
+        calls.append(request.get_method())
+        raise _http_error(request.full_url, 503, body=b"uncertain server outcome")
+    monkeypatch.setattr("urllib.request.urlopen", reject)
+    client = RegistryClient("registry.example", "team/app")
+    with pytest.raises(RegistryHTTPError) as caught:
+        getattr(client, method)("latest", b"{}")
+    assert caught.value.status == 503
+    assert calls == ["PUT"]
+
+
+def test_unknown_manifest_write_is_not_retry_overwritten(monkeypatch):
+    calls = []
+
+    def timeout(request, timeout):
+        calls.append(request.get_method())
+        raise TimeoutError("possibly committed")
+    monkeypatch.setattr("urllib.request.urlopen", timeout)
+    with pytest.raises(RegistryRequestError, match="TimeoutError"):
+        RegistryClient("registry.example", "team/app").push_manifest("latest", b"{}")
+    assert calls == ["PUT"]
 
 
 @pytest.mark.parametrize(

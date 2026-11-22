@@ -56,6 +56,9 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    python_versions: List[str] = field(default_factory=list)
+    python_matrix: Dict[str, str] = field(default_factory=dict)
+    default_python_version: Optional[str] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -74,6 +77,10 @@ class BuildConfig:
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
         platforms = normalize_platforms(self.platform)
+        if self.python_versions or self.python_matrix or self.default_python_version:
+            from .python_matrix import matrix_targets
+
+            matrix_targets(self)
         if len(platforms) > 1:
             unsupported = [p for p in platforms if p not in MULTI_PLATFORM_TARGETS]
             if unsupported:

@@ -11,6 +11,8 @@ daemon without discussing the trade-off first.
 - `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
+- `python_matrix.py`: independent Python-minor layouts, base validation and
+  digest-first/tag-last matrix publication with explicit partial outcomes.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
@@ -111,6 +113,16 @@ Surface invalid inputs and operational errors explicitly.
 Use host `Path` operations for local files and POSIX paths for Linux OCI
 entries. Target metadata selection does not compile native dependencies for
 another platform. Never silently copy incompatible host binaries into an image.
+
+Python-version matrices create separate `pyX.Y` layouts; Python versions are
+never OCI platform descriptors. Each version may contain its own architecture
+index. Validate pulled `PYTHON_VERSION` for every target even without dependency
+staging. Build and verify every version before publishing any registry content,
+then prepare digest-addressed content before all version tags and default-only
+aliases. Registry tag writes are non-atomic: stop on failure/unknown outcome,
+report confirmed/failed/unknown/unattempted operations, and never automatically
+roll back or retry-overwrite tags. Hold matrix-root and child output locks
+through verification/publication; exclude the entire output root from inputs.
 
 For image changes, check ordered manifest layers against `rootfs.diff_ids`,
 digest/size/media-type consistency, config inheritance and target platform.
