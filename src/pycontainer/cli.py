@@ -20,7 +20,9 @@ def main():
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
-    b.add_argument("--tag")
+    b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
+    b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
+    b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
     b.add_argument("--base-image",help="Base image to layer on (auto-detected from requires-python if not specified)")
     b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
@@ -53,7 +55,24 @@ def main():
         default=None,
         help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
     )
+    # --- import subcommand (Dockerfile migration) ---
+    imp=sub.add_parser("import",help="Convert a Dockerfile to [tool.pycontainer] settings")
+    imp.add_argument("dockerfile",help="Path to the Dockerfile")
+    imp.add_argument("--output","-o",help="Write settings to this pyproject.toml (default: print to stdout)")
+    imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
+    imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
+    # --- end import subcommand ---
     args=parser.parse_args()
+
+    if args.cmd=="import":
+        from .dockerfile_import import run_import
+        build_args=dict(a.partition("=")[::2] for a in args.build_arg)
+        try:
+            message,code=run_import(Path(args.dockerfile),Path(args.output) if args.output else None,args.force,build_args)
+        except (FileNotFoundError,ValueError) as exc:
+            parser.error(str(exc))
+        print(message)
+        raise SystemExit(code)
 
     if args.push and args.username and not (
         args.password or os.getenv('REGISTRY_PASSWORD')
@@ -61,7 +80,10 @@ def main():
         parser.error("--username requires --password or REGISTRY_PASSWORD.")
 
     cli_overrides={
-        'tag': args.tag,
+        'tag': args.tag[0] if args.tag else None,
+        'tags': args.tag[1:] if args.tag else None,
+        'semver_tags': args.semver_tags,
+        'latest_tag': args.latest_tag,
         'base_image': args.base_image,
         'context_dir': args.context_dir,
         'include_paths': args.include_paths,

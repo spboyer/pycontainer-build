@@ -110,11 +110,11 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.80.0",
+    "@vscode/vsce": "^4.1.1",
     "eslint": "^10.15.0",
     "globals": "^17.7.0",
     "typescript": "^5.0.0",
-    "typescript-eslint": "^8.72.2",
-    "@vscode/vsce": "^4.1.1"
+    "typescript-eslint": "^8.73.0"
   },
   "repository": {
     "type": "git",
