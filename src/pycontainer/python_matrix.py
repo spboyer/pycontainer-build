@@ -155,6 +155,11 @@ class PythonMatrixBuilder:
             for child in self.children.values():
                 child._build_image()
             self._verify()
+            for version, child in self.children.items():
+                if version != self.default:
+                    refs = Path(child.config.output_dir) / "refs" / "tags"
+                    for alias in self.config.all_tags():
+                        (refs / parse_image_reference(alias)[2]).unlink(missing_ok=True)
             self.built = True
         return self.config.tag
 

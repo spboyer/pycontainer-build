@@ -123,6 +123,18 @@ def test_each_minor_has_its_own_architecture_index_and_deps(tmp_path, monkeypatc
         assert [image.platform["architecture"] for image in child.platform_images] == ["amd64", "arm64"]
 
 
+def test_changing_default_removes_current_local_aliases_from_old_default(tmp_path, monkeypatch):
+    build, _, _ = matrix(tmp_path, monkeypatch)
+    build.build()
+    build = PythonMatrixBuilder(replace(build.config, default_python_version="3.12"))
+    build.build()
+    for version, child in build.children.items():
+        refs = Path(child.config.output_dir) / "refs" / "tags"
+        assert (refs / f"v1.2.3-py{version}").exists()
+        for alias in ("latest", "v1.2.3", "v1.2", "v1"):
+            assert (refs / alias).exists() == (version == "3.12")
+
+
 @pytest.mark.parametrize("base", ["custom:stable", "python:3.11-slim@" + "sha256:" + "a" * 64,
                                  "oci:base", "python:latest", "registry.example/python:3.11-slim"])
 def test_custom_and_pinned_bases_require_maps(base):
