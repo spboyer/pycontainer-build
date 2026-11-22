@@ -1,6 +1,7 @@
 import errno
 import fnmatch
 import hashlib
+import io
 import os
 import time
 from contextlib import contextmanager
@@ -34,6 +35,27 @@ DEFAULT_CONTEXT_EXCLUDES = (
     "**/*_test.py",
 )
 VIRTUALENV_EXCLUDES = ("**/.venv", "**/venv", "**/env")
+MAX_PROJECT_FILE_BYTES = 16 * 1024 * 1024
+
+
+class FileTooLargeError(ValueError):
+    """Raised when a file read into memory exceeds its size bound."""
+
+
+def read_bytes_limited(path, limit=None):
+    """Read a whole file into memory, refusing files larger than ``limit`` bytes."""
+    limit = MAX_PROJECT_FILE_BYTES if limit is None else limit
+    with open(path, "rb") as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise FileTooLargeError(f"{path} is larger than {limit} bytes.")
+    return data
+
+
+def read_text_limited(path, limit=None, encoding=None):
+    """Bounded equivalent of ``Path.read_text``: same decoding and newline handling."""
+    data = read_bytes_limited(path, limit)
+    return io.TextIOWrapper(io.BytesIO(data), encoding=encoding).read()
 
 
 def ensure_dir(path):

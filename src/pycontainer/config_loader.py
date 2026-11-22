@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig
+from .fs_utils import read_bytes_limited
 
 
 def load_config_file(path: Path) -> Dict[str, Any]:
@@ -12,8 +13,7 @@ def load_config_file(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, 'rb') as f:
-        data=tomllib.load(f)
+    data=tomllib.loads(read_bytes_limited(path).decode())
 
     build_config = data.get('build', {})
     if not isinstance(build_config, dict):

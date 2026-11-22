@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from pycontainer import cli, preview, registry_client
+from pycontainer import cli, fs_utils, preview, registry_client
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.config_loader import load_config_file
+from pycontainer.framework import detect_framework
 from pycontainer.preview import plan_app_layer, preview_image, render_text, run_preview
 from pycontainer.registry_client import RegistryClient
 
@@ -414,6 +416,35 @@ def test_plan_app_layer_is_deterministic(tmp_path):
     assert set(first[1]) == {"app/src/app.py", "app/pyproject.toml"}
 
 
+def test_oversized_project_metadata_is_rejected(built, tmp_path, monkeypatch):
+    cfg, baseline = built
+    (Path(cfg.context_dir) / "pyproject.toml").write_text('[project]\nname = "demo"\n' + "#" * 256 + "\n")
+    monkeypatch.setattr(fs_utils, "MAX_PROJECT_FILE_BYTES", 128)
+    output, code = run_preview(cfg, baseline)
+    assert code == 1 and "pyproject.toml is larger than 128 bytes" in output and "Baseline:" not in output
+
+
+def test_planned_application_layer_is_bounded(built, monkeypatch):
+    cfg, baseline = built
+    monkeypatch.setattr(preview, "MAX_LAYER_UNCOMPRESSED_BYTES", 1024)
+    output, code = run_preview(cfg, baseline)
+    assert code == 1 and "planned application layer is larger than 1024 bytes" in output
+
+
+def test_bounded_reads_accept_the_limit_and_reject_more(tmp_path):
+    path = tmp_path / "pycontainer.toml"
+    path.write_bytes(b"[build]\r\ntag = 'a'\r\n")
+    size = path.stat().st_size
+    assert fs_utils.read_bytes_limited(path, size) == path.read_bytes()
+    assert fs_utils.read_text_limited(path, size) == path.read_text()
+    with pytest.raises(fs_utils.FileTooLargeError):
+        fs_utils.read_bytes_limited(path, size - 1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(fs_utils, "MAX_PROJECT_FILE_BYTES", size - 1)
+        with pytest.raises(ValueError, match="larger than"):
+            load_config_file(path)
+
+
 def test_cli_preview_json(built, tmp_path, monkeypatch, capsys):
     cfg, baseline = built
     monkeypatch.setattr(sys, "argv", [
@@ -426,3 +457,9 @@ def test_cli_preview_json(built, tmp_path, monkeypatch, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["provenance"]["level"] in ("exact", "positional")
     assert result["components"]["base"]["status"] == "identical"
+
+def test_oversized_sources_are_skipped_by_framework_detection(tmp_path, monkeypatch):
+    ctx = context(tmp_path / "ctx", {"main.py": "from flask import Flask\napp = Flask(__name__)\n" + "#" * 256})
+    assert detect_framework(ctx)[0] == "Flask"
+    monkeypatch.setattr(fs_utils, "MAX_PROJECT_FILE_BYTES", 128)
+    assert detect_framework(ctx) is None

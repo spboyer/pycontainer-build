@@ -40,6 +40,14 @@ baseline never opens a network connection. When the planned base is a local
 `oci:`/`docker-archive:` image, its config is read offline too; a registry base
 is resolved only for a `docker://` baseline.
 
+Planning reads are bounded as well. Project metadata that is loaded whole into
+memory (`pyproject.toml`, the `--config` file, Python sources scanned for
+framework defaults, and the Docker credential config) is limited to 16 MiB per
+file; an oversized `pyproject.toml` or `--config` file is an error, and an
+oversized source file is skipped by framework detection, as it is in `build`.
+Application files are streamed through a hash, never held in memory, and the
+planned application layer is limited to 100,000 files and 64 GiB.
+
 No user code, `pip`, or container runtime is executed.
 
 ## Provenance

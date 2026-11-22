@@ -2,7 +2,7 @@
 from pathlib import Path
 from typing import Optional, Tuple, List
 import re
-from .fs_utils import iter_files
+from .fs_utils import iter_files, read_text_limited
 from .project import default_include_paths
 
 
@@ -54,7 +54,7 @@ def _detect_fastapi(files: List[Path], ctx: Path) -> Optional[Tuple[str, List[st
     """Detect FastAPI applications."""
     for py in files:
         try:
-            content=py.read_text()
+            content=read_text_limited(py)
             if "FastAPI" in content:
                 app_module=_find_fastapi_app(py, ctx)
                 if app_module:
@@ -65,7 +65,7 @@ def _detect_fastapi(files: List[Path], ctx: Path) -> Optional[Tuple[str, List[st
 def _find_fastapi_app(file_path: Path, ctx: Path) -> Optional[str]:
     """Find FastAPI app variable in file."""
     try:
-        content=file_path.read_text()
+        content=read_text_limited(file_path)
         match=re.search(r'^\s*(\w+)\s*=\s*FastAPI\s*\(', content, re.MULTILINE)
         if match:
             app_var=match.group(1)
@@ -79,7 +79,7 @@ def _detect_flask(files: List[Path]) -> Optional[Tuple[str, List[str], List[int]
     """Detect Flask applications."""
     for py in files:
         try:
-            content=py.read_text()
+            content=read_text_limited(py)
             if "Flask" in content and re.search(
                 r'^\s*\w+\s*=\s*Flask\s*\(', content, re.MULTILINE
             ):
@@ -95,7 +95,7 @@ def _detect_django(
         if manage_py.name != "manage.py" or manage_py.parent != context_dir:
             continue
         try:
-            content=manage_py.read_text()
+            content=read_text_limited(manage_py)
             if "django" in content.lower():
                 return ("Django", ["python", "manage.py", "runserver", "0.0.0.0:8000"], [8000])
         except: pass

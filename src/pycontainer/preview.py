@@ -38,7 +38,12 @@ from .layer_inspect import (
     read_layer,
     resolve_reference,
 )
-from .local_image import MAX_ARCHIVE_MEMBERS, open_local_image_source, parse_local_image_reference
+from .local_image import (
+    MAX_ARCHIVE_MEMBERS,
+    MAX_LAYER_UNCOMPRESSED_BYTES,
+    open_local_image_source,
+    parse_local_image_reference,
+)
 from .oci import build_config_json
 from .project import detect_entrypoint
 from .registry_client import RegistryClient, parse_image_reference
@@ -74,13 +79,16 @@ class PreviewError(RuntimeError):
 
 
 class _HashSink:
-    """Write-only file object that hashes and counts what is written to it."""
+    """Write-only file object that hashes and counts what is written to it, up to a byte bound."""
 
-    def __init__(self):
+    def __init__(self, limit: int):
         self.hasher = hashlib.sha256()
         self.offset = 0
+        self.limit = limit
 
     def write(self, data) -> int:
+        if self.offset + len(data) > self.limit:
+            raise PreviewError(f"The planned application layer is larger than {self.limit} bytes.")
         self.hasher.update(data)
         self.offset += len(data)
         return len(data)
@@ -156,7 +164,7 @@ def plan_app_layer(files, workdir: str, reproducible: bool) -> Tuple[str, Dict[s
     """Serialize the application layer exactly as the builder would and return (DiffID, entries)."""
     if len(files) > MAX_ARCHIVE_MEMBERS:
         raise PreviewError(f"The build context selects more than {MAX_ARCHIVE_MEMBERS} files.")
-    sink = _HashSink()
+    sink = _HashSink(MAX_LAYER_UNCOMPRESSED_BYTES)
     with _RecordingTar.open(fileobj=sink, mode="w") as tar:
         tar.recorded = []
         write_app_files(tar, files, workdir, reproducible,

@@ -451,8 +451,9 @@ It accepts the same content-affecting flags as `build` (`--config`,
 dependency and application components, added/modified/deleted application
 files, and image settings. Anything the evidence cannot establish is reported
 as `unknown`, never as unchanged, and environment values are always redacted.
-See [Build preview](docs/preview.md) for how provenance is established and the
-accuracy limits.
+Baseline and project reads are size-bounded; see
+[Build preview](docs/preview.md) for the limits, how provenance is established
+and the accuracy limits.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

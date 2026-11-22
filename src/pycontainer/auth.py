@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from abc import ABC, abstractmethod
+from .fs_utils import read_text_limited
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,7 @@ class DockerConfigAuthProvider(AuthProvider):
     def _load_config(self) -> Optional[Dict]:
         if not self.config_path.exists(): return None
         try:
-            return json.loads(self.config_path.read_text())
+            return json.loads(read_text_limited(self.config_path))
         except: return None
     
     def _decode_auth(self, auth_str: str) -> Tuple[str, str]:
