@@ -148,7 +148,17 @@ pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
 `PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
-source distributions, lockfiles and cross-compilation are not supported.
+source distributions and cross-compilation are not supported.
+
+Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
+without their tools, rejects stale locks against the manifest, evaluates
+markers for the target (never the host) and installs the selection through
+`install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
+venv, `requirements.txt`. Non-registry sources fail; never add an
+unconstrained fallback. Real lock fixtures live in `tests/fixtures/lockfiles`
+and are validated with `poetry check --lock`, `pipenv verify`,
+`pdm lock --check` and `uv lock --check`.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

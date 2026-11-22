@@ -331,18 +331,53 @@ pycontainer build \
 
 **Base Image & Dependencies**:
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
-- `--include-deps` — Stage importable dependencies from a venv or install a
-  requirements file as target-compatible binary wheels. Requirements installs
+- `--include-deps` — Stage importable dependencies from a lockfile, a
+  requirements file, or a venv as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
   supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
   must match the target Python minor version and contain only pure-Python
   packages. Dependencies are placed under `<workdir>/.python`, added to
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
-  distributions, cross-compilation, and lockfile resolution are not supported.
+  distributions and cross-compilation are not supported.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+- `--requirements FILE` — Install this requirements file (`[build]
+  requirements-file`). A requirements file that is not fully pinned with
+  `==` versions and `--hash` values logs a warning that the dependency layer
+  is not reproducible; generate one with `pip-compile --generate-hashes` or use
+  a lockfile.
+- `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
+  `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
+  (`use-lockfile = false`) ignores auto-detected lockfiles.
+
+**Lockfiles**: With `--include-deps`, the dependency source is chosen in this
+order: `--lockfile`, then `--requirements`, then a single lockfile at the
+context root, then a venv, then `requirements.txt`. More than one root lockfile
+is an error until you choose one. No locking tool is needed at build time, and
+none is added as a dependency:
+
+1. The lock is checked against its manifest (`pyproject.toml` or `Pipfile`):
+   Poetry and PDM content hashes, the Pipfile hash, or uv's recorded
+   requirements. A stale lock fails; run `poetry lock`, `pipenv lock`,
+   `pdm lock`, or `uv lock` and rebuild.
+2. Environment markers are evaluated for the target image, not the build host,
+   so a Windows-only or `python_version` fork resolves for the container's
+   Linux CPython. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
+3. The exact locked versions and their recorded hashes are installed with
+   `pip --no-deps --require-hashes` as target wheels and included in the SBOM.
+
+Only the default/main dependencies are staged; dev groups and project extras
+are not. Supported formats: Poetry lock-version 2.1+, Pipenv pipfile-spec 6,
+PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
+version 1 for a single project. Git, path, URL, and editable packages, uv
+workspaces, sources, overrides and constraints, and PDM `find_links` fail with
+an explicit error rather than falling back to an unconstrained install.
+Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
+PyPI itself is left to your pip configuration so mirrors keep working, and
+hashes still pin each artifact. Index credentials must be `${VARIABLE}`
+placeholders, never literal secrets.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
