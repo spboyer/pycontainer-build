@@ -363,10 +363,10 @@ def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
         openers.append((Opener(), handlers))
         return openers[-1][0]
 
+    client = RegistryClient("registry.example", "team/app")
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener", build_opener
     )
-    client = RegistryClient("registry.example", "team/app")
 
     for content in contents:
         digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
@@ -390,13 +390,14 @@ def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
     def unexpected_opener(*_handlers):
         pytest.fail("Push-only clients must not initialize the blob TLS opener")
 
+    client = RegistryClient("registry.example", "team/app")
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener", unexpected_opener
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.ssl.create_default_context", unexpected_opener
     )
-    client = RegistryClient("registry.example", "team/app")
+
     def make_request(method, *_args, **_kwargs):
         if method == "POST":
             return 202, b"", {"Location": "/v2/team/app/blobs/uploads/test"}
@@ -424,19 +425,19 @@ def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
             content = contents[int(request.full_url.endswith(digests[1]))]
             return _Response(content, headers={"Content-Length": str(len(content))})
 
-    def build_opener(*_handlers):
-        openers.append(Opener())
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
         try:
             both_building.wait()
         except threading.BrokenBarrierError:
             pass
-        return openers[-1]
+        return openers[-1][0]
 
+    digests = [f"sha256:{hashlib.sha256(c).hexdigest()}" for c in contents]
+    client = RegistryClient("registry.example", "team/app")
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener", build_opener
     )
-    digests = [f"sha256:{hashlib.sha256(c).hexdigest()}" for c in contents]
-    client = RegistryClient("registry.example", "team/app")
     results = []
 
     def pull(index):
@@ -454,6 +455,12 @@ def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
     assert results == [True, True]
     assert len(openers) == 1
     assert isinstance(client._ssl_context, ssl.SSLContext)
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    assert client._get_blob_opener() is openers[0][0]
 
 
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(
