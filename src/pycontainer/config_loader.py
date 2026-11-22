@@ -126,17 +126,22 @@ def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
             nested_table = f"{table[:-1]}.validate]"
             if not isinstance(value, dict):
                 raise ValueError(f"Invalid value for {nested_table}: expected a table.")
-            unknown = sorted(set(value) - {"ignore"})
+            from .image_validation import SIZE_THRESHOLDS, parse_size_threshold, validate_ignores
+            unknown = sorted(set(value) - {"ignore", *SIZE_THRESHOLDS})
             if unknown:
                 raise ValueError(f"Unknown {nested_table} setting(s): {', '.join(unknown)}.")
             ignores = value.get("ignore", [])
             if not isinstance(ignores, list) or any(not isinstance(item, str) for item in ignores):
                 raise ValueError(f"Invalid value for {nested_table}.ignore: expected list[str].")
-            from .image_validation import validate_ignores
             try:
                 validate_ignores(ignores)
             except ValueError as exc:
                 raise ValueError(f"{nested_table}.ignore: {exc}") from None
+            for name in SIZE_THRESHOLDS:
+                if name in value and isinstance(value[name], str):
+                    raise ValueError(f"Invalid value for {nested_table}.{name}: expected a number.")
+                if name in value:
+                    parse_size_threshold(value[name], f"{nested_table}.{name}")
             continue
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):

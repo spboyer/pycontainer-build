@@ -9,6 +9,7 @@ pycontainer validate image
 pycontainer validate image --output dist/image --tag myapp:latest --format json
 pycontainer validate image --tag myapp:latest --platform linux/arm64 --fail-on error
 pycontainer validate image --config pycontainer.toml --ignore PCB004
+pycontainer validate image --max-image-size-mb 500 --max-layer-size-mb 200
 pycontainer build --config pycontainer.toml --validate --push
 ```
 
@@ -31,6 +32,8 @@ their reachable contents are still verified.
 | PCB003 | error | Neither `Entrypoint` nor `Cmd` is set, leaving no default process. Set at least one. |
 | PCB004 | warning | Missing or empty `org.opencontainers.image.source` or `org.opencontainers.image.version` labels hinder traceability. Set both labels. |
 | PCB005 | error | A non-empty environment variable whose name contains `PASSWORD`, `TOKEN`, or `SECRET` (case-insensitive) persists a likely secret in the image. Supply secrets at runtime instead. |
+| PCB006 | warning | The stored image size exceeds `max_image_size_mb`. Reduce the base image or layer contents, or raise the threshold. Evaluated only when the threshold is set. |
+| PCB007 | warning | The largest stored layer exceeds `max_layer_size_mb`. Slim that layer or choose a smaller base image, or raise the threshold. Evaluated only when the threshold is set. |
 
 Findings contain a rule ID, severity, message and remediation. Environment
 names and values are not printed. Image labels and annotations are claims,
@@ -46,12 +49,24 @@ supported:
 ```toml
 [build.validate]
 ignore = ["PCB001", "PCB004"]
+max_image_size_mb = 500     # optional; total stored image size
+max_layer_size_mb = 200     # optional; largest single stored layer
 ```
 
 Repeat `--ignore RULE` to add CLI suppressions to the TOML list. Unknown IDs,
 invalid types and unknown validation settings are errors. PCB002 is a known,
 reserved ID, so ignoring it is currently a no-op. Suppressions apply only to
 findings, never to layout or integrity errors.
+
+`--max-image-size-mb` and `--max-layer-size-mb` (on `validate image`, and on
+`build` together with `--validate`) override the matching TOML key only when
+supplied; otherwise the TOML value, if any, applies. Thresholds are positive,
+finite decimal numbers of MiB (1 MiB = 1,048,576 bytes), compared exactly
+without binary rounding, so `0.1` means 104,857.6 bytes. A size equal to the
+threshold passes; only a larger size warns. Zero, negative, non-finite,
+boolean or non-numeric values (including TOML strings) are configuration
+errors with exit 2. Without a threshold, no size finding is produced. The TOML
+keys use underscores only.
 
 `--fail-on warning` is the default; `--fail-on error` still reports warnings,
 but does not fail solely because of them. `build --validate` always fails on
@@ -66,9 +81,44 @@ with `--dry-run`. Without `--validate`, the build output is unchanged.
 | 2 | Usage, configuration, layout or integrity error |
 
 JSON output contains `image` (selected `digest` and `platform`),
-`provenance.status`, and a `findings` array. Each finding has `rule_id`,
-`severity`, `message` and `remediation`. Usage and validation errors are
+`provenance.status`, a `findings` array and a `size` object. Each finding has
+`rule_id`, `severity`, `message` and `remediation`. Usage and validation errors are
 written to stderr with exit 2 and no JSON report on stdout.
+
+## Stored size report
+
+Every successful validation reports sizes for the selected image, whether or
+not a threshold is set. They come from descriptors whose digests and sizes
+were already verified against the blobs on disk; a descriptor that disagrees
+with its blob is an integrity error (exit 2), never a size finding, and
+ignoring PCB006 or PCB007 does not suppress it.
+
+- `image_bytes`: the config descriptor size plus the sum of every layer
+  descriptor in the manifest. A layer listed twice counts twice; the manifest
+  itself is excluded.
+- `largest_layer`: the largest layer descriptor (`digest`, `bytes`,
+  `media_type`), or `null` for an image without layers.
+- `layers`: each layer's `digest`, `bytes`, `media_type`, `compression`
+  (`gzip`, `zstd`, `none` for plain tar, or `unknown`, derived from the media
+  type) and `role`.
+- `contributions`: base versus application/dependency bytes, plus
+  `config_bytes` separately.
+- `thresholds` and `note`.
+
+These are **stored blob sizes**. Base layers pulled from a registry usually
+keep their compressed media types, so they count compressed bytes, while
+pycontainer writes dependency and application layers as uncompressed tar, so
+they count their full size. Network transfer, registry deduplication and
+cache reuse may differ from these numbers.
+
+An OCI layout does not record which layers came from the base image, and media
+types or labels are not proof. `validate image` therefore reports the
+contribution `status` as `unknown`, each layer's `role` as `unknown`, and the
+base and application byte counts as `null`. `build --validate` knows how many
+base layers it placed first in the manifest it just wrote; after confirming
+the layout still holds that exact manifest digest, it reports `status:
+determined`, `base` and `application` roles, and both byte totals. Text output
+prints the same summary and note.
 
 ## Integrity and limits
 

@@ -6,7 +6,9 @@ from .config_loader import load_validated_file_config
 from .builder import ImageBuilder
 from .effective_config import NOT_PERFORMED, resolve_build_config
 from .fs_utils import output_directory_lock
-from .image_validation import finding_exit_code, validate_ignores, validate_image
+from .image_validation import (
+    MIB, SIZE_THRESHOLDS, finding_exit_code, parse_size_threshold, validate_ignores, validate_image,
+)
 
 EFFECTIVE_CONFIG_FIELDS = (
     "semver_tags", "latest_tag", "base_image", "context_dir", "include_paths", "exclude_paths",
@@ -81,14 +83,56 @@ def _validate_config_command(parser, args):
         print(f"{invalid} of {len(sources)} configuration(s) invalid.", file=sys.stderr)
         raise SystemExit(2)
 
-def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None):
+def _add_size_threshold_arguments(parser, suffix=""):
+    for name in SIZE_THRESHOLDS:
+        subject = "total stored image" if name == "max_image_size_mb" else "largest stored layer"
+        parser.add_argument(
+            "--" + name.replace("_", "-"), metavar="MIB",
+            help=f"Warn when the {subject} size exceeds MIB mebibytes{suffix}",
+        )
+
+def _size_thresholds(parser, args, file_validate):
+    """Merge TOML thresholds with CLI values; a CLI value wins only when supplied."""
+    thresholds = {name: file_validate.get(name) for name in SIZE_THRESHOLDS}
+    for name in SIZE_THRESHOLDS:
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                thresholds[name] = parse_size_threshold(value, "--" + name.replace("_", "-"))
+            except ValueError as exc:
+                parser.error(str(exc))
+    return thresholds
+
+def _mib(size):
+    return f"{size} bytes ({size / MIB:.2f} MiB)"
+
+def _print_size(size):
+    largest = size["largest_layer"]
+    layers = "no layers" if largest is None else (
+        f"largest layer {_mib(largest['bytes'])}, {largest['media_type']}"
+    )
+    print(f"Stored image size: {_mib(size['image_bytes'])} "
+          f"(config and {len(size['layers'])} layer descriptor(s); {layers}).")
+    contributions = size["contributions"]
+    if contributions["status"] == "determined":
+        print(f"Contributions: base {_mib(contributions['base_bytes'])}; application/dependency "
+              f"{_mib(contributions['application_bytes'])}; config {_mib(size['config_bytes'])}.")
+    else:
+        print("Contributions: base versus application/dependency unknown (the layout does not "
+              f"record layer origin); config {_mib(size['config_bytes'])}.")
+    print(f"Note: {size['note']}")
+
+def _image_validation(
+    output, tag, platform, ignores, format_, fail_on, expected_digest=None,
+    thresholds=None, base_layer_count=None,
+):
     try:
-        report=validate_image(output, tag=tag, platform=platform, ignores=ignores)
+        report=validate_image(
+            output, tag=tag, platform=platform, ignores=ignores, thresholds=thresholds,
+            expected_digest=expected_digest, base_layer_count=base_layer_count,
+        )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if expected_digest is not None and report["image"]["digest"] != expected_digest:
-        print("error: the built image no longer matches the selected layout manifest.", file=sys.stderr)
         return 2
     if format_ == "json":
         print(json.dumps(report, sort_keys=True))
@@ -98,6 +142,7 @@ def _image_validation(output, tag, platform, ignores, format_, fail_on, expected
             print(f"  remediation: {finding['remediation']}")
         if not report["findings"]:
             print("No image validation findings.")
+        _print_size(report["size"])
         print("Base image provenance: unknown (PCB002 is deferred).")
     return finding_exit_code(report, fail_on)
 
@@ -106,10 +151,12 @@ def _validate_image_command(parser, args):
         if getattr(args, option) == "":
             parser.error(f"--{option} must not be empty.")
     ignores=list(args.ignore or [])
+    file_validate={}
     if args.config is not None:
         try:
             _, config=load_validated_file_config(Path(args.config))
-            ignores=[*config.get("validate", {}).get("ignore", []), *ignores]
+            file_validate=config.get("validate", {})
+            ignores=[*file_validate.get("ignore", []), *ignores]
         except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             raise SystemExit(2)
@@ -117,7 +164,11 @@ def _validate_image_command(parser, args):
         validate_ignores(ignores)
     except ValueError as exc:
         parser.error(str(exc))
-    code=_image_validation(Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on)
+    thresholds=_size_thresholds(parser, args, file_validate)
+    code=_image_validation(
+        Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on,
+        thresholds=thresholds,
+    )
     if code:
         raise SystemExit(code)
 
@@ -157,6 +208,7 @@ def main():
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     b.add_argument("--validate",action="store_true",help="Validate the image after building and before pushing")
     b.add_argument("--ignore",action="append",metavar="RULE",help="Ignore an image validation rule (requires --validate; repeatable)")
+    _add_size_threshold_arguments(b, " (requires --validate)")
     # --- validate subcommand ---
     val=sub.add_parser("validate",help="Validate configuration or an OCI image offline")
     val_sub=val.add_subparsers(dest="validate_cmd",metavar="{config,image}",required=True)
@@ -182,6 +234,7 @@ def main():
     vi.add_argument("--fail-on",choices=("warning","error"),default="warning",help="Minimum failing severity (default: warning)")
     vi.add_argument("--config","-c",help="Read validation ignores from a configuration file")
     vi.add_argument("--ignore",action="append",metavar="RULE",help="Ignore a rule ID (repeatable; extends config ignores)")
+    _add_size_threshold_arguments(vi, " (overrides the config value)")
     # --- end validate subcommand ---
     # --- import subcommand (Dockerfile migration) ---
     imp=sub.add_parser("import",help="Convert a Dockerfile to [tool.pycontainer] settings")
@@ -211,6 +264,9 @@ def main():
 
     if args.ignore and not args.validate:
         b.error("--ignore requires --validate.")
+    for name in SIZE_THRESHOLDS:
+        if getattr(args, name) is not None and not args.validate:
+            b.error(f"--{name.replace('_', '-')} requires --validate.")
     if args.push and args.username and not (
         args.password or os.getenv('REGISTRY_PASSWORD')
     ):
@@ -230,6 +286,7 @@ def main():
         validate_ignores(ignores)
     except ValueError as exc:
         b.error(str(exc))
+    thresholds=_size_thresholds(b, args, cfg.validate)
 
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
@@ -250,6 +307,7 @@ def main():
             code=_image_validation(
                 Path(builder.config.output_dir), builder.config.tag, builder.config.platform,
                 ignores, "text", "warning", expected_digest=builder.manifest_digest,
+                thresholds=thresholds, base_layer_count=builder.base_layer_count,
             )
             if code:
                 raise SystemExit(code)

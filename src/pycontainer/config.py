@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
@@ -35,7 +35,7 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
-    validate: Dict[str, List[str]] = field(default_factory=dict)
+    validate: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         from .system_packages import validate_system_packages

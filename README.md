@@ -481,8 +481,16 @@ best-practice findings without a registry or container daemon. Use
 ```bash
 pycontainer validate image --output dist/image --format json
 pycontainer validate image --tag myapp:latest --platform linux/arm64
+pycontainer validate image --max-image-size-mb 500 --max-layer-size-mb 200
 pycontainer build --config pycontainer.toml --validate --push
 ```
+
+Each run reports the stored image size, largest layer and, during
+`build --validate`, base versus application/dependency contributions. These
+are stored blob sizes (base layers usually compressed, application layers
+uncompressed tar), not network transfer or cache reuse. Optional thresholds, set with
+the flags above or `max_image_size_mb` / `max_layer_size_mb` under
+`[build.validate]`, warn as PCB006 and PCB007 only when exceeded.
 
 Validation exits 0 below the requested severity threshold, 1 for findings at or
 above it, and 2 for usage, layout or integrity errors. Base-image provenance

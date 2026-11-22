@@ -347,6 +347,7 @@ class ImageBuilder:
         self.manifest_digest=manifest_digest
         self.config_digest=cfg_digest
         self.layers=all_layers
+        self.base_layer_count=len(base_layers)
         
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
