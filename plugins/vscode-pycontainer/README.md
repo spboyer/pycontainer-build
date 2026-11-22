@@ -114,11 +114,14 @@ npm test
 npm run package
 ```
 
-The extension compiles with TypeScript 7 (`@typescript/native`, which
-provides `tsc`). TypeScript 7 does not yet ship the compiler API that
-`typescript-eslint` requires, so the `typescript` package name is aliased to
-the `@typescript/typescript6` compatibility package for linting. Remove the
-alias once `typescript-eslint` supports TypeScript 7.
+The extension compiles with TypeScript 7, installed as `@typescript/native`.
+TypeScript 7 does not yet ship the compiler API that `typescript-eslint`
+requires, so the `typescript` package name is aliased to the
+`@typescript/typescript6` compatibility package for linting. Both packages
+install a `tsc` executable, so the `compile` and `watch` scripts run
+`node_modules/@typescript/native/bin/tsc` explicitly rather than the
+ambiguous `tsc` link. Remove the alias once `typescript-eslint` supports
+TypeScript 7.
 
 `npm test` includes a dry-run smoke test of the exact Python module and
 arguments generated for the extension. The core package is not yet available

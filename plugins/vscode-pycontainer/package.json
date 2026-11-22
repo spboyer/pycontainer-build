@@ -99,8 +99,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "compile": "node ./node_modules/@typescript/native/bin/tsc -p ./",
+    "watch": "node ./node_modules/@typescript/native/bin/tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "node --test dist/test/commands.test.js",
     "lint": "eslint \"src/**/*.ts\"",
