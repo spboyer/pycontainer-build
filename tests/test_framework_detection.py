@@ -477,6 +477,9 @@ def test_build_config_serialization_preserves_default_and_explicit_empty_ports()
     restored_cleared = BuildConfig(**asdict(cleared))
     assert restored_cleared.has_exposed_ports()
     assert restored_cleared.exposed_ports == []
+    restored_json = BuildConfig(**json.loads(json.dumps(asdict(cleared))))
+    assert restored_json.has_exposed_ports()
+    assert restored_json.exposed_ports == []
     copied = deepcopy(default)
     copied.exposed_ports.clear()
     assert BuildConfig(**asdict(copied)).has_exposed_ports()
@@ -484,6 +487,15 @@ def test_build_config_serialization_preserves_default_and_explicit_empty_ports()
     shared.exposed_ports.clear()
     assert default.has_exposed_ports()
     assert BuildConfig(**asdict(default)).has_exposed_ports()
+
+
+def test_dataclass_replace_preserves_explicit_empty_port_override(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = replace(BuildConfig(), exposed_ports=[])
+
+    assert config.has_exposed_ports()
+    assert apply_framework_defaults(config, tmp_path).exposed_ports == []
 
 
 def test_jupyter_checkpoints_are_excluded_unless_default_excludes_are_disabled(tmp_path):

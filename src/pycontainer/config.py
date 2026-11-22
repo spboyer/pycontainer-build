@@ -43,6 +43,20 @@ class _GeneratedList(_TrackedList):
     pass
 
 
+class _PortState:
+    """Track list identity for dataclass copies while serializing the intent."""
+
+    def __init__(self, ports, configured):
+        self.ports = ports
+        self.configured = configured
+
+    def __bool__(self):
+        return self.configured
+
+    def __deepcopy__(self, memo):
+        return self.configured
+
+
 @dataclass
 class BuildConfig:
     tag: str = "local/test:latest"
@@ -74,15 +88,17 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
-    _exposed_ports_configured: Optional[bool] = field(default=None, repr=False, compare=False)
+    _exposed_ports_configured: Optional[Union[bool, _PortState]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def __getattribute__(self, name):
         if name == "_exposed_ports_configured":
-            # Keep serialized state accurate even when copies share the list.
             ports = object.__getattribute__(self, "exposed_ports")
-            return ports is not None and (
+            configured = ports is not None and (
                 not isinstance(ports, _DefaultPorts) or ports.specified
             )
+            return _PortState(ports, configured)
         return object.__getattribute__(self, name)
 
     def __post_init__(self):
@@ -90,6 +106,8 @@ class BuildConfig:
 
         ports = self.exposed_ports
         configured = self.__dict__["_exposed_ports_configured"]
+        if isinstance(configured, _PortState):
+            configured = configured.configured if ports is configured.ports else None
         if configured is None:
             configured = ports is not None and (
                 not isinstance(ports, _DefaultPorts) or ports.specified
