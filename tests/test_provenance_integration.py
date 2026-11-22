@@ -1,4 +1,6 @@
 """Opt-in test that attests provenance in a real registry and verifies it independently."""
+import base64
+import json
 import os
 import subprocess
 import uuid
@@ -70,4 +72,10 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
     statements = parse_verified_attestations(result.stdout, builder.manifest_digest)
     assert builder.provenance_statement in statements
     assert all(s["_type"] == STATEMENT_V1 and s["predicateType"] == SLSA_PROVENANCE_V1 for s in statements)
+    envelopes = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    payloads = [
+        base64.b64decode(envelope.get("dsseEnvelope", envelope)["payload"], validate=True)
+        for envelope in envelopes
+    ]
+    assert (tmp_path / "out" / "provenance.intoto.json").read_bytes() in payloads
     assert _verify(executable, wrong_key, subject).returncode != 0

@@ -144,9 +144,13 @@ Verification uses cosign's transparency log defaults.
   referrer by pycontainer's registry client, and independently discovered and
   verified by `cosign verify-attestation` v3.1.4 and v2.6.1
   (`--new-bundle-format`) using a key pair **with the transparency log
-  disabled**. A wrong key was rejected. Keyless signing, public Rekor upload,
-  registries without the Referrers API, GHCR, ACR and Docker Hub have not been
-  validated.
+  disabled**. A wrong key was rejected.
+- The opt-in real-registry test also passed with cosign v3.1.4 and its default
+  transparency settings on `ttl.sh`, using a synthetic app without dependencies.
+  Its published attestation included a transparency-log inclusion proof; the
+  log key matched `rekor.sigstore.dev`, and cosign verified the log entry and
+  exact statement bytes. A wrong key was rejected. Keyless signing, registries
+  without the Referrers API, GHCR, ACR and Docker Hub have not been validated.
 - Notation has no attestation path.
 - Dependency environment markers are evaluated on the build host
   ([#142](https://github.com/spboyer/pycontainer-build/issues/142)).
