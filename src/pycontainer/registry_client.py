@@ -2,9 +2,11 @@
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -47,6 +49,76 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def is_loopback_host(host: Optional[str]) -> bool:
+    """Return whether a URL hostname is a literal loopback name or address."""
+    if not host:
+        return False
+    host = host.strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or bool(mapped and mapped.is_loopback)
+
+
+def _origin(url: str) -> Tuple[str, str, Optional[int]]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or {"http": 80, "https": 443}.get(scheme)
+    return scheme, (parsed.hostname or "").lower(), port
+
+
+def _check_transport(source_url: str, target_url: str) -> None:
+    """Reject non-HTTP(S) targets, malformed URLs, and HTTPS-to-HTTP downgrades."""
+    try:
+        source_scheme = _origin(source_url)[0]
+        target_scheme = _origin(target_url)[0]
+    except ValueError as error:
+        raise RegistryRequestError(
+            f"Refusing malformed registry URL: {_safe_url(target_url)}."
+        ) from error
+    if target_scheme not in {"http", "https"}:
+        raise RegistryRequestError(
+            f"Refusing registry URL with unsupported scheme: {_safe_url(target_url)}."
+        )
+    if source_scheme == "https" and target_scheme != "https":
+        raise RegistryRequestError(
+            f"Refusing HTTPS-to-HTTP downgrade from {_safe_url(source_url)} "
+            f"to {_safe_url(target_url)}."
+        )
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects without downgrades or cross-origin authorization."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_transport(req.full_url, newurl)
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is not None and _origin(req.full_url) != _origin(newurl):
+            new_request.remove_header("Authorization")
+        return new_request
+
+
+def create_registry_ssl_context(ca_file: Optional[str] = None) -> ssl.SSLContext:
+    """Return a verifying TLS context, optionally trusting an extra CA bundle."""
+    context = ssl.create_default_context()
+    if ca_file is None:
+        return context
+    path = Path(ca_file)
+    if not path.is_file():
+        raise ValueError(f"Registry CA file not found or not a regular file: {ca_file}")
+    try:
+        context.load_verify_locations(cafile=str(path))
+    except (OSError, ssl.SSLError) as error:
+        raise ValueError(
+            f"Registry CA file could not be loaded: {ca_file} ({error})"
+        ) from error
+    return context
 
 
 def _safe_url(url: str) -> str:
@@ -99,6 +171,8 @@ class RegistryClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        insecure: bool = False,
+        ca_file: Optional[str] = None,
     ):
         if timeout <= 0:
             raise ValueError("Registry request timeout must be greater than zero.")
@@ -110,8 +184,38 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.base_url = f"https://{self.registry}/v2"
+        self.insecure = insecure
+        scheme = "http" if insecure else "https"
+        self.base_url = f"{scheme}://{self.registry}/v2"
         self._bearer_token = None
+        if (
+            insecure
+            and (auth_token or username or password)
+            and not self._is_loopback_registry()
+        ):
+            raise RegistryAuthenticationError(
+                f"Refusing to send credentials over plain HTTP to non-loopback "
+                f"registry {self.registry}. Use HTTPS (optionally with "
+                "--registry-ca-file) or remove the credentials."
+            )
+        context = create_registry_ssl_context(ca_file)
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context), SafeRedirect()
+        )
+        self._blob_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context), NoRedirect()
+        )
+
+    def _is_loopback_registry(self) -> bool:
+        return is_loopback_host(urllib.parse.urlsplit(self.base_url).hostname)
+
+    def _refuse_plain_http_credentials(self, url: str) -> None:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() == "http" and not is_loopback_host(parsed.hostname):
+            raise RegistryAuthenticationError(
+                f"Refusing to send registry credentials over plain HTTP to "
+                f"non-loopback host {parsed.hostname}."
+            )
 
     def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
         """Parse Www-Authenticate header for OAuth2 challenge."""
@@ -136,8 +240,10 @@ class RegistryClient:
             return {}
         token = self._bearer_token or self.auth_token
         if token:
+            self._refuse_plain_http_credentials(url)
             return {"Authorization": f"Bearer {token}"}
         if self.username and self.password:
+            self._refuse_plain_http_credentials(url)
             credentials = base64.b64encode(
                 f"{self.username}:{self.password}".encode()
             ).decode()
@@ -151,8 +257,21 @@ class RegistryClient:
             raise RegistryAuthenticationError(
                 "Registry authentication challenge did not include a token realm."
             )
+        if self.insecure and not self._is_loopback_registry():
+            raise RegistryAuthenticationError(
+                f"Registry {self.registry} requested token authentication, but "
+                "tokens are never sent over plain HTTP to non-loopback hosts."
+            )
 
         parsed = urllib.parse.urlsplit(realm)
+        realm_scheme = parsed.scheme.lower()
+        if realm_scheme not in {"http", "https"} or (
+            realm_scheme == "http" and not self.insecure
+        ):
+            raise RegistryAuthenticationError(
+                f"Refusing registry token realm {_safe_url(realm)}: HTTPS registries "
+                "require an HTTPS token realm."
+            )
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
             value = auth_params.get(key)
@@ -171,12 +290,14 @@ class RegistryClient:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         elif self.password:
             headers["Authorization"] = f"Bearer {self.password}"
+        if headers:
+            self._refuse_plain_http_credentials(url)
 
         request = urllib.request.Request(url, headers=headers)
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with urllib.request.urlopen(
+                with self._opener.open(
                     request, timeout=self.timeout
                 ) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
@@ -252,7 +373,7 @@ class RegistryClient:
                 url, data=data, headers=request_headers, method=method
             )
             try:
-                with urllib.request.urlopen(
+                with self._opener.open(
                     request, timeout=self.timeout
                 ) as response:
                     return response.status, response.read(), dict(response.headers)
@@ -333,7 +454,9 @@ class RegistryClient:
             raise RegistryRequestError(
                 "Registry did not return a Location for the blob upload."
             )
-        return urllib.parse.urljoin(url, location)
+        upload_url = urllib.parse.urljoin(url, location)
+        _check_transport(url, upload_url)
+        return upload_url
 
     def upload_blob_monolithic(self, digest: str, blob_path: Path) -> bool:
         """Upload a content-addressed file without loading it into memory."""
@@ -471,9 +594,8 @@ class RegistryClient:
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
-        opener = urllib.request.build_opener(NoRedirect())
         try:
-            response = opener.open(request, timeout=self.timeout)
+            response = self._blob_opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             if error.code not in REDIRECT_STATUSES:
                 raise
@@ -483,10 +605,7 @@ class RegistryClient:
                 raise RegistryRequestError(
                     "Registry blob redirect did not include a Location."
                 ) from error
-            target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return self._open_blob_redirect(url, location)
 
         if response.status in REDIRECT_STATUSES:
             location = response.headers.get("Location")
@@ -495,11 +614,15 @@ class RegistryClient:
                 raise RegistryRequestError(
                     "Registry blob redirect did not include a Location."
                 )
-            target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return self._open_blob_redirect(url, location)
         return response
+
+    def _open_blob_redirect(self, url: str, location: str):
+        target = urllib.parse.urljoin(url, location)
+        _check_transport(url, target)
+        return self._opener.open(
+            urllib.request.Request(target), timeout=self.timeout
+        )
 
     def _download_blob_once(
         self,

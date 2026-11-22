@@ -186,6 +186,17 @@ pycontainer build --tag registry.example.com/app:v1 --push
 
 **Recommendation**: Use Docker config with credential helpers or Azure CLI for best security.
 
+### Transport Security
+- Registry traffic is HTTPS with certificate verification by default.
+  `--registry-ca-file` adds a trusted CA; it never disables verification.
+- `--insecure-registry HOST[:PORT]` allows plain HTTP for that exact host.
+  Credentials are sent over HTTP only to loopback hosts; credentials for any
+  other HTTP registry, or a token challenge from one, fail with
+  `RegistryAuthenticationError` before secrets leave the process.
+- HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
+  rejected, and `Authorization` is dropped on cross-origin redirects. See
+  [REGISTRY_PUSH.md](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
+
 ### Token Scopes
 - **GitHub**: Require minimum scope (`write:packages`)
 - **Docker Hub**: Use access tokens, not account password

@@ -203,9 +203,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         )
         return Response(b'{"token":"exchanged-token"}')
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     status, body, _=client._make_request(
         "GET", f"{client.base_url}/{client.repository}/manifests/latest"
@@ -253,9 +251,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
             )
         raise _http_error(request.full_url, 403)
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     with pytest.raises(
         RegistryAuthenticationError, match="exchange failed with HTTP 403"
@@ -299,9 +295,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
             )
         return _Response(b'{"token":"access-token"}')
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )
@@ -330,12 +324,9 @@ def test_pull_blob_streams_and_atomically_publishes_verified_content(
             requests.append((request, timeout))
             return response
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     destination = tmp_path / "blobs" / digest.split(":", 1)[1]
     client = RegistryClient("registry.example", "team/app", auth_token="secret")
+    client._blob_opener = Opener()
 
     assert client.pull_blob(digest, destination, len(content))
     assert destination.read_bytes() == content
@@ -393,12 +384,9 @@ def test_pull_blob_rejects_digest_or_size_mismatch_without_publishing(
         def open(self, request, timeout):
             return response
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     destination = tmp_path / "blob"
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     digest = f"sha256:{hashlib.sha256(expected_content).hexdigest()}"
 
     with pytest.raises(BlobIntegrityError):
@@ -422,15 +410,12 @@ def test_pull_blob_cleans_only_owned_temp_after_interrupted_download(
         def open(self, request, timeout):
             return InterruptedResponse()
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _delay: None)
     destination = tmp_path / "blob"
     sentinel = tmp_path / ".blob-another-writer.tmp"
     sentinel.write_bytes(b"other writer")
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     content = b"complete"
     digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
 
@@ -472,17 +457,12 @@ def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
         )
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
-    monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )
     destination = tmp_path / "blob"
     client = RegistryClient("registry.example", "team/app", auth_token="registry-secret")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     assert client.pull_blob(digest, destination, len(content))
     assert destination.read_bytes() == content
@@ -527,9 +507,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
 
     client = RegistryClient("registry.example", "team/app", auth_token="token")
     monkeypatch.setattr(client, "initiate_blob_upload", lambda: location)
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     assert client.upload_blob_monolithic(digest, source)
     request, timeout = requests[0]
@@ -562,9 +540,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
         request.data.read()
         return _Response(status=201)
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     client.upload_blob_monolithic(
         f"sha256:{hashlib.sha256(content).hexdigest()}", source
@@ -610,9 +586,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
         requests.append((request, timeout))
         raise TimeoutError("not included in public error")
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )

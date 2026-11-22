@@ -129,12 +129,18 @@ docker run -d -p 5000:5000 --name registry registry:2
 
 ### Push to Local Registry
 
+The `registry:2` container serves plain HTTP, so opt that exact host in:
+
 ```bash
 # No authentication needed for local registry
 pycontainer build \
   --tag localhost:5000/myapp:test \
+  --insecure-registry localhost:5000 \
   --push
 ```
+
+Without `--insecure-registry`, pycontainer uses HTTPS and the push fails
+with a TLS/network error.
 
 ### Verify Push
 
@@ -145,6 +151,86 @@ curl http://localhost:5000/v2/_catalog
 # List tags
 curl http://localhost:5000/v2/myapp/tags/list
 ```
+
+## Insecure (HTTP) Registries and Custom CAs
+
+Registry traffic uses HTTPS with certificate verification by default. Two
+explicit settings change how a registry is reached; neither disables
+certificate verification, and there is no skip-verify option.
+
+### Plain HTTP for specific hosts
+
+```bash
+pycontainer build --tag registry.lan:5000/team/app:dev \
+  --insecure-registry registry.lan:5000 --push
+```
+
+```toml
+[build]
+insecure-registries = ["localhost:5000", "registry.lan:5000"]
+```
+
+- Entries are exact `host[:port]` values with no scheme, path, or
+  credentials (IPv6 literals must be bracketed, e.g. `[::1]:5000`). Matching
+  is case-insensitive and must equal the registry in the image reference,
+  including the port. Invalid entries are configuration errors.
+- Listed hosts use HTTP only; there is no HTTPS probe or fallback. Unlisted
+  hosts keep HTTPS and fail with the usual TLS/network error if the server
+  only speaks HTTP.
+- Each build logs `WARNING: using plain HTTP for insecure registry ...` once
+  per insecure host that it contacts (base-image pull or push).
+- **Credentials are never sent over HTTP to non-loopback hosts.** Only
+  `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped loopback literals may
+  receive Basic or bearer credentials over HTTP. For any other HTTP registry,
+  configured credentials (CLI, environment, Docker config, or Azure CLI) cause
+  an explicit `RegistryAuthenticationError`, and a token challenge from that
+  registry is refused before any token request is made. Such registries work
+  only anonymously.
+- HTTP traffic is unencrypted and unauthenticated: anyone on the network path
+  can read or alter image content. Use it only on trusted networks.
+
+`--insecure-registry` on the command line replaces, rather than extends, the
+`[build]` list.
+
+### Additional CA for private HTTPS registries
+
+```bash
+pycontainer build --tag registry.corp:443/team/app:1.0 \
+  --registry-ca-file ./corp-root-ca.pem --push
+```
+
+```toml
+[build]
+registry-ca-file = "corp-root-ca.pem"
+```
+
+- The PEM bundle is added to the system trust store for all registry HTTPS
+  traffic in the build: registry API calls, token realms, and blob storage
+  redirects. Hostname and chain verification remain enabled.
+- Relative paths resolve from the current working directory. A missing,
+  unreadable, or invalid file is a configuration error.
+- There is one bundle per build; per-registry CA mapping and client
+  certificates (mTLS) are not supported.
+
+### Redirect and transport rules
+
+- HTTPS responses may not redirect to HTTP (manifests, blobs, token realms,
+  and upload locations); the downgrade is rejected before the HTTP target is
+  contacted.
+- An HTTPS registry must advertise an HTTPS token realm.
+- `Authorization` is removed when a redirect changes scheme, host, or port;
+  blob storage redirects are always fetched without registry credentials.
+
+### Limitations
+
+- Tests cover an in-process loopback Registry v2 stub over HTTP and a
+  test-generated CA over HTTPS. Compatibility with specific registry products
+  (for example `registry:2`, Harbor, Nexus, or Artifactory) over HTTP or with
+  private CAs has not been verified in CI.
+- The Poetry, Hatch, and VS Code integrations do not expose these options;
+  use the CLI or `pycontainer.toml`.
+- Standard proxy environment variables apply to HTTP registries as they do
+  to HTTPS ones.
 
 ## Programmatic Usage
 
