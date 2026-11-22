@@ -520,3 +520,148 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
 
     with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> None:
+    wheelhouse.mkdir(parents=True, exist_ok=True)
+    module = name.replace("-", "_")
+    dist_info = f"{module}-1.0.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
+    metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
+    files = {
+        f"{module}/__init__.py": b"",
+        f"{dist_info}/METADATA": (metadata + "\n").encode(),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ).encode(),
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, content in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode()
+        writer.writerow((path, f"sha256={digest.rstrip('=')}", len(content)))
+    writer.writerow((f"{dist_info}/RECORD", "", ""))
+    files[f"{dist_info}/RECORD"] = record.getvalue().encode()
+    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-py3-none-any.whl", "w") as wheel:
+        for path, content in files.items():
+            wheel.writestr(path, content)
+
+
+def _install_marker_fixture(tmp_path, requirements, arch, python_version, full_version):
+    context = tmp_path / "context"
+    requirements_file = context / "requirements.txt"
+    requirements_file.write_text(
+        "--no-index\n--find-links ./wheelhouse\n" + "".join(f"{line}\n" for line in requirements)
+    )
+    destination = tmp_path / "stage" / "site-packages"
+    install_requirements(
+        requirements_file,
+        destination,
+        context,
+        "linux",
+        arch,
+        python_version,
+        f"python:{python_version}-slim",
+        {"config": {"Env": [f"PYTHON_VERSION={full_version}"]}},
+    )
+    return {name for name, _ in staged_packages(destination)}
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("amd64", {"marker-amd", "marker-root-amd"}),
+        ("arm64", {"marker-arm", "marker-feat", "marker-root-arm"}),
+    ],
+)
+def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
+    tmp_path, arch, expected
+):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    # A context-local pip must not replace the builder's pip.
+    (tmp_path / "context").mkdir()
+    (tmp_path / "context" / "pip.py").write_text("raise SystemExit('shadowed pip')\n")
+    _write_named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            "marker-plain",
+            'marker-arm; platform_machine == "aarch64"',
+            'marker-amd; platform_machine == "x86_64"',
+            'marker-win; sys_platform == "win32"',
+            'marker-oldpy; python_version < "3.10"',
+            'marker-linux; platform_system == "Linux" and os_name == "posix"',
+            'marker-feat; extra == "feat" and platform_machine == "aarch64"',
+        ],
+        extras=["feat"],
+    )
+    for name in (
+        "marker-plain", "marker-arm", "marker-amd", "marker-win", "marker-oldpy",
+        "marker-linux", "marker-feat", "marker-root-arm", "marker-root-amd",
+    ):
+        _write_named_wheel(wheelhouse, name)
+
+    installed = _install_marker_fixture(
+        tmp_path,
+        [
+            "marker-root[feat]",
+            'marker-root-arm; platform_machine == "aarch64"',
+            'marker-root-amd; platform_machine == "x86_64"',
+        ],
+        arch,
+        "3.9",
+        "3.9.18",
+    )
+
+    assert installed == {
+        "marker-root", "marker-plain", "marker-oldpy", "marker-linux", *expected
+    }
+
+
+def test_requirements_install_keeps_markers_that_match_host_and_target(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            "marker-plain",
+            'marker-cpython; implementation_name == "cpython"',
+            'marker-full; python_full_version >= "3.11.0"',
+        ],
+    )
+    for name in ("marker-plain", "marker-cpython", "marker-full"):
+        _write_named_wheel(wheelhouse, name)
+
+    installed = _install_marker_fixture(
+        tmp_path, ["marker-root"], "amd64", "3.11", "3.11.8"
+    )
+
+    assert installed == {"marker-root", "marker-plain", "marker-cpython", "marker-full"}
+
+
+def test_requirements_install_without_markers_needs_no_full_python_version(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=["marker-plain"])
+    _write_named_wheel(wheelhouse, "marker-plain")
+
+    installed = _install_marker_fixture(tmp_path, ["marker-root"], "arm64", "3.11", "3.11")
+
+    assert installed == {"marker-root", "marker-plain"}
+
+
+@pytest.mark.parametrize(
+    ("requires", "requirement", "full_version", "variable"),
+    [
+        (['marker-kernel; platform_release >= "5"'], "marker-root", "3.11.8", "platform_release"),
+        ([], 'marker-root; python_full_version >= "3.11.1"', "3.11", "python_full_version"),
+    ],
+)
+def test_requirements_install_fails_closed_for_unknown_target_marker_values(
+    tmp_path, requires, requirement, full_version, variable
+):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=requires)
+    _write_named_wheel(wheelhouse, "marker-kernel")
+
+    with pytest.raises(ValueError, match=f"refusing to stage.*{variable}"):
+        _install_marker_fixture(tmp_path, [requirement], "arm64", "3.11", full_version)

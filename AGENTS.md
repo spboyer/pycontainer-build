@@ -149,6 +149,13 @@ must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
 `PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
+`dependencies.install_requirements` runs pip through `_pip_target.py`, which
+forces every `pip._vendor.packaging` marker evaluation (requirement-file roots,
+extras, transitive `Requires-Dist`) onto the target environment and fails
+closed on `platform_release`, `platform_version`, unknown variables, or
+`python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
+pip's vendored `packaging`; a self-test refuses to install if that changes.
+Virtualenv staging keeps the host's marker resolution.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

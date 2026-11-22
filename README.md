@@ -343,6 +343,13 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Environment markers in the requirements file and in transitive
+  `Requires-Dist` metadata are evaluated for the target (`linux`, the target
+  machine, CPython and the base image's Python version), not the build host.
+  Markers on `platform_release` or `platform_version`, and on
+  `python_full_version` when the base image does not declare a full
+  `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
+  is copied as resolved on its host, so its markers are not re-evaluated.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

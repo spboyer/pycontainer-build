@@ -1,6 +1,7 @@
 """Target-aware staging for Python runtime dependencies."""
 import configparser
 import csv
+import json
 import os
 import re
 import shlex
@@ -24,6 +25,11 @@ _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
+_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+_PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
+_MARKER_ERROR_EXIT = 86
+_PATCH_ERROR_EXIT = 87
+_MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
@@ -157,6 +163,29 @@ def validate_target_platform(os_name: str, arch: str) -> None:
         )
 
 
+def _target_marker_environment(
+    os_name: str, arch: str, python_version: str, base_config: Optional[dict]
+) -> dict:
+    """PEP 508 marker values for the target; omitted keys are unknown and fail closed."""
+    validate_target_platform(os_name, arch)
+    environment = {
+        "implementation_name": "cpython",
+        "os_name": "posix",
+        "platform_machine": _MARKER_MACHINES[arch],
+        "platform_python_implementation": "CPython",
+        "platform_system": "Linux",
+        "python_version": python_version,
+        "sys_platform": "linux",
+    }
+    full_version = _base_environment(base_config).get("PYTHON_VERSION", "")
+    if re.fullmatch(r"\d+\.\d+\.\d+", full_version) and (
+        ".".join(full_version.split(".")[:2]) == python_version
+    ):
+        environment["python_full_version"] = full_version
+        environment["implementation_version"] = full_version
+    return environment
+
+
 def install_requirements(
     requirements: Path,
     destination: Path,
@@ -170,15 +199,25 @@ def install_requirements(
     validate_requirements(requirements, context_dir)
 
     destination.mkdir(parents=True, exist_ok=True)
+    error_file = destination.parent / _MARKER_ERROR_FILE
+    marker_config = {
+        "environment": _target_marker_environment(
+            os_name, arch, python_version, base_config
+        ),
+        "error_file": str(error_file),
+    }
     command = [
         sys.executable,
-        "-m",
-        "pip",
+        "-c",
+        _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
+        json.dumps(marker_config),
         "install",
         "--disable-pip-version-check",
         "--no-input",
         "--no-cache-dir",
         "--no-compile",
+        # pip's conflict check evaluates markers of the host's installed packages.
+        "--no-warn-conflicts",
         "--target",
         str(destination),
         *_target_options(
@@ -225,6 +264,18 @@ def install_requirements(
             _stop_process(process)
             raise
 
+    if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
+        details = _read_marker_error(error_file)
+        if returncode == _MARKER_ERROR_EXIT:
+            raise ValueError(
+                "Cannot evaluate dependency environment markers for target "
+                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"incomplete dependency set. {details}"
+            )
+        raise RuntimeError(
+            "The builder's pip cannot evaluate environment markers for the target "
+            f"platform; refusing to use host markers. {details}"
+        )
     if returncode:
         raise RuntimeError(
             "Target dependency installation failed. Only wheels compatible with "
@@ -238,6 +289,15 @@ def install_requirements(
     _drop_external_record_entries(destination)
 
     _check_stage_limits(destination.parent)
+
+
+def _read_marker_error(error_file: Path) -> str:
+    try:
+        return error_file.read_text(encoding="utf-8", errors="replace")[:4096].strip()
+    except OSError:
+        return "No marker diagnostics were produced."
+    finally:
+        error_file.unlink(missing_ok=True)
 
 
 def _drop_external_record_entries(site_packages: Path) -> None:
