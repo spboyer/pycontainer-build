@@ -294,7 +294,7 @@ def test_cli_reads_tool_pycontainer_table_and_cli_overrides_it(tmp_path, monkeyp
     config_path = tmp_path / "pyproject.toml"
     config_path.write_text(
         '[project]\nname = "demo"\n\n[tool.ruff]\nline-length = 99\n\n'
-        '[tool.pycontainer]\nbase-image = "python:3.12-alpine"\nworkdir = "/srv"\n\n'
+        '[tool.pycontainer]\nbase-image = "python:3.12-alpine"\nworkdir = "/srv"\nplatform = "linux/amd64"\n\n'
         '[tool.pycontainer.env]\nMODE = "production"\n'
     )
 
