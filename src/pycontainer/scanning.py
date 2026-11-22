@@ -234,7 +234,7 @@ def _layers_match(reported, layers, diff_ids):
     return all(
         isinstance(item, dict) and item.get("digest") == diff_id
         and item.get("mediaType") == layer["mediaType"]
-        and isinstance(item.get("size"), int) and item["size"] >= 0
+        and type(item.get("size")) is int and item["size"] >= 0
         for item, layer, diff_id in zip(reported, layers, diff_ids)
     )
 
@@ -253,6 +253,7 @@ def _validate_document(doc, root, descriptor, platform, status, scanner_config):
                 or "sha256:" + hashlib.sha256(raw_manifest).hexdigest() != descriptor["digest"]
                 or "sha256:" + hashlib.sha256(raw_config).hexdigest() != manifest["config"]["digest"]
                 or f"{image_config['os']}/{image_config['architecture']}" != platform
+                or f"{target['os']}/{target['architecture']}" != platform
                 or not _layers_match(target["layers"], manifest["layers"],
                                      image_config["rootfs"]["diff_ids"])):
             raise ScanError("identity", "scanner did not attest the selected image")
@@ -268,6 +269,8 @@ def _validate_document(doc, root, descriptor, platform, status, scanner_config):
         for key in ("ignore", "exclude", "only-fixed", "only-notfixed", "vex-documents", "vex-add"):
             if key not in configuration or configuration[key]:
                 raise ScanError("scanner", f"report contains unexpected filtering: {key}")
+        if configuration.get("match-upstream-kernel-headers") is not True:
+            raise ScanError("scanner", "report did not disable default kernel-header ignores")
         if configuration.get("search", {}).get("scope") != "squashed":
             raise ScanError("scanner", "report has unverified layer scope")
         for key, value in scanner_config["db"].items():

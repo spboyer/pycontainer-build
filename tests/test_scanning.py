@@ -80,6 +80,8 @@ else:
     if mode.get('bad_config'): doc['source']['target']['config'] = 'not base64!'
     if mode.get('wrong_layer'): doc['source']['target']['layers'][-1]['digest'] = 'sha256:' + '1'*64
     if mode.get('missing_layer'): doc['source']['target']['layers'].pop()
+    if mode.get('bool_layer_size'): doc['source']['target']['layers'][-1]['size'] = True
+    if mode.get('wrong_target_arch'): doc['source']['target']['architecture'] = 'arm64'
     if mode.get('unknown_distro'): doc['distro']['name'] = 'unknown'
     if mode.get('ignored'): doc['ignoredMatches'] = [{'reason': 'ambient ignore'}]
     if mode.get('db_changed'):
@@ -93,6 +95,7 @@ else:
         # Real Grype 0.119.0 default: inject kernel-header ignore rules.
         cfg['ignore'] = cfg.get('ignore', []) + [{'package': {'name': 'linux-libc-dev', 'type': 'deb'},
                                                   'match-type': 'exact-indirect-match'}]
+    if mode.get('kernel_option_dropped'): cfg.pop('match-upstream-kernel-headers', None)
     print(json.dumps(doc))
 """,
         encoding="utf-8",
@@ -175,6 +178,8 @@ def test_policy_overrides(tmp_path, monkeypatch, scanner, policy):
     ({"wrong_digest": True}, "identity"),
     ({"mutate_snapshot": True}, "identity"),
     ({"wrong_layer": True}, "identity"), ({"missing_layer": True}, "identity"),
+    ({"bool_layer_size": True}, "identity"), ({"wrong_target_arch": True}, "identity"),
+    ({"kernel_option_dropped": True}, "scanner"),
     ({"ignored": True}, "scanner"),
 ])
 def test_operational_errors_never_authorize_push(tmp_path, monkeypatch, scanner, mode, category):
