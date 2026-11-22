@@ -24,16 +24,21 @@ def _required(name):
     return value
 
 
-def _verify(executable, key, subject):
+def _verify(executable, key, subject, *, attestation):
+    args = [executable, "verify"]
+    if attestation:
+        args = [
+            executable, "verify-attestation", "--new-bundle-format",
+            "--type", "slsaprovenance1",
+        ]
     try:
         return subprocess.run(
-            [executable, "verify-attestation", "--new-bundle-format", "--type", "slsaprovenance1",
-             "--key", key, "--", subject],
+            [*args, "--key", key, "--", subject],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=300, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        pytest.fail("The independent attestation verifier failed or timed out.")
+        pytest.fail("The independent verifier failed or timed out.")
 
 
 def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
@@ -67,7 +72,9 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
     builder.push(show_progress=False)
     subject = f"{registry}/{repo}@{builder.manifest_digest}"
 
-    result = _verify(executable, public_key, subject)
+    assert _verify(executable, public_key, subject, attestation=False).returncode == 0
+    assert _verify(executable, wrong_key, subject, attestation=False).returncode != 0
+    result = _verify(executable, public_key, subject, attestation=True)
     assert result.returncode == 0, "Independent cosign attestation verification failed."
     statements = parse_verified_attestations(result.stdout, builder.manifest_digest)
     assert builder.provenance_statement in statements
@@ -78,4 +85,4 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
         for envelope in envelopes
     ]
     assert (tmp_path / "out" / "provenance.intoto.json").read_bytes() in payloads
-    assert _verify(executable, wrong_key, subject).returncode != 0
+    assert _verify(executable, wrong_key, subject, attestation=True).returncode != 0
