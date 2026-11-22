@@ -99,6 +99,8 @@ builder's supported credential providers.
 
 ## Development
 
+Use Node.js 22.13 or later in the Node.js 22 line for the lint and packaging tools.
+
 From the repository root, install the core into the selected Python
 environment, then run the extension checks:
 
@@ -111,6 +113,12 @@ npm run lint
 npm test
 npm run package
 ```
+
+The extension compiles with TypeScript 7 (`@typescript/native`, which
+provides `tsc`). TypeScript 7 does not yet ship the compiler API that
+`typescript-eslint` requires, so the `typescript` package name is aliased to
+the `@typescript/typescript6` compatibility package for linting. Remove the
+alias once `typescript-eslint` supports TypeScript 7.
 
 `npm test` includes a dry-run smoke test of the exact Python module and
 arguments generated for the extension. The core package is not yet available

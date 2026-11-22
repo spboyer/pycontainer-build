@@ -2,6 +2,7 @@ import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
     HASH_CHUNK_SIZE as _HASH_CHUNK_SIZE,
@@ -262,6 +263,7 @@ class ImageBuilder:
 
         os_name, arch = parse_platform(self.config.platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
@@ -338,8 +340,9 @@ class ImageBuilder:
             json.dumps(index,separators=(',',':')).encode(),
         )
 
-        _, _, tag_name=parse_image_reference(self.config.tag)
-        _atomic_write_bytes(refs_dir/tag_name, manifest_digest.encode())
+        for tag_ref in self.config.all_tags():
+            _, _, tag_name=parse_image_reference(tag_ref)
+            _atomic_write_bytes(refs_dir/tag_name, manifest_digest.encode())
 
         self.manifest_digest=manifest_digest
         self.config_digest=cfg_digest
@@ -502,6 +505,10 @@ class ImageBuilder:
         
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
+        push_tags=[tag]
+        for tag_ref in self.config.all_tags()[1:]:
+            extra_tag=parse_image_reference(tag_ref)[2]
+            if extra_tag not in push_tags: push_tags.append(extra_tag)
         
         auth=get_registry_auth(
             registry,
@@ -534,14 +541,18 @@ class ImageBuilder:
         if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
         manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
         manifest_data=manifest_path.read_bytes()
-        client.push_manifest(tag, manifest_data)
-        
-        if show_progress: print(f"✓ Pushed {registry}/{repo}:{tag}")
+        for push_tag in push_tags:
+            client.push_manifest(push_tag, manifest_data)
+            if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
+        self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
+
         return f"{registry}/{repo}:{tag}"
     
     def _show_build_plan(self):
         """Display build plan for dry-run mode."""
         print(f"Build Plan for {self.config.tag}:")
+        if len(self.config.all_tags())>1:
+            print(f"  Tags: {', '.join(self.config.all_tags())}")
         print(f"  Base Image: {self.config.base_image}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
@@ -553,6 +564,8 @@ class ImageBuilder:
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
+        if self.config.system_packages:
+            print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
