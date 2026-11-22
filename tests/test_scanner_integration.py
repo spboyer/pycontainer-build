@@ -39,8 +39,8 @@ def _package(files, root, name, version):
 
 
 @pytest.mark.scanner_integration
-@pytest.mark.parametrize("whiteouts", [False, True])
-def test_real_generated_layout_os_python_and_whiteouts(tmp_path, monkeypatch, whiteouts):
+@pytest.mark.parametrize("whiteouts,report_format", [(False, "json"), (True, "json"), (False, "sarif")])
+def test_real_generated_layout_os_python_and_whiteouts(tmp_path, monkeypatch, whiteouts, report_format):
     required = ("PYCONTAINER_GRYPE", "PYCONTAINER_SCAN_DB_DIR", "PYCONTAINER_SCAN_DB_SHA256")
     missing = [key for key in required if not os.getenv(key)]
     if missing:
@@ -98,17 +98,26 @@ def test_real_generated_layout_os_python_and_whiteouts(tmp_path, monkeypatch, wh
         context_dir=str(context), output_dir=str(tmp_path / "output"),
         include_paths=["app.py"], include_deps=True, use_cache=False,
         scan=True, scan_executable=os.environ["PYCONTAINER_GRYPE"],
-        scan_db_dir=str(db_dir), scan_offline=True,
+        scan_db_dir=str(db_dir), scan_offline=True, scan_report_format=report_format,
         scan_db_max_age_hours=int(os.getenv("PYCONTAINER_SCAN_DB_MAX_AGE_HOURS", "120")),
     ))
     with pytest.raises(VulnerabilityFoundError):
         builder.build()
-    report = json.loads((tmp_path / "output" / "vulnerabilities.json").read_text())
-    packages = {match["artifact"]["name"].lower() for match in report["matches"]}
+    report = json.loads((tmp_path / "output" / f"vulnerabilities.{report_format}").read_text())
+    if report_format == "sarif":
+        run = report["runs"][0]
+        packages = {result["properties"]["package"]["name"].lower() for result in run["results"]}
+        metadata = run["properties"]
+        assert run["invocations"][0]["executionSuccessful"] is True
+    else:
+        packages = {match["artifact"]["name"].lower() for match in report["matches"]}
+        metadata = report["pycontainer"]
+        assert report["source"]["target"]["manifestDigest"] == builder.manifest_digest
     assert {"openssl", "requests"} <= packages, "controlled DB must match OS and staged Python fixtures"
     if whiteouts:
         assert "urllib3" not in packages and "jinja2" not in packages, "whiteouted packages must not be scanned"
     else:
         assert {"urllib3", "jinja2"} <= packages, "control must prove the removed packages were detectable"
-    assert report["pycontainer"]["database"]["digest"] == digest
-    assert report["source"]["target"]["manifestDigest"] == builder.manifest_digest
+    assert metadata["database"]["digest"] == digest
+    assert metadata["image_digest"] == builder.manifest_digest
+    assert metadata["scanner"]["version"] == "0.119.0" and metadata["scan_status"] == "complete"
