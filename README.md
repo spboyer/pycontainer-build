@@ -330,7 +330,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
 - `--include-deps` — Stage importable dependencies from a venv or install a
   requirements file as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
@@ -343,6 +343,49 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+
+### Local base images
+
+`--base-image` (and `base_image` in `[build]`) can read a base image from disk
+without a registry, credentials, or a Docker daemon:
+
+```bash
+# OCI image layout (for example `skopeo copy docker://python:3.11-slim oci:base:3.11-slim`)
+pycontainer build --tag app:v1 --base-image oci:./base:3.11-slim
+pycontainer build --tag app:v1 --base-image oci:./base@sha256:<manifest-digest>
+
+# A previous pycontainer output is itself an OCI layout
+pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./dist/v2
+
+# Uncompressed `docker save` archive (legacy and Docker 25+ formats)
+pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+- `oci:<path>[:<ref>]` selects an index entry by its
+  `org.opencontainers.image.ref.name` annotation (or `@sha256:<digest>`). The
+  reference may be omitted when the layout holds one image, or a set of images
+  that all carry platform metadata. Nested image indexes use the same exact
+  OS/architecture/variant selection as registry pulls.
+- `docker-archive:<path>[:<repo-tag>]` selects a `manifest.json` entry by
+  `RepoTags`, normalized like registry references (`python:3.11-slim` matches
+  `docker.io/library/python:3.11-slim`). The tag may be omitted when the archive
+  holds one image.
+- The path ends at the first `:` after an optional Windows drive prefix, so
+  paths containing `:` are not supported. Relative paths resolve against the
+  current directory, and the source must not overlap `--output`.
+- Every blob is checked against its digest and size, and every base layer is
+  checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
+  needs Python 3.14+). Unknown layer media types, unsafe or duplicate archive
+  members, sparse members, symlinked OCI layout blobs, archive links that
+  escape the archive, and
+  more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+- Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
+  are not supported; extract or decompress them first.
+- Dependency staging recognizes official Python images by name. For OCI layouts
+  the name comes from the `io.containerd.image.name` or ref-name annotation
+  (often only a tag such as `3.11-slim`), so such images need
+  `PYTHON_IMPLEMENTATION`, `PYTHON_VERSION`, and `PYTHON_LIBC` in their config
+  for `--include-deps`.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
