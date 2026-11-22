@@ -25,8 +25,10 @@ than sharing a credential-bearing host with untrusted jobs.
 
 The builder installs from immutable merged commit
 `7bdec100c773d9a51e5aae63eb0d4456894ae43f`, not PyPI; review pin updates before
-adopting a newer release. The Git plugin's `GIT_COMMIT` supplies the image
-tag after `checkout scm`. Shell or installation errors fail the stage,
+adopting a newer release. The Git plugin's `GIT_COMMIT`, set by the implicit
+declarative checkout, supplies the image tag; do not add
+`skipDefaultCheckout`, because an explicit `checkout scm` step does not
+populate `env.GIT_COMMIT`. Shell or installation errors fail the stage,
 and credentials are not included in cache or image paths.
 
 The default `~/.pycontainer/cache` is used (`USERPROFILE` on Windows).

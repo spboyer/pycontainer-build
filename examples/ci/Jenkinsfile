@@ -5,7 +5,6 @@ pipeline {
         choice(name: 'AGENT_LABEL', choices: ['linux', 'windows'], description: 'Agent with Python 3.11 and Git on PATH')
     }
     options {
-        skipDefaultCheckout(true)
         disableConcurrentBuilds()
         timeout(time: 20, unit: 'MINUTES')
     }
@@ -13,11 +12,7 @@ pipeline {
         IMAGE_REPOSITORY = 'registry.example.com/team/app'
     }
     stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
+        // The implicit declarative checkout sets env.GIT_COMMIT for the image tag.
         stage('Install builder') {
             steps {
                 script {
