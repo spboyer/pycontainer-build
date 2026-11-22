@@ -2,8 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
-MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
-ARM_V7_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/119"
+MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 
 
 def normalize_platforms(value: str) -> List[str]:
@@ -80,8 +79,7 @@ class BuildConfig:
                 raise ValueError(
                     "Multi-platform builds support only "
                     f"{', '.join(MULTI_PLATFORM_TARGETS)}; unsupported target(s): "
-                    f"{', '.join(unsupported)}. linux/arm/v7 support is tracked in "
-                    f"{ARM_V7_FOLLOW_UP}."
+                    f"{', '.join(unsupported)}."
                 )
             if self.generate_sbom:
                 raise ValueError(

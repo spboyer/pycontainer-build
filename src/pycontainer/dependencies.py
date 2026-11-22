@@ -23,7 +23,15 @@ INSTALL_TIMEOUT_SECONDS = 300
 _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
+    ("linux", "arm"): "manylinux2014_armv7l",
 }
+# 32-bit ARM wheels are tagged armv7l, so only the v7 variant may use them.
+_REQUIRED_VARIANTS = {("linux", "arm"): "v7"}
+SUPPORTED_TARGETS_TEXT = "linux/amd64, linux/arm64 and linux/arm/v7"
+_NO_SOURCE_FALLBACK = (
+    "Source builds and host binaries are never used as a fallback."
+)
+_ARMV7_WHEEL_NOTE = " Many packages do not publish armv7l wheels."
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
@@ -110,14 +118,10 @@ def _target_options(
     python_version: str,
     base_image: str = "python:3.11-slim",
     base_config: Optional[dict] = None,
+    variant: Optional[str] = None,
 ) -> List[str]:
-    try:
-        glibc_platform = _PIP_PLATFORMS[(os_name, arch)]
-    except KeyError as exc:
-        raise ValueError(
-            f"Dependency staging does not support target platform {os_name}/{arch}; "
-            "supported targets are linux/amd64 and linux/arm64."
-        ) from exc
+    validate_target_platform(os_name, arch, variant)
+    glibc_platform = _PIP_PLATFORMS[(os_name, arch)]
     repository, image_tag = _base_image_parts(base_image)
     libc = _base_environment(base_config).get("PYTHON_LIBC")
     if _is_official_python_image(repository):
@@ -149,11 +153,21 @@ def _target_options(
     ]
 
 
-def validate_target_platform(os_name: str, arch: str) -> None:
-    if (os_name, arch) not in _PIP_PLATFORMS:
+def _target_text(os_name: str, arch: str, variant: Optional[str]) -> str:
+    return f"{os_name}/{arch}" + (f"/{variant}" if variant else "")
+
+
+def validate_target_platform(
+    os_name: str, arch: str, variant: Optional[str] = None
+) -> None:
+    required = _REQUIRED_VARIANTS.get((os_name, arch))
+    if (os_name, arch) not in _PIP_PLATFORMS or (
+        required is not None and variant != required
+    ):
         raise ValueError(
-            f"Dependency staging does not support target platform {os_name}/{arch}; "
-            "supported targets are linux/amd64 and linux/arm64."
+            "Dependency staging does not support target platform "
+            f"{_target_text(os_name, arch, variant)}; supported targets are "
+            f"{SUPPORTED_TARGETS_TEXT}."
         )
 
 
@@ -166,8 +180,10 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
+    variant: Optional[str] = None,
 ) -> None:
     validate_requirements(requirements, context_dir)
+    target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
     command = [
@@ -182,7 +198,7 @@ def install_requirements(
         "--target",
         str(destination),
         *_target_options(
-            os_name, arch, python_version, base_image, base_config
+            os_name, arch, python_version, base_image, base_config, variant
         ),
         "-r",
         str(requirements),
@@ -218,7 +234,7 @@ def install_requirements(
                     _check_stage_limits(destination.parent)
                     if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
                         raise TimeoutError(
-                            f"Target dependency installation exceeded "
+                            f"Target dependency installation for {target} exceeded "
                             f"{INSTALL_TIMEOUT_SECONDS} seconds."
                         )
         except BaseException:
@@ -228,8 +244,9 @@ def install_requirements(
     if returncode:
         raise RuntimeError(
             "Target dependency installation failed. Only wheels compatible with "
-            f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
-            "are supported."
+            f"{target}, CPython {python_version}, and binary-only resolution "
+            f"are supported. {_NO_SOURCE_FALLBACK}"
+            + (_ARMV7_WHEEL_NOTE if arch == "arm" else "")
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -337,8 +354,9 @@ def stage_virtualenv(
     python_version: str,
     os_name: str,
     arch: str,
+    variant: Optional[str] = None,
 ) -> None:
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     files = list(dependencies)
     site_roots = set()
     for source, relative in files:

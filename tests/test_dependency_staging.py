@@ -520,3 +520,89 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
 
     with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+
+ARM_V7_CONFIG = {**BASE_CONFIG, "architecture": "arm", "variant": "v7"}
+
+
+def _arm_v7_builder(tmp_path, monkeypatch, context):
+    monkeypatch.setattr(
+        ImageBuilder,
+        "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], ARM_V7_CONFIG),
+    )
+    return ImageBuilder(
+        BuildConfig(
+            context_dir=str(context),
+            output_dir=str(tmp_path / "output"),
+            use_cache=False,
+            include_deps=True,
+            platform="linux/arm/v7",
+        )
+    )
+
+
+def test_arm_v7_maps_to_armv7l_wheel_tags_and_requires_variant():
+    assert _target_options("linux", "arm", "3.11", variant="v7")[1] == "manylinux2014_armv7l"
+    assert _target_options(
+        "linux", "arm", "3.11", "python:3.11-alpine", variant="v7"
+    )[1] == "musllinux_1_2_armv7l"
+    custom_config = {"config": {"Env": ["PYTHON_LIBC=glibc-2.17"]}}
+    assert _target_options(
+        "linux", "arm", "3.11", "example/python:custom", custom_config, variant="v7"
+    )[1] == "manylinux_2_17_armv7l"
+    assert "--only-binary=:all:" in _target_options("linux", "arm", "3.11", variant="v7")
+    for variant, target in ((None, "linux/arm;"), ("v6", "linux/arm/v6;")):
+        with pytest.raises(ValueError, match=target):
+            _target_options("linux", "arm", "3.11", variant=variant)
+
+
+def test_arm_v7_requirements_stage_only_armv7l_wheels(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_armv7l")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+    (tmp_path / "layers").mkdir()
+
+    layer = builder._create_deps_layer(
+        tmp_path / "layers", base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+    )
+
+    with tarfile.open(layer.tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+
+
+def test_arm_v7_missing_wheel_fails_without_source_fallback(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_x86_64")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+
+    with pytest.raises(RuntimeError, match=r"linux/arm/v7.*never used as a fallback.*armv7l"):
+        builder._create_deps_layer(
+            tmp_path / "layers", base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+        )
+
+
+def test_dependency_layer_rejects_conflicting_base_config_variant(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+
+    with pytest.raises(ValueError, match="does not match the requested target linux/arm/v7"):
+        builder._create_deps_layer(
+            tmp_path / "layers",
+            base_config={**ARM_V7_CONFIG, "variant": "v6"},
+            os_name="linux",
+            arch="arm",
+            variant="v7",
+        )

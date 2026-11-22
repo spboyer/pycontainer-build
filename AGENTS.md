@@ -140,8 +140,8 @@ These are known gaps, **not fixed behavior**:
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
 
-Dependency staging installs wheel-only requirements for `linux/amd64` and
-`linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
+Dependency staging installs wheel-only requirements for `linux/amd64`,
+`linux/arm64` and `linux/arm/v7` CPython targets (1 MiB requirements file, 300-second timeout,
 512 MiB staged size and 100,000 files); the builder interpreter must provide
 `pip`. Existing virtualenv staging accepts
 pure-Python packages only and rejects native binaries; its Python minor version
@@ -149,8 +149,11 @@ must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
 `PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
-Comma-separated `platform` values build an OCI image index for exactly
-`linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own
+Comma-separated `platform` values build an OCI image index for a subset of
+`linux/amd64`, `linux/arm64` and `linux/arm/v7`. arm/v7 requires the exact
+`v7` variant, uses `armv7l` wheel tags from the shared `_PIP_PLATFORMS` table
+in `dependencies.py` (keep #143 libc changes in that table), and never falls
+back to source builds; each platform gets its own
 base selection and dependency layer, and tags move only after the whole index
 verifies. A local `oci:` base must keep the same layout `index.json` across
 platforms. Multi-tag registry pushes are not atomic: a later tag failure can

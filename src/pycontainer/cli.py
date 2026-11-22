@@ -44,7 +44,7 @@ def main():
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
-    b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list (linux/amd64,linux/arm64) to build an OCI image index")
+    b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list of linux/amd64, linux/arm64 and linux/arm/v7 to build an OCI image index")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
     b.add_argument(
         "--sbom",

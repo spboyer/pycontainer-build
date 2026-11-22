@@ -37,17 +37,24 @@ def _base_layer(arch: str):
 class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
-    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None):
+    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, config_variants=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
-        for arch in platforms:
-            layer, diff_id = _base_layer(arch)
-            if arch == wrong_diff_id_arch:
+        for entry in platforms:
+            arch, _, variant = entry.partition("/")
+            layer, diff_id = _base_layer(entry.replace("/", "-"))
+            if entry == wrong_diff_id_arch:
                 diff_id = _digest(b"not the layer content")
+            platform = {"os": "linux", "architecture": arch}
+            if variant:
+                platform["variant"] = variant
+            # Real configs may omit the variant; the index descriptor is authoritative.
+            config_variant = (config_variants or {}).get(entry)
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
+                **({"variant": config_variant} if config_variant else {}),
                 "config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc"], "WorkingDir": "/"},
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
@@ -68,7 +75,7 @@ class FakeBaseRegistry:
                 "mediaType": MANIFEST_TYPE,
                 "digest": _digest(manifest),
                 "size": len(manifest),
-                "platform": {"os": "linux", "architecture": arch},
+                "platform": platform,
             })
         index = json.dumps({"schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": descriptors}).encode()
         self.index_digest = _digest(index)
@@ -190,9 +197,11 @@ def test_normalize_platforms_strips_and_dedupes():
         normalize_platforms("linux/amd64,,linux/arm64")
 
 
-@pytest.mark.parametrize("platform", ["linux/amd64,linux/arm/v7", "linux/amd64,linux/arm64/v8"])
+@pytest.mark.parametrize(
+    "platform", ["linux/amd64,linux/arm64/v8", "linux/amd64,linux/arm", "linux/amd64,linux/arm/v6"]
+)
 def test_multi_platform_rejects_unsupported_targets(platform):
-    with pytest.raises(ValueError, match="issues/119"):
+    with pytest.raises(ValueError, match="unsupported target"):
         BuildConfig(tag="app:v1", platform=platform)
 
 
@@ -258,7 +267,7 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
     registry = FakeBaseRegistry()
     installs = []
 
-    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config):
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, variant=None):
         installs.append((os_name, arch, base_config["architecture"]))
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
@@ -344,6 +353,90 @@ def test_push_rejects_layout_mutated_after_build(tmp_path, monkeypatch):
     arm64 = builder.platform_images[1]
     config_path = tmp_path / "out" / "blobs" / "sha256" / arm64.config_digest.split(":", 1)[1]
     config_path.write_bytes(config_path.read_bytes().replace(b'"arm64"', b'"amd64"'))
+    client = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+
+    with pytest.raises(LayerIntegrityError):
+        builder.push(show_progress=False)
+    assert client.calls == []
+
+
+ARM_SET = ("amd64", "arm64", "arm/v5", "arm/v6", "arm/v7")
+WITH_ARM = "linux/amd64,linux/arm64,linux/arm/v7"
+
+
+def test_arm_v7_index_selects_exact_variant_and_round_trips_it(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=ARM_SET)
+    installs = []
+
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, variant=None):
+        installs.append((arch, variant, base_config.get("variant")))
+        (site_packages / f"native_{arch}").mkdir(parents=True)
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    builder = _builder(
+        tmp_path, monkeypatch, registry, platform=WITH_ARM, include_deps=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+    builder.build()
+    out = tmp_path / "out"
+
+    assert installs == [("amd64", None, None), ("arm64", None, None), ("arm", "v7", "v7")]
+    index = json.loads(_blob(out, builder.index_digest))
+    assert [m["platform"] for m in index["manifests"]] == [
+        {"architecture": "amd64", "os": "linux"},
+        {"architecture": "arm64", "os": "linux"},
+        {"architecture": "arm", "os": "linux", "variant": "v7"},
+    ]
+    arm_layer, _ = _base_layer("arm-v7")
+    descriptor = index["manifests"][2]
+    manifest = json.loads(_blob(out, descriptor["digest"]))
+    config = json.loads(_blob(out, manifest["config"]["digest"]))
+    assert (config["os"], config["architecture"], config["variant"]) == ("linux", "arm", "v7")
+    assert manifest["layers"][0]["digest"] == _digest(arm_layer)
+    assert {m["layers"][-1]["digest"] for m in (
+        json.loads(_blob(out, d["digest"])) for d in index["manifests"]
+    )} == {builder.platform_images[0].layers[-1].digest}
+    top_level = [call[0] for call in registry.manifest_calls if call[0] in ("3.11-slim", registry.index_digest)]
+    assert top_level == ["3.11-slim", registry.index_digest, registry.index_digest]
+
+
+def test_arm_v7_base_config_variant_conflict_fails_before_publication(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=ARM_SET, config_variants={"arm/v7": "v6"})
+    builder = _builder(tmp_path, monkeypatch, registry, platform=WITH_ARM)
+
+    with pytest.raises(UnsupportedPlatformError, match="does not match index variant"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_arm_v7_missing_from_base_fails_without_fallback(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6"))
+    builder = _builder(tmp_path, monkeypatch, registry, platform=WITH_ARM)
+
+    with pytest.raises(UnsupportedPlatformError, match="no exact manifest for linux/arm/v7"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_arm_without_v7_variant_rejects_dependency_staging_before_pull(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=("arm/v6",))
+    builder = _builder(
+        tmp_path, monkeypatch, registry, platform="linux/arm/v6", include_deps=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+
+    with pytest.raises(ValueError, match="linux/arm/v6; supported targets"):
+        builder.build()
+    assert registry.manifest_calls == []
+
+
+def test_push_rejects_arm_v7_config_variant_mutated_after_build(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(platforms=ARM_SET), platform=WITH_ARM)
+    builder.build()
+    arm = builder.platform_images[2]
+    config_path = tmp_path / "out" / "blobs" / "sha256" / arm.config_digest.split(":", 1)[1]
+    config_path.write_bytes(config_path.read_bytes().replace(b'"variant":"v7"', b'"variant":"v6"'))
     client = FakePushClient()
     monkeypatch.setattr(builder_module, "RegistryClient", client)
 

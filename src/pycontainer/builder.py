@@ -507,6 +507,8 @@ class ImageBuilder:
         self._staged_packages=[]
         self._dependency_site_packages=False
         os_name, arch = parse_platform(platform)
+        if self.config.include_deps:
+            validate_target_platform(os_name, arch, parse_platform_variant(platform))
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
@@ -519,7 +521,11 @@ class ImageBuilder:
         app_layers=[]
         if self.config.include_deps:
             deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                layers_dir,
+                base_config=base_config,
+                os_name=os_name,
+                arch=arch,
+                variant=variant,
             )
             if deps_layer: app_layers.append(deps_layer)
         
@@ -557,6 +563,8 @@ class ImageBuilder:
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers])
+        if variant:
+            cfg["variant"]=variant
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -906,6 +914,7 @@ class ImageBuilder:
         base_config: Optional[Dict] = None,
         os_name: Optional[str] = None,
         arch: Optional[str] = None,
+        variant: Optional[str] = None,
     ) -> Optional[OCILayer]:
         """Create a target-compatible dependency layer from a venv or requirements."""
         ctx=Path(self.config.context_dir)
@@ -928,14 +937,17 @@ class ImageBuilder:
             )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
-        validate_target_platform(os_name, arch)
+        if variant is None:
+            variant = parse_platform_variant(self._requested_platform())
+        validate_target_platform(os_name, arch, variant)
         if base_config and (
             base_config.get("os") != os_name
             or base_config.get("architecture") != arch
+            or (variant is not None and base_config.get("variant") not in (None, variant))
         ):
             raise ValueError(
                 "Pulled base image platform does not match the requested "
-                f"target {os_name}/{arch}."
+                f"target {os_name}/{arch}" + (f"/{variant}" if variant else "") + "."
             )
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
         version = target_python_version(base_image_name, base_config)
@@ -953,10 +965,11 @@ class ImageBuilder:
                     version,
                     base_image_name,
                     base_config,
+                    variant=variant,
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch
+                    deps_paths, site_packages, version, os_name, arch, variant=variant
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")
