@@ -624,7 +624,14 @@ class ImageBuilder:
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch, base_config
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / requirements_relative,
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")

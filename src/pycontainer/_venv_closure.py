@@ -73,6 +73,8 @@ def main():
             or opposite.evaluate(probe)
             or unknown_variables != {"platform_release"}
             or marker_info(Marker('extra == "Foo_Bar"'))[1] != {"foo-bar"}
+            or not Marker('extra == "Foo_Bar"').evaluate(dict(probe, extra="foo-bar"))
+            or Marker('extra != "Foo_Bar"').evaluate(dict(probe, extra="foo-bar"))
         ):
             raise ClosureError("target marker self-test failed")
     except Exception as exc:
@@ -86,13 +88,6 @@ def main():
             problems.append(message)
 
     def active(requirement, extra, label):
-        variables, _ = requirement.info
-        unknown = sorted(variables - allowed)
-        if unknown:
-            raise ClosureError(
-                f"{label} requires {requirement.text!r}, whose marker uses "
-                f"{', '.join(unknown)} without a known target value"
-            )
         if requirement.parsed.marker is None:
             return extra == ""
         return requirement.parsed.marker.evaluate(dict(environment, extra=extra))
@@ -100,7 +95,7 @@ def main():
     def unsatisfied(requirement, label):
         parsed = requirement.parsed
         if parsed.url:
-            return f"{label} requires direct URL dependency {requirement.text!r}"
+            return f"{label} requires direct URL dependency {parsed.name!r}"
         installed = dists.get(canonicalize_name(parsed.name))
         if installed is None:
             return f"{label} requires {requirement.text!r}, which is not installed"
@@ -113,20 +108,33 @@ def main():
             )
         return None
 
+    def absent_from_host(requirement):
+        parsed = requirement.parsed
+        if parsed.url:
+            return False
+        installed = dists.get(canonicalize_name(parsed.name))
+        return installed is None or (
+            bool(parsed.specifier)
+            and not parsed.specifier.contains(installed["version"], prereleases=True)
+        )
+
     def python_compatible(specifiers):
         if full_version:
             return specifiers.contains(full_version, prereleases=True)
         minor = Version(target_minor).release[:2]
         for spec in specifiers:
             wildcard = spec.version.endswith(".*")
-            release = () if spec.operator == "===" else Version(
+            version = None if spec.operator == "===" else Version(
                 spec.version[:-2] if wildcard else spec.version
-            ).release
+            )
+            release = version.release if version else ()
             padded = (release + (0, 0))[:2]
             if spec.operator == "===" or (padded == minor and not (
-                (spec.operator in {">=", "<"} and not any(release[2:]))
+                (spec.operator in {">=", "<"} and not any(release[2:])
+                 and not (version.is_prerelease or version.is_postrelease or version.local))
                 or (spec.operator in {"==", "!="} and wildcard and len(release) <= 2)
-                or (spec.operator == "~=" and len(release) == 2)
+                or (spec.operator == "~=" and len(release) == 2
+                    and not (version.is_prerelease or version.is_postrelease or version.local))
             )):
                 raise ClosureError(
                     f"Requires-Python {spec} depends on the target patch version; "
@@ -141,7 +149,17 @@ def main():
                 self.parsed = Requirement(text)
                 self.info = marker_info(self.parsed.marker)
             except (InvalidRequirement, ClosureError) as exc:
-                raise ClosureError(f"{label} has malformed Requires-Dist {text!r}: {exc}")
+                raise ClosureError(f"{label} has malformed Requires-Dist") from exc
+            unknown = sorted(self.info[0] - allowed)
+            if unknown:
+                description = (
+                    f"direct URL dependency {self.parsed.name!r}"
+                    if self.parsed.url else repr(self.text)
+                )
+                raise ClosureError(
+                    f"{label} requires {description}, whose marker uses "
+                    f"{', '.join(unknown)} without a known target value"
+                )
 
     dists = {}
     try:
@@ -207,6 +225,25 @@ def main():
 
         selected = set()
         pending = [(key, "") for key in sorted(dists)]
+        for label, required, lines in request["roots"]:
+            requirements = [Parsed(text, label) for text in lines]
+            if not required and any(
+                not requirement.info[0] and absent_from_host(requirement)
+                for requirement in requirements
+            ):
+                continue
+            for requirement in requirements:
+                if not active(requirement, "", label):
+                    continue
+                message = unsatisfied(requirement, label)
+                if message:
+                    problem(message if required else (
+                        f"Cannot determine whether {label} was selected; {message}"
+                    ))
+                    continue
+                dependency = canonicalize_name(requirement.parsed.name)
+                for requested in sorted(requirement.parsed.extras):
+                    pending.append((dependency, canonicalize_name(requested)))
         while pending:
             key, extra = pending.pop()
             if (key, extra) in selected:
@@ -242,19 +279,23 @@ def main():
                     if requirement.info[0] == {"extra"}
                 ]
                 if any(
-                    active(requirement, extra, label) and unsatisfied(requirement, label)
+                    active(requirement, extra, label) and absent_from_host(requirement)
                     for requirement in invariant
                 ):
                     # The host venv would contain this dependency if the extra had been selected.
                     continue
                 for requirement in members:
-                    if requirement in invariant or not active(requirement, extra, label):
+                    if not active(requirement, extra, label):
                         continue
                     if unsatisfied(requirement, label):
+                        description = (
+                            f"direct URL dependency {requirement.parsed.name!r}"
+                            if requirement.parsed.url else repr(requirement.text)
+                        )
                         problem(
                             f"Cannot determine whether extra [{extra}] of "
                             f"{dist['name']} was selected when the virtualenv was "
-                            f"created; on the target it requires {requirement.text!r}, "
+                            f"created; on the target it requires {description}, "
                             "which is not satisfied"
                         )
                         break

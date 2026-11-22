@@ -1,4 +1,5 @@
 """Target-aware staging for Python runtime dependencies."""
+import codecs
 import configparser
 import csv
 import json
@@ -13,6 +14,8 @@ import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
+
+from .venv_markers import declared_roots
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -321,14 +324,25 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def validate_requirements(requirements: Path, context_dir: Path) -> None:
+def _read_requirements_text(path: Path) -> str:
+    data = path.read_bytes()
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
+def validate_requirements(
+    requirements: Path, context_dir: Path, check_overrides: bool = True
+) -> List[str]:
+    """Validate requirements files and return their root requirement lines."""
     context_root = context_dir.resolve()
-    pending = [requirements.resolve(strict=True)]
+    pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     total_bytes = 0
+    roots = []
     while pending:
-        path = pending.pop()
-        if path in visited:
+        path, constraint = pending.pop()
+        if (path, constraint) in visited:
             continue
         try:
             path.relative_to(context_root)
@@ -336,7 +350,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
             raise ValueError(
                 f"Requirements include must stay inside the build context: {path}"
             ) from exc
-        visited.add(path)
+        visited.add((path, constraint))
         size = path.stat().st_size
         total_bytes += size
         if total_bytes > MAX_REQUIREMENTS_BYTES:
@@ -347,7 +361,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
 
         logical_lines = []
         continuation = ""
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
+        for raw_line in _read_requirements_text(path).splitlines():
             if raw_line.rstrip().endswith("\\"):
                 continuation += raw_line.rstrip()[:-1] + " "
                 continue
@@ -365,25 +379,32 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 continue
             for option in options:
                 name = option.split("=", 1)[0]
-                if name in _PIP_OVERRIDE_OPTIONS:
+                if check_overrides and name in _PIP_OVERRIDE_OPTIONS:
                     raise ValueError(
                         f"Requirements files cannot override target install option {name}."
                     )
 
             include = None
+            include_constraint = constraint
             option = options[0]
             if option in {"-r", "--requirement", "-c", "--constraint"}:
                 if len(options) != 2:
                     raise ValueError(f"Invalid requirements include in {path}.")
                 include = options[1]
+                include_constraint |= option in {"-c", "--constraint"}
             elif option.startswith("--requirement="):
                 include = option.split("=", 1)[1]
             elif option.startswith("--constraint="):
                 include = option.split("=", 1)[1]
+                include_constraint = True
             elif option.startswith("-r") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
             elif option.startswith("-c") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
+                include_constraint = True
+            elif not option.startswith("-") and not constraint:
+                requirement = re.sub(r"(^|\s)#.*$", "", line)
+                roots.append(re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip())
 
             if include is not None:
                 if include.startswith(("http://", "https://", "file://")):
@@ -392,7 +413,8 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                         "use a local file inside the build context."
                     )
                 included_path = (path.parent / include).resolve(strict=True)
-                pending.append(included_path)
+                pending.append((included_path, include_constraint))
+    return roots
 
 
 def stage_virtualenv(
@@ -402,6 +424,8 @@ def stage_virtualenv(
     os_name: str,
     arch: str,
     base_config: Optional[dict] = None,
+    context_dir: Optional[Path] = None,
+    requirements: Optional[Path] = None,
 ) -> None:
     validate_target_platform(os_name, arch)
     files = list(dependencies)
@@ -437,7 +461,15 @@ def stage_virtualenv(
         shutil.copy2(source, target)
     _check_stage_limits(destination)
     _validate_wheel_metadata(destination, python_version)
-    _verify_target_closure(destination, os_name, arch, python_version, base_config)
+    _verify_target_closure(
+        destination,
+        os_name,
+        arch,
+        python_version,
+        base_config,
+        context_dir,
+        requirements,
+    )
 
 
 def _verify_target_closure(
@@ -446,8 +478,16 @@ def _verify_target_closure(
     arch: str,
     python_version: str,
     base_config: Optional[dict],
+    context_dir: Optional[Path],
+    requirements: Optional[Path],
 ) -> None:
     """Reject staged packages whose target-active requirements are not installed."""
+    root_lines = (
+        validate_requirements(requirements, context_dir, check_overrides=False)
+        if context_dir is not None and requirements is not None and requirements.is_file()
+        else []
+    )
+    roots = declared_roots(context_dir, root_lines) if context_dir is not None else []
     legacy = sorted(
         path.name
         for pattern in ("*.egg-info", "*.egg", "*.egg-link")
@@ -473,6 +513,8 @@ def _verify_target_closure(
         except UnicodeDecodeError as exc:
             raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
         message = Parser().parsestr(text, headersonly=True)
+        if message.defects:
+            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
         headers = {
             name: [str(value) for value in message.get_all(name, [])]
             for name in _CLOSURE_HEADERS
@@ -484,7 +526,7 @@ def _verify_target_closure(
                 "headers": headers,
             }
         )
-    if not distributions:
+    if not distributions and not any(lines for _, _, lines in roots):
         return
 
     request = {
@@ -492,6 +534,7 @@ def _verify_target_closure(
             os_name, arch, python_version, base_config
         ),
         "distributions": distributions,
+        "roots": roots,
     }
     try:
         result = subprocess.run(
@@ -519,7 +562,7 @@ def _verify_target_closure(
         outcome = json.loads(result.stdout)
     except ValueError:
         outcome = None
-    problems = outcome.get("problems", []) if isinstance(outcome, dict) else None
+    problems = outcome.get("problems") if isinstance(outcome, dict) else None
     if (
         not isinstance(outcome, dict)
         or "fatal" in outcome
@@ -536,7 +579,7 @@ def _verify_target_closure(
     if problems:
         raise ValueError(
             f"Virtualenv dependencies are incomplete or unverifiable for target "
-            f"{os_name}/{arch}, CPython {python_version}: "
+            f"{os_name}/{arch}, CPython {python_version}; refusing to stage: "
             + "; ".join(problems)
             + ". Use a requirements file so pip resolves dependencies for the target."
         )
@@ -544,7 +587,9 @@ def _verify_target_closure(
 
 def _validate_virtualenv_version(
     files: List[Tuple[Path, Path]], root: Tuple[str, ...], python_version: str
-) -> None:
+) -> bool:
+    """Reject a mismatched venv Python; return whether its version was established."""
+    established = False
     for _, relative in files:
         match = re.search(r"(?:^|/)python(\d+\.\d+)/site-packages/", relative.as_posix())
         if match and match.group(1) != python_version:
@@ -552,20 +597,27 @@ def _validate_virtualenv_version(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
+        established |= bool(match)
     if not files:
-        return
-    context_root = files[0][0]
-    for _ in root:
+        return established
+    source, relative = files[0]
+    context_root = source
+    for _ in relative.parts:
         context_root = context_root.parent
-    venv_config = context_root / "pyvenv.cfg"
-    if venv_config.is_file():
+    venv_dirs = [context_root.joinpath(*root[:index]) for index in range(len(root) - 1, 0, -1)]
+    venv_config = next(
+        (path / "pyvenv.cfg" for path in venv_dirs if (path / "pyvenv.cfg").is_file()), None
+    )
+    if venv_config is not None:
         text = venv_config.read_text(errors="replace")
-        match = re.search(r"(?im)^\s*version\s*=\s*(\d+\.\d+)", text)
+        match = re.search(r"(?im)^\s*version(?:_info)?\s*=\s*(\d+\.\d+)", text)
         if match and match.group(1) != python_version:
             raise ValueError(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
+        established |= bool(match)
+    return established
 
 
 def _validate_virtualenv_file(source: Path, relative: Path) -> None:

@@ -157,14 +157,16 @@ closed on `platform_release`, `platform_version`, unknown variables, or
 pip's vendored `packaging`; a self-test refuses to install if that changes.
 Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
-that every target-active `Requires-Dist` (transitive, versions, requested extras)
-and `Requires-Python` is satisfied, using the same target marker environment
-and pip's vendored `packaging`. It never imports staged packages and fails
-closed on unknown marker variables, `.egg-info`/`.egg`/`.egg-link`, missing or inconsistent
+target-active roots, transitive `Requires-Dist`, versions, extras, and
+`Requires-Python` using pip's vendored `packaging`; `venv_markers.py` collects
+project roots and checks unparsed sources. The verifier never imports staged
+packages and fails closed on unknown markers, egg distributions, invalid
 metadata, direct URLs, and patch-dependent `Requires-Python` without a full
-`PYTHON_VERSION`. Unrecorded top-level extras are not guessed: an extra with a
-missing target-only requirement fails unless one of its `extra`-only
-requirements is also missing. Loose modules without metadata stay unverified.
+`PYTHON_VERSION`. Assuming a consistent host venv, an unrecorded extra or
+optional group is ruled out only when an extra-only or unconditional group
+requirement is missing or has an incompatible version. Loose modules without
+metadata remain unverified; host-only packages remain staged. Unparsed root
+sources with host markers and unreadable dynamic dependencies fail closed.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

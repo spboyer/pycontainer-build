@@ -349,18 +349,20 @@ pycontainer build \
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  is copied as resolved on its host, then its dependency closure is verified
-  for the target: every installed `.dist-info` must have readable `METADATA`,
-  and each `Requires-Dist` that is active on the target (including transitive
-  requirements, version specifiers, requested extras and `Requires-Python`)
-  must be satisfied by an installed package, or the build fails. Virtualenvs do
-  not record which top-level extras were selected, so an extra whose target-only
-  requirement is missing fails unless another of its marker-independent
-  requirements is also missing (proof that it was not installed). Direct URL
-  requirements, `.egg-info`/`.egg`/`.egg-link` distributions, and markers or
-  `Requires-Python` patch constraints whose target value is unknown also fail. Loose modules
-  without package metadata are copied unverified, and host-only packages
-  present in the virtualenv are still copied. Use a requirements file when a
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` is also checked. Every installed `.dist-info` needs valid
+  `METADATA`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. Assuming a consistent
+  host venv, one is ruled out only if an unconditional group requirement or
+  an extra-only requirement is missing or has an incompatible version;
+  otherwise missing target requirements fail. Host-only packages remain in
+  the image, and loose modules without package metadata are copied unverified.
+  `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies, and
+  Poetry, PDM, Hatch, setuptools or Flit tables mentioning host markers fail,
+  as do unreadable dynamic dependencies. Use a requirements file when a
   virtualenv cannot be verified.
 
 **Context Selection**:
