@@ -161,7 +161,8 @@ dependencies, dependency groups) and installed `Requires-Dist`/egg-info
 `requires.txt` are re-evaluated for each target, failing on missing,
 unknown-marker, or possibly-requested extra/group requirements. An extra is
 ruled out only if every Windows/Linux/macOS CPython host of the venv minor
-would have installed one of its missing requirements; `python_version` is
+(narrowed to posix or Windows by the `lib/pythonX.Y` or `Lib` site-packages
+layout) would have installed one of its missing requirements; `python_version` is
 shared only when the venv minor is established (`python3.X` path or
 `pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
 root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic

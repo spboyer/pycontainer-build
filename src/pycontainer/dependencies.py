@@ -15,7 +15,7 @@ from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
-from .venv_markers import declared_roots, verify_virtualenv_markers
+from .venv_markers import declared_roots, venv_layout_os, verify_virtualenv_markers
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -466,6 +466,7 @@ def stage_virtualenv(
         context_dir,
         requirements,
         version_established,
+        venv_layout_os(root),
     )
 
 
@@ -478,6 +479,7 @@ def _verify_virtualenv_targets(
     context_dir: Optional[Path],
     requirements: Optional[Path],
     version_established: bool,
+    host_os_name: Optional[str] = None,
 ) -> None:
     root_lines = (
         validate_requirements(requirements, context_dir, check_overrides=False)
@@ -490,6 +492,7 @@ def _verify_virtualenv_targets(
         _target_marker_environment(os_name, arch, python_version, base_config),
         roots,
         shared_python_version=version_established,
+        host_os_name=host_os_name,
     )
     if errors:
         shown = "; ".join(errors[:10])

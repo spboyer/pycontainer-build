@@ -668,8 +668,8 @@ def test_requirements_install_fails_closed_for_unknown_target_marker_values(
         _install_marker_fixture(tmp_path, [requirement], "arm64", "3.11", full_version)
 
 
-def _write_venv(context, dists, pyvenv="version = 3.11.7\n"):
-    site_packages = context / ".venv" / "Lib" / "site-packages"
+def _write_venv(context, dists, pyvenv="version = 3.11.7\n", lib=("Lib",)):
+    site_packages = context.joinpath(".venv", *lib, "site-packages")
     site_packages.mkdir(parents=True, exist_ok=True)
     (context / ".venv" / "pyvenv.cfg").write_text(pyvenv)
     for name, headers in dists.items():
@@ -902,3 +902,28 @@ def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
 
     with pytest.raises(ValueError, match="venv-egg requires venv-fast"):
         _stage_venv(tmp_path, monkeypatch, context)
+
+@pytest.mark.parametrize(
+    ("lib", "fails"), [(("lib", "python3.11"), False), (("Lib",), True)]
+)
+def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
+    tmp_path, monkeypatch, lib, fails
+):
+    context = tmp_path / "context"
+    _write_venv(
+        context,
+        {
+            "venv-root": [
+                "Provides-Extra: uvloop",
+                'Requires-Dist: venv-uvloop; sys_platform != "win32" and extra == "uvloop"',
+            ]
+        },
+        lib=lib,
+    )
+    (context / "requirements.txt").write_text("venv-root\n")
+
+    if fails:
+        with pytest.raises(ValueError, match="extra 'uvloop' of venv-root"):
+            _stage_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_venv(tmp_path, monkeypatch, context) is not None
