@@ -623,6 +623,11 @@ def _validate_virtualenv_version(
 def _validate_virtualenv_file(source: Path, relative: Path) -> None:
     if source.is_symlink():
         raise ValueError(f"Symlinked virtualenv dependencies are unsupported: {relative}")
+    if source.name == "direct_url.json" and source.parent.name.endswith(".dist-info"):
+        raise ValueError(
+            "Virtualenv direct URL metadata is unsupported because it can contain "
+            f"credentials: {relative}. Use a requirements file instead."
+        )
     suffix = source.suffix.lower()
     if suffix in _NATIVE_SUFFIXES or ".so." in source.name.lower():
         raise ValueError(

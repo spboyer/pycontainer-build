@@ -821,10 +821,9 @@ def test_virtualenv_accepts_complete_closure_and_unselected_extras(tmp_path, mon
             [
                 "Requires-Dist: Middle[Fast_Mode]>=1.0",
                 "Provides-Extra: socks",
-                'Requires-Dist: pysocks; extra == "socks"',
-                'Requires-Dist: linux-socks; extra == "socks" and sys_platform == "linux"',
+                'Requires-Dist: pysocks; extra == "socks" and sys_platform == "win32"',
                 "Provides-Extra: test",
-                'Requires-Dist: pytest; extra == "test"',
+                'Requires-Dist: pytest; extra == "test" and sys_platform == "win32"',
             ],
         ),
         (
@@ -994,7 +993,7 @@ def test_virtualenv_project_dependency_markers_are_verified(tmp_path, monkeypatc
                 'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
             ],
             "",
-            None,
+            "Cannot determine whether extra [speed]",
         ),
         (
             [
@@ -1181,6 +1180,14 @@ def test_virtualenv_optional_roots_fail_when_selection_is_unknown(tmp_path, monk
         '[project.optional-dependencies]\n'
         'speed = ["not-installed", "venv-linux; sys_platform == \'linux\'"]\n'
     )
+    with pytest.raises(ValueError, match="Cannot determine whether .*speed.*not-installed"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+    pyproject.write_text(
+        '[project]\nname = "app"\n'
+        '[project.optional-dependencies]\n'
+        'speed = ["not-installed; sys_platform == \'win32\'"]\n'
+    )
     assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
 
 
@@ -1205,15 +1212,28 @@ def test_virtualenv_errors_do_not_disclose_direct_url_credentials(tmp_path, monk
         _stage_base_venv(tmp_path, monkeypatch, context)
     assert "secret" not in str(error.value)
 
-def test_virtualenv_unrecorded_extra_with_direct_url_is_unverifiable(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match=r"Cannot determine whether extra \[speed\]") as error:
+@pytest.mark.parametrize("marker", ['extra == "speed"', 'sys_platform == "win32"'])
+def test_virtualenv_unrecorded_extra_with_direct_url_is_unverifiable(
+    tmp_path, monkeypatch, marker
+):
+    with pytest.raises(ValueError, match="direct URL dependency") as error:
         _stage_venv(tmp_path, monkeypatch, [
             ("app-lib", "1.0", [
                 "Provides-Extra: speed",
-                'Requires-Dist: direct @ https://user:secret@example.invalid/package.whl ; extra == "speed"',
+                f"Requires-Dist: direct @ https://user:secret@example.invalid/package.whl ; {marker}",
             ]),
             ("direct", "1.0", []),
         ])
+    assert "secret" not in str(error.value)
+
+def test_virtualenv_rejects_unverifiable_direct_url_metadata(tmp_path, monkeypatch):
+    site_packages = _write_venv(tmp_path / "context", [("good", "1.0", [])])
+    (site_packages / "good-1.0.dist-info" / "direct_url.json").write_text(
+        '{"url": "https://user:secret@example.invalid/good.whl"}'
+    )
+    builder = _builder(tmp_path, monkeypatch, context=tmp_path / "context", include_deps=True)
+    with pytest.raises(ValueError, match="direct URL metadata") as error:
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
     assert "secret" not in str(error.value)
 
 

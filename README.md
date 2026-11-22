@@ -355,14 +355,15 @@ pycontainer build \
   `Requires-Python` is also checked. Every installed `.dist-info` needs valid
   `METADATA`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
-  Virtualenvs do not record selected extras or groups. Assuming a consistent
-  host venv, one is ruled out only if an unconditional group requirement or
-  an extra-only requirement is missing or has an incompatible version;
-  otherwise missing target requirements fail. Host-only packages remain in
+  Virtualenvs do not record selected extras or groups. If an extra or group
+  may have been selected and its target requirements are not satisfied,
+  verification fails rather than guessing. Direct URL installation metadata
+  is rejected because it can contain credentials. Host-only packages remain in
   the image, and loose modules without package metadata are copied unverified.
   `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies, and
   Poetry, PDM, Hatch, setuptools or Flit tables mentioning host markers fail,
-  as do unreadable dynamic dependencies. Use a requirements file when a
+  as do unreadable dynamic dependencies. Unmarked declarations in those
+  unparsed sources are not verified. Use a requirements file when a
   virtualenv cannot be verified.
 
 **Context Selection**:

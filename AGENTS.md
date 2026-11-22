@@ -162,11 +162,12 @@ target-active roots, transitive `Requires-Dist`, versions, extras, and
 project roots and checks unparsed sources. The verifier never imports staged
 packages and fails closed on unknown markers, egg distributions, invalid
 metadata, direct URLs, and patch-dependent `Requires-Python` without a full
-`PYTHON_VERSION`. Assuming a consistent host venv, an unrecorded extra or
-optional group is ruled out only when an extra-only or unconditional group
-requirement is missing or has an incompatible version. Loose modules without
+`PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
+can contain credentials. Unrecorded extras and optional groups fail closed
+when their target-active requirements are unsatisfied. Loose modules without
 metadata remain unverified; host-only packages remain staged. Unparsed root
 sources with host markers and unreadable dynamic dependencies fail closed.
+Unmarked declarations in those unparsed sources are not verified.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

@@ -94,8 +94,6 @@ def main():
 
     def unsatisfied(requirement, label):
         parsed = requirement.parsed
-        if parsed.url:
-            return f"{label} requires direct URL dependency {parsed.name!r}"
         installed = dists.get(canonicalize_name(parsed.name))
         if installed is None:
             return f"{label} requires {requirement.text!r}, which is not installed"
@@ -107,16 +105,6 @@ def main():
                 f"{installed['name']} {installed['version']} is installed"
             )
         return None
-
-    def absent_from_host(requirement):
-        parsed = requirement.parsed
-        if parsed.url:
-            return False
-        installed = dists.get(canonicalize_name(parsed.name))
-        return installed is None or (
-            bool(parsed.specifier)
-            and not parsed.specifier.contains(installed["version"], prereleases=True)
-        )
 
     def python_compatible(specifiers):
         if full_version:
@@ -150,14 +138,14 @@ def main():
                 self.info = marker_info(self.parsed.marker)
             except (InvalidRequirement, ClosureError) as exc:
                 raise ClosureError(f"{label} has malformed Requires-Dist") from exc
+            if self.parsed.url:
+                raise ClosureError(
+                    f"{label} declares direct URL dependency {self.parsed.name!r}"
+                )
             unknown = sorted(self.info[0] - allowed)
             if unknown:
-                description = (
-                    f"direct URL dependency {self.parsed.name!r}"
-                    if self.parsed.url else repr(self.text)
-                )
                 raise ClosureError(
-                    f"{label} requires {description}, whose marker uses "
+                    f"{label} requires {self.text!r}, whose marker uses "
                     f"{', '.join(unknown)} without a known target value"
                 )
 
@@ -227,11 +215,6 @@ def main():
         pending = [(key, "") for key in sorted(dists)]
         for label, required, lines in request["roots"]:
             requirements = [Parsed(text, label) for text in lines]
-            if not required and any(
-                not requirement.info[0] and absent_from_host(requirement)
-                for requirement in requirements
-            ):
-                continue
             for requirement in requirements:
                 if not active(requirement, "", label):
                     continue
@@ -273,29 +256,14 @@ def main():
                     for requirement in dist["requirements"]
                     if "extra" in requirement.info[0]
                 ]
-                invariant = [
-                    requirement
-                    for requirement in members
-                    if requirement.info[0] == {"extra"}
-                ]
-                if any(
-                    active(requirement, extra, label) and absent_from_host(requirement)
-                    for requirement in invariant
-                ):
-                    # The host venv would contain this dependency if the extra had been selected.
-                    continue
                 for requirement in members:
                     if not active(requirement, extra, label):
                         continue
                     if unsatisfied(requirement, label):
-                        description = (
-                            f"direct URL dependency {requirement.parsed.name!r}"
-                            if requirement.parsed.url else repr(requirement.text)
-                        )
                         problem(
                             f"Cannot determine whether extra [{extra}] of "
                             f"{dist['name']} was selected when the virtualenv was "
-                            f"created; on the target it requires {description}, "
+                            f"created; on the target it requires {requirement.text!r}, "
                             "which is not satisfied"
                         )
                         break
