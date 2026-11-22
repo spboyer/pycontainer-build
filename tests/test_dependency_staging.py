@@ -14,6 +14,7 @@ import pytest
 
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.project import detect_conda_inputs
 from pycontainer.dependencies import (
     MAX_REQUIREMENTS_BYTES,
     _target_options,
@@ -84,6 +85,273 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
             **options,
         )
     )
+
+
+@pytest.mark.parametrize("signal", [
+    "environment.yml", "environment.yaml", "conda-lock.yml", "conda-meta",
+])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_conda_only_fails_before_pull(tmp_path, monkeypatch, signal, dry_run):
+    context = tmp_path / "context"
+    context.mkdir()
+    path = context / signal
+    if signal == "conda-meta":
+        path.mkdir()
+    else:
+        path.write_text("not even valid YAML")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
+        builder.build()
+    assert not Path(builder.config.output_dir).exists()
+
+
+@pytest.mark.parametrize("signal", [
+    "environment.yml", "environment.yaml", "conda-lock.yml", ".venv/conda-meta",
+])
+def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
+    tmp_path, monkeypatch, caplog, signal,
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    path = context / signal
+    if path.name == "conda-meta":
+        path.mkdir(parents=True)
+    else:
+        path.write_text("invalid YAML")
+    host = context / ".venv" / "Lib" / "site-packages"
+    host.mkdir(parents=True)
+    (host / "host.pyd").write_bytes(b"host binary")
+    requirements = context / "deps" / "export.txt"
+    requirements.parent.mkdir()
+    requirements.write_text("")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        requirements_file="deps\\export.txt", exclude_paths=["deps"],
+    )
+    installed = []
+
+    def install(path, destination, *args):
+        installed.append(path)
+        destination.mkdir(parents=True)
+        (destination / "pip_dep.py").write_text("value = 1\n")
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", install)
+    monkeypatch.setattr(
+        "pycontainer.builder.stage_virtualenv", lambda *args: pytest.fail("host staging"),
+    )
+    builder.build()
+
+    assert installed == [requirements]
+    assert len([record for record in caplog.records if "Conda inputs ignored" in record.message]) == 1
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/pip_dep.py" in archive.getnames()
+    with tarfile.open(builder.layers[1].tar_path) as archive:
+        assert "app/app.py" in archive.getnames()
+        assert not any(".venv" in name or "/deps/" in name for name in archive.getnames())
+
+
+@pytest.mark.parametrize("include", [None, ["."], ["app.py", "local/Lib"], ["app.py", "local"]])
+def test_no_deps_build_excludes_conda_prefix_even_without_defaults(
+    tmp_path, monkeypatch, caplog, include,
+):
+    context = tmp_path / "context"
+    prefix = context / "local"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "Lib").mkdir()
+    (prefix / "Lib" / "host.pyd").write_bytes(b"host binary")
+    (context / "app.py").write_text("print('app')\n")
+    (context / "environment.yml").write_text("invalid YAML")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_paths=include,
+        exclude_defaults=False,
+    )
+    builder.build()
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        names = archive.getnames()
+    assert "app/app.py" in names
+    assert not any("/local/" in name for name in names)
+    assert not [record for record in caplog.records if "Conda" in record.message]
+
+
+def test_conda_detection_respects_context_exclusions_and_path_types(tmp_path):
+    (tmp_path / "environment.yml").mkdir()
+    (tmp_path / "environment.yaml").write_text("invalid YAML")
+    (tmp_path / "conda-meta").write_text("not a directory")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "conda-lock.yml").write_text("ignored")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "environment.yml").write_text("invalid YAML")
+    (tmp_path / ".venv" / "conda-meta").mkdir(parents=True)
+    assert detect_conda_inputs(tmp_path, exclude_paths=["nested"]) == [
+        Path(".venv/conda-meta"), Path("environment.yaml"),
+    ]
+
+
+def test_conda_detection_independent_of_app_selection(tmp_path, monkeypatch):
+    (tmp_path / "environment.yml").write_text("invalid YAML")
+    (tmp_path / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        include_paths=["app.py"],
+    )
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+
+@pytest.mark.parametrize("selected", [
+    "environment.yml", "../requirements.txt", "C:\\requirements.txt", "folder",
+])
+def test_conda_rejects_invalid_selected_pip_input(tmp_path, monkeypatch, selected):
+    (tmp_path / "environment.yml").write_text("invalid YAML")
+    (tmp_path / "folder").mkdir()
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        requirements_file=selected,
+    )
+    monkeypatch.setattr(
+        "pycontainer.builder.install_requirements", lambda *args: pytest.fail("pip"),
+    )
+    with pytest.raises(ValueError):
+        builder.build()
+
+
+def test_root_conda_prefix_requires_source_only_context(tmp_path, monkeypatch):
+    (tmp_path / "conda-meta").mkdir()
+    (tmp_path / "app.py").write_text("print('app')\n")
+    builder = _builder(tmp_path / "run", monkeypatch, context=tmp_path)
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+    with pytest.raises(ValueError, match="source-only build context"):
+        builder.build()
+
+
+@pytest.mark.parametrize("signal", [
+    "environment.yml", "environment.yaml", "conda-lock.yml",
+])
+def test_no_deps_conda_descriptors_do_not_install_or_warn(
+    tmp_path, monkeypatch, caplog, signal,
+):
+    (tmp_path / signal).write_text("invalid YAML")
+    (tmp_path / "app.py").write_text("print('app')\n")
+    builder = _builder(tmp_path / "run", monkeypatch, context=tmp_path)
+    monkeypatch.setattr(builder, "_create_deps_layer", lambda *args, **kwargs: pytest.fail("staging"))
+    builder.build()
+    assert len(builder.layers) == 1
+    assert not [record for record in caplog.records if "Conda" in record.message]
+
+
+def test_excluded_conda_descriptor_does_not_change_ordinary_venv_selection(
+    tmp_path, monkeypatch, caplog,
+):
+    (tmp_path / "environment.yml").write_text("invalid YAML")
+    host = tmp_path / ".venv" / "Lib" / "site-packages"
+    host.mkdir(parents=True)
+    (host / "pure.py").write_text("value = 1\n")
+    (tmp_path / "requirements.txt").write_text("")
+    (tmp_path / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        exclude_paths=["environment.yml"],
+    )
+    monkeypatch.setattr("pycontainer.builder.install_requirements", lambda *args: pytest.fail("pip"))
+    builder.build()
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/pure.py" in archive.getnames()
+    assert not [record for record in caplog.records if "Conda" in record.message]
+
+
+def test_conda_prefix_cannot_be_staged_when_signal_is_excluded(tmp_path, monkeypatch):
+    host = tmp_path / ".venv" / "Lib" / "site-packages"
+    host.mkdir(parents=True)
+    (host / "pure.py").write_text("value = 1\n")
+    (tmp_path / ".venv" / "conda-meta").mkdir()
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        exclude_paths=[".venv/conda-meta"],
+    )
+    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+
+def test_conda_signal_rejects_ordinary_venv_without_exported_requirements(tmp_path, monkeypatch):
+    (tmp_path / "environment.yml").write_text("invalid YAML")
+    host = tmp_path / ".venv" / "Lib" / "site-packages"
+    host.mkdir(parents=True)
+    (host / "pure.py").write_text("value = 1\n")
+    builder = _builder(tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True)
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+
+def test_requirements_inside_conda_prefix_are_not_used(tmp_path, monkeypatch):
+    prefix = tmp_path / "local"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "requirements.txt").write_text("")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        requirements_file="local/requirements.txt",
+    )
+    with pytest.raises(ValueError, match="host Conda environments are never copied"):
+        builder.build()
+
+
+def test_conda_and_pip_dry_run_warns_without_installing(tmp_path, monkeypatch, caplog):
+    (tmp_path / "environment.yml").write_text("invalid YAML")
+    (tmp_path / "requirements.txt").write_text("")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True, dry_run=True,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+    monkeypatch.setattr("pycontainer.builder.install_requirements", lambda *args: pytest.fail("pip"))
+    assert builder.build() == builder.config.tag
+    assert len([record for record in caplog.records if "Conda inputs ignored" in record.message]) == 1
+
+
+def _symlink_or_skip(link, target, *, directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as error:
+        pytest.skip(f"Symlinks unavailable: {error}")
+
+
+@pytest.mark.parametrize("include", [
+    [".", "alias", "alias.pyd"], ["app.py", "alias"], ["app.py", "alias.pyd"],
+])
+def test_conda_prefix_symlink_aliases_never_enter_app_layer(tmp_path, monkeypatch, include):
+    context = tmp_path / "context"
+    context.mkdir()
+    outside = tmp_path / "host-env"
+    (outside / "conda-meta").mkdir(parents=True)
+    binary = outside / "host.pyd"
+    binary.write_bytes(b"host binary")
+    (context / "app.py").write_text("print('app')\n")
+    _symlink_or_skip(context / "alias.pyd", binary)
+    _symlink_or_skip(context / "alias", outside, directory=True)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, exclude_defaults=False,
+        include_paths=include,
+    )
+    builder.build()
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert archive.getnames() == ["app/app.py"]
+
+
+def test_conda_rejects_requirements_symlink_outside_context(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "environment.yml").write_text("invalid YAML")
+    outside = tmp_path / "export.txt"
+    outside.write_text("")
+    _symlink_or_skip(context / "requirements.txt", outside)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    with pytest.raises(ValueError, match="stay inside the build context"):
+        builder.build()
 
 
 def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):

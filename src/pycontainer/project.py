@@ -1,4 +1,4 @@
-import tomllib, re
+import tomllib, re, os
 from pathlib import Path
 from typing import List, Tuple
 from .fs_utils import (
@@ -7,7 +7,39 @@ from .fs_utils import (
     iter_files,
     path_is_excluded,
     relative_context_path,
+    conda_prefix,
+    _raise_walk_error,
 )
+
+CONDA_FILES = ("environment.yml", "environment.yaml", "conda-lock.yml")
+
+
+def detect_conda_inputs(context_dir, *, exclude_paths=(), exclude_defaults=True):
+    """Detect supported Conda signal names, without parsing environment files."""
+    ctx = Path(context_dir)
+    excludes = [
+        path for path in DEFAULT_CONTEXT_EXCLUDES if path not in VIRTUALENV_EXCLUDES
+    ] if exclude_defaults else []
+    excludes.extend(exclude_paths)
+    signals = []
+    for root, directories, filenames in os.walk(ctx, onerror=_raise_walk_error):
+        root_path = Path(root)
+        relative = root_path.relative_to(ctx)
+        metadata = relative / "conda-meta"
+        if "conda-meta" in directories:
+            if not path_is_excluded(metadata, excludes):
+                signals.append(metadata)
+            directories[:] = []
+        else:
+            directories[:] = sorted(
+                directory for directory in directories
+                if not path_is_excluded(relative / directory, excludes)
+            )
+        for name in CONDA_FILES:
+            path = relative / name
+            if name in filenames and not path_is_excluded(path, excludes):
+                signals.append(path)
+    return sorted(signals, key=lambda path: path.as_posix())
 
 def detect_python_version(context_dir):
     """Detect Python version from pyproject.toml requires-python field."""
@@ -63,6 +95,7 @@ def find_dependencies(
     *,
     exclude_paths=None,
     exclude_defaults=True,
+    prefer_requirements=False,
 ) -> List[Tuple[Path, Path]]:
     """Find dependency files to include in dependency layer."""
     ctx=Path(context_dir); deps=[]
@@ -77,6 +110,10 @@ def find_dependencies(
     )
     if exclude_paths is not None:
         excludes.extend(exclude_paths)
+    requirements_relative=relative_context_path(requirements_file)
+    req_path=ctx/requirements_relative
+    if prefer_requirements and req_path.is_file():
+        return [(req_path, requirements_relative)]
     
     venv_dirs=['venv','.venv','env']
     for venv in venv_dirs:
@@ -99,9 +136,7 @@ def find_dependencies(
                 break
     
     if not deps:
-        requirements_relative=relative_context_path(requirements_file)
-        req_path=ctx/requirements_relative
-        if req_path.exists():
+        if req_path.is_file() and conda_prefix(ctx, requirements_relative) is None:
             deps.append((req_path, requirements_relative))
     
     return deps

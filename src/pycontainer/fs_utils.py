@@ -104,6 +104,21 @@ def _raise_walk_error(error):
     raise error
 
 
+def conda_prefix(base, relative):
+    """Find a Conda prefix containing a context path without reading metadata."""
+    base = Path(base)
+    relative = relative_context_path(relative)
+    for parent in (relative, *relative.parents):
+        if (base / parent / "conda-meta").is_dir():
+            return parent
+    resolved = (base / relative).resolve()
+    if resolved != base.absolute() / relative:
+        for parent in (resolved, *resolved.parents):
+            if (parent / "conda-meta").is_dir():
+                return parent
+    return None
+
+
 def context_exclude_paths(
     context_dir,
     *,
@@ -139,6 +154,8 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
     seen = set()
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
+        if conda_prefix(base, relative) is not None:
+            continue
         absolute = base / relative
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
@@ -150,6 +167,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
+                    and conda_prefix(base, root_relative / directory) is None
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename
@@ -157,6 +175,10 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     relative_name = child_relative.as_posix()
                     if (
                         child.is_file()
+                        and (
+                            not child.is_symlink()
+                            or conda_prefix(base, child_relative) is None
+                        )
                         and relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)
                     ):

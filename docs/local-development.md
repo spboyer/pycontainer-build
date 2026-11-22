@@ -107,6 +107,47 @@ pycontainer build \
 # 4. Combine everything into a complete image
 ```
 
+### Conda Projects
+
+Conda staging is unsupported. Detection checks names only: `environment.yml`,
+`environment.yaml`, `conda-lock.yml`, and `conda-meta/` directories anywhere in
+the selected build context. It does not parse YAML, run Conda, or inspect the
+active host environment. Application include paths do not limit dependency
+detection; excluded tests, fixtures, generated output/cache directories, and
+explicitly excluded descendants do not trigger it. Conventional virtualenv
+directories are checked because they may actually contain Conda environments.
+
+With `--include-deps`, detected Conda inputs without a supported selected pip
+requirements file raise an explicit error before pulling the base image, also
+in dry-run. When both are present, the selected pip requirements file wins over
+virtualenv discovery and a warning explains that Conda inputs are ignored.
+`--requirements` remains relative to the context and can select an exported
+file excluded from the application layer. Selecting a Conda YAML file as pip
+requirements is rejected, not passed to pip.
+
+Export the pip-compatible portion from your Conda environment, then build from
+your application source directory:
+
+```bash
+python -m pip freeze > requirements.txt
+python -m pycontainer.cli build --tag myapp:latest --include-deps --requirements requirements.txt
+```
+
+Review the export: remove host-local paths and ensure requirements resolve to
+target-compatible wheels. `pip freeze` is not a conversion of Conda-only
+packages or native/system libraries; provide those in a compatible base image.
+No YAML resolution or full Conda staging is implemented; that work is tracked
+in [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+Without `--include-deps`, a source project containing Conda descriptors still
+builds application-only, without dependency warnings or installation. Nested
+host Conda prefixes (directories containing `conda-meta/`) are always omitted
+from application and virtualenv dependency selection, including explicit
+includes and `--no-default-excludes`. A context that is itself a host Conda
+prefix is rejected: choose a source-only context instead of the environment
+directory. This protects against copying host binaries, not a guarantee that
+an application-only image has all dependencies needed to run.
+
 ### Preview Before Building
 
 ```bash
