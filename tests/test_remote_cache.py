@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -14,7 +15,13 @@ from pathlib import Path
 import pytest
 
 from pycontainer import remote_cache
-from pycontainer.auth import RegistryAuth
+from pycontainer import auth as auth_module
+from pycontainer.auth import (
+    AzureCLIAuthProvider,
+    ChainAuthProvider,
+    EnvironmentAuthProvider,
+    RegistryAuth,
+)
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.registry_client import (
@@ -494,6 +501,121 @@ def test_cache_credentials_stay_on_cache_host_and_off_storage(tmp_path, registry
     assert storage and all(auth is None for *_, auth in storage)
     cache_requests = [r for r in registry.requests if r[0] == CACHE_HOST]
     assert all(auth == CACHE_AUTH for *_, auth in cache_requests)
+
+
+@pytest.mark.parametrize("option", ["cache_from", "cache_to"])
+@pytest.mark.parametrize(
+    ("host", "authorization", "azure_calls"),
+    [
+        ("ghcr.io", "Bearer synthetic-github-token", 0),
+        ("ghcr.io.attacker.test", None, 0),
+        ("trusted.azurecr.io", "Bearer synthetic-azure-token", 1),
+        ("trusted.azurecr.io.attacker.test", None, 0),
+    ],
+)
+def test_cache_registry_credentials_are_scoped_to_the_actual_host(
+    tmp_path, monkeypatch, option, host, authorization, azure_calls
+):
+    for name in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD", "REGISTRY_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-github-token")
+    monkeypatch.setattr(
+        auth_module,
+        "get_default_auth_provider",
+        lambda **options: ChainAuthProvider([
+            EnvironmentAuthProvider(**options), AzureCLIAuthProvider()
+        ]),
+    )
+    azure_requests = []
+
+    def fake_azure(command, **kwargs):
+        azure_requests.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout='{"accessToken":"synthetic-azure-token"}'
+        )
+
+    monkeypatch.setattr(auth_module.subprocess, "run", fake_azure)
+    requests = []
+
+    def fake_open(request, timeout=None):
+        requests.append((request.full_url, request.get_header("Authorization")))
+        if request.get_method() in {"GET", "HEAD"}:
+            return _Response(404)
+        if request.get_method() == "POST":
+            return _Response(
+                202, headers={"Location": f"/v2/{CACHE_REPO}/blobs/uploads/1"}
+            )
+        return _Response(201)
+
+    monkeypatch.setattr("pycontainer.registry_client._open_url", fake_open)
+    builder = _builder(
+        tmp_path, "credentials", **{option: f"type=registry,ref={host}/{CACHE_REPO}"}
+    )
+    _app_layer(builder, tmp_path, "credentials")
+
+    assert requests
+    assert all(urllib.parse.urlsplit(url).netloc == host for url, _ in requests)
+    assert all(header == authorization for _, header in requests)
+    assert len(azure_requests) == azure_calls
+
+
+@pytest.mark.parametrize("option", ["cache_from", "cache_to"])
+@pytest.mark.parametrize("generic_auth", ["bearer", "basic", "both"])
+@pytest.mark.parametrize("scoped_cache_auth", [False, True])
+@pytest.mark.parametrize("image_registry", ["push.example", CACHE_HOST])
+def test_cache_ignores_generic_environment_credentials(
+    tmp_path, registry, monkeypatch, option, generic_auth, scoped_cache_auth, image_registry
+):
+    _export(tmp_path, registry)
+    registry.requests.clear()
+    if option == "cache_to":
+        registry.manifests.clear()
+    home = tmp_path / "home"
+    docker_dir = home / ".docker"
+    docker_dir.mkdir(parents=True)
+    auths = {
+        host: {"username": "cache-user", "password": "cache-pass"}
+        for host in ("push.example", f"{CACHE_HOST}:8443", f"{CACHE_HOST}.attacker.test")
+    }
+    if scoped_cache_auth:
+        auths[CACHE_HOST] = {"username": "cache-user", "password": "cache-pass"}
+    (docker_dir / "config.json").write_text(json.dumps({"auths": auths}))
+    monkeypatch.setattr(auth_module.Path, "home", lambda: home)
+    monkeypatch.setattr(remote_cache, "get_registry_auth", auth_module.get_registry_auth)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    for name in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD", "REGISTRY_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    if generic_auth in {"bearer", "both"}:
+        monkeypatch.setenv("REGISTRY_TOKEN", "synthetic-push-token")
+    if generic_auth in {"basic", "both"}:
+        monkeypatch.setenv("REGISTRY_USERNAME", "push-user")
+        monkeypatch.setenv("REGISTRY_PASSWORD", "synthetic-push-password")
+
+    push_auth = auth_module.get_registry_auth(image_registry)
+    if generic_auth == "basic":
+        assert (push_auth.username, push_auth.password) == (
+            "push-user", "synthetic-push-password"
+        )
+    else:
+        assert push_auth.bearer_token == "synthetic-push-token"
+
+    builder = _builder(
+        tmp_path, "credentials", tag=f"{image_registry}/team/app:latest", **{option: CACHE_SPEC}
+    )
+    if option == "cache_to" and not scoped_cache_auth:
+        with pytest.raises(RemoteCacheError, match="Failed to export"):
+            _app_layer(builder, tmp_path, "credentials")
+    else:
+        if option == "cache_from" and scoped_cache_auth:
+            _forbid_tar_build(monkeypatch)
+        _app_layer(builder, tmp_path, "credentials")
+
+    assert registry.requests
+    expected = CACHE_AUTH if scoped_cache_auth else None
+    assert all(host == CACHE_HOST for host, *_ in registry.requests)
+    assert all(header == expected for *_, header in registry.requests)
+    if option == "cache_to" and scoped_cache_auth:
+        assert registry.manifest_puts()
 
 
 def test_blob_redirect_to_plain_http_is_refused():

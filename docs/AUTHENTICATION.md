@@ -40,6 +40,22 @@ Push Request
         └─> Success
 ```
 
+### Remote cache requests
+
+Remote-cache import and export resolve credentials for the cache registry,
+independently of image push. They use `get_registry_auth` with
+`include_generic_environment=False`: `REGISTRY_TOKEN`, `REGISTRY_USERNAME`
+and `REGISTRY_PASSWORD` are ignored because they carry no registry identity,
+including when the cache and image registry are the same host. CLI image-push
+credentials are not passed to the cache.
+
+Host-scoped Docker configuration, GHCR's `GITHUB_TOKEN` and ACR's Azure CLI
+provider remain available. For other private cache registries, configure an
+exact registry entry in `~/.docker/config.json`. Without usable cache
+credentials, an unauthorized import warns and rebuilds locally; an
+unauthorized export fails explicitly. Normal image authentication continues
+to accept generic environment credentials.
+
 ## Components
 
 ### 1. Auth Providers (`src/pycontainer/auth.py`)

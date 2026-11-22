@@ -45,6 +45,9 @@ repository defines the trusted writers; digests prove integrity, not
 provenance. Import failures warn and rebuild; export publishes blobs before
 the tag and fails explicitly. Control-plane redirects drop `Authorization`
 across origins, and blob redirects must be HTTPS and carry no credentials.
+Cache auth excludes unscoped `REGISTRY_TOKEN` and `REGISTRY_USERNAME`/
+`REGISTRY_PASSWORD` environment credentials, including for same-host caches;
+use host-scoped Docker config, GHCR or ACR providers instead.
 S3, Azure Blob and GCS backends remain open in #61 and #34.
 
 ## Setup and verified checks

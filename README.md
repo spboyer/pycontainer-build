@@ -386,6 +386,14 @@ trusted writer whose layers are copied verbatim into your images. Use a
 dedicated cache repository that only trusted CI jobs can push to, and give
 pull-request or fork builds pull-only access. Records are not signed.
 
+Cache authentication uses host-scoped Docker configuration, `GITHUB_TOKEN`
+for GHCR, or Azure CLI credentials for ACR. It ignores `REGISTRY_TOKEN`,
+`REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, even when the cache and image
+registry are the same, because these environment variables do not identify
+their intended host. Image-push credentials and CLI username/password values
+are not reused for caching. Configure the cache registry in
+`~/.docker/config.json` or use its host-specific provider.
+
 Import is best-effort: a missing record is a quiet miss, and an invalid record,
 integrity failure, auth or network error logs a warning and rebuilds the layer
 locally. Export errors fail the build. Manifests and configs are size-bounded,

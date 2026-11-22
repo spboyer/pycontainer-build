@@ -220,7 +220,9 @@ class RegistryLayerCache:
     @property
     def client(self) -> RegistryClient:
         if self._client is None:
-            auth = get_registry_auth(self.ref.registry)
+            auth = get_registry_auth(
+                self.ref.registry, include_generic_environment=False
+            )
             self._client = RegistryClient(
                 self.ref.registry,
                 self.ref.repository,
