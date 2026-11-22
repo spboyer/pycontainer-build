@@ -1,0 +1,43 @@
+# Copy to .circleci/config.yml in the application repository.
+version: 2.1
+
+jobs:
+  build-image:
+    docker:
+      - image: cimg/python:3.11
+    environment:
+      IMAGE_REPOSITORY: registry.example.com/team/app
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pycontainer-linux-amd64-py311-v1-{{ .Branch }}-
+      - run:
+          name: Install builder
+          command: |
+            python -m venv .ci-venv
+            . .ci-venv/bin/activate
+            python -m pip install --no-deps "git+https://github.com/spboyer/pycontainer-build.git@7bdec100c773d9a51e5aae63eb0d4456894ae43f"
+      - run:
+          name: Build and push
+          command: |
+            set -eu
+            set +x
+            : "${REGISTRY_USERNAME:?Set REGISTRY_USERNAME in the registry-push context}"
+            : "${REGISTRY_PASSWORD:?Set REGISTRY_PASSWORD in the registry-push context}"
+            unset REGISTRY_TOKEN GITHUB_TOKEN
+            . .ci-venv/bin/activate
+            python -m pycontainer.cli build --tag "$IMAGE_REPOSITORY:$CIRCLE_SHA1" --base-image python:3.11-slim --platform linux/amd64 --context . --exclude .ci-venv --push --no-progress
+      - save_cache:
+          key: pycontainer-linux-amd64-py311-v1-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - /home/circleci/.pycontainer/cache
+
+workflows:
+  build:
+    jobs:
+      - build-image:
+          context: registry-push
+          filters:
+            branches:
+              only: main

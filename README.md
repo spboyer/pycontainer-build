@@ -223,6 +223,7 @@ builder.build()  # Creates dist/image/
 Perfect for integration with:
 - **Azure Developer CLI (azd)** — Custom build strategies ([docs](docs/azd-integration.md))
 - **GitHub Actions** — Automated CI/CD workflows ([docs](docs/github-actions.md))
+- **GitLab CI, Jenkins, CircleCI** — Standalone pipeline examples ([GitLab](docs/ci/gitlab.md), [Jenkins](docs/ci/jenkins.md), [CircleCI](docs/ci/circleci.md))
 - **Poetry/Hatch** — Build plugins ([plugins](plugins/))
 - **VS Code** — Extension for container builds ([plugin](plugins/vscode-pycontainer/))
 - **AI agents** — Copilot, MCP servers, automated scaffolding
