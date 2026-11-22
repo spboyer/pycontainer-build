@@ -205,6 +205,8 @@ from .local_image import (
 )
 from .cache import LayerCache
 from .sbom import generate_sbom
+from .squash import SquashError, squash_layers
+from .layer_analysis import analyze_platform, shared_blobs
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -217,6 +219,21 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
+SQUASH_HISTORY_CREATOR = "pycontainer-build --squash"
+
+
+def _append_squash_history(cfg: Dict, base_layer_count: int, source_layer_count: int) -> None:
+    """Describe the squashed layer only when base history already aligns with its layers."""
+    history = cfg.get("history")
+    if not isinstance(history, list):
+        return
+    layered = [entry for entry in history if not (isinstance(entry, dict) and entry.get("empty_layer"))]
+    if len(layered) != base_layer_count:
+        return
+    history.append({
+        "created_by": SQUASH_HISTORY_CREATOR,
+        "comment": f"Squashed {source_layer_count} builder-created layers; base layers unchanged.",
+    })
 
 
 @dataclass
@@ -407,6 +424,7 @@ class ImageBuilder:
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
         self._app_layer=None
+        self._layer_reports=[]
         if len(platforms)>1:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
 
@@ -440,6 +458,8 @@ class ImageBuilder:
         self.layers=image.layers
         self.index_digest=None
         self.platform_images=[image]
+        if self.config.analyze_layers:
+            self._write_layer_analysis(output, [image])
         
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
@@ -488,6 +508,8 @@ class ImageBuilder:
         self.config_digest=None
         self.platform_images=images
         self.layers=list({layer.digest: layer for image in images for layer in image.layers}.values())
+        if self.config.analyze_layers:
+            self._write_layer_analysis(output, images)
         print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
         return self.config.tag
 
@@ -527,6 +549,18 @@ class ImageBuilder:
         if self._app_layer is None:
             self._app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(self._app_layer)
+
+        source_layers=list(app_layers)
+        squash_stats=None
+        if self.config.squash and len(app_layers)>1:
+            squashed, squash_stats=self._squash_builder_layers(layers_dir, app_layers)
+            app_layers=[squashed]
+            print(
+                f"✓ Squashed {len(source_layers)} builder layers into one "
+                f"({squash_stats.source_bytes} -> {squashed.size} bytes)"
+            )
+        elif self.config.squash:
+            logger.info("Only one builder-created layer; --squash leaves the layout unchanged.")
         
         all_layers=base_layers+app_layers
 
@@ -557,6 +591,8 @@ class ImageBuilder:
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers])
+        if squash_stats is not None:
+            _append_squash_history(cfg, len(base_layers), len(source_layers))
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -571,7 +607,7 @@ class ImageBuilder:
         platform_descriptor={"architecture": arch, "os": os_name}
         if variant:
             platform_descriptor["variant"]=variant
-        return PlatformImage(
+        image=PlatformImage(
             platform=platform_descriptor,
             manifest_digest=manifest_digest,
             manifest_size=len(manifest_bytes),
@@ -580,6 +616,55 @@ class ImageBuilder:
             layers=all_layers,
             app_layer_count=len(app_layers),
         )
+        if self.config.analyze_layers:
+            self._layer_reports.append(analyze_platform(image, source_layers, squash_stats))
+        return image
+
+    def _squash_builder_layers(self, layers_dir: Path, layers: List[OCILayer]):
+        """Publish one uncompressed layer equivalent to the builder-created layers."""
+        for layer in layers:
+            if layer.media_type!=UNCOMPRESSED_LAYER_MEDIA_TYPE:
+                raise SquashError(f"Cannot squash builder layer with media type {layer.media_type}.")
+        tmp=_create_temporary_file(layers_dir,"squash-layer")
+        try:
+            with tmp.open("wb") as target:
+                stats=squash_layers([Path(layer.tar_path) for layer in layers], target)
+                target.flush()
+                os.fsync(target.fileno())
+            digest, size=_hash_file(tmp)
+            final=layers_dir/_digest_filename(digest)
+            _publish_content_addressed(tmp, final, digest, size)
+            return OCILayer(UNCOMPRESSED_LAYER_MEDIA_TYPE, digest, size, str(final)), stats
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _write_layer_analysis(self, output: Path, images: List["PlatformImage"]) -> None:
+        report={
+            "squash_requested": bool(self.config.squash),
+            "platforms": self._layer_reports,
+            "shared_blobs": shared_blobs(images),
+        }
+        _atomic_write_bytes(
+            output/'layer-analysis.json',
+            (json.dumps(report,indent=2,sort_keys=True)+"\n").encode(),
+        )
+        for platform in self._layer_reports:
+            squash=platform["squash"]
+            line=(
+                f"Layer analysis {platform['platform']}: {len(platform['layers'])} layers, "
+                f"{platform['compressed_bytes']} blob bytes"
+            )
+            if "measured_bytes" in squash:
+                line+=(
+                    f"; builder layers {squash['source_bytes']} bytes, squashed "
+                    f"{squash['measured_bytes']} (predicted {squash['predicted_bytes']})"
+                )
+            elif "unsquashable" in squash:
+                line+=f"; builder layers cannot be squashed: {squash['unsquashable']}"
+            print(line)
+            for warning in platform["warnings"]:
+                print(f"  warning: {warning}")
+        print(f"✓ Layer analysis saved to {output/'layer-analysis.json'}")
     
     def _requested_platform(self) -> str:
         return getattr(self, "_target_platform", None) or self.config.platform
@@ -908,6 +993,10 @@ class ImageBuilder:
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
+        if self.config.squash:
+            print("  Squash: builder-created layers flattened into one (base layers unchanged)")
+        if self.config.analyze_layers:
+            print("  Layer Analysis: layer-analysis.json in the output directory")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")

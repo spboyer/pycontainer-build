@@ -56,6 +56,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    squash: bool = False
+    analyze_layers: bool = False
 
     def __post_init__(self):
         from .system_packages import validate_system_packages

@@ -55,6 +55,8 @@ def main():
         default=None,
         help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
     )
+    b.add_argument("--squash",action="store_true",default=None,help="Flatten builder-created dependency and application layers into one layer (base layers are unchanged; loses layer-level cache reuse)")
+    b.add_argument("--analyze-layers",action="store_true",default=None,help="Report per-platform layer sizes, repeated content and squash savings to layer-analysis.json")
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
     # --- import subcommand (Dockerfile migration) ---
@@ -102,6 +104,8 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'squash': args.squash,
+        'analyze_layers': args.analyze_layers,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
