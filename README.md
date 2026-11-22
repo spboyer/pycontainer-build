@@ -305,6 +305,8 @@ By default, `pycontainer` auto-detects:
 
 [Framework detection](docs/framework-detection.md) documents commands,
 precedence, ambiguous projects, explicit overrides, and Jupyter authentication.
+Detection priority is FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, then
+Celery; Celery defaults to a worker with no exposed ports.
 Detection does not install dependencies or execute application code. For a root
 image user, the generated Jupyter command permits root; prefer a non-root user.
 

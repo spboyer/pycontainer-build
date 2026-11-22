@@ -123,9 +123,9 @@ def main():
 
     try:
         builder=ImageBuilder(cfg)
-    except (ValueError, FileNotFoundError, configparser.Error) as exc:
+        out=builder.build()
+    except (ValueError, OSError, RuntimeError, configparser.Error) as exc:
         parser.error(str(exc))
-    out=builder.build()
     print("Built:", out)
     
     if args.push:

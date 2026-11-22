@@ -198,6 +198,18 @@ from .dependencies import (
 
 logger=logging.getLogger(__name__)
 
+
+def _configured_streamlit_port(arguments):
+    port = None
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--server.port="):
+            port = _environment_port(argument.partition("=")[2], "--server.port")
+        elif argument == "--server.port":
+            value = arguments[index + 1] if index + 1 < len(arguments) else None
+            port = _environment_port(value, "--server.port")
+    return port
+
+
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
         context_dir=Path(config.context_dir)
@@ -313,11 +325,13 @@ class ImageBuilder:
         generated_entrypoint = (
             getattr(self.config, "_framework_entrypoint_generated", False)
             and entry is getattr(self.config, "_framework_generated_entrypoint", None)
+            and not getattr(entry, "specified", False)
             and tuple(entry) == getattr(self.config, "_framework_entrypoint_snapshot", ())
         )
         generated_ports = (
             getattr(self.config, "_framework_ports_generated", False)
             and exposed_ports is getattr(self.config, "_framework_generated_ports", None)
+            and not getattr(exposed_ports, "specified", False)
             and tuple(exposed_ports) == getattr(self.config, "_framework_ports_snapshot", ())
         )
         if (
@@ -327,22 +341,35 @@ class ImageBuilder:
             image_user = self.config.user or (base_config or {}).get("config", {}).get("User", "")
             if image_user.partition(":")[0] in ("", "0", "root"):
                 entry = [*entry, "--allow-root"]
-        if detection and detection.name == "Streamlit" and entry:
+        if detection and detection.name == "Streamlit":
+            command_port = (
+                _configured_streamlit_port([*(entry or []), *(self.config.cmd or [])])
+                if generated_ports and not generated_entrypoint else None
+            )
+            base_port = None
+            if (
+                "STREAMLIT_SERVER_PORT" not in self.config.env
+                and "STREAMLIT_SERVER_PORT" in base_env
+                and (
+                    generated_ports and command_port is None
+                    or generated_entrypoint and exposed_ports == []
+                )
+            ):
+                base_port = _environment_port(base_env["STREAMLIT_SERVER_PORT"], "STREAMLIT_SERVER_PORT")
             if generated_entrypoint:
                 entry = list(entry)
-                if (
-                    "STREAMLIT_SERVER_PORT" not in self.config.env
-                    and "STREAMLIT_SERVER_PORT" in base_env
-                    and generated_ports
-                ):
-                    port = _environment_port(base_env["STREAMLIT_SERVER_PORT"], "STREAMLIT_SERVER_PORT")
-                    entry[-1] = f"--server.port={port}"
-                    exposed_ports = [port]
+                if base_port is not None and (generated_ports or exposed_ports == []):
+                    entry[-1] = f"--server.port={base_port}"
                 if (
                     "STREAMLIT_SERVER_ADDRESS" not in self.config.env
                     and "STREAMLIT_SERVER_ADDRESS" in base_env
                 ):
                     entry[-2] = f"--server.address={base_env['STREAMLIT_SERVER_ADDRESS']}"
+            if generated_ports:
+                if command_port is not None:
+                    exposed_ports = [command_port]
+                elif base_port is not None:
+                    exposed_ports = [base_port]
         if (
             detection and detection.name == "Gradio"
             and not detection.port_from_source

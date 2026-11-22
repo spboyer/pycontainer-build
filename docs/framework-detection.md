@@ -20,8 +20,11 @@ configuration nor the base image supplies it. A literal `launch(server_port=...)
 or `GRADIO_SERVER_PORT` determines its default exposed port; configure ports
 explicitly when the listener port cannot be inferred. For Streamlit, a single
 explicitly exposed port or `STREAMLIT_SERVER_PORT` changes the generated
-listener port. Conflicting explicit values are rejected. JupyterLab wins when
-both Jupyter dependencies are declared.
+listener port. When no listener is specified by the build, an inherited
+`STREAMLIT_SERVER_PORT` is honored even if exposed-port metadata is explicitly
+cleared. An explicit command's `--server.port` takes precedence. Conflicting
+explicit values for a generated command are rejected. JupyterLab wins when both
+Jupyter dependencies are declared.
 
 ## Precedence and ambiguity
 
@@ -40,6 +43,13 @@ candidates. Dynamic factories and other patterns that cannot be established
 statically may need manual configuration. Celery applications under `src/`
 use that directory as a Python import root.
 
+Python sources that appear relevant are parsed statically, up to 1 MiB per
+file. If a relevant source cannot be parsed or is too large and could change
+the selected framework, specify the entrypoint or command explicitly. A
+dynamic or conflicting Gradio `server_port` also requires explicit exposed
+ports. Port ambiguity in an unselected script does not prevent selecting
+another script explicitly.
+
 For the new detectors, dependency names are read from the configured
 requirements file (including local `-r` files inside the context),
 `[project].dependencies`, non-optional `[tool.poetry.dependencies]`, and
@@ -47,9 +57,11 @@ requirements file (including local `-r` files inside the context),
 constraints, and markers are not resolved by detection. Optional dependency
 groups and remote requirements includes are not inspected. Local requirements
 includes support pip's `${NAME}` environment-variable syntax and must stay
-inside the build context; their combined size is limited to 1 MiB.
+inside the build context; their combined size is limited to 1 MiB and nesting
+to 64 files. Local `file:` requirements in `setup.cfg` are also inspected.
 
-The normal include/exclude rules apply. Test, virtualenv, and
+The normal include/exclude rules apply, including when a caller supplies a
+preselected file iterable. Test, virtualenv, and
 `.ipynb_checkpoints` paths are excluded by default; `--no-default-excludes`
 opts out. With automatic file selection, notebook files outside excluded paths
 are included when Jupyter is declared; explicit includes remain authoritative.

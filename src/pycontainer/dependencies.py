@@ -15,6 +15,7 @@ from typing import Iterable, List, Optional, Tuple
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
+MAX_REQUIREMENTS_NESTING = 64
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
 MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
@@ -262,9 +263,9 @@ def _logical_requirement_lines(path, *, display=None):
     try:
         with path.open("rb") as source:
             data = source.read(MAX_REQUIREMENTS_BYTES + 1)
-    except OSError as exc:
+    except OSError:
         if display is not None and display != path:
-            raise OSError(f"Cannot read requirements file: {display}") from exc
+            raise OSError(f"Cannot read requirements file: {display}") from None
         raise
     if len(data) > MAX_REQUIREMENTS_BYTES:
         raise ValueError(
@@ -298,22 +299,38 @@ def _expand_requirement_variables(line):
 
 def validate_requirements(requirements: Path, context_dir: Path) -> None:
     context_root = context_dir.resolve()
-    pending = [(requirements.resolve(strict=True), False)]
+    logical_root = Path(os.path.abspath(context_dir))
+    pending = [(Path(os.path.abspath(requirements)), False, frozenset())]
     visited = set()
     total_bytes = 0
     while pending:
-        path, environment_path = pending.pop()
-        if path in visited:
-            continue
+        path, environment_path, ancestors = pending.pop()
+        display = "<environment-based requirements file>" if environment_path else path
         try:
-            path.relative_to(context_root)
-        except ValueError as exc:
-            display = "<environment-based requirements file>" if environment_path else path
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements include.") from None
+            raise
+        if not path.is_relative_to(logical_root) or not resolved.is_relative_to(context_root):
             raise ValueError(
                 f"Requirements include must stay inside the build context: {display}"
-            ) from exc
+            )
+        if path in ancestors:
+            raise ValueError(f"Requirements include cycle in {display}.")
+        if path in visited:
+            continue
+        if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
+            raise ValueError(
+                f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
+            )
         visited.add(path)
-        size = path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError:
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements file.") from None
+            raise
         total_bytes += size
         if total_bytes > MAX_REQUIREMENTS_BYTES:
             raise ValueError(
@@ -321,7 +338,6 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
 
-        display = "<environment-based requirements file>" if environment_path else path
         for _, line in _logical_requirement_lines(path, display=display):
             expanded = _expand_requirement_variables(line)
             try:
@@ -361,13 +377,11 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                         "use a local file inside the build context."
                     )
                 environment_include = environment_path or expanded != line
-                try:
-                    included_path = (path.parent / include).resolve(strict=True)
-                except OSError as exc:
-                    if environment_include:
-                        raise OSError("Cannot access an environment-based requirements include.") from exc
-                    raise
-                pending.append((included_path, environment_include))
+                windows_path = PureWindowsPath(include)
+                if Path(include).is_absolute() or windows_path.drive or windows_path.root:
+                    raise ValueError("Requirements includes must use context-relative paths.")
+                included_path = Path(os.path.abspath(path.parent / include))
+                pending.append((included_path, environment_include, ancestors | {path}))
 
 
 def stage_virtualenv(

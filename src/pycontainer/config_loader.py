@@ -77,7 +77,7 @@ def _format_type(expected_type: Any) -> str:
 
 
 def _validate_config(config: Dict[str, Any]) -> None:
-    valid_fields = {field.name for field in fields(BuildConfig)}
+    valid_fields = {field.name for field in fields(BuildConfig) if not field.name.startswith("_")}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))

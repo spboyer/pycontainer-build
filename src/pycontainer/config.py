@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Union
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
 
-def _track_port_mutation(method):
+def _track_list_mutation(method):
     def tracked(self, *args, **kwargs):
         result = method(self, *args, **kwargs)
         self.specified = True
@@ -12,25 +12,35 @@ def _track_port_mutation(method):
     return tracked
 
 
-class _DefaultPorts(list):
+class _TrackedList(list):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.specified = False
+
+    append = _track_list_mutation(list.append)
+    clear = _track_list_mutation(list.clear)
+    extend = _track_list_mutation(list.extend)
+    insert = _track_list_mutation(list.insert)
+    pop = _track_list_mutation(list.pop)
+    remove = _track_list_mutation(list.remove)
+    reverse = _track_list_mutation(list.reverse)
+    sort = _track_list_mutation(list.sort)
+    __delitem__ = _track_list_mutation(list.__delitem__)
+    __iadd__ = _track_list_mutation(list.__iadd__)
+    __imul__ = _track_list_mutation(list.__imul__)
+    __setitem__ = _track_list_mutation(list.__setitem__)
+
+
+class _DefaultPorts(_TrackedList):
     """Keep the mutable list API while distinguishing an untouched default."""
 
     def __init__(self, values=()):
         super().__init__(values)
         self.specified = bool(self)
 
-    append = _track_port_mutation(list.append)
-    clear = _track_port_mutation(list.clear)
-    extend = _track_port_mutation(list.extend)
-    insert = _track_port_mutation(list.insert)
-    pop = _track_port_mutation(list.pop)
-    remove = _track_port_mutation(list.remove)
-    reverse = _track_port_mutation(list.reverse)
-    sort = _track_port_mutation(list.sort)
-    __delitem__ = _track_port_mutation(list.__delitem__)
-    __iadd__ = _track_port_mutation(list.__iadd__)
-    __imul__ = _track_port_mutation(list.__imul__)
-    __setitem__ = _track_port_mutation(list.__setitem__)
+
+class _GeneratedList(_TrackedList):
+    pass
 
 
 @dataclass
@@ -64,9 +74,34 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    _exposed_ports_configured: Optional[bool] = field(default=None, repr=False, compare=False)
+
+    def __getattribute__(self, name):
+        if name == "_exposed_ports_configured":
+            # Keep serialized state accurate even when copies share the list.
+            ports = object.__getattribute__(self, "exposed_ports")
+            return ports is not None and (
+                not isinstance(ports, _DefaultPorts) or ports.specified
+            )
+        return object.__getattribute__(self, name)
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
+
+        ports = self.exposed_ports
+        configured = self.__dict__["_exposed_ports_configured"]
+        if configured is None:
+            configured = ports is not None and (
+                not isinstance(ports, _DefaultPorts) or ports.specified
+            )
+        elif not configured and ports:
+            configured = True
+        if not configured and ports is not None and not isinstance(ports, _DefaultPorts):
+            ports = _DefaultPorts()
+            object.__setattr__(self, "exposed_ports", ports)
+        if isinstance(ports, _DefaultPorts):
+            ports.specified = configured
+        object.__setattr__(self, "_exposed_ports_configured", configured)
 
         self.system_packages = validate_system_packages(self.system_packages)
         if not isinstance(self.generate_sbom, (bool, str)):
@@ -90,7 +125,4 @@ class BuildConfig:
 
     def has_exposed_ports(self) -> bool:
         """Return whether ports were explicitly configured or detected."""
-        return self.exposed_ports is not None and (
-            not isinstance(self.exposed_ports, _DefaultPorts)
-            or self.exposed_ports.specified
-        )
+        return bool(self._exposed_ports_configured)

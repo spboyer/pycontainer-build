@@ -2,12 +2,11 @@
 import ast
 import keyword
 import logging
-import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
-import re
-from .fs_utils import iter_files
+from .config import _DefaultPorts, _GeneratedList
+from .fs_utils import DEFAULT_CONTEXT_EXCLUDES, iter_files, path_is_excluded
 from .project import declared_dependency_names, default_include_paths
 
 
@@ -16,6 +15,7 @@ ALL_INTERFACES = "0.0.0.0"
 STREAMLIT_PORT = 8501
 GRADIO_PORT = 7860
 JUPYTER_PORT = 8888
+MAX_FRAMEWORK_SOURCE_BYTES = 1024 * 1024
 FRAMEWORK_PRIORITY = ("FastAPI", "Flask", "Django", "Streamlit", "Gradio", "Jupyter", "Celery")
 FRAMEWORK_PORTS = {
     "FastAPI": [8000],
@@ -43,6 +43,7 @@ class _Detection:
     ports: List[int]
     source_root: Optional[str] = None
     port_from_source: bool = False
+    port_problem: Optional[str] = None
 
 
 def detect_framework(
@@ -82,6 +83,9 @@ def _detect_framework(
 ):
     context_path = Path(context_dir).absolute()
     ctx = context_path.resolve()
+    excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
+    if exclude_paths is not None:
+        excludes.extend(exclude_paths)
     if files is None:
         paths = (
             default_include_paths(
@@ -119,6 +123,8 @@ def _detect_framework(
             relative = resolved.relative_to(ctx)
         if ".." in relative.parts:
             raise ValueError(f"Selected source is outside the build context: {path}")
+        if path_is_excluded(relative, excludes):
+            continue
         selected_path = ctx / relative
         if not selected_path.resolve().is_relative_to(ctx):
             raise ValueError(f"Selected source is outside the build context: {path}")
@@ -130,18 +136,14 @@ def _detect_framework(
     notebooks = [path for path in selected_files if path.suffix == ".ipynb"]
 
     candidates = {
-        "FastAPI": _detect_fastapi(python_files, ctx),
-        "Flask": _detect_flask(python_files),
+        "FastAPI": [],
+        "Flask": [],
         "Django": [],
         "Streamlit": [],
         "Gradio": [],
         "Jupyter": [],
         "Celery": [],
     }
-    django = _detect_django(python_files, ctx)
-    if django:
-        candidates["Django"].append(_Detection(*django))
-
     dependencies = declared_dependency_names(
         ctx,
         requirements_file,
@@ -151,19 +153,32 @@ def _detect_framework(
     problems = {}
     unlaunched_gradio = []
     unparsed = []
-    gradio_port_problem = None
     for path in python_files:
-        if not ({"streamlit", "gradio", "celery"} & dependencies):
-            break
-        tree = _parse_source(path, ctx)
+        tree, hints = _parse_source(path, ctx, dependencies)
         if tree is None:
-            unparsed.append(path.relative_to(ctx).as_posix())
+            if hints:
+                unparsed.append((path.relative_to(ctx).as_posix(), hints))
             continue
+        relative = path.relative_to(ctx).as_posix()
+        module = ".".join(path.relative_to(ctx).with_suffix("").parts)
+        for variable in _web_app_variables(tree, "FastAPI"):
+            candidates["FastAPI"].append(_Detection(
+                "FastAPI",
+                ["uvicorn", f"{module}:{variable}", "--host", ALL_INTERFACES, "--port", "8000"],
+                [8000],
+            ))
+        for _ in _web_app_variables(tree, "Flask"):
+            candidates["Flask"].append(_Detection(
+                "Flask", ["flask", "run", "--host=0.0.0.0", "--port=5000"], [5000]
+            ))
+        if "Django" in hints:
+            candidates["Django"].append(_Detection(
+                "Django", ["python", "manage.py", "runserver", "0.0.0.0:8000"], [8000]
+            ))
         (
             streamlit, celery_modules, celery_classes,
             gradio_modules, gradio_classes, gradio_mounts,
         ) = _import_aliases(tree)
-        relative = path.relative_to(ctx).as_posix()
         if "streamlit" in dependencies and streamlit:
             candidates["Streamlit"].append(
                 _Detection(
@@ -177,13 +192,19 @@ def _detect_framework(
                 )
             )
         if "gradio" in dependencies:
-            launched, constructed, mounted, launch_ports = _gradio_app(
+            launched, constructed, mounted, launch_ports, unknown_port = _gradio_app(
                 tree, gradio_modules, gradio_classes, gradio_mounts
             )
             if launched:
-                if len(launch_ports) > 1 and not configured_ports:
-                    gradio_port_problem = (
+                port_problem = None
+                if len(launch_ports) > 1:
+                    port_problem = (
                         f"Multiple Gradio listener ports were found in {relative}; "
+                        "specify exposed ports explicitly."
+                    )
+                elif unknown_port:
+                    port_problem = (
+                        f"Cannot infer the Gradio listener port in {relative}; "
                         "specify exposed ports explicitly."
                     )
                 port = min(launch_ports) if launch_ports else GRADIO_PORT
@@ -191,10 +212,11 @@ def _detect_framework(
                     _Detection(
                         "Gradio", ["python", relative], [port],
                         port_from_source=bool(launch_ports),
+                        port_problem=port_problem,
                     )
                 )
-            elif constructed and not (mounted and candidates["FastAPI"]):
-                unlaunched_gradio.append(relative)
+            elif constructed:
+                unlaunched_gradio.append((relative, mounted))
         if "celery" in dependencies:
             variables, constructed = _celery_apps(tree, celery_modules, celery_classes)
             module, source_root = _module_name(path, ctx)
@@ -214,6 +236,10 @@ def _detect_framework(
                         )
                     )
 
+    unlaunched_gradio = [
+        path for path, mounted in unlaunched_gradio
+        if not (mounted and candidates["FastAPI"])
+    ]
     if unlaunched_gradio:
         message = (
             f"Gradio application in {', '.join(unlaunched_gradio)} has no matching "
@@ -245,15 +271,20 @@ def _detect_framework(
         logger.debug("Notebooks found but no jupyterlab or notebook dependency is declared.")
 
     present = [name for name in FRAMEWORK_PRIORITY if candidates[name] or name in problems]
-    if not present:
-        if unparsed:
+    configured = configured_entrypoint is not None or configured_cmd is not None
+    if unparsed and not configured:
+        possible = {name for _, hints in unparsed for name in hints}
+        if not present or any(
+            FRAMEWORK_PRIORITY.index(name) <= FRAMEWORK_PRIORITY.index(present[0])
+            for name in possible
+        ):
             raise FrameworkDetectionError(
                 "Could not inspect selected Python sources; specify an explicit "
                 "entrypoint or command."
             )
+    if not present:
         return None
     chosen = present[0]
-    configured = configured_entrypoint is not None or configured_cmd is not None
     selected_match = None
     if configured:
         arguments = [*(configured_entrypoint or []), *(configured_cmd or [])]
@@ -263,7 +294,7 @@ def _detect_framework(
             for candidate in candidates[name]
             if _matches_configured_command(candidate, arguments)
         ]
-        if len(matches) == 1:
+        if matches and len({candidate.name for candidate in matches}) == 1:
             selected_match = matches[0]
             chosen = selected_match.name
     if len(present) > 1:
@@ -280,10 +311,13 @@ def _detect_framework(
     for name in present:
         if name != chosen and name in problems:
             logger.warning("%s", problems[name])
-    if gradio_port_problem and chosen != "Gradio":
-        logger.warning("%s", gradio_port_problem)
-    if chosen == "Gradio" and gradio_port_problem:
-        raise FrameworkPortDetectionError(gradio_port_problem)
+    if chosen == "Gradio" and not configured_ports:
+        relevant = [selected_match] if selected_match else candidates["Gradio"]
+        port_problem = next(
+            (candidate.port_problem for candidate in relevant if candidate.port_problem), None
+        )
+        if port_problem:
+            raise FrameworkPortDetectionError(port_problem)
     if chosen in problems:
         if not configured:
             raise FrameworkDetectionError(problems[chosen])
@@ -299,8 +333,9 @@ def _matches_configured_command(detection, arguments):
         return False
     args = {str(arg).replace("\\", "/").removeprefix("./") for arg in arguments}
     executables = {arg.rsplit("/", 1)[-1] for arg in args}
+    executables = {name.removesuffix(".exe") for name in executables}
     if detection.name == "Streamlit":
-        return detection.entrypoint[2] in args and bool({"streamlit", "streamlit.exe"} & executables)
+        return detection.entrypoint[2] in args and "streamlit" in executables
     if detection.name == "Gradio":
         return detection.entrypoint[1] in args and any(
             executable.startswith("python") for executable in executables
@@ -308,23 +343,84 @@ def _matches_configured_command(detection, arguments):
     if detection.name in ("FastAPI", "Celery"):
         reference = detection.entrypoint[1 if detection.name == "FastAPI" else 2]
         executors = {"uvicorn", "gunicorn", "hypercorn"} if detection.name == "FastAPI" else {"celery"}
-        has_executor = bool(executors & {name.removesuffix(".exe") for name in executables})
-        return has_executor and (
-            reference in args or f"--app={reference}" in args or f"-A{reference}" in args
+        references = {reference}
+        if detection.name == "Celery":
+            references.add(reference.partition(":")[0])
+        return bool(executors & executables) and any(
+            ref in args or f"--app={ref}" in args or f"-A{ref}" in args or f"-A={ref}" in args
+            for ref in references
+        )
+    if detection.name == "Flask":
+        return "flask" in executables and "run" in args
+    if detection.name == "Django":
+        return "manage.py" in executables and "runserver" in args
+    if detection.name == "Jupyter":
+        return bool({"jupyter-lab", "jupyter-notebook"} & executables) or (
+            "jupyter" in executables and bool({"lab", "notebook"} & args)
+        ) or (
+            any(name.startswith("python") for name in executables)
+            and "-m" in args and bool({"jupyterlab", "notebook"} & args)
         )
     return False
 
 
-def _parse_source(path, context_dir):
+def _parse_source(path, context_dir, dependencies):
+    markers = {"FastAPI": b"fastapi", "Flask": b"flask"}
+    for package, framework in (
+        ("streamlit", "Streamlit"), ("gradio", "Gradio"), ("celery", "Celery")
+    ):
+        if package in dependencies:
+            markers[framework] = package.encode("ascii")
+    if path.name == "manage.py" and path.parent == context_dir:
+        markers["Django"] = b"django"
+
+    hints = set()
+    content = bytearray()
+    tail = b""
+    overlap = max(map(len, markers.values())) - 1
+    with path.open("rb") as source:
+        while chunk := source.read(64 * 1024):
+            part = tail + chunk.lower()
+            hints.update(name for name, marker in markers.items() if marker in part)
+            tail = part[-overlap:]
+            if content is not None:
+                content.extend(chunk)
+                if len(content) > MAX_FRAMEWORK_SOURCE_BYTES:
+                    content = None
+            if content is None and len(hints) == len(markers):
+                break
+    if not hints:
+        return None, hints
+    relative = path.relative_to(context_dir).as_posix()
+    if content is None:
+        logger.warning(
+            "Cannot inspect %s: source exceeds the %s-byte limit.",
+            relative, MAX_FRAMEWORK_SOURCE_BYTES,
+        )
+        return None, hints
     try:
-        with tokenize.open(path) as source:
-            return ast.parse(source.read(), filename=str(path))
+        return ast.parse(bytes(content), filename=str(path)), hints
     except (SyntaxError, UnicodeError) as error:
         logger.warning(
             "Cannot inspect %s: %s. Specify an explicit entrypoint if needed.",
-            path.relative_to(context_dir).as_posix(), error,
+            relative, error,
         )
-        return None
+        return None, hints
+
+
+def _web_app_variables(tree, constructor):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not _is_constructor(node.value, set(), {constructor}, set()):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                yield target.id
 
 
 def _import_aliases(tree):
@@ -440,10 +536,16 @@ def _gradio_app(tree, modules, classes, mounts):
         and is_app_expression(node.func.value)
     ]
     ports = set()
+    unknown_port = False
+    uses_default_port = False
     for launch in launches:
+        has_port = False
         for option in launch.keywords:
+            if option.arg is None:
+                unknown_port = True
             if option.arg != "server_port":
                 continue
+            has_port = True
             if (
                 isinstance(option.value, ast.Constant)
                 and isinstance(option.value.value, int)
@@ -451,12 +553,16 @@ def _gradio_app(tree, modules, classes, mounts):
                 and 0 < option.value.value <= 65535
             ):
                 ports.add(option.value.value)
-            elif not (
+            elif (
                 isinstance(option.value, ast.Constant) and option.value.value is None
             ):
-                logger.warning(
-                    "Cannot infer the Gradio listener port; configure exposed ports explicitly."
-                )
+                uses_default_port = True
+            else:
+                unknown_port = True
+        if not has_port:
+            uses_default_port = True
+    if ports and uses_default_port:
+        unknown_port = True
 
     def is_mount(node):
         if not isinstance(node, ast.Call):
@@ -475,72 +581,18 @@ def _gradio_app(tree, modules, classes, mounts):
         )
 
     mounted = any(is_mount(node) for node in ast.walk(tree))
-    return bool(launches), constructed, mounted, ports
-
-
-def _detect_fastapi(files: List[Path], ctx: Path) -> List[_Detection]:
-    """Detect FastAPI applications."""
-    detections = []
-    for py in files:
-        try:
-            with tokenize.open(py) as source:
-                content = source.read()
-        except (OSError, UnicodeError, SyntaxError) as error:
-            logger.warning("Cannot inspect %s: %s", py, error)
-            continue
-        module = ".".join(py.relative_to(ctx).with_suffix("").parts)
-        for match in re.finditer(r'^\s*(\w+)\s*=\s*FastAPI\s*\(', content, re.MULTILINE):
-            app_module = f"{module}:{match.group(1)}"
-            detections.append(_Detection(
-                "FastAPI", ["uvicorn", app_module, "--host", "0.0.0.0", "--port", "8000"], [8000]
-            ))
-    return detections
+    return bool(launches), constructed, mounted, ports, unknown_port
 
 def _find_fastapi_app(file_path: Path, ctx: Path) -> Optional[str]:
     """Find FastAPI app variable in file."""
-    try:
-        with tokenize.open(file_path) as source:
-            content = source.read()
-        match=re.search(r'^\s*(\w+)\s*=\s*FastAPI\s*\(', content, re.MULTILINE)
-        if match:
-            app_var=match.group(1)
-            rel=file_path.relative_to(ctx)
-            module=".".join(rel.with_suffix("").parts)
-            return f"{module}:{app_var}"
-    except (OSError, UnicodeError, SyntaxError) as error:
-        logger.warning("Cannot inspect %s: %s", file_path, error)
-    return None
-
-
-def _detect_flask(files: List[Path]) -> List[_Detection]:
-    """Detect Flask applications."""
-    detections = []
-    for py in files:
-        try:
-            with tokenize.open(py) as source:
-                content = source.read()
-        except (OSError, UnicodeError, SyntaxError) as error:
-            logger.warning("Cannot inspect %s: %s", py, error)
-            continue
-        for _ in re.finditer(r'^\s*\w+\s*=\s*Flask\s*\(', content, re.MULTILINE):
-            detections.append(_Detection(
-                "Flask", ["flask", "run", "--host=0.0.0.0", "--port=5000"], [5000]
-            ))
-    return detections
-
-def _detect_django(
-    files: List[Path], context_dir: Path
-) -> Optional[Tuple[str, List[str], List[int]]]:
-    """Detect Django applications."""
-    for manage_py in files:
-        if manage_py.name != "manage.py" or manage_py.parent != context_dir:
-            continue
-        try:
-            content=manage_py.read_text()
-            if "django" in content.lower():
-                return ("Django", ["python", "manage.py", "runserver", "0.0.0.0:8000"], [8000])
-        except: pass
-    return None
+    tree, _ = _parse_source(file_path, ctx, set())
+    if tree is None:
+        return None
+    variable = next(_web_app_variables(tree, "FastAPI"), None)
+    if variable is None:
+        return None
+    module = ".".join(file_path.relative_to(ctx).with_suffix("").parts)
+    return f"{module}:{variable}"
 
 
 def _environment_port(value, name):
@@ -564,17 +616,31 @@ def apply_framework_defaults(
 ):
     """Apply framework-specific defaults to build config."""
     previous_entrypoint = getattr(config, "_framework_generated_entrypoint", None)
+    previous_cmd = getattr(config, "_framework_generated_cmd", None)
     previous_ports = getattr(config, "_framework_generated_ports", None)
     generated_entrypoint = (
         previous_entrypoint is not None
         and config.entrypoint is previous_entrypoint
+        and not getattr(previous_entrypoint, "specified", False)
         and tuple(previous_entrypoint) == getattr(config, "_framework_entrypoint_snapshot", ())
     )
     generated_ports = (
         previous_ports is not None
         and config.exposed_ports is previous_ports
+        and not getattr(previous_ports, "specified", False)
         and tuple(previous_ports) == getattr(config, "_framework_ports_snapshot", ())
     )
+    generated_cmd = (
+        previous_cmd is not None
+        and config.cmd is previous_cmd
+        and not getattr(previous_cmd, "specified", False)
+        and tuple(previous_cmd) == getattr(config, "_framework_cmd_snapshot", ())
+    )
+    configured_entrypoint = None if generated_entrypoint else config.entrypoint
+    configured_cmd = None if generated_cmd else config.cmd
+    if generated_entrypoint and configured_cmd is not None:
+        config.entrypoint = None
+        generated_entrypoint = False
     try:
         detection = _detect_framework(
             context_dir,
@@ -583,18 +649,28 @@ def apply_framework_defaults(
             exclude_defaults=exclude_defaults,
             requirements_file=config.requirements_file,
             files=files,
-            configured_entrypoint=config.entrypoint,
-            configured_cmd=config.cmd,
-            configured_ports=config.has_exposed_ports(),
+            configured_entrypoint=configured_entrypoint,
+            configured_cmd=configured_cmd,
+            configured_ports=config.has_exposed_ports() and not generated_ports,
         )
     except FrameworkPortDetectionError:
         raise
     except FrameworkDetectionError as error:
-        if config.entrypoint is None and config.cmd is None:
+        if configured_entrypoint is None and configured_cmd is None:
             raise
         logger.warning("%s Using the configured entrypoint or command.", error)
         return config
     if not detection:
+        if generated_entrypoint:
+            config.entrypoint = None
+        if generated_cmd:
+            config.cmd = None
+        if generated_ports:
+            config.exposed_ports = _DefaultPorts()
+        previous_detection = getattr(config, "_framework_detection", None)
+        if previous_detection and config.labels and config.labels.get("framework") == previous_detection.name.lower():
+            del config.labels["framework"]
+        config._framework_detection = None
         return config
 
     framework = detection.name
@@ -607,7 +683,7 @@ def apply_framework_defaults(
             if env_port is not None else STREAMLIT_PORT
         )
         if (
-            (generated_entrypoint or (config.entrypoint is None and config.cmd is None))
+            (generated_entrypoint or (config.entrypoint is None and configured_cmd is None))
             and config.has_exposed_ports() and not generated_ports
             and len(config.exposed_ports) == 1
         ):
@@ -627,16 +703,18 @@ def apply_framework_defaults(
         if env_port is not None:
             ports = [_environment_port(env_port, "GRADIO_SERVER_PORT")]
 
-    if generated_entrypoint or (config.entrypoint is None and config.cmd is None):
-        config.entrypoint = entrypoint
-        if config.cmd is None:
-            config.cmd = []
+    if generated_entrypoint or (config.entrypoint is None and configured_cmd is None):
+        config.entrypoint = _GeneratedList(entrypoint)
+        if config.cmd is None or generated_cmd:
+            config.cmd = _GeneratedList()
+            config._framework_generated_cmd = config.cmd
+            config._framework_cmd_snapshot = tuple(config.cmd)
         generated_entrypoint = True
         config._framework_generated_entrypoint = config.entrypoint
         config._framework_entrypoint_snapshot = tuple(config.entrypoint)
 
     if generated_ports or not config.has_exposed_ports():
-        config.exposed_ports = ports
+        config.exposed_ports = _GeneratedList(ports)
         generated_ports = True
         config._framework_generated_ports = config.exposed_ports
         config._framework_ports_snapshot = tuple(config.exposed_ports)

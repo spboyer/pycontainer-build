@@ -1,4 +1,4 @@
-import configparser, logging, shlex, tomllib, re
+import configparser, logging, os, shlex, tomllib, re
 from pathlib import Path, PureWindowsPath
 from typing import List, Tuple
 from urllib.parse import unquote
@@ -36,6 +36,7 @@ def declared_dependency_names(
     """Read declared runtime dependency names without resolving or installing them."""
     from .dependencies import (
         MAX_REQUIREMENTS_BYTES,
+        MAX_REQUIREMENTS_NESTING,
         _REQUIREMENT_VARIABLE,
         _expand_requirement_variables,
         _logical_requirement_lines,
@@ -43,6 +44,7 @@ def declared_dependency_names(
 
     ctx = Path(context_dir)
     root = ctx.resolve()
+    logical_root = Path(os.path.abspath(ctx))
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
     if exclude_paths is not None:
         excludes.extend(exclude_paths)
@@ -57,11 +59,17 @@ def declared_dependency_names(
         path = ctx / relative
         if not path.is_file():
             return None
-        if not path.resolve().is_relative_to(root):
+        try:
+            contained = path.resolve().is_relative_to(root)
+        except (OSError, RuntimeError):
+            if display is not None and display != relative:
+                raise ValueError("Cannot access an environment-based requirements file.") from None
+            raise
+        if not contained:
             raise ValueError(f"Dependency file is outside the build context: {display or relative}")
         return path
 
-    def read_requirements(relative, *, required=False, environment_path=False):
+    def read_requirements(relative, *, required=False, environment_path=False, ancestors=frozenset()):
         nonlocal total_bytes
         relative = relative_context_path(relative)
         display = "<environment-based requirements file>" if environment_path else relative
@@ -70,11 +78,21 @@ def declared_dependency_names(
             if required and not path_is_excluded(relative, excludes):
                 raise FileNotFoundError(f"Requirements file not found: {display}")
             return
-        resolved = path.resolve()
-        if resolved in visited:
+        if relative in ancestors:
+            raise ValueError(f"Requirements include cycle in {display}.")
+        if relative in visited:
             return
-        visited.add(resolved)
-        total_bytes += path.stat().st_size
+        if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
+            raise ValueError(
+                f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
+            )
+        visited.add(relative)
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements file.") from None
+            raise
         if total_bytes > MAX_REQUIREMENTS_BYTES:
             raise ValueError(
                 "Requirements files exceed the combined "
@@ -123,15 +141,28 @@ def declared_dependency_names(
                         raise ValueError(
                             f"Invalid requirements include in {display} at line {line_number}"
                         )
-                    resolved = (ctx / relative.parent / nested_path).resolve()
-                    if not resolved.is_relative_to(root):
+                    logical_path = Path(os.path.abspath(ctx / relative.parent / nested_path))
+                    environment_include = environment_path or expanded != line
+                    try:
+                        contained = (
+                            logical_path.is_relative_to(logical_root)
+                            and logical_path.resolve().is_relative_to(root)
+                        )
+                    except (OSError, RuntimeError):
+                        if environment_include:
+                            raise ValueError(
+                                "Cannot access an environment-based requirements include."
+                            ) from None
+                        raise
+                    if not contained:
                         raise ValueError(
                             f"Requirements include in {display} escapes the build context"
                         )
                     read_requirements(
-                        resolved.relative_to(root),
+                        logical_path.relative_to(logical_root),
                         required=True,
-                        environment_path=environment_path or expanded != line,
+                        environment_path=environment_include,
+                        ancestors=ancestors | {relative},
                     )
             elif not first.startswith("-") or first in ("-e", "--editable"):
                 declaration = expanded
@@ -147,6 +178,8 @@ def declared_dependency_names(
     if pyproject:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project = data.get("project", {})
+        if not isinstance(project, dict):
+            raise ValueError("[project] must be a TOML table.")
         dependencies = project.get("dependencies", [])
         if not isinstance(dependencies, list) or not all(
             isinstance(item, str) for item in dependencies
@@ -156,24 +189,37 @@ def declared_dependency_names(
             name = requirement_name(dependency)
             if name:
                 names.add(name)
-        poetry = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
-        if isinstance(poetry, dict):
-            for name, value in poetry.items():
-                if name != "python" and not (
-                    isinstance(value, dict) and value.get("optional", False)
-                ):
-                    normalized = requirement_name(name)
-                    if normalized:
-                        names.add(normalized)
+        tool = data.get("tool", {})
+        if not isinstance(tool, dict):
+            raise ValueError("[tool] must be a TOML table.")
+        poetry = tool.get("poetry", {})
+        if not isinstance(poetry, dict):
+            raise ValueError("[tool.poetry] must be a TOML table.")
+        poetry_dependencies = poetry.get("dependencies", {})
+        if not isinstance(poetry_dependencies, dict):
+            raise ValueError("[tool.poetry.dependencies] must be a TOML table.")
+        for name, value in poetry_dependencies.items():
+            if name != "python" and not (
+                isinstance(value, dict) and value.get("optional", False)
+            ):
+                normalized = requirement_name(name)
+                if normalized:
+                    names.add(normalized)
 
     setup_cfg = selected_file("setup.cfg")
     if setup_cfg:
         parser = configparser.ConfigParser(interpolation=None)
         parser.read_string(setup_cfg.read_text(encoding="utf-8"))
-        for dependency in parser.get("options", "install_requires", fallback="").splitlines():
-            name = requirement_name(dependency)
-            if name:
-                names.add(name)
+        value = parser.get("options", "install_requires", fallback="")
+        if value.strip().startswith("file:"):
+            for included_file in value.strip()[len("file:"):].split(","):
+                read_requirements(included_file.strip(), required=True)
+        else:
+            dependencies = value.splitlines() if "\n" in value else value.split(";")
+            for dependency in dependencies:
+                name = requirement_name(dependency)
+                if name:
+                    names.add(name)
     return names
 
 
@@ -182,7 +228,12 @@ def detect_python_version(context_dir):
     ctx=Path(context_dir); py=ctx/'pyproject.toml'
     if py.exists():
         data=tomllib.loads(py.read_text())
-        proj=data.get("project",{}); requires_py=proj.get("requires-python")
+        proj=data.get("project",{})
+        if not isinstance(proj, dict):
+            raise ValueError("[project] must be a TOML table.")
+        requires_py=proj.get("requires-python")
+        if requires_py is not None and not isinstance(requires_py, str):
+            raise ValueError("[project].requires-python must be a string.")
         if requires_py:
             match=re.search(r'(\d+\.\d+)', requires_py)
             if match: return match.group(1)

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from pycontainer.dependencies import (
     target_python_version,
     validate_requirements,
 )
+from pycontainer.project import declared_dependency_names
 
 
 BASE_CONFIG = {
@@ -237,6 +239,89 @@ def test_environment_expansion_cannot_override_pip_target_options(tmp_path, monk
     monkeypatch.setenv("PIP_OVERRIDE", "--target outside")
     with pytest.raises(ValueError, match="cannot override target install option"):
         validate_requirements(requirements, tmp_path)
+
+
+def test_environment_requirements_path_is_redacted_from_exception_traceback(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", "private-credential-filename.txt")
+    with pytest.raises(OSError) as error:
+        validate_requirements(requirements, tmp_path)
+    assert "private-credential-filename" not in "".join(traceback.format_exception(error.value))
+
+
+def test_cyclic_environment_requirement_link_is_redacted(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n")
+    link = tmp_path / "private-credential-filename.txt"
+    try:
+        link.symlink_to(link)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", link.name)
+    with pytest.raises((OSError, ValueError)) as error:
+        validate_requirements(requirements, tmp_path)
+    assert "private-credential-filename" not in "".join(traceback.format_exception(error.value))
+
+
+def test_symlinked_requirements_validate_nested_files_relative_to_link(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r configs/alias.txt\n")
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "shared").mkdir()
+    target = tmp_path / "shared" / "actual.txt"
+    target.write_text("-r nested.txt\n")
+    (tmp_path / "configs" / "nested.txt").write_text("--target outside\n")
+    link = tmp_path / "configs" / "alias.txt"
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_repeated_symlink_target_does_not_skip_nested_requirement_validation(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r branch/actual.txt\n")
+    nested = tmp_path / "branch" / "sub" / "sub"
+    nested.mkdir(parents=True)
+    target = tmp_path / "branch" / "actual.txt"
+    target.write_text("-r sub/alias.txt\n")
+    (nested / "alias.txt").write_text("--target outside\n")
+    try:
+        (tmp_path / "branch" / "sub" / "alias.txt").symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_recursive_requirements_include_is_rejected(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r nested.txt\n")
+    (tmp_path / "nested.txt").write_text("-r requirements.txt\n")
+    with pytest.raises(ValueError, match="include cycle"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_requirements_nesting_limit_matches_dependency_discovery(tmp_path):
+    for index in range(63):
+        (tmp_path / f"requirements-{index}.txt").write_text(
+            f"-r requirements-{index + 1}.txt\n"
+        )
+    last = tmp_path / "requirements-63.txt"
+    last.write_text("streamlit\n")
+    root = tmp_path / "requirements-0.txt"
+    validate_requirements(root, tmp_path)
+    assert declared_dependency_names(tmp_path, root.name) == {"streamlit"}
+
+    last.write_text("-r requirements-64.txt\n")
+    (tmp_path / "requirements-64.txt").write_text("streamlit\n")
+    with pytest.raises(ValueError, match="nesting depth"):
+        validate_requirements(root, tmp_path)
+    with pytest.raises(ValueError, match="nesting depth"):
+        declared_dependency_names(tmp_path, root.name)
 
 
 def test_excluded_explicit_requirements_still_install_dependencies(
