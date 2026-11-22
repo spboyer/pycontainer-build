@@ -226,6 +226,19 @@ def _database(status, db_dir, max_age):
         raise ScanError("database", f"unverifiable database: {error}") from error
 
 
+def _layers_match(reported, layers, diff_ids):
+    """Grype 0.119.0 reports uncompressed diffIDs with cataloged sizes, not blob descriptors."""
+    if not (isinstance(reported, list) and isinstance(diff_ids, list)
+            and len(reported) == len(layers) == len(diff_ids)):
+        return False
+    return all(
+        isinstance(item, dict) and item.get("digest") == diff_id
+        and item.get("mediaType") == layer["mediaType"]
+        and isinstance(item.get("size"), int) and item["size"] >= 0
+        for item, layer, diff_id in zip(reported, layers, diff_ids)
+    )
+
+
 def _validate_document(doc, root, descriptor, platform, status, scanner_config):
     manifest = verify_snapshot(root, descriptor)
     try:
@@ -240,7 +253,8 @@ def _validate_document(doc, root, descriptor, platform, status, scanner_config):
                 or "sha256:" + hashlib.sha256(raw_manifest).hexdigest() != descriptor["digest"]
                 or "sha256:" + hashlib.sha256(raw_config).hexdigest() != manifest["config"]["digest"]
                 or f"{image_config['os']}/{image_config['architecture']}" != platform
-                or target["layers"] != manifest["layers"]):
+                or not _layers_match(target["layers"], manifest["layers"],
+                                     image_config["rootfs"]["diff_ids"])):
             raise ScanError("identity", "scanner did not attest the selected image")
         info = doc["descriptor"]
         if info["name"] != "grype" or info["version"] != GRYPE_VERSION:

@@ -68,12 +68,17 @@ else:
             'manifest': base64.b64encode(blob.read_bytes()).decode(),
             'config': base64.b64encode(configblob.read_bytes()).decode(),
             'architecture': imagecfg['architecture'], 'os': imagecfg['os'],
-            'layers': manifest['layers']}},
+            # Observed Grype 0.119.0 contract: uncompressed diffIDs and cataloged sizes.
+            'layers': [{'mediaType': layer['mediaType'], 'digest': diff_id, 'size': 0}
+                       for layer, diff_id in zip(manifest['layers'],
+                                                 imagecfg['rootfs']['diff_ids'])]}},
         'distro': {'name': 'debian', 'version': '12'},
         'descriptor': {'name': 'grype', 'version': '0.119.0', 'db': db,
                        'configuration': cfg}}
     if mode.get('missing_matches'): del doc['matches']
     if mode.get('bad_config'): doc['source']['target']['config'] = 'not base64!'
+    if mode.get('wrong_layer'): doc['source']['target']['layers'][-1]['digest'] = 'sha256:' + '1'*64
+    if mode.get('missing_layer'): doc['source']['target']['layers'].pop()
     if mode.get('unknown_distro'): doc['distro']['name'] = 'unknown'
     if mode.get('ignored'): doc['ignoredMatches'] = [{'reason': 'ambient ignore'}]
     if mode.get('db_changed'):
@@ -164,6 +169,7 @@ def test_policy_overrides(tmp_path, monkeypatch, scanner, policy):
     ({"db_changed": True}, "database"),
     ({"wrong_digest": True}, "identity"),
     ({"mutate_snapshot": True}, "identity"),
+    ({"wrong_layer": True}, "identity"), ({"missing_layer": True}, "identity"),
     ({"ignored": True}, "scanner"),
 ])
 def test_operational_errors_never_authorize_push(tmp_path, monkeypatch, scanner, mode, category):
