@@ -343,11 +343,18 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
-  Official `python` images derive libc from the tag (`alpine` tags use musl,
-  others glibc). A digest-only reference such as `python@sha256:...` carries no
-  tag, so pin the tag with the digest (`python:3.11-slim@sha256:...`) or use an
-  image config with a supported `PYTHON_LIBC`; otherwise staging fails rather
-  than guessing. Unsupported or tag-conflicting `PYTHON_LIBC` values also fail.
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to requirements and
+  virtualenv staging alike.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
