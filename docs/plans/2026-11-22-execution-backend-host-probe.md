@@ -25,6 +25,12 @@ artifact.
 | Runtime-built rootfs | overlay with `userxattr` inside a crun container, whiteout and opaque-directory encoding |
 | Limits and cleanup | crun `--cgroup-manager=systemd` limits, OOM enforcement, `kill`/`delete --force` |
 
+Every probe container starts from `runtime spec --rootless` with host `/usr`
+bind-mounted read-only, and the overlay test also binds a host temporary
+directory read-write. These containers show that the runtime starts and
+enforces limits. They are not evidence of a private rootfs, the absence of
+host mounts or network isolation, which the backend contract still requires.
+
 ## Results
 
 Runs [45053253547](https://github.com/spboyer/pycontainer-build/actions/runs/45053253547),
@@ -38,9 +44,10 @@ show the same results on both architectures: Ubuntu 24.04.5, kernel 7.0
   unconfined process can create a userns, and `unshare --map-auto` gets a
   65536-id map through setuid `newuidmap`. Inside that userns it holds no
   usable capabilities (AppArmor `DENIED ... sys_admin`), so `unshare -Ur`
-  cannot write `uid_map` and nothing can mount tmpfs or overlay. Only binaries
-  with a `userns,` profile get full capabilities: crun (`/usr/bin/crun`), runc
-  (`/usr/sbin/runc`), podman and buildah. Rootfs assembly, overlay mounts and
+  cannot write `uid_map` and nothing can mount tmpfs or overlay. Of the
+  profiles checked, crun (`/usr/bin/crun`), runc (`/usr/sbin/runc`), podman
+  and buildah have a `userns,` rule that grants full capabilities in a new
+  userns. Rootfs assembly, overlay mounts and
   cleanup inside the uid map therefore need runtime-launched steps, not the
   unconfined Python builder.
 - **Runtimes.**
