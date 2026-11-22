@@ -506,7 +506,55 @@ argument builds omit source-path metadata. Unused argument changes do not
 invalidate the app-layer cache. The cache stores actual layer contents, not
 encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
 scoped interface; imported values escape dollars to preserve their runtime
-meaning when loaded. Build arguments do not introduce stages or conditions.
+meaning when loaded. Build arguments do not introduce stages; conditional file
+selection is limited to the file rules below.
+
+### Conditional file rules
+
+`file-rules` add or remove application files based on declared build arguments
+and the explicit target platform:
+
+```toml
+[build]
+include-paths = ["src", "pyproject.toml"]
+
+[build.build-args]
+BUILD_MODE = "production"
+
+[[build.file-rules]]
+when = 'BUILD_MODE == "dev"'
+include = ["debug_tools/**"]
+
+[[build.file-rules]]
+when = 'BUILD_MODE == "dev" and target.arch == "arm64"'
+exclude = "debug_tools/x86_only"
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg BUILD_MODE=dev --platform linux/arm64
+```
+
+Use `[[tool.pycontainer.file-rules]]` in `pyproject.toml`. Each rule has
+exactly `when` plus one of `include` or `exclude` (a pattern or a non-empty
+list). A condition is one or more `NAME == "value"` or `NAME != "value"`
+comparisons joined by `and`; string values use double quotes and support only
+`\"` and `\\` escapes. Names are declared build arguments, `target.os` and
+`target.arch` (from `platform`, including a `--platform` override). The host
+environment is never read and nothing is evaluated as code. Unknown names,
+unknown keys, malformed expressions, and absolute, drive-qualified or `..`
+patterns fail before building, even for inactive rules. Patterns are literal
+(not `${}`-expanded), relative to the context, case-sensitive, and use `/` or
+`\` interchangeably; a pattern matching a directory matches everything below it.
+
+Active includes add to `include-paths`; **every exclusion wins** over every
+include. That covers active exclude rules, `exclude-paths`, the default
+exclusions (so a `tests/**` rule needs `--no-default-excludes`), and the output
+and cache directories, which are always excluded. The selection is computed
+once and shared by framework detection, `--dry-run` (which reports the count and,
+with `-v`, each path), the app layer and the cache key; active rule sets are part
+of the cache identity. Conditionally selected symlinks must resolve to a file
+inside the context; dangling, cyclic, escaping or directory links are rejected.
+Any include root that passes through a symlinked directory is rejected.
 
 ---
 

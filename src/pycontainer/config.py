@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, resolve_arguments
+from .file_rules import evaluate_file_rules
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
@@ -37,7 +38,10 @@ class BuildConfig:
     semver_tags: bool = False
     latest_tag: bool = False
     build_args: Dict[str, BuildArgument] = field(default_factory=dict, repr=False)
+    file_rules: List[Dict[str, Union[str, List[str]]]] = field(default_factory=list)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _conditional_includes: Tuple[str, ...] = field(default=(), init=False, repr=False)
+    _conditional_excludes: Tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self):
         self._resolved_build_args = resolve_arguments(self.build_args)
@@ -45,6 +49,10 @@ class BuildConfig:
             setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
         try:
             self._validate()
+            if self.file_rules:
+                self._conditional_includes, self._conditional_excludes = evaluate_file_rules(
+                    self.file_rules, self._resolved_build_args, self.platform
+                )
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
 
@@ -92,6 +100,11 @@ class BuildConfig:
             for name in EXPANDABLE_FIELDS if name not in storage_fields
         }
         identity["backend"] = backend
+        if self.file_rules:
+            identity["file_rules"] = {
+                "include": sorted(self._conditional_includes),
+                "exclude": sorted(self._conditional_excludes),
+            }
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 

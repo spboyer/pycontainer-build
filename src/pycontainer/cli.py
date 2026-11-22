@@ -31,7 +31,7 @@ def main():
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
-    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
+    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret; also used by file-rules conditions)")
     b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
     b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
     b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")

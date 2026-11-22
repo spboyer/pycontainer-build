@@ -16,8 +16,8 @@ from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     context_exclude_paths,
     ensure_dir,
-    iter_files,
     output_directory_lock,
+    select_context_files,
 )
 
 
@@ -213,7 +213,7 @@ class ImageBuilder:
             cache_dir=cache_dir,
             exclude_paths=config.exclude_paths,
             exclude_defaults=config.exclude_defaults,
-        )
+        )+config._conditional_excludes
         self.context_include_paths=(
             config.include_paths
             if config.include_paths is not None
@@ -232,12 +232,16 @@ class ImageBuilder:
                 and exclude not in config.exclude_paths
             )
         )
-        self.config=apply_framework_defaults(
-            config,
+        self.context_files=select_context_files(
             context_dir,
             self.context_include_paths,
             self.context_excludes,
-            exclude_defaults=False,
+            config._conditional_includes,
+        )
+        self.config=apply_framework_defaults(
+            config,
+            context_dir,
+            files=[path for path, _ in self.context_files],
         )
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
@@ -281,7 +285,7 @@ class ImageBuilder:
             )
             if deps_layer: app_layers.append(deps_layer)
         
-        app_layer=self._create_app_layer(layers_dir, include)
+        app_layer=self._create_app_layer(layers_dir)
         app_layers.append(app_layer)
         
         all_layers=base_layers+app_layers
@@ -570,6 +574,13 @@ class ImageBuilder:
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
+        if self.config.file_rules:
+            active=len(self.config._conditional_includes)+len(self.config._conditional_excludes)
+            self._print(f"  Conditional File Patterns Active: {active}")
+        self._print(f"  Application Files: {len(self.context_files)} selected")
+        if self.verbose:
+            for _, relative in self.context_files:
+                self._print(f"    {relative.as_posix()}")
 
     def _create_deps_layer(
         self,
@@ -680,14 +691,15 @@ class ImageBuilder:
             finally:
                 tmp.unlink(missing_ok=True)
 
-    def _create_app_layer(self, layers_dir, include_paths):
-        ctx=Path(self.config.context_dir)
-        files=list(
-            iter_files(
-                ctx,
+    def _create_app_layer(self, layers_dir, include_paths=None):
+        files=(
+            list(self.context_files)
+            if include_paths is None
+            else select_context_files(
+                self.config.context_dir,
                 include_paths,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=self.config.exclude_defaults,
+                self.context_excludes,
+                self.config._conditional_includes,
             )
         )
 

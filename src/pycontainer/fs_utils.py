@@ -67,6 +67,7 @@ def _glob_matches(path_parts, pattern_parts):
 
 
 def path_is_excluded(relative_path, excludes):
+    """Return whether a path or any parent directory matches a pattern."""
     parts = Path(relative_path).as_posix().split("/")
     for exclude in excludes:
         pattern = str(exclude).replace("\\", "/").removeprefix("./").rstrip("/")
@@ -119,27 +120,91 @@ def context_exclude_paths(
         if generated_path is None:
             continue
         absolute_path = Path(os.path.abspath(generated_path))
-        try:
-            excludes.append(absolute_path.relative_to(context).as_posix())
-        except ValueError:
-            continue
+        for root, path in (
+            (context, absolute_path),
+            (context.resolve(), absolute_path.resolve()),
+        ):
+            try:
+                excludes.append(path.relative_to(root).as_posix())
+            except ValueError:
+                continue
 
     for path in exclude_paths:
         excludes.append(relative_context_path(path).as_posix())
     return tuple(dict.fromkeys(excludes))
 
 
-def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=True):
-    """Yield unique context files, pruning excluded directories during traversal."""
+def _check_root_links(base, relative):
+    """Reject include roots reached through a directory symlink."""
+    current = Path(base)
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if current.is_symlink() and (
+            index < len(relative.parts) - 1 or current.is_dir()
+        ):
+            raise ValueError(
+                f"Include path {relative.as_posix()!r} traverses a symlinked "
+                "directory; directory symlinks are never followed."
+            )
+
+
+def _check_selected_link(base, path, relative):
+    """Require a selected file symlink to resolve to a file inside the context."""
+    try:
+        target = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} is dangling or cyclic."
+        ) from None
+    if not target.is_relative_to(Path(base).resolve()) or not target.is_file():
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} must point to a file inside "
+            "the build context."
+        )
+
+
+def glob_root(pattern):
+    """Return the literal leading directory a context glob can match beneath."""
+    parts = []
+    for part in relative_context_path(pattern).parts:
+        if any(character in part for character in "*?["):
+            break
+        parts.append(part)
+    return Path(*parts) if parts else Path(".")
+
+
+def iter_files(
+    base,
+    relative_paths,
+    *,
+    exclude_paths=None,
+    exclude_defaults=True,
+    match_patterns=None,
+):
+    """Yield unique context files, pruning excluded directories during traversal.
+
+    With ``match_patterns`` only matching files are yielded and selected
+    symlinks must resolve to files inside the context.
+    """
     base = Path(base)
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
     if exclude_paths is not None:
         excludes.extend(exclude_paths)
 
+    def selected(path, relative):
+        if match_patterns is None:
+            return path.is_file()
+        if not path_is_excluded(relative, match_patterns):
+            return False
+        if path.is_symlink():
+            _check_selected_link(base, path, relative)
+        return path.is_file()
+
     seen = set()
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
         absolute = base / relative
+        _check_root_links(base, relative)
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
                 absolute, topdown=True, onerror=_raise_walk_error
@@ -156,21 +221,50 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     child_relative = child.relative_to(base)
                     relative_name = child_relative.as_posix()
                     if (
-                        child.is_file()
-                        and relative_name not in seen
+                        relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)
+                        and selected(child, child_relative)
                     ):
                         seen.add(relative_name)
                         yield child, child_relative
-        elif absolute.is_file():
+        elif absolute.is_file() or (match_patterns is not None and absolute.is_symlink()):
             child_relative = absolute.relative_to(base)
             relative_name = child_relative.as_posix()
             if (
                 relative_name not in seen
                 and not path_is_excluded(child_relative, excludes)
+                and selected(absolute, child_relative)
             ):
                 seen.add(relative_name)
                 yield absolute, child_relative
+
+
+def select_context_files(base, include_paths, excludes, conditional_includes=()):
+    """Return the single deterministic (absolute, relative) application selection.
+
+    Ordinary include paths keep their existing order; files added only by
+    active conditional include globs follow in POSIX path order. Every exclude
+    pattern wins over both.
+    """
+    files = list(
+        iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
+    )
+    if conditional_includes:
+        seen = {relative.as_posix() for _, relative in files}
+        roots = sorted({glob_root(pattern).as_posix() for pattern in conditional_includes})
+        added = [
+            (path, relative)
+            for path, relative in iter_files(
+                base,
+                roots,
+                exclude_paths=excludes,
+                exclude_defaults=False,
+                match_patterns=conditional_includes,
+            )
+            if relative.as_posix() not in seen
+        ]
+        files.extend(sorted(added, key=lambda item: item[1].as_posix()))
+    return files
 
 
 @contextmanager
