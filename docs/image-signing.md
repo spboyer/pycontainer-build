@@ -156,9 +156,10 @@ with a public key succeeded against `ttl.sh` using v2.6.1 and v3.1.4 with
 default transparency settings; a wrong key failed. Notation named-key
 signatures were independently verified with the strict test policy. A separate
 real-base multi-platform run in #219 failed during Cosign v3.1.4 signing before
-tag publication; its cause remains unconfirmed. A valid signature authenticates
-an artifact only under the verifier's policy; it does not establish that an
-image is free of vulnerabilities or safe to run.
+tag publication. Later direct signing of the same index and a fresh full index
+run succeeded; the original failure's cause remains unknown. A valid signature
+authenticates an artifact only under the verifier's policy; it does not
+establish that an image is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
