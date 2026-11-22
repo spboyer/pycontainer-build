@@ -41,7 +41,10 @@ def _verify(executable, key, subject, *, attestation):
         pytest.fail("The independent verifier failed or timed out.")
 
 
-def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
+@pytest.mark.parametrize(
+    "platform", ["linux/amd64", "linux/amd64,linux/arm64"], ids=["manifest", "index"]
+)
+def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path, platform):
     repository = _required("PYCONTAINER_SIGNING_TEST_REPOSITORY")
     key = _required("PYCONTAINER_COSIGN_TEST_KEY")
     public_key = _required("PYCONTAINER_COSIGN_TEST_PUBLIC_KEY")
@@ -61,6 +64,7 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
         output_dir=str(tmp_path / "out"),
         include_paths=["fixture.txt"],
         use_cache=False,
+        platform=platform,
         sign=True,
         sign_provider="cosign",
         sign_key=key,
@@ -70,13 +74,15 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
     builder = ImageBuilder(config)
     builder.build()
     builder.push(show_progress=False)
-    subject = f"{registry}/{repo}@{builder.manifest_digest}"
+    digest = builder.index_digest or builder.manifest_digest
+    assert bool(builder.index_digest) == ("," in platform)
+    subject = f"{registry}/{repo}@{digest}"
 
     assert _verify(executable, public_key, subject, attestation=False).returncode == 0
     assert _verify(executable, wrong_key, subject, attestation=False).returncode != 0
     result = _verify(executable, public_key, subject, attestation=True)
     assert result.returncode == 0, "Independent cosign attestation verification failed."
-    statements = parse_verified_attestations(result.stdout, builder.manifest_digest)
+    statements = parse_verified_attestations(result.stdout, digest)
     assert builder.provenance_statement in statements
     assert all(s["_type"] == STATEMENT_V1 and s["predicateType"] == SLSA_PROVENANCE_V1 for s in statements)
     envelopes = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]

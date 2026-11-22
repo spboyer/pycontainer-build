@@ -147,11 +147,14 @@ Verification uses cosign's transparency log defaults.
   disabled**. A wrong key was rejected.
 - The opt-in real-registry test also passed with cosign v2.6.1 and v3.1.4 and
   their default transparency settings on `ttl.sh`, using a synthetic app
-  without dependencies. Each published attestation included a transparency-log
-  inclusion proof; the log key matched `rekor.sigstore.dev`, and cosign verified
-  the log entry and exact statement bytes. Independent signature and attestation
-  verification both rejected a wrong key. Keyless signing, registries without
-  the Referrers API, GHCR, ACR and Docker Hub have not been validated.
+  without dependencies, for manifest and index subjects. One v3 index signing
+  attempt failed before tagging with an unknown cause; a fresh index run and a
+  separate signing attempt on the failed digest later succeeded. Published
+  attestations included transparency-log inclusion proofs; the log key matched
+  `rekor.sigstore.dev`, and cosign verified the log entry and exact statement
+  bytes. Independent signature and attestation verification both rejected a
+  wrong key. Keyless signing, registries without the Referrers API, GHCR, ACR
+  and Docker Hub have not been validated.
 - Notation has no attestation path.
 - Dependency environment markers are evaluated on the build host
   ([#142](https://github.com/spboyer/pycontainer-build/issues/142)).
