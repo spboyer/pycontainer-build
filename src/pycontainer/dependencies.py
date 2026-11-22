@@ -24,6 +24,10 @@ _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
+_SUPPORTED_LIBC = {
+    "glibc-2.17": "manylinux_2_17",
+    "musl-1.2": "musllinux_1_2",
+}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
@@ -120,15 +124,38 @@ def _target_options(
         ) from exc
     repository, image_tag = _base_image_parts(base_image)
     libc = _base_environment(base_config).get("PYTHON_LIBC")
+    if libc is not None and libc not in _SUPPORTED_LIBC:
+        raise ValueError(
+            f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
+            "supported values are glibc-2.17 and musl-1.2."
+        )
     if _is_official_python_image(repository):
-        if "alpine" in image_tag.lower():
-            platform = glibc_platform.replace("manylinux2014", "musllinux_1_2")
+        if image_tag:
+            tag_family = "musl" if "alpine" in image_tag.lower() else "glibc"
+        elif "@" not in base_image:
+            tag_family = "glibc"
         else:
+            tag_family = None
+        if libc and tag_family and libc.split("-", 1)[0] != tag_family:
+            raise ValueError(
+                f"Base image tag {image_tag or 'latest'!r} implies {tag_family}, "
+                f"which conflicts with PYTHON_LIBC={libc} in its image config."
+            )
+        if tag_family == "musl":
+            platform = glibc_platform.replace("manylinux2014", "musllinux_1_2")
+        elif tag_family == "glibc":
             platform = glibc_platform
-    elif libc == "glibc-2.17":
-        platform = glibc_platform.replace("manylinux2014", "manylinux_2_17")
-    elif libc == "musl-1.2":
-        platform = glibc_platform.replace("manylinux2014", "musllinux_1_2")
+        elif libc:
+            platform = glibc_platform.replace("manylinux2014", _SUPPORTED_LIBC[libc])
+        else:
+            raise ValueError(
+                "Cannot determine the target libc for a digest-only python base "
+                "image; pin a tag with the digest (for example "
+                "python:3.11-slim@sha256:...) or use an image whose config sets "
+                "PYTHON_LIBC to glibc-2.17 or musl-1.2."
+            )
+    elif libc:
+        platform = glibc_platform.replace("manylinux2014", _SUPPORTED_LIBC[libc])
     else:
         raise ValueError(
             "Cannot validate target wheel compatibility for this base image; "

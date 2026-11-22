@@ -147,7 +147,10 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
+`PYTHON_LIBC` value. Official `python` images derive libc from the tag
+(`alpine` means musl, otherwise glibc); a digest-only reference has no tag, so
+it needs supported `PYTHON_LIBC` metadata or fails. Unsupported or conflicting
+`PYTHON_LIBC` values fail before pip runs. Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)

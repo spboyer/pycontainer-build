@@ -343,6 +343,11 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Official `python` images derive libc from the tag (`alpine` tags use musl,
+  others glibc). A digest-only reference such as `python@sha256:...` carries no
+  tag, so pin the tag with the digest (`python:3.11-slim@sha256:...`) or use an
+  image config with a supported `PYTHON_LIBC`; otherwise staging fails rather
+  than guessing. Unsupported or tag-conflicting `PYTHON_LIBC` values also fail.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

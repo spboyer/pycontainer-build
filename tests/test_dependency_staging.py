@@ -376,6 +376,90 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 
+def _libc_config(*env):
+    return {"config": {"Env": ["PYTHON_VERSION=3.11.8", *env]}}
+
+
+DIGEST = "sha256:" + "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("base_image", "libc", "expected"),
+    [
+        (f"python@{DIGEST}", "musl-1.2", "musllinux_1_2_x86_64"),
+        (f"docker.io/library/python@{DIGEST}", "glibc-2.17", "manylinux_2_17_x86_64"),
+        (f"python:3.11-alpine@{DIGEST}", None, "musllinux_1_2_x86_64"),
+        (f"python:3.11-slim@{DIGEST}", None, "manylinux2014_x86_64"),
+        ("python:3.11-alpine", "musl-1.2", "musllinux_1_2_x86_64"),
+        ("python:3.11-slim", "glibc-2.17", "manylinux2014_x86_64"),
+        ("python", None, "manylinux2014_x86_64"),
+    ],
+)
+def test_official_image_libc_uses_tag_or_explicit_metadata(base_image, libc, expected):
+    config = _libc_config(f"PYTHON_LIBC={libc}") if libc else _libc_config()
+    assert _target_options("linux", "amd64", "3.11", base_image, config)[1] == expected
+
+
+@pytest.mark.parametrize(
+    ("base_image", "env", "message"),
+    [
+        (f"python@{DIGEST}", (), "digest-only"),
+        (f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.1",), "Unsupported PYTHON_LIBC"),
+        (f"python@{DIGEST}", ("PYTHON_LIBC=",), "Unsupported PYTHON_LIBC"),
+        ("python:3.11-alpine", ("PYTHON_LIBC=glibc-2.17",), "conflicts"),
+        (f"python:3.11-slim@{DIGEST}", ("PYTHON_LIBC=musl-1.2",), "conflicts"),
+        ("python:3.11-slim", ("PYTHON_LIBC=glibc",), "Unsupported PYTHON_LIBC"),
+    ],
+)
+def test_official_image_libc_fails_closed_when_ambiguous_or_inconsistent(
+    base_image, env, message
+):
+    with pytest.raises(ValueError, match=message):
+        _target_options("linux", "amd64", "3.11", base_image, _libc_config(*env))
+
+
+def test_digest_only_official_image_without_config_fails_closed():
+    with pytest.raises(ValueError, match="digest-only"):
+        _target_options("linux", "amd64", "3.11", f"python@{DIGEST}", None)
+
+
+@pytest.mark.parametrize(
+    "base_image",
+    [
+        f"python@{DIGEST}",
+        f"docker.io/library/python@{DIGEST}",
+        f"index.docker.io/library/python@{DIGEST}",
+    ],
+)
+def test_digest_only_source_name_with_musl_metadata_stages_musl_wheels_only(
+    tmp_path, base_image
+):
+    # Registry references and OCI layout `org.opencontainers.image.base.name`
+    # annotations reach install_requirements as the same base image string.
+    context = tmp_path / "context"
+    context.mkdir()
+    requirements = context / "requirements.txt"
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    config = _libc_config("PYTHON_LIBC=musl-1.2")
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_x86_64")
+    with pytest.raises(RuntimeError, match="Only wheels compatible with"):
+        install_requirements(
+            requirements, tmp_path / "rejected", context,
+            "linux", "amd64", "3.11", base_image, config,
+        )
+
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-musllinux_1_2_x86_64")
+    destination = tmp_path / "staged"
+    install_requirements(
+        requirements, destination, context,
+        "linux", "amd64", "3.11", base_image, config,
+    )
+    wheel = (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
+    assert "Tag: cp311-cp311-musllinux_1_2_x86_64" in wheel
+
+
 def test_requirements_install_rejects_incompatible_cpython_wheel(tmp_path, monkeypatch):
     context = tmp_path / "context"
     context.mkdir()
