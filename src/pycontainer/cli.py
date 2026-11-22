@@ -64,7 +64,20 @@ def main():
     imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     # --- end import subcommand ---
+    ins=sub.add_parser("inspect",help="Inspect the layers of a local OCI layout or docker-save archive")
+    ins.add_argument("image",help="oci:<dir>[:<ref>|@sha256:<digest>], docker-archive:<file>[:<tag>], or an OCI layout directory such as dist/image")
+    ins.add_argument("--platform",help="Select a platform from a multi-platform index or verify an image's platform (os/arch[/variant])")
+    ins.add_argument("--files",action="store_true",help="List the entries of every layer")
+    ins.add_argument("--layer",dest="layers",type=int,action="append",help="List the entries of this 1-based layer (repeatable)")
+    ins.add_argument("--diff",nargs=2,type=int,metavar=("FROM","TO"),help="Compare the filesystem after layer FROM (0 = empty) with the filesystem after layer TO")
+    ins.add_argument("--json",action="store_true",help="Emit the report as JSON")
     args=parser.parse_args()
+
+    if args.cmd=="inspect":
+        from .layer_inspect import run_inspect
+        output,code=run_inspect(args.image,args.platform,args.files,args.layers,args.diff,args.json)
+        print(output,file=sys.stderr if code else sys.stdout)
+        raise SystemExit(code)
 
     if args.cmd=="import":
         from .dockerfile_import import run_import

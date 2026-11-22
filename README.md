@@ -170,6 +170,7 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
+- ✅ **Layer inspection** — `pycontainer inspect` reports local image layer sizes, contents, and diffs without a daemon
 
 ### Coming Soon
 
@@ -386,6 +387,31 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   (often only a tag such as `3.11-slim`), so such images need
   `PYTHON_IMPLEMENTATION`, `PYTHON_VERSION`, and `PYTHON_LIBC` in their config
   for `--include-deps`.
+
+### Inspecting images
+
+`pycontainer inspect` reads a local OCI layout or `docker save` archive without
+a registry, credentials, or a Docker daemon and reports what each layer adds,
+changes, and removes:
+
+```bash
+pycontainer inspect dist/image                         # pycontainer output
+pycontainer inspect oci:./base:3.11-slim --files       # every layer's entries
+pycontainer inspect oci:./base --platform linux/arm64 --layer 3
+pycontainer inspect docker-archive:./app.tar --diff 2 5 # compare filesystem states
+pycontainer inspect dist/image --json                   # machine-readable report
+```
+
+The report lists each layer's compressed and uncompressed size, member count and
+added/modified/deleted paths, the final filesystem totals, and observations:
+content shadowed by later deletions or replacements, duplicate files, Python
+bytecode, pip and APT caches, VCS metadata, and the largest files. Observation
+sizes are uncompressed tar-header sizes, not measured registry or disk savings.
+Inspection verifies every layer's DiffID and fails with an explicit error,
+never a partial report, on unsafe paths, entries beneath symlinks, malformed or
+mislabeled layers, or an ambiguous multi-platform index without `--platform`.
+It does not start the image; use the opt-in runtime check for that. See
+[Image inspection](docs/inspection.md).
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
@@ -641,6 +667,7 @@ This style is intentional for the experimental phase.
 ### Documentation
 
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
+- **[Image inspection](docs/inspection.md)** — Daemon-free layer sizes, contents, diffs, and observations
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 
