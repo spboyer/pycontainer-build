@@ -44,12 +44,20 @@ def _write_unique_fixture(context):
 def _provider_settings(mode):
     if mode == "cosign-key":
         return (
-            {"sign_provider": "cosign", "sign_key": _required("PYCONTAINER_COSIGN_TEST_KEY")},
+            {
+                "sign_provider": "cosign",
+                "sign_key": _required("PYCONTAINER_COSIGN_TEST_KEY"),
+                "sign_verify_key": _required("PYCONTAINER_COSIGN_TEST_PUBLIC_KEY"),
+            },
             ["cosign", "verify", "--key=" + _required("PYCONTAINER_COSIGN_TEST_PUBLIC_KEY")],
         )
     if mode == "cosign-keyless":
         return (
-            {"sign_provider": "cosign"},
+            {
+                "sign_provider": "cosign",
+                "sign_certificate_identity": _required("PYCONTAINER_COSIGN_TEST_IDENTITY"),
+                "sign_certificate_oidc_issuer": _required("PYCONTAINER_COSIGN_TEST_ISSUER"),
+            },
             [
                 "cosign", "verify",
                 "--certificate-identity=" + _required("PYCONTAINER_COSIGN_TEST_IDENTITY"),

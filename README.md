@@ -69,7 +69,9 @@ pycontainer build \
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
 # Opt in to Cosign keyless signing with an ambient OIDC identity
-pycontainer build --tag ghcr.io/user/myapp:v1 --push --sign --sign-provider cosign
+pycontainer build --tag ghcr.io/user/myapp:v1 --push --sign --sign-provider cosign \
+  --sign-certificate-identity '<expected-identity>' \
+  --sign-certificate-oidc-issuer '<expected-issuer>'
 
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build --tag myapp:latest --platform linux/amd64
@@ -352,7 +354,9 @@ pycontainer build \
 **Image signing:** `--sign --sign-provider cosign|notation` requires `--push`
 and an independently configured signer. The registry must accept publication
 by digest. The image manifest, or the top-level multi-platform image index, is
-verified and signed before tags are written. See the
+verified, signed, and its signature verified by the same provider and trust
+configuration (`--sign-verify-key`, or the keyless certificate identity and
+issuer, or a strict Notation trust policy) before tags are written. See the
 [signing guide](docs/image-signing.md) for keys, OIDC, verification, limitations
 and real-registry test prerequisites.
 

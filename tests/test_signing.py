@@ -16,6 +16,13 @@ from pycontainer.config import BuildConfig
 from pycontainer.registry_client import RegistryAuthenticationError, RegistryRequestError
 
 
+COSIGN_KEYLESS = {
+    "sign_certificate_identity": "https://github.com/example/app/.github/workflows/release.yml@refs/heads/main",
+    "sign_certificate_oidc_issuer": "https://token.actions.githubusercontent.com",
+}
+COSIGN_KEY = {"sign_key": "env://COSIGN_KEY", "sign_verify_key": "cosign.pub"}
+
+
 def _digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -34,6 +41,7 @@ def _builder(tmp_path, monkeypatch, platform="linux/amd64"):
         platform=platform,
         sign=True,
         sign_provider="cosign",
+        **COSIGN_KEYLESS,
     )
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
@@ -104,10 +112,11 @@ class FakeRegistry:
 
 
 class FakeSigner:
-    def __init__(self, registry, fail=False, race=False):
+    def __init__(self, registry, fail=False, race=False, fail_verify=False):
         self.registry = registry
         self.fail = fail
         self.race = race
+        self.fail_verify = fail_verify
 
     def sign(self, subject):
         self.registry.events.append(("sign", subject))
@@ -116,8 +125,13 @@ class FakeSigner:
         if self.fail:
             raise signing.SigningError("provider exited unsuccessfully")
 
+    def verify(self, subject):
+        self.registry.events.append(("verify", subject))
+        if self.fail_verify:
+            raise signing.SigningError("verifier exited unsuccessfully")
 
-def _use_registry(monkeypatch, registry, *, fail=False, race=False):
+
+def _use_registry(monkeypatch, registry, *, fail=False, race=False, fail_verify=False):
     monkeypatch.setattr(builder_module, "RegistryClient", registry)
     monkeypatch.setattr(
         builder_module, "get_registry_auth",
@@ -127,7 +141,7 @@ def _use_registry(monkeypatch, registry, *, fail=False, race=False):
     )
     monkeypatch.setattr(
         builder_module, "create_signer",
-        lambda config: FakeSigner(registry, fail=fail, race=race),
+        lambda config: FakeSigner(registry, fail=fail, race=race, fail_verify=fail_verify),
     )
 
 
@@ -147,13 +161,14 @@ def test_signed_push_verifies_and_signs_immutable_top_level_before_tags(
     assert registry.repository == "other/app"
     assert ("sign", subject) in registry.events
     sign_index = registry.events.index(("sign", subject))
+    verify_index = registry.events.index(("verify", subject))
     stage_kind = "index" if builder.index_digest else "manifest"
-    assert registry.events.index((stage_kind, digest)) < sign_index
+    assert registry.events.index((stage_kind, digest)) < sign_index < verify_index
     assert registry.events.index(("read", digest)) < sign_index
     assert registry.events.index(("head", digest)) < sign_index
     assert all(
-        registry.events.index((stage_kind, tag)) > sign_index
-        and registry.events.index(("read", tag)) > sign_index
+        registry.events.index((stage_kind, tag)) > verify_index
+        and registry.events.index(("read", tag)) > verify_index
         for tag in ("v2", "stable")
     )
     assert all(_digest(registry.manifests[tag]) == digest for tag in ("v2", "stable"))
@@ -281,6 +296,29 @@ def test_index_staging_failure_reports_verified_prior_publications(tmp_path, mon
 
 
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_signed_push_does_not_move_tags_when_signature_verification_fails(
+    tmp_path, monkeypatch, platform
+):
+    builder = _builder(tmp_path, monkeypatch, platform)
+    digest = builder.index_digest or builder.manifest_digest
+    subject = f"registry.example/team/app@{digest}"
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry, fail_verify=True)
+
+    with pytest.raises(signing.SigningError, match="Verifying the signature") as raised:
+        builder.push(show_progress=False)
+
+    assert ("verify", subject) in registry.events
+    assert "not attempted" in str(raised.value).lower()
+    assert builder.signed_ref is None
+    assert builder.pushed_refs == []
+    assert not any(
+        event[1] in {"v1", "stable"}
+        for event in registry.events if event[0] in {"manifest", "index"}
+    )
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_signed_push_rechecks_subject_after_signing_before_tags(
     tmp_path, monkeypatch, platform
 ):
@@ -293,6 +331,9 @@ def test_signed_push_rechecks_subject_after_signing_before_tags(
         def sign(self, subject):
             registry.events.append(("sign", subject))
             registry.fail_read = digest
+
+        def verify(self, subject):
+            registry.events.append(("verify", subject))
 
     monkeypatch.setattr(builder_module, "create_signer", lambda config: DisappearingSubjectSigner())
     with pytest.raises(RegistryRequestError, match="reverified") as raised:
@@ -405,6 +446,15 @@ def test_signed_push_rejects_digest_override(tmp_path, monkeypatch):
         {"sign": True, "sign_provider": "notation", "sign_key": "named", "sign_timestamp_url": "https://user:secret@tsa.example"},
         {"sign": True, "sign_provider": "notation", "sign_key": "named", "sign_timestamp_root_cert": "ca.pem"},
         {"sign": True, "sign_provider": "notation", "sign_key": "named", "sign_signature_format": "unsupported"},
+        {"sign": True, "sign_provider": "cosign"},
+        {"sign": True, "sign_provider": "cosign", "sign_certificate_identity": "id"},
+        {"sign": True, "sign_provider": "cosign", "sign_certificate_oidc_issuer": "https://issuer.example"},
+        {"sign": True, "sign_provider": "cosign", **COSIGN_KEYLESS, "sign_verify_key": "cosign.pub"},
+        {"sign": True, "sign_provider": "cosign", "sign_key": "cosign.key"},
+        {"sign": True, "sign_provider": "cosign", **COSIGN_KEY, **COSIGN_KEYLESS},
+        {"sign": True, "sign_provider": "notation", "sign_key": "named", "sign_verify_key": "cosign.pub"},
+        {"sign": True, "sign_provider": "notation", "sign_key": "named", **COSIGN_KEYLESS},
+        {"sign": True, "sign_provider": "cosign", **COSIGN_KEY, "sign_verify_key": "-----BEGIN PRIVATE KEY-----"},
     ],
 )
 def test_invalid_signing_configuration_is_rejected(options):
@@ -428,8 +478,8 @@ def _fake_version_run(commands, provider, version):
 @pytest.mark.parametrize(
     ("provider", "options", "expected"),
     [
-        ("cosign", {}, ["--yes", "--upload=true"]),
-        ("cosign", {"sign_key": "env://COSIGN_KEY"}, ["--yes", "--upload=true", "--key=env://COSIGN_KEY"]),
+        ("cosign", COSIGN_KEYLESS, ["--yes", "--upload=true"]),
+        ("cosign", COSIGN_KEY, ["--yes", "--upload=true", "--key=env://COSIGN_KEY"]),
         ("notation", {"sign_key": "release-key"}, ["--force-referrers-tag=false", "--key=release-key"]),
         ("notation", {"sign_plugin": "plugin", "sign_key_id": "key-id"}, ["--force-referrers-tag=false", "--plugin=plugin", "--id=key-id"]),
         (
@@ -476,7 +526,7 @@ def test_incompatible_signer_versions_are_rejected(monkeypatch, provider, versio
     monkeypatch.setattr(
         signing.subprocess, "run", _fake_version_run(commands, provider, version)
     )
-    options = {"sign_key": "named"} if provider == "notation" else {}
+    options = {"sign_key": "named"} if provider == "notation" else COSIGN_KEYLESS
     with pytest.raises(signing.SigningError, match="version"):
         signing.create_signer(BuildConfig(sign=True, sign_provider=provider, **options))
 
@@ -489,12 +539,12 @@ def test_supported_versions_with_build_metadata_are_accepted(monkeypatch, provid
     monkeypatch.setattr(signing, "_find_executable", lambda name: name + ".exe")
     monkeypatch.setattr(signing.subprocess, "run", _fake_version_run(commands, provider, version))
     monkeypatch.delenv("COSIGN_REPOSITORY", raising=False)
-    options = {"sign_key": "named"} if provider == "notation" else {}
+    options = {"sign_key": "named"} if provider == "notation" else COSIGN_KEYLESS
     assert signing.create_signer(BuildConfig(sign=True, sign_provider=provider, **options))
 
 
 def test_signer_missing_or_failing_does_not_expose_output(monkeypatch, capsys):
-    config = BuildConfig(sign=True, sign_provider="cosign")
+    config = BuildConfig(sign=True, sign_provider="cosign", **COSIGN_KEYLESS)
     monkeypatch.delenv("COSIGN_REPOSITORY", raising=False)
     monkeypatch.setattr(signing, "_find_executable", lambda name: None)
     with pytest.raises(signing.SigningError, match="not found"):
@@ -524,7 +574,7 @@ def test_windows_batch_signer_is_rejected(monkeypatch, extension):
     monkeypatch.setattr(signing, "_find_executable", lambda name: name + extension)
     monkeypatch.delenv("COSIGN_REPOSITORY", raising=False)
     with pytest.raises(signing.SigningError, match="native Windows executable"):
-        signing.create_signer(BuildConfig(sign=True, sign_provider="cosign"))
+        signing.create_signer(BuildConfig(sign=True, sign_provider="cosign", **COSIGN_KEYLESS))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows PATH resolution differs from Unix")
@@ -554,7 +604,7 @@ def test_windows_signer_lookup_excludes_the_current_directory(tmp_path, monkeypa
 def test_cosign_signature_repository_override_is_rejected(monkeypatch):
     monkeypatch.setenv("COSIGN_REPOSITORY", "other.example/team/signatures")
     with pytest.raises(signing.SigningError, match="COSIGN_REPOSITORY"):
-        signing.create_signer(BuildConfig(sign=True, sign_provider="cosign"))
+        signing.create_signer(BuildConfig(sign=True, sign_provider="cosign", **COSIGN_KEYLESS))
 
 
 def test_signer_timeout_is_explicit_and_does_not_expose_output(monkeypatch):
@@ -569,7 +619,7 @@ def test_signer_timeout_is_explicit_and_does_not_expose_output(monkeypatch):
         raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="secret")
 
     monkeypatch.setattr(signing.subprocess, "run", run)
-    signer = signing.create_signer(BuildConfig(sign=True, sign_provider="cosign"))
+    signer = signing.create_signer(BuildConfig(sign=True, sign_provider="cosign", **COSIGN_KEYLESS))
     with pytest.raises(signing.SigningError, match="timed out") as raised:
         signer.sign("registry.example/app@sha256:" + "a" * 64)
     assert "secret" not in str(raised.value)
@@ -591,6 +641,179 @@ def test_real_notation_verification_requires_strict_policy(policy, expected):
     from test_signing_integration import _notation_policy_is_strict
 
     assert _notation_policy_is_strict(policy) is expected
+
+
+def _provider_run(commands, provider, *, verify_output="", policy=None, policies=None):
+    version_run = _fake_version_run(commands, provider, "v3.1.4" if provider == "cosign" else "1.3.2")
+    policies = list(policies) if policies is not None else None
+
+    def run(args, **kwargs):
+        if args[1] == "version":
+            return version_run(args, **kwargs)
+        commands.append((args, kwargs))
+        if args[1:3] == ["policy", "show"]:
+            current = policies.pop(0) if policies else policy
+            return SimpleNamespace(returncode=0, stdout=json.dumps(current), stderr="")
+        return SimpleNamespace(returncode=0, stdout=verify_output, stderr="")
+    return run
+
+
+def _create_signer(monkeypatch, commands, provider, options, **run_options):
+    monkeypatch.setattr(signing, "_find_executable", lambda name: name + ".exe")
+    monkeypatch.delenv("COSIGN_REPOSITORY", raising=False)
+    monkeypatch.setattr(signing.subprocess, "run", _provider_run(commands, provider, **run_options))
+    return signing.create_signer(BuildConfig(sign=True, sign_provider=provider, **options))
+
+
+SUBJECT = "registry.example/team/app@sha256:" + "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (COSIGN_KEY, ["--key=cosign.pub"]),
+        (
+            COSIGN_KEYLESS,
+            [
+                "--certificate-identity=" + COSIGN_KEYLESS["sign_certificate_identity"],
+                "--certificate-oidc-issuer=" + COSIGN_KEYLESS["sign_certificate_oidc_issuer"],
+            ],
+        ),
+    ],
+)
+def test_cosign_verifies_exact_digest_with_configured_trust(monkeypatch, options, expected):
+    commands = []
+    signer = _create_signer(monkeypatch, commands, "cosign", options)
+
+    signer.verify(SUBJECT)
+
+    args, kwargs = commands[-1]
+    assert args == ["cosign.exe", "verify", *expected, "--", SUBJECT]
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["timeout"] > 0
+
+
+def test_cosign_verification_failure_is_explicit_and_redacted(monkeypatch):
+    commands = []
+    signer = _create_signer(monkeypatch, commands, "cosign", COSIGN_KEYLESS)
+    monkeypatch.setattr(
+        signing.subprocess, "run",
+        lambda args, **kwargs: SimpleNamespace(returncode=1, stdout="secret", stderr="secret"),
+    )
+    with pytest.raises(signing.SigningError, match="verification") as raised:
+        signer.verify(SUBJECT)
+    assert "secret" not in str(raised.value)
+
+
+def test_signer_verify_requires_an_immutable_subject(monkeypatch):
+    signer = _create_signer(monkeypatch, [], "cosign", COSIGN_KEYLESS)
+    with pytest.raises(signing.SigningError, match="immutable"):
+        signer.verify("registry.example/team/app:v1")
+
+
+def _notation_policy(level="strict", scopes=None, **verification):
+    return {
+        "version": "1.0",
+        "trustPolicies": [
+            {
+                "name": "release",
+                "registryScopes": scopes or ["registry.example/team/app"],
+                "signatureVerification": {"level": level, **verification},
+                "trustStores": ["ca:release"],
+                "trustedIdentities": ["*"],
+            }
+        ],
+    }
+
+
+def test_notation_verifies_exact_digest_under_strict_policy(monkeypatch):
+    commands = []
+    signer = _create_signer(
+        monkeypatch, commands, "notation", {"sign_key": "release"},
+        policy=_notation_policy(),
+        verify_output=f"Successfully verified signature for {SUBJECT}\n",
+    )
+
+    signer.verify(SUBJECT)
+
+    invoked = [args[1:] for args, _ in commands if args[1:] != ["version"]]
+    assert invoked == [["policy", "show"], ["verify", "--", SUBJECT], ["policy", "show"]]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        _notation_policy("skip"),
+        _notation_policy("audit"),
+        _notation_policy("permissive"),
+        _notation_policy(override={"revocation": "skip"}),
+        _notation_policy(override=None),
+        _notation_policy(override={}),
+        _notation_policy(scopes=["registry.example/team/other"]),
+        _notation_policy(scopes="registry.example/team/app"),
+        _notation_policy(scopes=[1, "registry.example/team/other"]),
+        _notation_policy(scopes={"registry.example/team/app": True}),
+        {"trustPolicies": []},
+        None,
+    ],
+)
+def test_notation_rejects_non_strict_or_missing_policy_before_verify(monkeypatch, policy):
+    commands = []
+    signer = _create_signer(
+        monkeypatch, commands, "notation", {"sign_key": "release"},
+        policy=policy, verify_output=f"Successfully verified signature for {SUBJECT}\n",
+    )
+    with pytest.raises(signing.SigningError, match="trust policy"):
+        signer.verify(SUBJECT)
+    assert not any(args[1] == "verify" for args, _ in commands)
+
+
+def test_notation_wildcard_policy_applies_only_without_an_exact_scope(monkeypatch):
+    policy = _notation_policy()
+    policy["trustPolicies"].append(
+        {**_notation_policy("skip", ["*"])["trustPolicies"][0], "name": "default"}
+    )
+    signer = _create_signer(
+        monkeypatch, [], "notation", {"sign_key": "release"},
+        policy=policy, verify_output=f"Successfully verified signature for {SUBJECT}\n",
+    )
+    signer.verify(SUBJECT)
+
+    wildcard_only = _notation_policy("skip", ["*"])
+    signer = _create_signer(
+        monkeypatch, [], "notation", {"sign_key": "release"},
+        policy=wildcard_only, verify_output=f"Successfully verified signature for {SUBJECT}\n",
+    )
+    with pytest.raises(signing.SigningError, match="trust policy"):
+        signer.verify(SUBJECT)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "",
+        f"Trust policy is configured to skip signature verification for {SUBJECT}\n",
+        "Successfully verified signature for registry.example/team/app@sha256:" + "b" * 64 + "\n",
+    ],
+)
+def test_notation_requires_success_report_for_the_exact_subject(monkeypatch, output):
+    signer = _create_signer(
+        monkeypatch, [], "notation", {"sign_key": "release"},
+        policy=_notation_policy(), verify_output=output,
+    )
+    with pytest.raises(signing.SigningError, match="did not report"):
+        signer.verify(SUBJECT)
+
+
+def test_notation_rejects_policy_changes_during_verification(monkeypatch):
+    signer = _create_signer(
+        monkeypatch, [], "notation", {"sign_key": "release"},
+        policies=[_notation_policy(), _notation_policy(trustedIdentities=None)],
+        verify_output=f"Successfully verified signature for {SUBJECT}\n",
+    )
+    with pytest.raises(signing.SigningError, match="changed"):
+        signer.verify(SUBJECT)
 
 
 def test_real_provider_fixtures_have_distinct_subject_digests(tmp_path, monkeypatch):
