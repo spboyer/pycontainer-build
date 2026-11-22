@@ -291,6 +291,34 @@ def test_oci_layout_selects_by_containerd_image_name_alias(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
 
 
+@pytest.mark.parametrize("reference", ["v1", "example.com/app:v1"])
+def test_oci_layout_selects_single_entry_by_either_index_annotation(
+    tmp_path, offline, reference
+):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"index")
+    layout.add(descriptor)
+    layout.write_index({
+        "org.opencontainers.image.ref.name": "v1",
+        "io.containerd.image.name": "example.com/app:v1",
+    })
+
+    _, manifest, _ = build(tmp_path, f"oci:{layout.root}:{reference}")
+    assert manifest["layers"][0] == layer
+
+
+def test_oci_layout_does_not_select_multi_entry_by_index_annotation(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    first, _, _ = layout.image(b"first")
+    second, _, _ = layout.image(b"second")
+    layout.add(first, ref="one")
+    layout.add(second, ref="two")
+    layout.write_index({"org.opencontainers.image.ref.name": "index-name"})
+
+    with pytest.raises(LocalImageError, match="has no image matching"):
+        build(tmp_path, f"oci:{layout.root}:index-name")
+
+
 def test_oci_layout_selects_by_digest(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     first, platform, first_layer = layout.image(b"first")

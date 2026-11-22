@@ -442,8 +442,11 @@ class OCILayoutSource:
         if self.reference.reference:
             wanted = self.reference.reference
             matches = [d for d in descriptors if wanted in _descriptor_aliases(d)]
-            index_name = _image_name(self.index.get("annotations"))
-            if not matches and len(descriptors) == 1 and index_name == wanted:
+            if (
+                not matches
+                and len(descriptors) == 1
+                and wanted in _descriptor_aliases(self.index)
+            ):
                 matches = descriptors
             return matches
         return descriptors
