@@ -104,6 +104,23 @@ def test_cli_overrides_take_precedence_and_are_attributed(offline, monkeypatch, 
     assert _run(monkeypatch, ["validate", "config", "-c", path, "--platform", "linux/amd64"]) == 0
 
 
+@pytest.mark.parametrize(
+    ("content", "extra", "origin"),
+    [
+        ('[build]\ntag = "app:1"\ntags = ["bad tag"]\n', [], "[build].tags"),
+        ('[tool.pycontainer]\ntag = "app:1"\n', ["--semver-tags"], "CLI option --semver-tags"),
+    ],
+)
+def test_tag_errors_identify_the_setting_that_failed(
+    offline, monkeypatch, capsys, content, extra, origin
+):
+    path = _write(offline / "config.toml", content)
+
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, [*command, *extra]) == 2
+        assert f"{origin}:" in capsys.readouterr().err
+
+
 def test_invalid_paths_are_aggregated_with_source_and_field(offline, monkeypatch, capsys):
     good = _write(offline / "good.toml", '[build]\ntag = "app:1"\n')
     unknown = _write(offline / "unknown.toml", "[tool.pycontainer]\nworkdr = \"/x\"\n")

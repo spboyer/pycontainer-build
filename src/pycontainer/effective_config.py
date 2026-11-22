@@ -14,6 +14,7 @@ from .dependencies import validate_target_platform
 from .fs_utils import relative_context_path
 from .project import detect_python_version
 from .registry_client import parse_image_reference
+from .tags import resolve_tags
 
 CLI_FLAGS = {
     "tag": "--tag",
@@ -76,7 +77,21 @@ def _constructor_errors(merged: Dict[str, Any], origin) -> List[str]:
         try:
             BuildConfig(**{key: merged[key] for key in group if key in merged})
         except ValueError as exc:
-            field = next((key for key in group if key in merged), group[0])
+            if group[0] == "tag":
+                primary = merged.get("tag", BuildConfig.tag)
+                try:
+                    resolve_tags(primary)
+                except ValueError:
+                    field = "tag"
+                else:
+                    try:
+                        resolve_tags(primary, merged.get("tags"))
+                    except ValueError:
+                        field = "tags"
+                    else:
+                        field = "semver_tags" if merged.get("semver_tags") else "latest_tag"
+            else:
+                field = group[0]
             errors.append(f"{origin(field)}: {exc}")
     return errors
 
