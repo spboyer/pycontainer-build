@@ -174,6 +174,85 @@ export REGISTRY_PASSWORD="mypass"
 pycontainer build --tag registry.example.com/app:v1 --push
 ```
 
+## Private Package Indexes
+
+With `--include-deps` and a requirements file, the builder runs the host
+interpreter's `pip` to download target wheels. Index credentials are read by
+pip on the build host only; they are not passed through pycontainer
+configuration. This section covers that path; registry authentication above is
+separate.
+
+### Supported credential sources
+
+| Source | How to use it |
+|--------|---------------|
+| Environment | `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` containing `https://user:token@host/simple` |
+| pip config file | `index-url` / `extra-index-url` in a pip config file outside the build context, or selected with `PIP_CONFIG_FILE` |
+| netrc | `~/.netrc` (or the file named by `NETRC`) with a `machine <host>` entry; the index URL carries no credentials |
+| keyring | `PIP_KEYRING_PROVIDER=import` (keyring importable by the builder's Python) or `subprocess` (a `keyring` executable on `PATH`; put the username in the URL, e.g. `https://user@host/simple`). pip runs with `--no-input`, so the default `auto` provider does not query keyring |
+| Placeholders | `--index-url https://${INDEX_USER}:${INDEX_TOKEN}@host/simple` in the requirements file; pip expands `${NAME}` (uppercase letters, digits, `_`) from the builder's environment |
+
+### What the builder enforces
+
+- **Literal credentials are rejected.** Every file in the requirements graph
+  (`-r` and `-c` includes, comments included) is scanned before pip runs. URLs
+  with a password, a bare username or token (other than `git@`), or a query
+  parameter named like `token`, `key`, `secret`, `password`, `auth`, `sig` or
+  `credential` fail the build. Userinfo made only of `${VAR}` placeholders, or
+  a literal user with a `${VAR}` password, is allowed. The error names the file,
+  line and URL scheme and host only.
+- **Shipped pip inputs are checked even without `--include-deps`.** Before the
+  application layer is created (and before any cache lookup), included
+  `requirements*.txt|.in`, `constraints*.txt|.in`, `pip.conf`, `pip.ini` and
+  requirements-graph files are scanned the same way, and `.netrc` / `_netrc`
+  files are rejected. A host `PIP_CONFIG_FILE` or `NETRC` that points inside
+  the context is treated the same way, whatever its file name. Exclude them
+  from the context or use placeholders.
+- **Host pip settings cannot change target selection.** Only these `PIP_*`
+  variables, and the matching pip config-file keys, reach pip:
+  `PIP_CERT`, `PIP_CLIENT_CERT`, `PIP_CONFIG_FILE`, `PIP_DEFAULT_TIMEOUT`,
+  `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `PIP_INDEX_URL`,
+  `PIP_KEYRING_PROVIDER`, `PIP_NO_INDEX`, `PIP_PROXY`, `PIP_REQUIRE_HASHES`,
+  `PIP_RETRIES`, `PIP_TIMEOUT` and `PIP_TRUSTED_HOST`. Others, such as
+  `PIP_PLATFORM`, `PIP_ONLY_BINARY`, `PIP_NO_BINARY`, `PIP_TARGET`,
+  `PIP_PREFIX` or `PIP_USER`, are ignored; their names (never values) are
+  printed. pip `append` options combine config and command-line values, so
+  command-line flags alone would not pin the target. A self-test refuses to
+  install if pip's configuration hook changes. Standard `HTTP(S)_PROXY`,
+  `NO_PROXY`, `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` variables still apply.
+  pip runs with `python -E`, so `PYTHONPATH` and `PYTHONHOME` cannot replace
+  the pinned pip.
+- **Only installed packages ship.** The dependency layer contains the staged
+  `site-packages` and generated console scripts. pip's stderr and debug log are
+  kept in host temporary files outside the staged tree. Installed
+  `direct_url.json` metadata with URL credentials fails the build, for both
+  pip-staged and virtualenv-staged dependencies.
+- **Errors are classified and redacted.** HTTP 401/403 failures name the
+  supported credential sources, HTTP 407 points at proxy credentials, and
+  connection or TLS failures say so. Excerpts are limited to a few pip lines
+  with URL userinfo, secret-like query values, known environment URL
+  credentials and expanded placeholder values replaced by `****`.
+
+### Limits
+
+- Detection is pattern-based. Tokens embedded in URL paths, or credentials in
+  other source files (for example application config), are not detected;
+  keep secrets out of the build context.
+- Redaction covers values the builder can see: URL userinfo, secret-like query
+  parameters, `PIP_*`/proxy URL credentials and placeholder values. Values pip
+  reads from config files, netrc or keyring are redacted only where they
+  appear as URL userinfo; pip itself also masks passwords in URLs it logs.
+- pip, keyring backends and the index are trusted. A malicious index or
+  package is out of scope.
+- The tests use a loopback basic-auth index and synthetic secrets
+  (`tests/test_private_index.py`); they verify that those secrets do not
+  appear in the OCI layout blobs (decompressed), SBOM, layer cache, standard
+  output or errors. A second loopback origin on a different hostname verifies
+  that index credentials (environment userinfo, netrc and placeholders) are not
+  sent to an artifact host that the index links or redirects to. Credentials
+  configured for that artifact host itself would still be sent. The tests do
+  not cover every index product or authentication scheme.
+
 ## Security Considerations
 
 ### Credential Storage

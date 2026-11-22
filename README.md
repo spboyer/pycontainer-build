@@ -350,6 +350,12 @@ pycontainer build \
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
   is copied as resolved on its host, so its markers are not re-evaluated.
+  Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
+  `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
+  placeholders in the requirements file. Literal credentials in requirements
+  files are rejected, and host pip settings that could change target
+  selection (for example `PIP_PLATFORM` or `PIP_NO_BINARY`) are ignored; see
+  [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

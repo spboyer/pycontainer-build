@@ -6,9 +6,12 @@ pip selects wheels with ``--platform``/``--python-version`` but evaluates
 markers against the build host, so every marker evaluation (requirements-file
 roots, extras and transitive ``Requires-Dist``) is forced through the target
 environment here. Markers that reference a variable whose target value is
-unknown fail the install instead of falling back to host values.
+unknown fail the install instead of falling back to host values. Host pip
+configuration (environment and config files) is filtered to index and
+authentication keys so it cannot change target selection options.
 """
 import json
+import os
 import runpy
 import sys
 
@@ -34,6 +37,35 @@ def _variables(markers):
         elif item not in {"and", "or"}:
             raise TargetMarkerError("unrecognized marker structure")
     return names
+
+
+def _pin_pip_configuration(allowed_keys):
+    """Ignore pip config-file and environment keys that could change target options."""
+    from pip._internal.cli import parser
+    from pip._internal.commands import create_command
+
+    original_items = parser.ConfigOptionParser._get_ordered_configuration_items
+
+    def configuration_items(self):
+        for key, value in original_items(self):
+            if key.replace("_", "-").lower() in allowed_keys:
+                yield key, value
+
+    parser.ConfigOptionParser._get_ordered_configuration_items = configuration_items
+
+    probes = {"PIP_PLATFORM": "pycontainer-self-test", "PIP_TIMEOUT": "123"}
+    saved = {name: os.environ.get(name) for name in probes}
+    os.environ.update(probes)
+    try:
+        options, _ = create_command("install").parse_args([])
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    if options.platforms or options.timeout != 123:
+        raise TargetMarkerError("pip configuration pinning self-test failed")
 
 
 def main():
@@ -89,9 +121,11 @@ def main():
             {"extra": ""}
         ):
             raise TargetMarkerError("target marker self-test failed")
+
+        _pin_pip_configuration(set(config["allowed_config_keys"]))
     except Exception as exc:
         with open(config["error_file"], "w", encoding="utf-8") as error_file:
-            error_file.write(f"pip marker evaluation could not be targeted: {exc}\n")
+            error_file.write(f"pip could not be pinned to the target: {exc}\n")
         sys.exit(PATCH_ERROR_EXIT)
 
     sys.argv = ["pip", *pip_args]
