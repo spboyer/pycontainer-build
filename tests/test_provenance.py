@@ -13,7 +13,7 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import _hash_wheelhouse, _verify_installed_wheels, install_requirements
 from pycontainer.provenance import (
-    BUILD_TYPE, STATEMENT_V01, STATEMENT_V1, IncompleteProvenanceError, ProvenanceError,
+    BUILD_TYPE, STATEMENT_V1, IncompleteProvenanceError, ProvenanceError,
     parse_verified_attestations,
 )
 
@@ -166,7 +166,7 @@ def test_evidence_mode_rejects_tampered_installs_and_non_wheel_downloads(tmp_pat
         _hash_wheelhouse(evidence / "wheels")
 
 
-def _statement(digest="a" * 64, *, complete=True, statement_type=STATEMENT_V01, **overrides):
+def _statement(digest="a" * 64, *, complete=True, statement_type=STATEMENT_V1, **overrides):
     statement = {
         "_type": statement_type,
         "predicateType": provenance.SLSA_PROVENANCE_V1,
@@ -195,10 +195,8 @@ def _envelope(statement, payload_type=provenance.DSSE_PAYLOAD_TYPE, bundle=False
 DIGEST = "sha256:" + "a" * 64
 
 
-def test_verified_output_accepts_cosign_v01_wrapper_and_bundles():
-    output = _envelope(_statement()) + b"\n" + _envelope(
-        _statement(statement_type=STATEMENT_V1), bundle=True
-    )
+def test_verified_output_accepts_v1_envelopes_and_bundles():
+    output = _envelope(_statement()) + b"\n" + _envelope(_statement(), bundle=True)
     assert len(parse_verified_attestations(output, DIGEST, require_complete_evidence=True)) == 2
 
 
@@ -210,12 +208,17 @@ def test_verified_output_accepts_cosign_v01_wrapper_and_bundles():
     (_envelope(_statement(digest="b" * 64)), "subject"),
     (_envelope(_statement(predicateType="https://slsa.dev/provenance/v0.2")), "SLSA provenance v1"),
     (_envelope(_statement(_type="https://example.com/Statement")), "_type"),
+    (_envelope(_statement(statement_type="https://in-toto.io/Statement/v0.1")), "_type"),
     (_envelope(_statement(predicate={"buildDefinition": {"buildType": "other"}})), "No verified"),
     (_envelope(["not", "an", "object"]), "JSON object"),
     (_envelope(_statement(predicate={"buildDefinition": {
         "buildType": BUILD_TYPE,
         "internalParameters": {"evidence": {"complete": False, "incomplete": [{"material": "m"}]}},
     }})), "malformed evidence"),
+    (_envelope(_statement(predicate={"buildDefinition": {
+        "buildType": BUILD_TYPE, "internalParameters": ["not", "an", "object"],
+    }})), "malformed evidence"),
+    (_envelope(_statement(predicate={"buildDefinition": ["not", "an", "object"]})), "No verified"),
 ])
 def test_verified_output_policy_rejections(output, message):
     with pytest.raises(ProvenanceError, match=message):
@@ -230,28 +233,40 @@ def test_require_complete_rejects_any_incomplete_matching_attestation():
 
 
 class FakeCosign:
-    def __init__(self, *, verify_output=b"", attest_code=0, verify_code=0, wrapper=True):
+    """Simulates cosign attest-blob plus registry referrer discovery for verify-attestation."""
+
+    def __init__(self, *, verify_output=None, sign_code=0, verify_code=0, tamper=False):
         self.calls = []
         self.verify_output = verify_output
-        self.attest_code = attest_code
+        self.sign_code = sign_code
         self.verify_code = verify_code
-        self.wrapper = wrapper
+        self.tamper = tamper
+        self.published = []
+
+    def publish(self, bundle):
+        self.calls.append(["publish"])
+        self.published.append(bundle)
+        if self.verify_output is None:
+            self.verify_output = json.dumps(json.loads(bundle)).encode()
 
     def __call__(self, args, stdout=None, **kwargs):
         assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["timeout"] > 0
         self.calls.append(list(args))
-        if args[1] == "attest":
-            predicate_path = next(a.split("=", 1)[1] for a in args if a.startswith("--predicate="))
-            predicate = json.loads(Path(predicate_path).read_text())
-            if self.wrapper:
-                statement = {
-                    "_type": STATEMENT_V01, "predicateType": provenance.SLSA_PROVENANCE_V1,
-                    "subject": [{"name": "r/a", "digest": {"sha256": args[-1].rsplit(":", 1)[1]}}],
-                    "predicate": predicate,
-                }
-                self.verify_output = _envelope(statement)
-            return subprocess.CompletedProcess(args, self.attest_code)
-        stdout.write(self.verify_output)
+        if args[1] == "attest-blob":
+            option = lambda name: next(a.split("=", 1)[1] for a in args if a.startswith(name))
+            payload = Path(option("--statement=")).read_bytes()
+            if self.tamper:
+                payload = payload.replace(b"registry.example/app", b"registry.example/evil")
+            Path(option("--bundle=")).write_text(json.dumps({
+                "mediaType": provenance.SIGSTORE_BUNDLE_MEDIA_TYPE,
+                "dsseEnvelope": {
+                    "payloadType": provenance.DSSE_PAYLOAD_TYPE,
+                    "payload": base64.b64encode(payload).decode(),
+                    "signatures": [{"sig": "x"}],
+                },
+            }))
+            return subprocess.CompletedProcess(args, self.sign_code)
+        stdout.write(self.verify_output or b"")
         return subprocess.CompletedProcess(args, self.verify_code)
 
 
@@ -259,58 +274,99 @@ def _attestor():
     return provenance.CosignAttestor("cosign", "cosign.key", "cosign.pub", None, None)
 
 
-PREDICATE = _statement()["predicate"]
+STATEMENT = _statement()
+SUBJECT = "registry.example/app@" + DIGEST
 
 
-def test_attestor_attests_then_verifies_exact_predicate(monkeypatch):
+def test_attestor_signs_exact_v1_statement_publishes_then_verifies(monkeypatch):
     fake = FakeCosign()
     monkeypatch.setattr(provenance.subprocess, "run", fake)
-    subject = "registry.example/app@" + DIGEST
 
-    _attestor().attest_and_verify(subject, PREDICATE, require_complete_evidence=True)
+    _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish, require_complete_evidence=True)
 
-    assert fake.calls[0][:4] == ["cosign", "attest", "--yes", "--type=slsaprovenance1"]
-    assert fake.calls[0][-3:] == ["--key=cosign.key", "--", subject]
-    assert fake.calls[1] == [
-        "cosign", "verify-attestation", "--type=slsaprovenance1", "--key=cosign.pub", "--", subject,
+    sign, publish, verify = fake.calls
+    assert sign[:4] == ["cosign", "attest-blob", "--yes", "--new-bundle-format"]
+    assert sign[-1] == "--key=cosign.key"
+    assert publish == ["publish"]
+    assert verify == [
+        "cosign", "verify-attestation", "--new-bundle-format", "--type=slsaprovenance1",
+        "--key=cosign.pub", "--", SUBJECT,
     ]
+    signed = json.loads(base64.b64decode(json.loads(fake.published[0])["dsseEnvelope"]["payload"]))
+    assert signed == STATEMENT and signed["_type"] == STATEMENT_V1
 
 
-def test_attestor_rejects_other_predicates_failures_and_tags(monkeypatch):
-    subject = "registry.example/app@" + DIGEST
-    fake = FakeCosign(wrapper=False, verify_output=_envelope(_statement()))
+def test_attestor_rejects_other_statements_tampered_bundles_and_failures(monkeypatch):
+    replayed = _statement()
+    replayed["predicate"]["buildDefinition"]["externalParameters"] = {"tags": ["replayed"]}
+    fake = FakeCosign(verify_output=_envelope(replayed))
     monkeypatch.setattr(provenance.subprocess, "run", fake)
-    other = json.loads(json.dumps(PREDICATE))
-    other["buildDefinition"]["externalParameters"] = {"tags": ["replayed"]}
-    with pytest.raises(ProvenanceError, match="do not contain the predicate"):
-        _attestor().attest_and_verify(subject, other)
+    with pytest.raises(ProvenanceError, match="do not contain the statement"):
+        _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish)
 
-    monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(attest_code=1))
-    with pytest.raises(ProvenanceError, match="cosign attest exited"):
-        _attestor().attest_and_verify(subject, PREDICATE)
+    fake = FakeCosign(tamper=True)
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    with pytest.raises(ProvenanceError, match="exact provenance statement"):
+        _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish)
+    assert fake.published == []
+
+    fake = FakeCosign(sign_code=1)
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    with pytest.raises(ProvenanceError, match="attest-blob exited"):
+        _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish)
+    fake = FakeCosign()
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    with pytest.raises(IncompleteProvenanceError):
+        _attestor().attest_and_verify(
+            SUBJECT, _statement(complete=False), fake.publish, require_complete_evidence=True,
+        )
+    with pytest.raises(ProvenanceError, match="subject"):
+        _attestor().attest_and_verify(
+            "registry.example/app@sha256:" + "b" * 64, STATEMENT, fake.publish,
+        )
+    assert fake.calls == []
+
     monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_code=1))
     with pytest.raises(ProvenanceError, match="verify-attestation exited"):
-        _attestor().verify(subject)
+        _attestor().verify(SUBJECT)
     monkeypatch.setattr(provenance, "MAX_VERIFY_OUTPUT_BYTES", 4)
     monkeypatch.setattr(provenance.subprocess, "run", FakeCosign(verify_output=b"x" * 5))
     with pytest.raises(ProvenanceError, match="size limit"):
-        _attestor().verify(subject)
+        _attestor().verify(SUBJECT)
     with pytest.raises(ProvenanceError, match="immutable"):
         _attestor().verify("registry.example/app:v1")
+
+
+def test_referrer_manifest_matches_cosign_bundle_layout():
+    bundle = b'{"bundle": true}'
+    subject = {"mediaType": "application/vnd.oci.image.index.v1+json", "size": 321, "digest": DIGEST}
+
+    data, blobs = provenance.referrer_manifest(bundle, subject)
+
+    manifest = json.loads(data)
+    assert manifest["artifactType"] == provenance.SIGSTORE_BUNDLE_MEDIA_TYPE
+    assert manifest["subject"] == subject
+    assert manifest["config"]["mediaType"] == provenance.OCI_EMPTY_MEDIA_TYPE
+    assert [layer["mediaType"] for layer in manifest["layers"]] == [provenance.SIGSTORE_BUNDLE_MEDIA_TYPE]
+    assert manifest["annotations"]["dev.sigstore.bundle.predicateType"] == provenance.SLSA_PROVENANCE_V1
+    assert blobs == {
+        "sha256:" + hashlib.sha256(b"{}").hexdigest(): b"{}",
+        "sha256:" + hashlib.sha256(bundle).hexdigest(): bundle,
+    }
 
 
 class FakeAttestor:
     def __init__(self, registry, fail=False):
         self.registry = registry
         self.fail = fail
-        self.predicates = []
+        self.statements = []
 
-    def attest_and_verify(self, subject, predicate, require_complete_evidence=False):
+    def attest_and_verify(self, subject, statement, publish, require_complete_evidence=False):
         self.registry.events.append(("attest", subject))
-        self.predicates.append(predicate)
+        self.statements.append(statement)
+        publish(b'{"bundle": true}')
         if self.fail:
             raise ProvenanceError("verification rejected")
-
 
 def _signed_builder(tmp_path, monkeypatch, registry, attestor, platform="linux/amd64"):
     context = _context(tmp_path, requirements=False)
@@ -339,7 +395,18 @@ def test_signed_push_attests_published_digest_before_tags(tmp_path, monkeypatch,
     assert registry.events.index(("sign", subject)) < attest_index
     kind = "index" if builder.index_digest else "manifest"
     assert registry.events.index((kind, "v1")) > attest_index
-    assert attestor.predicates == [builder.provenance_statement["predicate"]]
+    assert attestor.statements == [builder.provenance_statement]
+    assert attestor.statements[0]["_type"] == STATEMENT_V1
+    referrers = [
+        (reference, json.loads(data)) for reference, data in registry.manifests.items()
+        if reference.startswith("sha256:") and b"subject" in data
+    ]
+    assert len(referrers) == 1
+    reference, manifest = referrers[0]
+    assert reference == "sha256:" + hashlib.sha256(registry.manifests[reference]).hexdigest()
+    assert manifest["subject"]["digest"] == digest
+    assert manifest["subject"]["mediaType"].endswith(f"image.{kind}.v1+json")
+    assert registry.events.index(("manifest", reference)) < registry.events.index((kind, "v1"))
     assert builder.attested_ref == subject
 
 
@@ -361,7 +428,17 @@ def test_attestation_rejects_statement_for_a_different_digest(tmp_path, monkeypa
 
     with pytest.raises(ProvenanceError, match="subject does not match"):
         builder.push(show_progress=False)
-    assert attestor.predicates == [] and "v1" not in registry.manifests
+    assert attestor.statements == [] and "v1" not in registry.manifests
+
+
+def test_attestation_rejects_push_to_a_different_repository(tmp_path, monkeypatch):
+    registry = FakeRegistry()
+    attestor = FakeAttestor(registry)
+    builder = _signed_builder(tmp_path, monkeypatch, registry, attestor)
+
+    with pytest.raises(ValueError, match="different repository"):
+        builder.push(registry_url="mirror.example/team/app:v1", show_progress=False)
+    assert registry.events == [] and attestor.statements == []
 
 
 @pytest.mark.parametrize("options, message", [

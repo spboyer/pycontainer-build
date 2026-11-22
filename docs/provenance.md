@@ -3,8 +3,8 @@
 pycontainer-build can write an in-toto
 [Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md)
 with a [SLSA provenance v1](https://slsa.dev/spec/v1.0/provenance) predicate
-for the image it builds, and optionally attach that predicate to the published
-image as a cosign attestation.
+for the image it builds, and optionally attach that exact statement to the
+published image as a signed cosign attestation.
 
 > **Trust model.** A locally written statement is **unsigned and therefore
 > unauthenticated**: anyone who can write the output directory can edit it.
@@ -42,10 +42,30 @@ Notation has no in-toto attestation path and is rejected. The verifier policy
 is mandatory: either `provenance_verify_key`, or both a certificate identity
 and an OIDC issuer. The order on push is: publish by digest, sign, attest,
 verify the attestation with the configured policy and confirm the verified
-predicate is the one just attested, re-verify the signature, then move tags.
-If attestation or verification fails, no requested tag is attempted.
-Attestations use cosign's own storage for the image; `COSIGN_REPOSITORY` is
-rejected so that storage cannot be silently redirected.
+statement is exactly the one just attested, re-read the published manifest
+digest, then move tags. If attestation or verification fails, no requested tag
+is attempted. `COSIGN_REPOSITORY` is rejected so that verification cannot be
+silently redirected to another repository.
+
+### How the v1 statement is attached
+
+Released cosign (checked with v2.6.1 and v3.1.4) cannot attach a caller-supplied
+statement to an image: `cosign attest` always wraps the predicate in its own
+`https://in-toto.io/Statement/v0.1` statement and ignores `--statement` for
+images. pycontainer-build therefore signs the exact local statement bytes with
+`cosign attest-blob --new-bundle-format --statement`, checks that the returned
+Sigstore bundle (`application/vnd.dev.sigstore.bundle.v0.3+json`) signs those
+exact bytes, and pushes the bundle itself as an OCI 1.1 referrer of the image
+digest, in the layout cosign uses: an empty `{}` config, one bundle layer, and
+`dev.sigstore.bundle.content=dsse-envelope` and
+`dev.sigstore.bundle.predicateType` annotations. `cosign verify-attestation
+--new-bundle-format` then discovers and verifies it.
+
+The registry must support the OCI Referrers API. The referrers tag-schema
+fallback (`sha256-<digest>`) is not written; on registries without the
+Referrers API, verification finds no attestation and the push fails closed
+before any tag moves. cosign v2 only discovers bundle referrers with
+`--new-bundle-format`; v3 discovers them by default.
 
 ## Build type v1
 
@@ -102,24 +122,26 @@ paths and any value derived from them are not recorded.
 
 ## Verification
 
-`pycontainer verify-provenance` runs `cosign verify-attestation --type
-slsaprovenance1` with your policy, then rejects any envelope that is not an
-in-toto DSSE payload, is not SLSA provenance v1, has a subject that does not
+`pycontainer verify-provenance` runs `cosign verify-attestation
+--new-bundle-format --type slsaprovenance1` with your policy, then rejects any
+pycontainer envelope that is not an in-toto DSSE payload, is not an in-toto
+Statement v1, is not SLSA provenance v1, has a subject that does not
 match the requested digest, or has malformed completeness fields. Non-pycontainer
 SLSA attestations are ignored; at least one pycontainer attestation must match.
 Verification uses cosign's transparency log defaults.
 
 ## Status and limitations
 
-- cosign `attest` (checked with v2.6.1 and v3.1.4) wraps the predicate in its
-  own `https://in-toto.io/Statement/v0.1` statement, so the attached
-  attestation is not the v1 statement written locally. The verifier accepts
-  v0.1 or v1 envelopes; the predicate is identical.
 - Real-provider evidence: a build on `python:3.11-slim` with a real installed
-  wheel was published to a disposable registry, attested and verified with
-  cosign v2.6.1 and v3.1.4 using a key pair **with the transparency log
-  disabled**. A wrong key was rejected. Keyless signing, public Rekor upload
-  and other registries have not been validated.
+  wheel was published to `ttl.sh` (which supports the Referrers API). Its exact
+  Statement v1 was signed with cosign v3.1.4 `attest-blob`, pushed as a bundle
+  referrer by pycontainer's registry client, and independently discovered and
+  verified by `cosign verify-attestation` v3.1.4 and v2.6.1
+  (`--new-bundle-format`) using a key pair **with the transparency log
+  disabled**. A wrong key was rejected. Keyless signing, public Rekor upload,
+  registries without the Referrers API, GHCR, ACR and Docker Hub have not been
+  validated.
+- Notation has no attestation path.
 - Dependency environment markers are evaluated on the build host
   ([#142](https://github.com/spboyer/pycontainer-build/issues/142)).
 - Multi-tag pushes are not atomic; see the [signing guide](image-signing.md).

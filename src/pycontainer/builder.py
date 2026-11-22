@@ -564,7 +564,7 @@ class ImageBuilder:
             version=slsa.builder_version(),
         )
         path=output/slsa.STATEMENT_FILENAME
-        _atomic_write_bytes(path, json.dumps(statement, indent=2, sort_keys=True).encode())
+        _atomic_write_bytes(path, slsa.statement_bytes(statement))
         self.provenance_statement=statement
         self.provenance_path=path
 
@@ -949,6 +949,11 @@ class ImageBuilder:
             if self.config.attest_provenance:
                 if getattr(self, "provenance_statement", None) is None:
                     raise ValueError("Provenance attestation requires a provenance statement from build().")
+                if self.provenance_statement["subject"][0]["name"] != f"{registry}/{repo}":
+                    raise ValueError(
+                        "Provenance subject names a different repository than the push target; "
+                        "build with --tag set to the push target."
+                    )
                 attestor=slsa.create_attestor(self.config)
 
         if getattr(self, "index_digest", None):
@@ -1104,12 +1109,28 @@ class ImageBuilder:
             ) from None
 
         if attestor is not None:
+            def publish_attestation(bundle: bytes) -> None:
+                manifest, referrer_blobs=slsa.referrer_manifest(
+                    bundle, {"mediaType": media_type, "size": size, "digest": digest}
+                )
+                try:
+                    with tempfile.TemporaryDirectory(prefix="pycontainer-referrer-") as workdir:
+                        for blob_digest, blob in referrer_blobs.items():
+                            blob_path=Path(workdir)/_digest_filename(blob_digest)
+                            blob_path.write_bytes(blob)
+                            client.push_blob(blob_digest, blob_path, check_exists=True)
+                    client.push_manifest(f"sha256:{hashlib.sha256(manifest).hexdigest()}", manifest)
+                except (RegistryRequestError, BlobIntegrityError, OSError) as error:
+                    raise slsa.ProvenanceError(
+                        f"unable to publish the attestation referrer ({type(error).__name__})."
+                    ) from None
+
             try:
                 statement=self.provenance_statement
                 if statement["subject"][0]["digest"]["sha256"] != digest.split(":",1)[1]:
                     raise slsa.ProvenanceError("Provenance subject does not match the pushed digest.")
                 attestor.attest_and_verify(
-                    subject, statement["predicate"],
+                    subject, statement, publish_attestation,
                     require_complete_evidence=self.config.provenance_require_complete,
                 )
             except slsa.ProvenanceError as error:

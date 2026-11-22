@@ -6,6 +6,7 @@ of who produced it; neither form asserts a SLSA build level.
 """
 import base64
 import binascii
+import hashlib
 import json
 import os
 import platform as host_platform
@@ -16,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .signing import SigningError, _check_version, _find_executable
 
@@ -25,10 +26,14 @@ if TYPE_CHECKING:
 
 
 STATEMENT_V1 = "https://in-toto.io/Statement/v1"
-# cosign attest wraps a predicate in its own v0.1 Statement (checked with v2.6.1 and v3.1.4).
-STATEMENT_V01 = "https://in-toto.io/Statement/v0.1"
 SLSA_PROVENANCE_V1 = "https://slsa.dev/provenance/v1"
 DSSE_PAYLOAD_TYPE = "application/vnd.in-toto+json"
+# `cosign attest` wraps a predicate in a Statement/v0.1 and ignores --statement for images
+# (v2.6.1, v3.1.4), so the exact v1 statement is signed with attest-blob and published as
+# an OCI 1.1 referrer in the layout cosign verify-attestation --new-bundle-format discovers.
+SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+OCI_EMPTY_MEDIA_TYPE = "application/vnd.oci.empty.v1+json"
+OCI_EMPTY_DATA = b"{}"
 BUILD_TYPE = (
     "https://github.com/spboyer/pycontainer-build/blob/main/docs/provenance.md#build-type-v1"
 )
@@ -129,13 +134,12 @@ def validate_statement(
     statement: object,
     expected_digest: str,
     *,
-    statement_types=(STATEMENT_V1,),
     require_complete_evidence: bool = False,
 ) -> Dict:
     """Check structure and subject only; this does not authenticate anything."""
     if not isinstance(statement, dict):
         raise ProvenanceError("Provenance statement is not a JSON object.")
-    if statement.get("_type") not in statement_types:
+    if statement.get("_type") != STATEMENT_V1:
         raise ProvenanceError("Provenance statement has an unsupported _type.")
     if statement.get("predicateType") != SLSA_PROVENANCE_V1:
         raise ProvenanceError("Provenance statement is not SLSA provenance v1.")
@@ -151,7 +155,8 @@ def validate_statement(
     definition = predicate.get("buildDefinition") if isinstance(predicate, dict) else None
     if not isinstance(definition, dict) or definition.get("buildType") != BUILD_TYPE:
         raise ProvenanceError("Provenance statement has an unrecognized build type.")
-    evidence = (definition.get("internalParameters") or {}).get("evidence")
+    internal = definition.get("internalParameters")
+    evidence = internal.get("evidence") if isinstance(internal, dict) else None
     if (
         not isinstance(evidence, dict)
         or type(evidence.get("complete")) is not bool
@@ -190,18 +195,14 @@ def parse_verified_attestations(
         if not isinstance(statement, dict):
             raise ProvenanceError("Verified attestation payload is not a JSON object.")
         predicate = statement.get("predicate")
-        build_type = (
-            (predicate.get("buildDefinition") or {}).get("buildType")
-            if isinstance(predicate, dict) else None
-        )
+        definition = predicate.get("buildDefinition") if isinstance(predicate, dict) else None
+        build_type = definition.get("buildType") if isinstance(definition, dict) else None
         if build_type != BUILD_TYPE:
             if statement.get("predicateType") != SLSA_PROVENANCE_V1:
                 raise ProvenanceError("Verified attestation is not SLSA provenance v1.")
             continue
         validate_statement(
-            statement, expected_digest,
-            statement_types=(STATEMENT_V1, STATEMENT_V01),
-            require_complete_evidence=require_complete_evidence,
+            statement, expected_digest, require_complete_evidence=require_complete_evidence,
         )
         statements.append(statement)
     if not statements:
@@ -230,30 +231,40 @@ class CosignAttestor:
         except OSError:
             raise ProvenanceError("Unable to run cosign.") from None
 
-    def attest(self, subject: str, predicate: Dict) -> None:
-        _require_subject(subject)
-        descriptor_fd, name = tempfile.mkstemp(prefix="pycontainer-predicate-", suffix=".json")
-        try:
-            with os.fdopen(descriptor_fd, "w", encoding="utf-8") as target:
-                json.dump(predicate, target, sort_keys=True)
+    def sign_statement(self, statement: Dict) -> bytes:
+        """Sign the exact statement into a Sigstore bundle with cosign attest-blob."""
+        payload = statement_bytes(statement)
+        with tempfile.TemporaryDirectory(prefix="pycontainer-attest-") as workdir:
+            statement_path = Path(workdir) / "statement.json"
+            bundle_path = Path(workdir) / "bundle.sigstore.json"
+            statement_path.write_bytes(payload)
             args = [
-                self.executable, "attest", "--yes", "--type=slsaprovenance1",
-                f"--predicate={name}",
+                self.executable, "attest-blob", "--yes", "--new-bundle-format",
+                f"--statement={statement_path}", f"--bundle={bundle_path}",
             ]
             if self.key:
                 args.append(f"--key={self.key}")
-            returncode = self._run([*args, "--", subject], subprocess.DEVNULL)
-        finally:
-            Path(name).unlink(missing_ok=True)
-        if returncode:
-            raise ProvenanceError(
-                f"cosign attest exited with status {returncode}; check registry "
-                "authentication and signing configuration."
-            )
+            returncode = self._run(args, subprocess.DEVNULL)
+            if returncode:
+                raise ProvenanceError(
+                    f"cosign attest-blob exited with status {returncode}; check "
+                    "signing configuration."
+                )
+            try:
+                if bundle_path.stat().st_size > MAX_VERIFY_OUTPUT_BYTES:
+                    raise ProvenanceError("cosign attestation bundle exceeds the size limit.")
+                bundle = bundle_path.read_bytes()
+            except OSError:
+                raise ProvenanceError("cosign did not write an attestation bundle.") from None
+        check_bundle(bundle, payload)
+        return bundle
 
     def verify(self, subject: str, *, require_complete_evidence: bool = False) -> List[Dict]:
         _require_subject(subject)
-        args = [self.executable, "verify-attestation", "--type=slsaprovenance1"]
+        args = [
+            self.executable, "verify-attestation", "--new-bundle-format",
+            "--type=slsaprovenance1",
+        ]
         if self.verify_key:
             args.append(f"--key={self.verify_key}")
         else:
@@ -278,18 +289,76 @@ class CosignAttestor:
         )
 
     def attest_and_verify(
-        self, subject: str, predicate: Dict, *, require_complete_evidence: bool = False
+        self, subject: str, statement: Dict, publish: Callable[[bytes], None], *,
+        require_complete_evidence: bool = False,
     ) -> None:
-        self.attest(subject, predicate)
+        """Sign the statement, publish the bundle with ``publish``, then verify it independently."""
+        _require_subject(subject)
+        validate_statement(
+            statement, subject.rsplit("@", 1)[1],
+            require_complete_evidence=require_complete_evidence,
+        )
+        publish(self.sign_statement(statement))
         statements = self.verify(subject, require_complete_evidence=require_complete_evidence)
-        expected = json.dumps(predicate, sort_keys=True)
-        if not any(
-            json.dumps(statement.get("predicate"), sort_keys=True) == expected
-            for statement in statements
-        ):
+        if statement not in statements:
             raise ProvenanceError(
-                "The verified attestations do not contain the predicate that was attested."
+                "The verified attestations do not contain the statement that was attested."
             )
+
+
+def statement_bytes(statement: Dict) -> bytes:
+    return (json.dumps(statement, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def check_bundle(bundle: bytes, payload: bytes) -> None:
+    """Require a Sigstore bundle whose DSSE payload is exactly ``payload``."""
+    try:
+        document = json.loads(bundle)
+        envelope = document["dsseEnvelope"]
+        signed = base64.b64decode(envelope["payload"], validate=True)
+    except (ValueError, TypeError, KeyError, binascii.Error):
+        raise ProvenanceError("cosign wrote a malformed attestation bundle.") from None
+    if (
+        document.get("mediaType") != SIGSTORE_BUNDLE_MEDIA_TYPE
+        or envelope.get("payloadType") != DSSE_PAYLOAD_TYPE
+        or signed != payload
+    ):
+        raise ProvenanceError(
+            "cosign attestation bundle does not sign the exact provenance statement."
+        )
+
+
+def _blob_descriptor(media_type: str, data: bytes) -> Dict:
+    return {
+        "mediaType": media_type,
+        "size": len(data),
+        "digest": f"sha256:{hashlib.sha256(data).hexdigest()}",
+    }
+
+
+def referrer_manifest(bundle: bytes, subject: Dict) -> Tuple[bytes, Dict[str, bytes]]:
+    """Return an OCI 1.1 referrer manifest for a Sigstore bundle and the blobs it needs."""
+    _hex(subject["digest"])
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": SIGSTORE_BUNDLE_MEDIA_TYPE,
+        "config": _blob_descriptor(OCI_EMPTY_MEDIA_TYPE, OCI_EMPTY_DATA),
+        "layers": [_blob_descriptor(SIGSTORE_BUNDLE_MEDIA_TYPE, bundle)],
+        "annotations": {
+            "dev.sigstore.bundle.content": "dsse-envelope",
+            "dev.sigstore.bundle.predicateType": SLSA_PROVENANCE_V1,
+        },
+        "subject": {
+            "mediaType": subject["mediaType"], "size": subject["size"],
+            "digest": subject["digest"],
+        },
+    }
+    blobs = {
+        manifest["config"]["digest"]: OCI_EMPTY_DATA,
+        manifest["layers"][0]["digest"]: bundle,
+    }
+    return json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode(), blobs
 
 
 def _require_subject(subject: str) -> None:

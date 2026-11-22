@@ -7,7 +7,7 @@ import pytest
 
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.provenance import SLSA_PROVENANCE_V1, parse_verified_attestations
+from pycontainer.provenance import SLSA_PROVENANCE_V1, STATEMENT_V1, parse_verified_attestations
 from pycontainer.registry_client import parse_image_reference
 from pycontainer.signing import _find_executable
 
@@ -25,7 +25,8 @@ def _required(name):
 def _verify(executable, key, subject):
     try:
         return subprocess.run(
-            [executable, "verify-attestation", "--type", "slsaprovenance1", "--key", key, "--", subject],
+            [executable, "verify-attestation", "--new-bundle-format", "--type", "slsaprovenance1",
+             "--key", key, "--", subject],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=300, check=False,
         )
@@ -67,5 +68,6 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
     result = _verify(executable, public_key, subject)
     assert result.returncode == 0, "Independent cosign attestation verification failed."
     statements = parse_verified_attestations(result.stdout, builder.manifest_digest)
-    assert statements and all(s["predicateType"] == SLSA_PROVENANCE_V1 for s in statements)
+    assert builder.provenance_statement in statements
+    assert all(s["_type"] == STATEMENT_V1 and s["predicateType"] == SLSA_PROVENANCE_V1 for s in statements)
     assert _verify(executable, wrong_key, subject).returncode != 0
