@@ -40,7 +40,8 @@ def _base_layer(arch: str):
 class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
-    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, config_variants=None):
+    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, config_variants=None,
+                 base_env=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
@@ -58,7 +59,10 @@ class FakeBaseRegistry:
                 "os": "linux",
                 "architecture": arch,
                 **({"variant": config_variant} if config_variant else {}),
-                "config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
+                "config": {"Env": base_env if base_env is not None else [
+                    "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
+                    "PYTHON_LIBC=glibc-2.17",
+                ], "WorkingDir": "/"},
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -241,6 +245,41 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
         for variant in (None, None, "v7")
         for name in ("version", "wheel", "install")
     ]
+
+
+@pytest.mark.parametrize("by_digest", [False, True])
+def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
+    tmp_path, monkeypatch, by_digest
+):
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"), base_env=[])
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, variant=None, *, base_image_tag_verified):
+        installs.append((arch, variant, version, base_image_tag_verified))
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    base_image = "python:3.11-slim"
+    if by_digest:
+        base_image += "@" + registry.index_digest
+    builder = _builder(
+        tmp_path, monkeypatch, registry, include_deps=True,
+        ctx=_context(tmp_path, requirements=True), base_image=base_image,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+    )
+
+    if by_digest:
+        with pytest.raises(ValueError, match="unverified or custom base image"):
+            builder.build()
+        assert installs == []
+        assert not (tmp_path / "out" / "index.json").exists()
+    else:
+        builder.build()
+        assert installs == [
+            ("amd64", None, "3.11", True),
+            ("arm64", None, "3.11", True),
+            ("arm", "v7", "3.11", True),
+        ]
 
 
 def test_normalize_platforms_strips_and_dedupes():
