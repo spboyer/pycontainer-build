@@ -304,6 +304,12 @@ def test_attestor_rejects_other_statements_tampered_bundles_and_failures(monkeyp
     with pytest.raises(ProvenanceError, match="do not contain the statement"):
         _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish)
 
+    # Same JSON value, different bytes than were signed: not the attested statement.
+    fake = FakeCosign(verify_output=_envelope(STATEMENT))
+    monkeypatch.setattr(provenance.subprocess, "run", fake)
+    with pytest.raises(ProvenanceError, match="do not contain the statement"):
+        _attestor().attest_and_verify(SUBJECT, STATEMENT, fake.publish)
+
     fake = FakeCosign(tamper=True)
     monkeypatch.setattr(provenance.subprocess, "run", fake)
     with pytest.raises(ProvenanceError, match="exact provenance statement"):

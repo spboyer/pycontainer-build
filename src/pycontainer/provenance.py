@@ -178,6 +178,16 @@ def parse_verified_attestations(
     output: bytes, expected_digest: str, *, require_complete_evidence: bool = False
 ) -> List[Dict]:
     """Apply payload policy to DSSE envelopes printed by cosign verify-attestation."""
+    return [
+        statement for _, statement in _verified_payloads(
+            output, expected_digest, require_complete_evidence=require_complete_evidence,
+        )
+    ]
+
+
+def _verified_payloads(
+    output: bytes, expected_digest: str, *, require_complete_evidence: bool
+) -> List[Tuple[bytes, Dict]]:
     statements = []
     for line in output.splitlines():
         if not line.strip():
@@ -204,7 +214,7 @@ def parse_verified_attestations(
         validate_statement(
             statement, expected_digest, require_complete_evidence=require_complete_evidence,
         )
-        statements.append(statement)
+        statements.append((payload, statement))
     if not statements:
         raise ProvenanceError(
             "No verified pycontainer SLSA provenance attestation matched the image digest."
@@ -260,6 +270,12 @@ class CosignAttestor:
         return bundle
 
     def verify(self, subject: str, *, require_complete_evidence: bool = False) -> List[Dict]:
+        return parse_verified_attestations(
+            self._verify_output(subject), subject.rsplit("@", 1)[1],
+            require_complete_evidence=require_complete_evidence,
+        )
+
+    def _verify_output(self, subject: str) -> bytes:
         _require_subject(subject)
         args = [
             self.executable, "verify-attestation", "--new-bundle-format",
@@ -282,11 +298,7 @@ class CosignAttestor:
             if size > MAX_VERIFY_OUTPUT_BYTES:
                 raise ProvenanceError("cosign verify-attestation output exceeds the size limit.")
             output.seek(0)
-            data = output.read()
-        return parse_verified_attestations(
-            data, subject.rsplit("@", 1)[1],
-            require_complete_evidence=require_complete_evidence,
-        )
+            return output.read()
 
     def attest_and_verify(
         self, subject: str, statement: Dict, publish: Callable[[bytes], None], *,
@@ -299,8 +311,12 @@ class CosignAttestor:
             require_complete_evidence=require_complete_evidence,
         )
         publish(self.sign_statement(statement))
-        statements = self.verify(subject, require_complete_evidence=require_complete_evidence)
-        if statement not in statements:
+        payloads = _verified_payloads(
+            self._verify_output(subject), subject.rsplit("@", 1)[1],
+            require_complete_evidence=require_complete_evidence,
+        )
+        # Compare the signed bytes, not decoded JSON values.
+        if statement_bytes(statement) not in {payload for payload, _ in payloads}:
             raise ProvenanceError(
                 "The verified attestations do not contain the statement that was attested."
             )
