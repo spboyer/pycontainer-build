@@ -258,6 +258,39 @@ def test_oci_layout_selects_each_tag_for_shared_manifest(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
 
 
+def test_oci_layout_selects_by_containerd_image_name_alias(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    tagged, _, tagged_layer = layout.image(b"tagged")
+    named, _, named_layer = layout.image(b"named")
+    layout.descriptors.append(
+        {
+            **tagged,
+            "annotations": {
+                "org.opencontainers.image.ref.name": "3.11",
+                "io.containerd.image.name": "docker.io/library/python:3.11",
+            },
+        }
+    )
+    layout.descriptors.append(
+        {**named, "annotations": {"io.containerd.image.name": "example.com/app:v2"}}
+    )
+    layout.write_index()
+
+    for selector, layer in (
+        ("3.11", tagged_layer),
+        ("docker.io/library/python:3.11", tagged_layer),
+        ("example.com/app:v2", named_layer),
+    ):
+        _, manifest, _ = build(tmp_path, f"oci:{layout.root}:{selector}")
+        assert manifest["layers"][0] == layer
+
+    with pytest.raises(
+        LocalImageError,
+        match=r"multiple images.*3\.11, docker\.io/library/python:3\.11, example\.com/app:v2",
+    ):
+        build(tmp_path, f"oci:{layout.root}")
+
+
 def test_oci_layout_selects_by_digest(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     first, platform, first_layer = layout.image(b"first")

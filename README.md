@@ -361,8 +361,9 @@ pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./d
 pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
 ```
 
-- `oci:<path>[:<ref>]` selects an index entry by its
-  `org.opencontainers.image.ref.name` annotation (or `@sha256:<digest>`). The
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). The
   reference may be omitted when the layout holds one image, or a set of images
   that all carry platform metadata. Nested image indexes use the same exact
   OS/architecture/variant selection as registry pulls.

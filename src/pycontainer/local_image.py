@@ -310,13 +310,20 @@ def _stage_stream(
         staged.unlink(missing_ok=True)
 
 
-def _descriptor_name(descriptor: Dict) -> Optional[str]:
+def _descriptor_aliases(descriptor: Dict) -> List[str]:
     annotations = descriptor.get("annotations")
-    if isinstance(annotations, dict):
-        name = annotations.get(REF_NAME_ANNOTATION)
-        if isinstance(name, str) and name:
-            return name
-    return None
+    if not isinstance(annotations, dict):
+        return []
+    return [
+        name
+        for key in (REF_NAME_ANNOTATION, CONTAINERD_NAME_ANNOTATION)
+        if isinstance(name := annotations.get(key), str) and name
+    ]
+
+
+def _descriptor_name(descriptor: Dict) -> Optional[str]:
+    aliases = _descriptor_aliases(descriptor)
+    return aliases[0] if aliases else None
 
 
 def _image_name(annotations) -> Optional[str]:
@@ -434,7 +441,7 @@ class OCILayoutSource:
             return [d for d in descriptors if d["digest"] == self.reference.digest]
         if self.reference.reference:
             wanted = self.reference.reference
-            matches = [d for d in descriptors if _descriptor_name(d) == wanted]
+            matches = [d for d in descriptors if wanted in _descriptor_aliases(d)]
             index_name = _image_name(self.index.get("annotations"))
             if not matches and len(descriptors) == 1 and index_name == wanted:
                 matches = descriptors
@@ -443,7 +450,12 @@ class OCILayoutSource:
 
     def _available(self) -> str:
         names = sorted(
-            {name for d in self.index.get("manifests", []) if isinstance(d, dict) and (name := _descriptor_name(d))}
+            {
+                name
+                for d in self.index.get("manifests", [])
+                if isinstance(d, dict)
+                for name in _descriptor_aliases(d)
+            }
         )
         return ", ".join(names) or "none"
 
