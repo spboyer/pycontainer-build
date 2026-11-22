@@ -73,7 +73,8 @@ else:
                        for layer, diff_id in zip(manifest['layers'],
                                                  imagecfg['rootfs']['diff_ids'])]}},
         'distro': {'name': 'debian', 'version': '12'},
-        'descriptor': {'name': 'grype', 'version': '0.119.0', 'db': db,
+        'descriptor': {'name': 'grype', 'version': '0.119.0',
+                       'db': {'status': db, 'providers': {'debian': {'captured': built}}},
                        'configuration': cfg}}
     if mode.get('missing_matches'): del doc['matches']
     if mode.get('bad_config'): doc['source']['target']['config'] = 'not base64!'
@@ -88,6 +89,10 @@ else:
     if mode.get('mutate_snapshot'): blob.write_bytes(b'changed snapshot')
     cfg['db']['max-allowed-built-age'] = int(cfg['db']['max-allowed-built-age'][:-1]) * 3600 * 1000000000
     cfg['db']['max-update-check-frequency'] = 0
+    if not cfg.get('match-upstream-kernel-headers'):
+        # Real Grype 0.119.0 default: inject kernel-header ignore rules.
+        cfg['ignore'] = cfg.get('ignore', []) + [{'package': {'name': 'linux-libc-dev', 'type': 'deb'},
+                                                  'match-type': 'exact-indirect-match'}]
     print(json.dumps(doc))
 """,
         encoding="utf-8",

@@ -259,8 +259,8 @@ def _validate_document(doc, root, descriptor, platform, status, scanner_config):
         info = doc["descriptor"]
         if info["name"] != "grype" or info["version"] != GRYPE_VERSION:
             raise ScanError("scanner", "report scanner version mismatch")
-        report_db = info["db"]
-        if (report_db.get("valid") is not True or report_db.get("error")
+        report_db = info["db"]["status"]
+        if (not isinstance(report_db, dict) or report_db.get("valid") is not True or report_db.get("error")
                 or any(report_db.get(key) != status.get(key)
                        for key in ("schemaVersion", "built", "from", "path"))):
             raise ScanError("database", "report database does not match checked database")
@@ -400,6 +400,8 @@ def scan_image(root, descriptor, config, *, report=None):
     scanner_config = {
         "check-for-app-update": False, "only-fixed": False, "only-notfixed": False,
         "ignore": [], "exclude": [], "vex-documents": [], "vex-add": [],
+        # Otherwise Grype 0.119.0 injects default kernel-header ignore rules.
+        "match-upstream-kernel-headers": True,
         "search": {"scope": "squashed"},
         "external-sources": {"enable": False},
         "db": {"cache-dir": str(db_dir), "auto-update": False,
