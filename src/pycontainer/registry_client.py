@@ -308,25 +308,22 @@ class RegistryClient:
     def blob_exists(self, digest: str) -> bool:
         """Check if blob exists in registry via HEAD request."""
         url = f"{self.base_url}/{self.repository}/blobs/{digest}"
-        status, body, _ = self._make_request("HEAD", url)
+        status, _, _ = self._make_request("HEAD", url)
         if status == 200:
             return True
         if status == 404:
             return False
-        detail = body.decode("utf-8", errors="replace")
         raise RegistryRequestError(
-            f"Registry blob HEAD failed with HTTP {status}: {detail or '(empty response)'}"
+            f"Registry blob HEAD failed with HTTP {status}."
         )
 
     def initiate_blob_upload(self) -> str:
         """Initiate blob upload and return its absolute upload URL."""
         url = f"{self.base_url}/{self.repository}/blobs/uploads/"
-        status, body, headers = self._make_request("POST", url, data=b"")
+        status, _, headers = self._make_request("POST", url, data=b"")
         if status not in (200, 202):
-            detail = body.decode("utf-8", errors="replace")
             raise RegistryRequestError(
-                f"Failed to initiate blob upload (HTTP {status}): "
-                f"{detail or '(empty response)'}"
+                f"Failed to initiate blob upload (HTTP {status})."
             )
         location = headers.get("Location") or headers.get("location")
         if not location:
@@ -352,14 +349,12 @@ class RegistryClient:
             "Content-Length": str(size),
         }
         with blob_path.open("rb") as source:
-            status, body, _ = self._make_request(
+            status, _, _ = self._make_request(
                 "PUT", final_url, data=source, headers=headers
             )
         if status not in (201, 202):
-            detail = body.decode("utf-8", errors="replace")
             raise RegistryRequestError(
-                f"Blob upload failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+                f"Blob upload failed with HTTP {status}."
             )
         return True
 
@@ -374,14 +369,12 @@ class RegistryClient:
         """Push manifest by tag or digest."""
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Content-Type": "application/vnd.oci.image.manifest.v1+json"}
-        status, body, _ = self._make_request(
+        status, _, _ = self._make_request(
             "PUT", url, data=manifest_data, headers=headers
         )
         if status not in (200, 201):
-            detail = body.decode("utf-8", errors="replace")
             raise RegistryRequestError(
-                f"Manifest push failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+                f"Manifest push failed with HTTP {status}."
             )
         return True
 
@@ -389,14 +382,12 @@ class RegistryClient:
         """Push OCI index."""
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Content-Type": "application/vnd.oci.image.index.v1+json"}
-        status, body, _ = self._make_request(
+        status, _, _ = self._make_request(
             "PUT", url, data=index_data, headers=headers
         )
         if status not in (200, 201):
-            detail = body.decode("utf-8", errors="replace")
             raise RegistryRequestError(
-                f"Index push failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+                f"Index push failed with HTTP {status}."
             )
         return True
 
@@ -427,9 +418,8 @@ class RegistryClient:
             "GET", url, headers=headers
         )
         if status != 200:
-            body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
             raise RegistryRequestError(
-                f"Failed to pull manifest (HTTP {status}): {body_text}"
+                f"Failed to pull manifest (HTTP {status})."
             )
         if not body:
             raise RegistryRequestError(
@@ -448,11 +438,15 @@ class RegistryClient:
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
-            preview = body[:500].decode("utf-8", errors="replace")
+            parse_error = f" at line {error.lineno}, column {error.colno}"
+        except UnicodeDecodeError:
+            parse_error = ": expected UTF-8"
+        else:
+            parse_error = None
+        if parse_error:
             raise RegistryRequestError(
-                f"Registry returned invalid manifest JSON: {error}\n"
-                f"Body preview: {preview}"
-            ) from error
+                f"Registry returned invalid manifest JSON{parse_error}."
+            )
         if not isinstance(manifest, dict):
             raise RegistryRequestError(
                 f"Registry returned a non-object manifest for {reference}."
@@ -462,8 +456,8 @@ class RegistryClient:
         )
         if digest and digest.startswith("sha256:") and digest != body_digest:
             raise BlobIntegrityError(
-                f"Registry reported manifest digest {digest}, but its body hashes "
-                f"to {body_digest}."
+                f"Registry-reported manifest digest does not match its body "
+                f"digest {body_digest}."
             )
         return manifest, digest or body_digest
 
@@ -519,10 +513,12 @@ class RegistryClient:
             if content_length:
                 try:
                     response_size = int(content_length)
-                except ValueError as error:
+                except (TypeError, ValueError):
+                    response_size = None
+                if response_size is None:
                     raise RegistryRequestError(
                         "Registry returned an invalid blob Content-Length."
-                    ) from error
+                    )
                 if response_size != expected_size:
                     raise BlobIntegrityError(
                         f"Blob Content-Length is {response_size}, expected "
@@ -587,13 +583,10 @@ class RegistryClient:
                     ):
                         time.sleep(_retry_delay(error.headers, attempt))
                         continue
-                    detail = error.read(MAX_ERROR_BODY_BYTES).decode(
-                        "utf-8", errors="replace"
-                    )
+                    error.read(MAX_ERROR_BODY_BYTES)
                     raise RegistryRequestError(
-                        f"Blob download failed with HTTP {error.code}: "
-                        f"{detail or '(empty response)'}"
-                    ) from error
+                        f"Blob download failed with HTTP {error.code}."
+                    ) from None
                 except (
                     urllib.error.URLError,
                     TimeoutError,

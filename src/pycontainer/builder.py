@@ -200,6 +200,7 @@ logger=logging.getLogger(__name__)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
+        config.validate_metadata()
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -247,6 +248,7 @@ class ImageBuilder:
             self.cache=None
 
     def build(self):
+        self.config.validate_metadata()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -315,7 +317,10 @@ class ImageBuilder:
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
         _write_content_addressed_bytes(cfg_path, cfg_bytes, cfg_digest)
 
-        manifest=build_manifest_json(cfg_digest,len(cfg_bytes),all_layers)
+        manifest=build_manifest_json(
+            cfg_digest,len(cfg_bytes),all_layers,
+            annotations=self.config.manifest_annotations,
+        )
         manifest_bytes=json.dumps(manifest,separators=(',',':')).encode()
         manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
         manifest_path=layers_dir/manifest_digest.split(":",1)[1]
@@ -334,6 +339,7 @@ class ImageBuilder:
             arch,
             os_name,
             variant=variant,
+            annotations=self.config.index_annotations,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -444,8 +450,12 @@ class ImageBuilder:
         client.pull_blob(config_digest, config_path, config_size)
         try:
             base_config=json.loads(config_path.read_bytes())
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise RegistryRequestError("Base image config is not valid JSON.") from error
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            invalid_base_config = True
+        else:
+            invalid_base_config = False
+        if invalid_base_config:
+            raise RegistryRequestError("Base image config is not valid JSON.")
         if not isinstance(base_config, dict):
             raise RegistryRequestError("Base image config is not a JSON object.")
 
@@ -562,7 +572,11 @@ class ImageBuilder:
         if self.config.env:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
-            print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+            print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
+        if self.config.manifest_annotations:
+            print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
+        if self.config.index_annotations:
+            print(f"  Index Annotations: {len(self.config.index_annotations)} configured (values hidden)")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")

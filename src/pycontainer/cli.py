@@ -5,6 +5,12 @@ from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
 
+def _metadata_argument(value: str) -> tuple[str, str]:
+    key, separator, item = value.partition("=")
+    if not separator or not key.strip():
+        raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
+    return key, item
+
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
     for stream in (sys.stdout, sys.stderr):
@@ -57,6 +63,9 @@ def main():
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
+    b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
+    b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
     # --- import subcommand (Dockerfile migration) ---
     imp=sub.add_parser("import",help="Convert a Dockerfile to [tool.pycontainer] settings")
     imp.add_argument("dockerfile",help="Path to the Dockerfile")
@@ -102,6 +111,9 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'labels': dict(args.labels) if args.labels is not None else None,
+        'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
+        'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 

@@ -367,12 +367,23 @@ exclude-defaults = true
 
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
+- `--label KEY=VALUE` — Set an image-config label; repeat to add labels
+- `--manifest-annotation KEY=VALUE` — Set an image-manifest annotation; repeat to add annotations
+- `--index-annotation KEY=VALUE` — Set a local layout-index annotation; repeat to add annotations
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
   `linux/arm64` or `linux/arm/v7`)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+Labels inherit from the base image; their precedence is CLI, configuration
+file, detected framework, then base image. Manifest and index annotations are
+separate from labels and are not inherited from the base. For a single-image
+build, index annotations are in the local `index.json`; registry pushes publish
+the image manifest, not that layout index. Metadata is visible to image
+consumers and registries: **do not put secrets in labels or annotations**.
+See [metadata configuration and integration details](docs/metadata.md).
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -399,6 +410,8 @@ config = BuildConfig(
     workdir="/app",
     env={"DEBUG": "false", "ENV": "production"},
     labels={"version": "1.0", "maintainer": "team@example.com"},
+    manifest_annotations={"org.opencontainers.image.title": "myapp"},
+    index_annotations={"org.opencontainers.image.description": "myapp layout"},
     include_paths=["src/", "lib/", "pyproject.toml"],
     exclude_paths=["src/generated", "fixtures/**"],
     entrypoint=["python", "-m", "myapp"],
@@ -424,6 +437,12 @@ generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
 [build.labels]
 maintainer = "team@example.com"
 version = "1.0.0"
+
+[build.manifest_annotations]
+"org.opencontainers.image.title" = "myapp"
+
+[build.index_annotations]
+"org.opencontainers.image.description" = "myapp layout"
 
 [build.env]
 PORT = "8080"

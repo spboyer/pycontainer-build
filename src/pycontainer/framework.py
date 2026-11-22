@@ -129,6 +129,6 @@ def apply_framework_defaults(
     
     if not config.labels:
         config.labels={}
-    config.labels["framework"]=framework.lower()
+    config.labels.setdefault("framework", framework.lower())
     
     return config

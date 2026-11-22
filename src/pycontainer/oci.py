@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Dict, Optional
+from .metadata import REFERENCE_ANNOTATION, merge_image_labels, validate_metadata
 
 @dataclass
 class OCILayer:
@@ -29,14 +30,24 @@ class OCIIndex:
     schema_version: int
     manifests: List[OCIManifestDescriptor]
     annotations: Optional[Dict[str,str]] = None
+    reference_name: Optional[str] = None
 
     def to_json(self) -> Dict:
         idx={"schemaVersion":self.schema_version,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[m.to_dict() for m in self.manifests]}
-        if self.annotations: idx["annotations"]=self.annotations
+        validate_metadata(self.annotations, "Index annotations", protect_reference=True)
+        reference = (
+            {REFERENCE_ANNOTATION: self.reference_name}
+            if self.reference_name is not None else {}
+        )
+        validate_metadata(reference, "Internal reference annotation")
+        annotations = {**reference, **(self.annotations or {})}
+        if annotations: idx["annotations"]={key: annotations[key] for key in sorted(annotations)}
         return idx
 
 def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None):
     """Build OCI config, optionally merging with base image config."""
+    base_labels=base_config.get('config',{}).get('Labels') if base_config else None
+    merged_labels=merge_image_labels(base_labels=base_labels, labels=labels)
     if base_config:
         cfg=deepcopy(base_config)
         base_env={kv.split('=',1)[0]:kv.split('=',1)[1] for kv in base_config.get('config',{}).get('Env',[]) if '=' in kv}
@@ -58,12 +69,10 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         elif 'Cmd' in base_config.get('config',{}): cfg['config']['Cmd']=base_config['config']['Cmd']
         if user: cfg['config']['User']=user
         elif 'User' in base_config.get('config',{}): cfg['config']['User']=base_config['config']['User']
-        base_labels=base_config.get('config',{}).get('Labels',{})
-        if labels: cfg['config']['Labels']={**base_labels, **labels}
-        elif base_labels: cfg['config']['Labels']=base_labels
+        if merged_labels: cfg['config']['Labels']=merged_labels
     else:
         cfg={"architecture":architecture,"os":os_name,"config":{"Env":[f"{k}={v}" for k,v in env.items()],"WorkingDir":working_dir,"Entrypoint":entrypoint}}
-        if labels: cfg['config']['Labels']=labels
+        if merged_labels: cfg['config']['Labels']=merged_labels
         if user: cfg['config']['User']=user
         if cmd: cfg['config']['Cmd']=cmd
     rootfs=cfg.setdefault("rootfs", {})
@@ -75,13 +84,16 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
 
 def is_distroless(config: Dict) -> bool:
     """Detect if base image is distroless (no shell)."""
-    labels=config.get('config',{}).get('Labels',{})
+    labels=config.get('config',{}).get('Labels') or {}
     return 'distroless' in labels.get('org.opencontainers.image.base.name','').lower() or 'distroless' in labels.get('name','').lower()
 
-def build_manifest_json(config_digest, config_size, layers: List[OCILayer]):
-    return {"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
-            "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_digest,"size":config_size},
-            "layers":[l.to_descriptor() for l in layers]}
+def build_manifest_json(config_digest, config_size, layers: List[OCILayer], *, annotations=None):
+    validate_metadata(annotations, "Manifest annotations", protect_reference=True)
+    manifest={"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+              "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_digest,"size":config_size},
+              "layers":[l.to_descriptor() for l in layers]}
+    if annotations: manifest["annotations"]={key: annotations[key] for key in sorted(annotations)}
+    return manifest
 
 def build_oci_layout():
     return {"imageLayoutVersion":"1.0.0"}
@@ -93,10 +105,12 @@ def build_index_json(
     architecture="amd64",
     os_name="linux",
     variant=None,
+    *,
+    annotations=None,
 ):
+    validate_metadata(annotations, "Index annotations", protect_reference=True)
     platform = {"architecture": architecture, "os": os_name}
     if variant:
         platform["variant"] = variant
     desc=OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,platform)
-    annot={"org.opencontainers.image.ref.name":tag} if tag else None
-    return OCIIndex(2,[desc],annot).to_json()
+    return OCIIndex(2,[desc],annotations,reference_name=tag or None).to_json()
