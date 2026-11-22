@@ -112,6 +112,7 @@ class RegistryClient:
         self.timeout = timeout
         self.base_url = f"https://{self.registry}/v2"
         self._bearer_token = None
+        self._blob_opener = None
 
     def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
         """Parse Www-Authenticate header for OAuth2 challenge."""
@@ -471,9 +472,12 @@ class RegistryClient:
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
-        opener = urllib.request.build_opener(NoRedirect())
+        # Building an opener creates a fresh TLS context and reloads the
+        # system certificate store, so reuse one per client.
+        if self._blob_opener is None:
+            self._blob_opener = urllib.request.build_opener(NoRedirect())
         try:
-            response = opener.open(request, timeout=self.timeout)
+            response = self._blob_opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             if error.code not in REDIRECT_STATUSES:
                 raise

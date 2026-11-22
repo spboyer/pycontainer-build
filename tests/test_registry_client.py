@@ -346,6 +346,34 @@ def test_pull_blob_streams_and_atomically_publishes_verified_content(
     assert not client.pull_blob(digest, destination, len(content))
 
 
+def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[len(requests)]
+            requests.append(request)
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*_handlers):
+        openers.append(Opener())
+        return openers[-1]
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+    client = RegistryClient("registry.example", "team/app")
+
+    for content in contents:
+        digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        assert client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+
+    assert len(requests) == 2
+    assert len(openers) == 1
+
+
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(
     tmp_path, monkeypatch
 ):
