@@ -211,6 +211,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 
@@ -520,6 +521,7 @@ class ImageBuilder:
         self._target_platform=platform
         self._staged_packages=[]
         self._dependency_site_packages=False
+        self._base_image_tag_verified=False
         os_name, arch = parse_platform(platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         if hasattr(self, "expected_python_version"):
@@ -984,7 +986,23 @@ class ImageBuilder:
                 f"target {os_name}/{arch}."
             )
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
-        version = target_python_version(base_image_name, base_config)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        # Later platforms are pulled by the pinned index digest; they inherit tag
+        # provenance only when that digest was resolved from the initial tag pull.
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+            and getattr(self, "_base_image_tag_verified", False)
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
@@ -999,6 +1017,7 @@ class ImageBuilder:
                     version,
                     base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(
