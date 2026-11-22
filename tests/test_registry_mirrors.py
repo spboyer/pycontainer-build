@@ -69,6 +69,7 @@ class _Registry:
         self.requests = []
         self.status = None
         self.status_paths = {}
+        self.redirect_paths = {}
         self.challenge_realm = None
 
     def serve_image(self, tag="1"):
@@ -102,6 +103,10 @@ def _handler(state):
                     "Www-Authenticate": f'Bearer realm="{state.challenge_realm}",service="mirror"'
                 })
                 return True
+            for fragment, destination in state.redirect_paths.items():
+                if fragment in self.path:
+                    self._send(307, headers={"Location": f"{destination}{self.path}"})
+                    return True
             for fragment, status in state.status_paths.items():
                 if fragment in self.path:
                     self._send(status)
@@ -252,6 +257,25 @@ def test_https_mirror_uses_configured_ca_or_falls_back(
         assert mir.requests == []
         assert up.requests
         assert {auth for _, _, auth in up.requests} == {UPSTREAM_HEADER}
+
+
+@pytest.mark.parametrize("redirected_object", ["manifests", "blobs"])
+def test_mirror_cross_origin_redirect_never_sends_credentials(
+    tmp_path, mirror_auth, redirected_object
+):
+    with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
+        storage, target
+    ):
+        mir.serve_image()
+        target.serve_image()
+        mir.redirect_paths[f"/{redirected_object}/"] = f"http://{storage}"
+        layers, config = _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
+
+    assert config["os"] == "linux" and len(layers) == 1
+    assert up.requests == []
+    assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
+    assert target.requests
+    assert all(auth is None for _, _, auth in target.requests)
 
 
 def test_fallback_order_connection_404_5xx_then_upstream(tmp_path, mirror_auth, caplog):
