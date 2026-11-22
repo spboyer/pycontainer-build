@@ -2,6 +2,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
+OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+
 @dataclass
 class OCILayer:
     media_type: str
@@ -100,3 +103,13 @@ def build_index_json(
     desc=OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,platform)
     annot={"org.opencontainers.image.ref.name":tag} if tag else None
     return OCIIndex(2,[desc],annot).to_json()
+
+def build_image_index_json(manifests: List[OCIManifestDescriptor]) -> Dict:
+    """Build a multi-platform image index referencing one manifest per platform."""
+    return OCIIndex(2, manifests).to_json()
+
+def build_layout_index_json(index_digest, index_size, ref_names: List[str]) -> Dict:
+    """Build an image-layout index.json whose tagged descriptors resolve to an image index."""
+    return {"schemaVersion":2,"mediaType":OCI_INDEX_MEDIA_TYPE,
+            "manifests":[{"mediaType":OCI_INDEX_MEDIA_TYPE,"digest":index_digest,"size":index_size,
+                          "annotations":{"org.opencontainers.image.ref.name":ref}} for ref in ref_names]}
