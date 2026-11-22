@@ -108,7 +108,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^20.0.0",
+    "@types/node": "^26.6.6",
     "@types/vscode": "^1.80.0",
     "@vscode/vsce": "^4.1.1",
     "eslint": "^10.15.0",
