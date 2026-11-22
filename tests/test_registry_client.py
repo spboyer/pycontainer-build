@@ -165,8 +165,8 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
-        requests.append((method, url, headers))
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        requests.append((method, url, headers, max_response_bytes))
         return 200, body, {"Docker-Content-Digest": digest}
 
     monkeypatch.setattr(client, "_make_request", fake_request)
@@ -179,6 +179,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
         requests[0][2]["Accept"]
     )
+    assert requests[0][3] == len(body)
 
     with pytest.raises(BlobIntegrityError, match="size"):
         client.pull_manifest(digest, expected_size=len(body) + 1)

@@ -231,6 +231,9 @@ registry-ca-file = "corp-root-ca.pem"
   using that same context; push-only clients never construct it. Concurrent
   initial bearer challenges share one token acquisition and replay once.
   Rejection of the current bearer token is reported, not refreshed indefinitely.
+- Manifest responses are read at most to the descriptor's expected size, or
+  16 MiB when the size is unknown (never more than 16 MiB), including after a
+  bearer-challenge replay; larger responses fail with `RegistryRequestError`.
 
 ### Proxy policy
 

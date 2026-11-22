@@ -661,6 +661,43 @@ def test_redirect_and_token_targets_require_custom_ca(
         assert target.requests == []
 
 
+@pytest.mark.parametrize(
+    ("expected_size", "cap", "allowed"),
+    [
+        (None, 64, True),
+        (None, 8, False),
+        ("exact", 1024, True),
+        ("short", 1024, False),
+        ("exact", 8, False),
+    ],
+)
+def test_manifest_read_is_bounded_through_token_replay(
+    monkeypatch, expected_size, cap, allowed
+):
+    manifest = json.dumps({"schemaVersion": 2}).encode()
+    size = {"exact": len(manifest), "short": len(manifest) - 1}.get(expected_size)
+    monkeypatch.setattr("pycontainer.registry_client.MAX_MANIFEST_BYTES", cap)
+    with _serve() as (auth_port, auth), _serve() as (port, state):
+        auth.token_response = {"token": "acquired-token"}
+        state.token_realm = f"http://127.0.0.1:{auth_port}/token"
+        state.manifests["latest"] = manifest
+        client = RegistryClient(
+            f"127.0.0.1:{port}", "team/app", insecure=True,
+            username="synthetic-user", password="synthetic-password",
+        )
+        if allowed:
+            assert client.pull_manifest("latest", expected_size=size)[0] == {
+                "schemaVersion": 2
+            }
+        else:
+            with pytest.raises(RegistryRequestError, match="exceeds"):
+                client.pull_manifest("latest", expected_size=size)
+
+    assert len(state.requests) == 2
+    assert state.requests[0][2].startswith("Basic ")
+    assert state.requests[1][2] == "Bearer acquired-token"
+
+
 def test_environment_proxies_are_not_used(monkeypatch):
     manifest = json.dumps({"schemaVersion": 2}).encode()
     with _serve() as (proxy_port, proxy), _serve() as (port, state):

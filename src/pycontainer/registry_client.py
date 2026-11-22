@@ -35,6 +35,7 @@ MAX_RETRY_DELAY_SECONDS = 5
 RETRY_BACKOFF_SECONDS = 0.25
 TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 MAX_REPORTED_ERRORS = 5
@@ -722,6 +723,7 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_response_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
         method = method.upper()
         _check_transport(self.base_url, url, self.insecure)
@@ -752,7 +754,15 @@ class RegistryClient:
                 ) as response:
                     response_headers = dict(response.headers)
                     self._observe_rate_limit(response_headers, url)
-                    return response.status, response.read(), response_headers
+                    if max_response_bytes is None:
+                        return response.status, response.read(), response_headers
+                    body = response.read(max_response_bytes + 1)
+                    if len(body) > max_response_bytes:
+                        raise RegistryRequestError(
+                            f"{method} response from {_safe_url(url)} exceeds "
+                            f"{max_response_bytes} bytes."
+                        )
+                    return response.status, body, response_headers
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 self._observe_rate_limit(response_headers, url)
@@ -761,7 +771,12 @@ class RegistryClient:
                     if body_position is not None:
                         data.seek(body_position)
                     return self._make_request(
-                        method, url, data, headers, retry_auth=False
+                        method,
+                        url,
+                        data,
+                        headers,
+                        retry_auth=False,
+                        max_response_bytes=max_response_bytes,
                     )
                 if retry_safe and _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
@@ -912,7 +927,14 @@ class RegistryClient:
             )
         }
         status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
+            "GET",
+            url,
+            headers=headers,
+            max_response_bytes=(
+                MAX_MANIFEST_BYTES
+                if expected_size is None
+                else min(expected_size, MAX_MANIFEST_BYTES)
+            ),
         )
         if status != 200:
             raise self._error("Manifest pull", url, status, body, response_headers)
