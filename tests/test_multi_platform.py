@@ -580,7 +580,7 @@ def test_push_rejects_layout_mutated_after_build(tmp_path, monkeypatch):
 
 
 def _install_fake_deps(monkeypatch):
-    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config):
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(f"ARCH = {arch!r}\n")
