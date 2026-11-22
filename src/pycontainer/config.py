@@ -58,18 +58,44 @@ class _GeneratedList(_TrackedList):
         return self.generated and not self.specified and tuple(self) == self.snapshot
 
 
-class _PortState:
-    """Track list identity for dataclass copies while serializing the intent."""
+_FRAMEWORK_FIELDS = {
+    "entrypoint": "_framework_generated_entrypoint",
+    "cmd": "_framework_generated_cmd",
+    "exposed_ports": "_framework_generated_ports",
+}
 
-    def __init__(self, ports, configured):
-        self.ports = ports
-        self.configured = configured
 
-    def __bool__(self):
-        return self.configured
+def _ports_configured(ports):
+    return ports is not None and (
+        not isinstance(ports, _DefaultPorts) or ports.specified
+    )
+
+
+def _is_generated_field(config, name):
+    value = getattr(config, name)
+    previous = getattr(config, _FRAMEWORK_FIELDS[name], None)
+    return (
+        isinstance(value, _GeneratedList) and value.untouched
+        and (previous is None or value is previous)
+    )
+
+
+class _FrameworkState:
+    """Track generated fields across dataclass copies and serialization."""
+
+    def __init__(self, values, generated):
+        self.values = values
+        self.generated = generated
 
     def __deepcopy__(self, memo):
-        return self.configured
+        return {
+            "ports_configured": _ports_configured(self.values["exposed_ports"]),
+            "generated": {
+                name: list(value)
+                for name, value in self.values.items()
+                if self.generated[name]
+            },
+        }
 
 
 @dataclass
@@ -103,30 +129,57 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
-    _exposed_ports_configured: Optional[Union[bool, _PortState]] = field(
+    _framework_default_env: Dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+    _framework_generated_state: Optional[Union[Dict[str, object], _FrameworkState]] = field(
         default=None, repr=False, compare=False
     )
 
     def __getattribute__(self, name):
-        if name == "_exposed_ports_configured":
-            ports = object.__getattribute__(self, "exposed_ports")
-            configured = ports is not None and (
-                not isinstance(ports, _DefaultPorts) or ports.specified
-            )
-            return _PortState(ports, configured)
+        if name == "_framework_generated_state":
+            values = {
+                field_name: object.__getattribute__(self, field_name)
+                for field_name in _FRAMEWORK_FIELDS
+            }
+            generated = {
+                field_name: _is_generated_field(self, field_name)
+                for field_name in _FRAMEWORK_FIELDS
+            }
+            return _FrameworkState(values, generated)
         return object.__getattribute__(self, name)
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
+        generated_state = self.__dict__["_framework_generated_state"]
+        configured = None
+        if isinstance(generated_state, _FrameworkState):
+            if self.exposed_ports is generated_state.values["exposed_ports"]:
+                configured = _ports_configured(self.exposed_ports)
+            for name, previous in generated_state.values.items():
+                value = getattr(self, name)
+                if isinstance(value, _GeneratedList):
+                    if value is not previous or not generated_state.generated[name]:
+                        object.__setattr__(self, name, list(value))
+                    else:
+                        object.__setattr__(self, _FRAMEWORK_FIELDS[name], value)
+        elif isinstance(generated_state, dict):
+            configured = generated_state.get("ports_configured")
+            snapshots = generated_state.get("generated")
+            if not isinstance(configured, bool) or not isinstance(snapshots, dict):
+                raise ValueError("Invalid serialized framework defaults.")
+            for name in _FRAMEWORK_FIELDS:
+                snapshot = snapshots.get(name)
+                value = getattr(self, name)
+                if isinstance(snapshot, list) and isinstance(value, list) and value == snapshot:
+                    value = _GeneratedList(value, generated=True)
+                    object.__setattr__(self, name, value)
+                    object.__setattr__(self, _FRAMEWORK_FIELDS[name], value)
+        elif generated_state is not None:
+            raise ValueError("Invalid serialized framework defaults.")
+
         ports = self.exposed_ports
-        configured = self.__dict__["_exposed_ports_configured"]
-        if isinstance(configured, _PortState):
-            configured = configured.configured if ports is configured.ports else None
         if configured is None:
-            configured = ports is not None and (
-                not isinstance(ports, _DefaultPorts) or ports.specified
-            )
+            configured = _ports_configured(ports)
         elif not configured and ports:
             configured = True
         if not configured and ports is not None and not isinstance(ports, _DefaultPorts):
@@ -134,7 +187,6 @@ class BuildConfig:
             object.__setattr__(self, "exposed_ports", ports)
         if isinstance(ports, _DefaultPorts):
             ports.specified = configured
-        object.__setattr__(self, "_exposed_ports_configured", configured)
 
         self.system_packages = validate_system_packages(self.system_packages)
         if not isinstance(self.generate_sbom, (bool, str)):
@@ -158,4 +210,4 @@ class BuildConfig:
 
     def has_exposed_ports(self) -> bool:
         """Return whether ports were explicitly configured or detected."""
-        return bool(self._exposed_ports_configured)
+        return _ports_configured(self.exposed_ports)

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
-from .config import _DefaultPorts, _GeneratedList
+from .config import _DefaultPorts, _GeneratedList, _is_generated_field
 from .fs_utils import DEFAULT_CONTEXT_EXCLUDES, iter_files, path_is_excluded
 from .project import declared_dependency_names, default_include_paths
 
@@ -143,9 +143,10 @@ def _detect_framework(
     selected_files = []
     for name in sorted(selected):
         path = selected[name]
-        if not _selected_symlink_chain(path, ctx, available):
+        target = path.resolve().relative_to(ctx)
+        if path_is_excluded(target, excludes) or not _selected_symlink_chain(path, ctx, available):
             logger.warning(
-                "Skipping source symlink %s: its target chain is not included in the selected files.",
+                "Skipping source symlink %s: its target chain is excluded or not selected.",
                 name,
             )
             continue
@@ -179,13 +180,25 @@ def _detect_framework(
             continue
         relative = path.relative_to(ctx).as_posix()
         module = ".".join(path.relative_to(ctx).with_suffix("").parts)
-        for variable in _web_app_variables(tree, "FastAPI"):
+        fastapi_variables, fastapi_constructed = _web_app_details(tree, "FastAPI")
+        if fastapi_constructed and not fastapi_variables:
+            problems["FastAPI"] = (
+                f"Cannot determine an importable FastAPI entrypoint in {relative}; "
+                "specify an explicit entrypoint or command."
+            )
+        for variable in fastapi_variables:
             candidates["FastAPI"].append(_Detection(
                 "FastAPI",
                 ["uvicorn", f"{module}:{variable}", "--host", ALL_INTERFACES, "--port", "8000"],
                 [8000],
             ))
-        for _ in _web_app_variables(tree, "Flask"):
+        flask_variables, flask_constructed = _web_app_details(tree, "Flask")
+        if flask_constructed and not flask_variables:
+            problems["Flask"] = (
+                f"Cannot determine an importable Flask entrypoint in {relative}; "
+                "specify an explicit entrypoint or command."
+            )
+        for _ in flask_variables:
             candidates["Flask"].append(_Detection(
                 "Flask", ["flask", "run", "--host=0.0.0.0", "--port=5000"], [5000]
             ))
@@ -428,25 +441,30 @@ def _matches_configured_command(detection, arguments):
     if not detection.entrypoint:
         return False
     arguments = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
-    args = set(arguments)
-    executables = {arg.rsplit("/", 1)[-1] for arg in args}
-    executables = {name.removesuffix(".exe") for name in executables}
+    executable, index = _configured_executable(arguments)
+    target = _configured_python_target(arguments)
+    if target and target[0] == "module":
+        executable, index = target[1], target[2]
+    command_arguments = arguments[index:]
     if detection.name == "Streamlit":
-        executable, index = _configured_executable(arguments)
-        if executable and executable.startswith("python"):
-            target = _configured_python_target(arguments)
-            if not target or target[:2] != ("module", "streamlit"):
-                return False
-            index = target[2]
-        elif executable != "streamlit":
+        if executable != "streamlit" or not command_arguments or command_arguments[0] != "run":
             return False
-        return (
-            index + 1 < len(arguments)
-            and arguments[index] == "run"
-            and arguments[index + 1] == detection.entrypoint[2]
-        )
+        index = 1
+        while index < len(command_arguments):
+            option = command_arguments[index]
+            if option == "--":
+                index += 1
+                break
+            if option in ("--server.port", "--server.address"):
+                index += 2
+            elif option.startswith(("--server.port=", "--server.address=")):
+                index += 1
+            elif option.startswith("-"):
+                return False
+            else:
+                break
+        return index < len(command_arguments) and command_arguments[index] == detection.entrypoint[2]
     if detection.name == "Gradio":
-        target = _configured_python_target(arguments)
         if not target:
             return False
         script = detection.entrypoint[1]
@@ -455,23 +473,39 @@ def _matches_configured_command(detection, arguments):
     if detection.name in ("FastAPI", "Celery"):
         reference = detection.entrypoint[1 if detection.name == "FastAPI" else 2]
         executors = {"uvicorn", "gunicorn", "hypercorn"} if detection.name == "FastAPI" else {"celery"}
+        if executable not in executors:
+            return False
+        args = set(command_arguments[:command_arguments.index("--")]) if "--" in command_arguments else set(command_arguments)
         references = {reference}
         if detection.name == "Celery":
             references.add(reference.partition(":")[0])
-        return bool(executors & executables) and any(
+        return any(
             ref in args or f"--app={ref}" in args or f"-A{ref}" in args or f"-A={ref}" in args
             for ref in references
         )
     if detection.name == "Flask":
-        return "flask" in executables and "run" in args
+        if executable != "flask":
+            return False
+        index = 0
+        while index < len(command_arguments):
+            option = command_arguments[index]
+            if option in ("--app", "-A", "--env-file", "-e"):
+                index += 2
+            elif option.startswith("-"):
+                index += 1
+            else:
+                return option == "run"
+        return False
     if detection.name == "Django":
-        return "manage.py" in executables and "runserver" in args
+        if target and target[0] == "script" and target[1].rsplit("/", 1)[-1] == "manage.py":
+            command_arguments = arguments[target[2]:]
+        elif executable != "manage.py":
+            return False
+        return bool(command_arguments) and command_arguments[0] == "runserver"
     if detection.name == "Jupyter":
-        return bool({"jupyter-lab", "jupyter-notebook"} & executables) or (
-            "jupyter" in executables and bool({"lab", "notebook"} & args)
-        ) or (
-            any(name.startswith("python") for name in executables)
-            and "-m" in args and bool({"jupyterlab", "notebook"} & args)
+        return executable in {"jupyter-lab", "jupyter-notebook", "jupyterlab", "notebook"} or (
+            executable == "jupyter" and bool(command_arguments)
+            and command_arguments[0] in {"lab", "notebook"}
         )
     return False
 
@@ -530,11 +564,12 @@ def _module_scope_nodes(tree):
         pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
-def _web_app_variables(tree, constructor):
+def _web_app_details(tree, constructor):
     package = constructor.lower()
     modules = set()
     classes = {constructor}
     nodes = list(_module_scope_nodes(tree))
+    variables = []
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -555,7 +590,15 @@ def _web_app_variables(tree, constructor):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
-                yield target.id
+                variables.append(target.id)
+    constructed = any(
+        _is_constructor(node, modules, classes, {constructor}) for node in ast.walk(tree)
+    )
+    return variables, constructed
+
+
+def _web_app_variables(tree, constructor):
+    yield from _web_app_details(tree, constructor)[0]
 
 
 def _import_aliases(tree):
@@ -750,15 +793,9 @@ def apply_framework_defaults(
     files=None,
 ):
     """Apply framework-specific defaults to build config."""
-    generated_entrypoint = (
-        isinstance(config.entrypoint, _GeneratedList) and config.entrypoint.untouched
-    )
-    generated_ports = (
-        isinstance(config.exposed_ports, _GeneratedList) and config.exposed_ports.untouched
-    )
-    generated_cmd = (
-        isinstance(config.cmd, _GeneratedList) and config.cmd.untouched
-    )
+    generated_entrypoint = _is_generated_field(config, "entrypoint")
+    generated_ports = _is_generated_field(config, "exposed_ports")
+    generated_cmd = _is_generated_field(config, "cmd")
     configured_entrypoint = None if generated_entrypoint else config.entrypoint
     configured_cmd = None if generated_cmd else config.cmd
     if generated_entrypoint and configured_cmd is not None:
@@ -846,7 +883,7 @@ def apply_framework_defaults(
         config._framework_generated_ports = config.exposed_ports
         config._framework_ports_snapshot = tuple(config.exposed_ports)
     if framework == "Gradio":
-        default_env = getattr(config, "_framework_default_env", {})
+        default_env = dict(config._framework_default_env)
         if "GRADIO_SERVER_NAME" not in config.env:
             config.env["GRADIO_SERVER_NAME"] = ALL_INTERFACES
             default_env["GRADIO_SERVER_NAME"] = ALL_INTERFACES

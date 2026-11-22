@@ -37,9 +37,10 @@ alongside a web application needs a separate image or an explicit entrypoint.
 Multiple FastAPI, Flask, or Celery applications or multiple Streamlit or Gradio
 scripts cannot be selected safely: the build asks for an explicit entrypoint
 or command. An unlaunched Gradio application and a Celery app without an
-importable module-level name also require an explicit entrypoint. A valid
-higher-precedence framework still wins over ambiguous lower-precedence
-candidates. Dynamic factories and other patterns that cannot be established
+importable module-level name also require an explicit entrypoint. FastAPI and
+Flask factories without a module-level app binding require explicit commands.
+A valid higher-precedence framework still wins over ambiguous lower-precedence
+candidates. Other patterns that cannot be established
 statically may need manual configuration. Celery applications under `src/`
 use that directory as a Python import root.
 
