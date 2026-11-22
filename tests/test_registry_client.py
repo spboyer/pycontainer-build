@@ -3,8 +3,10 @@ import base64
 import hashlib
 import io
 import json
+import ssl
 import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.message import Message
@@ -357,9 +359,9 @@ def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
             requests.append(request)
             return _Response(content, headers={"Content-Length": str(len(content))})
 
-    def build_opener(*_handlers):
-        openers.append(Opener())
-        return openers[-1]
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
+        return openers[-1][0]
 
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener", build_opener
@@ -372,6 +374,16 @@ def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
 
     assert len(requests) == 2
     assert len(openers) == 1
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert isinstance(client._ssl_context, ssl.SSLContext)
+    assert client._ssl_context.verify_mode == ssl.CERT_REQUIRED
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    context = client._ssl_context
+    assert client._get_blob_opener() is openers[0][0]
+    assert client._ssl_context is context
 
 
 def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
@@ -380,6 +392,9 @@ def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener", unexpected_opener
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.ssl.create_default_context", unexpected_opener
     )
     client = RegistryClient("registry.example", "team/app")
     def make_request(method, *_args, **_kwargs):
@@ -438,6 +453,7 @@ def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
 
     assert results == [True, True]
     assert len(openers) == 1
+    assert isinstance(client._ssl_context, ssl.SSLContext)
 
 
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(

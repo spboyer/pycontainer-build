@@ -60,7 +60,8 @@ request; real HTTPS without connection reuse pays several. Pass
 Include client construction when comparing push lifecycles: TLS opener setup
 can dominate small or already-present uploads. The blob opener is initialized
 lazily under a per-client lock, so push-only clients avoid that setup while
-concurrent first blob pulls still share one opener. The product-path push
+concurrent first blob pulls still share one opener and one verifying TLS
+context retained by the client. The product-path push
 timings include client construction; the probe push timings reuse a client
 constructed outside the timed region.
 

@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -113,6 +114,7 @@ class RegistryClient:
         self.timeout = timeout
         self.base_url = f"https://{self.registry}/v2"
         self._bearer_token = None
+        self._ssl_context = None
         self._blob_opener = None
         self._blob_opener_lock = threading.Lock()
 
@@ -470,16 +472,24 @@ class RegistryClient:
             )
         return manifest, digest or body_digest
 
+    def _get_blob_opener(self):
+        # TLS setup is expensive; build one verifying context and opener per
+        # client, only on first blob pull, and never race concurrent pulls.
+        with self._blob_opener_lock:
+            if self._blob_opener is None:
+                if self._ssl_context is None:
+                    self._ssl_context = ssl.create_default_context()
+                self._blob_opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=self._ssl_context),
+                    NoRedirect(),
+                )
+            return self._blob_opener
+
     def _open_blob_response(self, url: str):
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
         )
-        # TLS setup is expensive; reuse one opener without charging push-only
-        # clients or racing concurrent first blob requests.
-        with self._blob_opener_lock:
-            if self._blob_opener is None:
-                self._blob_opener = urllib.request.build_opener(NoRedirect())
-            opener = self._blob_opener
+        opener = self._get_blob_opener()
         try:
             response = opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
