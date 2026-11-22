@@ -2,6 +2,7 @@ import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
     HASH_CHUNK_SIZE as _HASH_CHUNK_SIZE,
@@ -262,6 +263,7 @@ class ImageBuilder:
 
         os_name, arch = parse_platform(self.config.platform)
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
@@ -562,6 +564,8 @@ class ImageBuilder:
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
+        if self.config.system_packages:
+            print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
