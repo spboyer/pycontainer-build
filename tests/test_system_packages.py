@@ -163,11 +163,17 @@ def test_config_file_and_cli_flags(tmp_path, monkeypatch):
         sys,
         "argv",
         ["pycontainer", "build", "--base-image", "x", "--system-package", "libpq5",
-         "--system-package", "libssl3", "--no-detect-system-packages"],
+         "--system-package", "libssl3", "--no-detect-system-packages",
+         "--tag", "app:v1.2.3", "--tag", "app:stable", "--semver-tags", "--latest"],
     )
     cli.main()
     assert configs[0].system_packages == ["libpq5", "libssl3"]
     assert configs[0].detect_system_packages is False
+    assert configs[0].all_tags() == [
+        "docker.io/library/app:v1.2.3", "docker.io/library/app:stable",
+        "docker.io/library/app:v1.2", "docker.io/library/app:v1",
+        "docker.io/library/app:latest",
+    ]
 
 
 def test_build_config_rejects_invalid_system_package():

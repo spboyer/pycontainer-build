@@ -16,6 +16,9 @@ daemon without discussing the trade-off first.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
+- External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
+  the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
+  Change that contract only together with the adapter.
 - `tests/`: actual pytest suite; `docs/TESTING.md` describes an aspirational
   strategy, including directories and tooling that do not yet exist.
 

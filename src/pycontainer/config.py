@@ -32,6 +32,9 @@ class BuildConfig:
     generate_sbom: Union[bool, str] = False
     system_packages: List[str] = field(default_factory=list)
     detect_system_packages: bool = True
+    tags: Optional[List[str]] = None
+    semver_tags: bool = False
+    latest_tag: bool = False
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -45,3 +48,13 @@ class BuildConfig:
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
             )
+        if self.tags or self.semver_tags or self.latest_tag:
+            from .tags import resolve_tags
+
+            resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def all_tags(self) -> List[str]:
+        """Return every full image reference this build is tagged with."""
+        from .tags import resolve_tags
+
+        return resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
