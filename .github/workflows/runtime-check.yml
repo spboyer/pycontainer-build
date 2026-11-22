@@ -1,0 +1,89 @@
+name: Runtime image check
+
+# Real OCI import and container startup on native runners. Each target must
+# produce passing evidence; a missing, skipped or failed target fails the gate.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    name: OCI import and startup (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            slug: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: linux-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install Skopeo
+        timeout-minutes: 5
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q skopeo
+          fi
+          skopeo --version
+      - name: Build, import and start the image
+        env:
+          PYTHONPATH: src
+        run: >-
+          timeout 600 python scripts/check_runtime_image.py
+          --base-image python:3.11-slim
+          --platform ${{ matrix.platform }}
+          --timeout 300
+          --evidence runtime-evidence/${{ matrix.slug }}.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-evidence-${{ matrix.slug }}
+          path: runtime-evidence/${{ matrix.slug }}.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90
+
+  gate:
+    name: Runtime evidence gate
+    needs: startup
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download evidence
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: runtime-evidence-linux-*
+          path: runtime-evidence
+      - name: Verify every required target passed
+        run: >-
+          python3 scripts/verify_runtime_evidence.py
+          --evidence-dir runtime-evidence
+          --require linux/amd64
+          --require linux/arm64
+          --commit ${{ github.sha }}
+          --summary runtime-evidence-summary.md
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-evidence-summary
+          path: runtime-evidence-summary.md
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90

@@ -84,18 +84,29 @@ a pass/fail gate. A passing layout assertion is not evidence that an image
 starts in a container runtime. Do not silently remove, mock away, or claim
 success for unrun integration tests.
 
-An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
-and a running Docker daemon:
-`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+A real OCI import/startup check runs on Linux/WSL with Skopeo and a running
+Docker daemon:
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json`.
 It pulls the selected base image, imports the generated layout into Docker, and
-starts a container. To test only dependency importability in the real target
-base image, without Skopeo, add `--dependency-layer-only`. These checks are not
-part of the default test suite or CI.
+starts a container. `--platform` must match the daemon; emulated runs fail
+rather than count as evidence. `--evidence` writes a passed or failed JSON
+record. To test only dependency importability in the real target base image,
+without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+It is not part of default pytest.
+
+`.github/workflows/runtime-check.yml` runs the full check natively on
+`linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
+same-repository PRs, pushes to main and release tags.
+`scripts/verify_runtime_evidence.py` then requires exactly one passing full
+record per target for the current commit; missing, skipped, failed, emulated,
+partial or duplicate evidence fails the gate and is listed separately as not
+validated. The release job depends on this gate and appends its summary to the
+release notes. Only targets listed as validated have runtime evidence.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
-and 3.15. The benchmark includes synthetic loopback registry transfers at
+and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
 multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
 does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
