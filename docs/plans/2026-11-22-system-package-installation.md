@@ -116,11 +116,14 @@ uses the standard library only and has no callers yet:
   without host mounts, the id map, `network=none`, limits, cleanup, and
   whiteout-correct layer export. Until it lands and is verified on real
   runners, no configuration enables installation and no install command runs.
-  The #194 host probe does not establish this. crun 1.14.1 bind-mounts host
-  device nodes such as `/dev/null` and `/dev/zero` into user-namespace
-  containers, which breaks the no-host-mount boundary. crun is therefore not
-  an accepted backend until #22 settles a virtualized-device alternative or
-  fails closed.
+  The #194 host probe does not establish this. Rootless crun 1.14.1
+  bind-mounts host `/dev/{null,zero,full,tty,random,urandom}` (and `/dev/null`
+  over masked paths) because `mknod` is denied in a user namespace. The #22
+  decision allows only those pseudo-devices as host-sourced mounts, with
+  `/dev/tty` neutralised and an in-stage mountinfo classifier that fails
+  closed on anything else. Installation must run through that executor and
+  add no bind mounts of its own: package files, signing keys and repository
+  metadata are copied in, and results leave as the OCI delta layer.
 - **Signed local-repository fixtures.** apt fixtures need `dpkg-deb`,
   `apt-ftparchive` and a throwaway `gpg` key. apk fixtures need
   `abuild-sign`. Both need a lib package, a dependent package and a runtime
