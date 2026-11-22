@@ -3,6 +3,7 @@ import ast
 import keyword
 import logging
 import os
+import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -81,6 +82,7 @@ def _detect_framework(
     configured_entrypoint=None,
     configured_cmd=None,
     configured_ports=False,
+    configured_workdir=None,
 ):
     context_path = Path(context_dir).absolute()
     ctx = context_path.resolve()
@@ -319,11 +321,16 @@ def _detect_framework(
     selected_match = None
     if configured:
         arguments = [*(configured_entrypoint or []), *(configured_cmd or [])]
+        normalized = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+        executable, command_arguments, _, _ = _configured_command(normalized)
+        if executable == "celery" and _celery_subcommand(command_arguments) != "worker":
+            logger.warning("The configured Celery command is not a worker; no framework defaults applied.")
+            return None
         matches = [
             candidate
             for name in present
             for candidate in candidates[name]
-            if _matches_configured_command(candidate, arguments)
+            if _matches_configured_command(candidate, arguments, configured_workdir)
         ]
         if matches and len({candidate.name for candidate in matches}) == 1:
             selected_match = matches[0]
@@ -388,28 +395,39 @@ def _selected_symlink_chain(path, context_dir, available):
 
 def _configured_executable(arguments):
     if not arguments:
-        return None, 0
+        return None, 0, None
     index = 0
+    directory = None
     executable = arguments[index].rsplit("/", 1)[-1].removesuffix(".exe")
     if executable == "env":
         index += 1
         while index < len(arguments):
             option = arguments[index]
-            if option in ("-u", "--unset"):
+            if option in ("-u", "--unset", "-C", "--chdir"):
+                if index + 1 >= len(arguments):
+                    return None, index, directory
+                if option in ("-C", "--chdir"):
+                    directory = arguments[index + 1]
                 index += 2
+            elif option.startswith("--chdir="):
+                directory = option.partition("=")[2]
+                index += 1
+            elif option.startswith("-C") and len(option) > 2:
+                directory = option[2:]
+                index += 1
             elif option.startswith("-") or "=" in option:
                 index += 1
             else:
                 break
         if index >= len(arguments):
-            return None, index
+            return None, index, directory
         executable = arguments[index].rsplit("/", 1)[-1].removesuffix(".exe")
-    return executable, index + 1
+    return executable, index + 1, directory
 
 
 def _configured_python_target(arguments):
-    executable, index = _configured_executable(arguments)
-    if not executable or not executable.startswith("python"):
+    executable, index, _ = _configured_executable(arguments)
+    if not executable or not (executable.startswith("python") or executable in ("py", "pyw")):
         return None
     while index < len(arguments):
         argument = arguments[index]
@@ -437,15 +455,44 @@ def _configured_python_target(arguments):
     return None
 
 
-def _matches_configured_command(detection, arguments):
-    if not detection.entrypoint:
-        return False
-    arguments = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
-    executable, index = _configured_executable(arguments)
+def _configured_command(arguments):
+    executable, index, directory = _configured_executable(arguments)
     target = _configured_python_target(arguments)
     if target and target[0] == "module":
         executable, index = target[1], target[2]
-    command_arguments = arguments[index:]
+    return executable, arguments[index:], target, directory
+
+
+def _celery_subcommand(arguments):
+    index = 0
+    while index < len(arguments):
+        option = arguments[index]
+        if option in ("-A", "--app", "-b", "--broker", "--result-backend", "--loader", "--config", "--workdir"):
+            index += 2
+        elif option.startswith("-"):
+            index += 1
+        else:
+            return option
+    return None
+
+
+def _configured_script_path(script, workdir, directory):
+    if not workdir or not posixpath.isabs(workdir):
+        return None
+    root = posixpath.normpath(workdir)
+    working = posixpath.normpath(posixpath.join(root, directory or ""))
+    absolute = posixpath.normpath(posixpath.join(working, script))
+    if root == "/":
+        return absolute.lstrip("/")
+    prefix = root + "/"
+    return absolute[len(prefix):] if absolute.startswith(prefix) else None
+
+
+def _matches_configured_command(detection, arguments, workdir):
+    if not detection.entrypoint:
+        return False
+    arguments = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+    executable, command_arguments, target, directory = _configured_command(arguments)
     if detection.name == "Streamlit":
         if executable != "streamlit" or not command_arguments or command_arguments[0] != "run":
             return False
@@ -457,19 +504,28 @@ def _matches_configured_command(detection, arguments):
                 break
             if option in ("--server.port", "--server.address"):
                 index += 2
-            elif option.startswith(("--server.port=", "--server.address=")):
+            elif option in ("--help", "-h"):
+                return False
+            elif option.startswith("-") and "=" in option:
                 index += 1
             elif option.startswith("-"):
-                return False
+                index += (
+                    2 if index + 1 < len(command_arguments)
+                    and not command_arguments[index + 1].startswith("-") else 1
+                )
             else:
                 break
-        return index < len(command_arguments) and command_arguments[index] == detection.entrypoint[2]
+        return (
+            index < len(command_arguments)
+            and _configured_script_path(command_arguments[index], workdir, directory)
+            == detection.entrypoint[2]
+        )
     if detection.name == "Gradio":
         if not target:
             return False
         script = detection.entrypoint[1]
-        module = script.removesuffix(".py").replace("/", ".")
-        return target[:2] in (("script", script), ("module", module))
+        target_path = target[1] if target[0] == "script" else target[1].replace(".", "/") + ".py"
+        return _configured_script_path(target_path, workdir, directory) == script
     if detection.name in ("FastAPI", "Celery"):
         reference = detection.entrypoint[1 if detection.name == "FastAPI" else 2]
         executors = {"uvicorn", "gunicorn", "hypercorn"} if detection.name == "FastAPI" else {"celery"}
@@ -497,9 +553,11 @@ def _matches_configured_command(detection, arguments):
                 return option == "run"
         return False
     if detection.name == "Django":
-        if target and target[0] == "script" and target[1].rsplit("/", 1)[-1] == "manage.py":
+        if target and target[0] == "script" and _configured_script_path(
+            target[1], workdir, directory
+        ) == "manage.py":
             command_arguments = arguments[target[2]:]
-        elif executable != "manage.py":
+        elif executable not in {"manage.py", "django-admin", "django"}:
             return False
         return bool(command_arguments) and command_arguments[0] == "runserver"
     if detection.name == "Jupyter":
@@ -815,6 +873,7 @@ def apply_framework_defaults(
             configured_entrypoint=configured_entrypoint,
             configured_cmd=configured_cmd,
             configured_ports=config.has_exposed_ports() and not generated_ports,
+            configured_workdir=config.workdir,
         )
     except FrameworkPortDetectionError:
         raise
@@ -829,11 +888,12 @@ def apply_framework_defaults(
         if generated_cmd:
             config.cmd = None
         if generated_ports:
-            config.exposed_ports = _DefaultPorts()
+            object.__setattr__(config, "exposed_ports", _DefaultPorts())
         previous_detection = getattr(config, "_framework_detection", None)
         if previous_detection and config.labels and config.labels.get("framework") == previous_detection.name.lower():
             config.labels = dict(config.labels)
             del config.labels["framework"]
+        config._framework_default_env = {}
         config._framework_detection = None
         return config
 
@@ -882,14 +942,9 @@ def apply_framework_defaults(
         generated_ports = True
         config._framework_generated_ports = config.exposed_ports
         config._framework_ports_snapshot = tuple(config.exposed_ports)
-    if framework == "Gradio":
-        default_env = dict(config._framework_default_env)
-        if "GRADIO_SERVER_NAME" not in config.env:
-            config.env["GRADIO_SERVER_NAME"] = ALL_INTERFACES
-            default_env["GRADIO_SERVER_NAME"] = ALL_INTERFACES
-        elif default_env.get("GRADIO_SERVER_NAME") != config.env["GRADIO_SERVER_NAME"]:
-            default_env.pop("GRADIO_SERVER_NAME", None)
-        config._framework_default_env = default_env
+    config._framework_default_env = (
+        {"GRADIO_SERVER_NAME": ALL_INTERFACES} if framework == "Gradio" else {}
+    )
 
     config._framework_detection = detection
     config._framework_entrypoint_generated = generated_entrypoint

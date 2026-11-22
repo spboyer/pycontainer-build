@@ -106,7 +106,7 @@ class BuildConfig:
     workdir: str = "/app"
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = field(default_factory=dict)
-    exposed_ports: List[int] = field(default_factory=_DefaultPorts)
+    exposed_ports: Optional[List[int]] = None
     include_paths: Optional[List[str]] = None
     exclude_paths: List[str] = field(default_factory=list)
     exclude_defaults: bool = True
@@ -134,6 +134,14 @@ class BuildConfig:
         default=None, repr=False, compare=False
     )
 
+    def __setattr__(self, name, value):
+        if (
+            name == "exposed_ports" and isinstance(value, _DefaultPorts)
+            and self.__dict__.get("_framework_initialized", False)
+        ):
+            value = list(value)
+        object.__setattr__(self, name, value)
+
     def __getattribute__(self, name):
         if name == "_framework_generated_state":
             values = {
@@ -155,6 +163,8 @@ class BuildConfig:
         if isinstance(generated_state, _FrameworkState):
             if self.exposed_ports is generated_state.values["exposed_ports"]:
                 configured = _ports_configured(self.exposed_ports)
+            else:
+                configured = self.exposed_ports is not None
             for name, previous in generated_state.values.items():
                 value = getattr(self, name)
                 if isinstance(value, _GeneratedList):
@@ -176,14 +186,26 @@ class BuildConfig:
                     object.__setattr__(self, _FRAMEWORK_FIELDS[name], value)
         elif generated_state is not None:
             raise ValueError("Invalid serialized framework defaults.")
+        else:
+            configured = self.exposed_ports is not None
+            for name in _FRAMEWORK_FIELDS:
+                value = getattr(self, name)
+                if isinstance(value, _GeneratedList):
+                    object.__setattr__(self, name, list(value))
+            self._framework_default_env = {}
 
         ports = self.exposed_ports
         if configured is None:
             configured = _ports_configured(ports)
         elif not configured and ports:
             configured = True
-        if not configured and ports is not None and not isinstance(ports, _DefaultPorts):
+        if ports is None or (
+            not configured and not isinstance(ports, _DefaultPorts)
+        ):
             ports = _DefaultPorts()
+            object.__setattr__(self, "exposed_ports", ports)
+        elif configured and isinstance(ports, _DefaultPorts):
+            ports = list(ports)
             object.__setattr__(self, "exposed_ports", ports)
         if isinstance(ports, _DefaultPorts):
             ports.specified = configured
@@ -201,6 +223,7 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+        object.__setattr__(self, "_framework_initialized", True)
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

@@ -16,7 +16,9 @@ provide the packages in the base image.
 | Celery | A module-level assignment to `Celery(...)` and the `celery` dependency | `celery -A <module>:<variable> worker --loglevel=INFO` | None |
 
 Gradio defaults `GRADIO_SERVER_NAME` to `0.0.0.0` only when neither the build
-configuration nor the base image supplies it. A literal `launch(server_port=...)`
+configuration nor the base image supplies it; the default is applied when the
+image configuration is assembled without mutating the build environment.
+A literal `launch(server_port=...)`
 or `GRADIO_SERVER_PORT` determines its default exposed port; configure ports
 explicitly when the listener port cannot be inferred. For Streamlit, a single
 explicitly exposed port or `STREAMLIT_SERVER_PORT` changes the generated
@@ -33,6 +35,9 @@ When several frameworks are detected, the builder warns and uses the first,
 unless a configured command identifies another detected application.
 A Gradio app mounted in FastAPI is treated as FastAPI. A detected Celery worker
 alongside a web application needs a separate image or an explicit entrypoint.
+An explicit Celery subcommand other than `worker` receives no inferred
+framework defaults. Script paths in configured commands are matched against
+the image working directory, including an `env -C` directory change.
 
 Multiple FastAPI, Flask, or Celery applications or multiple Streamlit or Gradio
 scripts cannot be selected safely: the build asks for an explicit entrypoint

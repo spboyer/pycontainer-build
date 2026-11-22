@@ -178,7 +178,7 @@ def _select_index_descriptor(
     )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
 from .project import detect_entrypoint, default_include_paths, find_dependencies
-from .framework import _environment_port, apply_framework_defaults
+from .framework import _configured_command, _environment_port, apply_framework_defaults
 from .registry_client import (
     RegistryClient,
     RegistryRequestError,
@@ -201,13 +201,17 @@ logger=logging.getLogger(__name__)
 
 def _configured_streamlit_port(arguments):
     port = None
-    for index, argument in enumerate(arguments):
+    normalized = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+    executable, command_arguments, _, _ = _configured_command(normalized)
+    if executable != "streamlit":
+        return None
+    for index, argument in enumerate(command_arguments):
         if argument == "--":
             break
         if argument.startswith("--server.port="):
             port = _environment_port(argument.partition("=")[2], "--server.port")
         elif argument == "--server.port":
-            value = arguments[index + 1] if index + 1 < len(arguments) else None
+            value = command_arguments[index + 1] if index + 1 < len(command_arguments) else None
             port = _environment_port(value, "--server.port")
     return port
 
@@ -318,8 +322,8 @@ class ImageBuilder:
         detection = getattr(self.config, "_framework_detection", None)
         if detection and detection.name == "Gradio":
             for name, value in getattr(self.config, "_framework_default_env", {}).items():
-                if name in base_env and image_env.get(name) == value:
-                    image_env.pop(name)
+                if name not in image_env and name not in base_env:
+                    image_env[name] = value
 
         exposed_ports = (
             self.config.exposed_ports if self.config.has_exposed_ports() else None

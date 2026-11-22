@@ -209,7 +209,7 @@ def test_gradio_finds_launched_apps_and_preserves_user_environment(tmp_path, sou
 
     assert detect_framework(tmp_path) == ("Gradio", ["python", "demo.py"], [7860])
     config = apply_framework_defaults(BuildConfig(), tmp_path)
-    assert config.env["GRADIO_SERVER_NAME"] == "0.0.0.0"
+    assert "GRADIO_SERVER_NAME" not in config.env
     config = apply_framework_defaults(
         BuildConfig(env={"GRADIO_SERVER_NAME": "127.0.0.1"}), tmp_path
     )
@@ -587,6 +587,53 @@ def test_direct_replacement_of_generated_ports_remains_an_override(tmp_path):
         apply_framework_defaults(candidate, tmp_path)
         assert candidate.entrypoint[0] == "uvicorn"
         assert candidate.exposed_ports == []
+
+
+def test_constructor_supplied_generated_lists_are_explicit(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    original = apply_framework_defaults(BuildConfig(), tmp_path)
+    config = BuildConfig(
+        entrypoint=deepcopy(original.entrypoint),
+        exposed_ports=deepcopy(original.exposed_ports),
+    )
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint[0] == "celery"
+    assert config.exposed_ports == []
+
+
+def test_replacing_default_ports_with_an_explicit_empty_copy(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    default = BuildConfig()
+    config = replace(default, exposed_ports=deepcopy(default.exposed_ports))
+    apply_framework_defaults(config, tmp_path)
+    assert config.exposed_ports == []
+
+
+@pytest.mark.parametrize("assign_after_construction", [False, True])
+def test_copied_untouched_default_ports_are_explicit_when_supplied(
+    tmp_path, assign_after_construction
+):
+    write_file(tmp_path, "app.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    original = BuildConfig()
+    copied_ports = deepcopy(original.exposed_ports)
+    if assign_after_construction:
+        config = BuildConfig()
+        config.exposed_ports = copied_ports
+    else:
+        config = BuildConfig(exposed_ports=copied_ports)
+    apply_framework_defaults(config, tmp_path)
+    assert config.has_exposed_ports()
+    assert config.exposed_ports == []
+    assert not original.has_exposed_ports()
+
+
+def test_deepcopy_of_config_preserves_unspecified_ports():
+    original = BuildConfig()
+    assert not deepcopy(original).has_exposed_ports()
 
 
 def test_serialization_preserves_user_mutations_of_generated_defaults(tmp_path):
@@ -1176,6 +1223,45 @@ def test_copied_gradio_defaults_preserve_inherited_bind_address(tmp_path, monkey
     assert env["GRADIO_SERVER_NAME"] == "127.0.0.1"
 
 
+@pytest.mark.parametrize("copy_kind", ["direct", "replace", "json"])
+def test_replaced_gradio_environment_remains_explicit(tmp_path, monkeypatch, copy_kind):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "gradio\n")
+    write_file(context, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False
+    )
+    config = apply_framework_defaults(config, context)
+    explicit_env = {"GRADIO_SERVER_NAME": "0.0.0.0"}
+    if copy_kind == "replace":
+        config = replace(config, env=explicit_env)
+    else:
+        config.env = explicit_env
+        if copy_kind == "json":
+            config = BuildConfig(**json.loads(json.dumps(asdict(config))))
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["GRADIO_SERVER_NAME=127.0.0.1"]
+    )
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert env["GRADIO_SERVER_NAME"] == "0.0.0.0"
+
+
+def test_inplace_gradio_environment_override_wins_over_base_image(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "gradio\n")
+    write_file(context, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False
+    )
+    apply_framework_defaults(config, context)
+    config.env["GRADIO_SERVER_NAME"] = "0.0.0.0"
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["GRADIO_SERVER_NAME=127.0.0.1"]
+    )
+    env = dict(item.split("=", 1) for item in image["Env"])
+    assert env["GRADIO_SERVER_NAME"] == "0.0.0.0"
+
+
 def test_explicit_gradio_script_selects_its_defaults_over_fastapi(tmp_path, monkeypatch):
     context = tmp_path / "context"
     write_file(context, "requirements.txt", "gradio\n")
@@ -1298,6 +1384,17 @@ def test_celery_arguments_do_not_select_an_unrelated_fastapi_command(tmp_path):
     assert config.exposed_ports == []
 
 
+def test_nonworker_celery_command_does_not_get_worker_defaults(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    command = ["celery", "-A", "worker:app", "beat"]
+    config = BuildConfig(entrypoint=command)
+    apply_framework_defaults(config, tmp_path)
+    assert config.entrypoint == command
+    assert not config.has_exposed_ports()
+
+
 @pytest.mark.parametrize("port_arguments", [["--server.port=9001"], ["--server.port", "9001"]])
 def test_streamlit_options_before_script_select_streamlit(tmp_path, port_arguments):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
@@ -1305,6 +1402,16 @@ def test_streamlit_options_before_script_select_streamlit(tmp_path, port_argumen
     write_file(tmp_path, "dashboard.py", "import streamlit\n")
     command = ["streamlit", "run", *port_arguments, "dashboard.py"]
     config = BuildConfig(entrypoint=command)
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "streamlit"
+
+
+@pytest.mark.parametrize("options", [["--server.headless=true"], ["--server.headless", "true"]])
+def test_other_streamlit_options_before_script_select_streamlit(tmp_path, options):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "dashboard.py", "import streamlit\n")
+    config = BuildConfig(entrypoint=["streamlit", "run", *options, "dashboard.py"])
     apply_framework_defaults(config, tmp_path)
     assert config.labels["framework"] == "streamlit"
 
@@ -1331,6 +1438,65 @@ def test_python_module_selects_the_invoked_framework(
     config = BuildConfig(entrypoint=command)
     apply_framework_defaults(config, tmp_path)
     assert config.labels["framework"] == framework
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["django-admin", "runserver"], ["python", "-m", "django", "runserver"]],
+)
+def test_django_command_variants_select_django(tmp_path, command):
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "manage.py", "import django\n")
+    config = BuildConfig(entrypoint=command)
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "django"
+
+
+@pytest.mark.parametrize(
+    ("requirements", "filename", "source", "command", "framework"),
+    [
+        ("streamlit\n", "dashboard.py", "import streamlit\n",
+         ["streamlit", "run", "/workspace/dashboard.py"], "streamlit"),
+        ("gradio\n", "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n",
+         ["python", "/workspace/demo.py"], "gradio"),
+        ("streamlit\n", "dashboard.py", "import streamlit\n",
+         ["py", "-m", "streamlit", "run", "dashboard.py"], "streamlit"),
+        ("streamlit\n", "sub/dashboard.py", "import streamlit\n",
+         ["env", "-C", "/workspace/sub", "streamlit", "run", "dashboard.py"], "streamlit"),
+        ("gradio\n", "sub/demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n",
+         ["env", "--chdir=sub", "python", "demo.py"], "gradio"),
+    ],
+)
+def test_configured_script_paths_are_resolved_against_image_workdir(
+    tmp_path, requirements, filename, source, command, framework
+):
+    write_file(tmp_path, "requirements.txt", requirements)
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, filename, source)
+    config = BuildConfig(entrypoint=command, workdir="/workspace")
+    apply_framework_defaults(config, tmp_path, include_paths=["."])
+    assert config.labels["framework"] == framework
+
+
+def test_absolute_script_outside_image_workdir_is_not_associated(tmp_path):
+    write_file(tmp_path, "requirements.txt", "gradio\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "demo.py", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n")
+    config = BuildConfig(entrypoint=["python", "/other/demo.py"], workdir="/workspace")
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "fastapi"
+
+
+def test_env_chdir_outside_image_workdir_is_not_associated(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    write_file(tmp_path, "dashboard.py", "import streamlit\n")
+    config = BuildConfig(
+        entrypoint=["env", "-C", "/other", "streamlit", "run", "dashboard.py"],
+        workdir="/workspace",
+    )
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "fastapi"
 
 
 def test_explicit_command_disambiguates_frameworks_in_one_script(tmp_path):
@@ -1509,6 +1675,22 @@ def test_streamlit_explicit_listener_port_ignores_invalid_inherited_port(tmp_pat
         tmp_path, monkeypatch, config, base_env=["STREAMLIT_SERVER_PORT=invalid"]
     )
     assert "--server.port=9200" in image["Entrypoint"]
+    assert image["ExposedPorts"] == {"9200/tcp": {}}
+
+
+def test_streamlit_env_wrapper_delimiter_does_not_hide_listener_port(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "streamlit\n")
+    write_file(context, "app.py", "import streamlit\n")
+    command = ["env", "--", "streamlit", "run", "app.py", "--server.port=9200"]
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"),
+        use_cache=False, entrypoint=command,
+    )
+    image = image_config_from_build(
+        tmp_path, monkeypatch, config, base_env=["STREAMLIT_SERVER_PORT=9100"]
+    )
+    assert image["Entrypoint"] == command
     assert image["ExposedPorts"] == {"9200/tcp": {}}
 
 
