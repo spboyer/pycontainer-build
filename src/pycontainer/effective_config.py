@@ -144,7 +144,7 @@ def resolve_build_config(
     if config_path is None and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
-        except (TypeError, ValueError) as exc:
+        except (AttributeError, TypeError, ValueError) as exc:
             pyproject = Path(cfg.context_dir) / "pyproject.toml"
             raise ConfigValidationError(
                 [f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}"]
