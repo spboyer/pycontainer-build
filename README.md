@@ -380,6 +380,9 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   members, sparse members, symlinked OCI layout blobs, archive links that
   escape the archive, and
   more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+  Each OCI index, including nested indexes, is limited to 1,000 entries.
+  Layers are limited to 64 GiB (including decompressed content); Docker archive
+  member sizes are checked before any selected image blobs are staged.
 - Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
   are not supported; extract or decompress them first.
 - Dependency staging recognizes official Python images by name. For OCI layouts

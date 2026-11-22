@@ -139,7 +139,8 @@ def open_local_image_source(
     """Open a local base image source after rejecting overlap with the output.
 
     ``os_name=None`` and ``arch=None`` skip the Docker archive's early platform
-    check for inspection; callers must validate ``source.platform`` themselves.
+    check for inspection; Docker archive callers must validate the returned
+    ``DockerArchiveSource.platform`` themselves.
     """
     if _paths_overlap(reference.path, Path(output_dir)):
         raise LocalImageError(
@@ -539,6 +540,11 @@ class OCILayoutSource:
                     f"but its index descriptor declares {media_type!r}."
                 )
         if isinstance(manifest.get("manifests"), list):
+            if len(manifest["manifests"]) > MAX_INDEX_ENTRIES:
+                raise LocalImageError(
+                    f"Local OCI index {digest} lists more than "
+                    f"{MAX_INDEX_ENTRIES} manifests."
+                )
             self._remember_media_types(manifest["manifests"])
         return manifest, digest
 
@@ -797,6 +803,14 @@ class DockerArchiveSource:
                 f"{len(layer_paths)} layers."
             )
 
+        layer_members = [
+            self._resolve(path, f"layer {position}")
+            for position, path in enumerate(layer_paths, 1)
+        ]
+        check_local_image_bounds(
+            len(config_bytes), [member.size for member in layer_members]
+        )
+
         _stage_stream(
             io.BytesIO(config_bytes), self.layers_dir, config_digest,
             len(config_bytes), "Docker archive image config",
@@ -804,9 +818,8 @@ class DockerArchiveSource:
         self._published[config_digest] = len(config_bytes)
 
         layers = []
-        for position, layer_path in enumerate(layer_paths, 1):
+        for position, (layer_path, member) in enumerate(zip(layer_paths, layer_members), 1):
             description = f"layer {position}"
-            member = self._resolve(layer_path, description)
             path_digest = self._path_digest(layer_path)
             print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
             try:
