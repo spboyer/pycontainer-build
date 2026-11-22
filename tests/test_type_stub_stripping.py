@@ -105,6 +105,7 @@ def test_strip_type_stubs_normalizes_shared_paths_and_keeps_external_launchers(t
     record = site / "runtime_dep-1.0.dist-info" / "RECORD"
     record.write_text(
         ".\\shared\\py.typed,,\n../../Scripts/runtime.exe,sha256=x,1\n"
+        "..\\..\\..\\bin\\runtime,sha256=x,1\n"
         "runtime_dep/__init__.pyi,,\r\n",
         newline="",
     )
@@ -114,6 +115,7 @@ def test_strip_type_stubs_normalizes_shared_paths_and_keeps_external_launchers(t
     assert (site / "shared" / "py.typed").is_file()
     assert record.read_bytes() == (
         b".\\shared\\py.typed,,\n../../Scripts/runtime.exe,sha256=x,1\n"
+        b"..\\..\\..\\bin\\runtime,sha256=x,1\n"
     )
 
 
@@ -123,6 +125,12 @@ def test_strip_type_stubs_normalizes_shared_paths_and_keeps_external_launchers(t
         ("runtime-1.0.dist-info", "runtime", ["runtime.py,sha256=x\n"], "Malformed RECORD"),
         ("runtime-1.0.dist-info", "runtime", ['runtime.py,sha256=x,"1\n'], "Malformed RECORD"),
         ("runtime-1.0.dist-info", "runtime", ["../../outside.pyi,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["../../Scripts/x.pyi,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["../../../share/x/data.txt,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["../../Scripts/../../x.exe,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["/etc/runtime.conf,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["\\\\server\\share\\x.py,,\n"], "escapes"),
+        ("runtime-1.0.dist-info", "runtime", ["D:/outside/x.py,,\n"], "escapes"),
         ("types_x-1.0.dist-info", "types-x", ["C:\\outside\\x.py,,\n"], "escapes"),
         ("x_stubs-1.0.dist-info", "x-stubs", ["x-stubs/../../y.pyi,,\n"], "escapes"),
     ],

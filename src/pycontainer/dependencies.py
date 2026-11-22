@@ -28,6 +28,9 @@ _PIP_PLATFORMS = {
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
+_LAUNCHER_RECORD_PATH = re.compile(
+    r"(?:\.\./\.\./Scripts|\.\./\.\./\.\./bin)/([^/:]+)", re.IGNORECASE
+)
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
     "--build",
@@ -577,7 +580,7 @@ def strip_type_stubs(site_packages: Path) -> List[str]:
             continue
         for path in paths:
             if _is_escaping_record_path(path):
-                if path.endswith(".pyi"):
+                if not _is_launcher_record_path(path):
                     raise ValueError(
                         f"RECORD path escapes site-packages in {info_dir.name}: {path}"
                     )
@@ -679,6 +682,12 @@ def _is_escaping_record_path(path: str) -> bool:
         or PureWindowsPath(path).drive != ""
         or ".." in normalized.split("/")
     )
+
+
+def _is_launcher_record_path(path: str) -> bool:
+    # Venv launchers: Lib/site-packages -> ../../Scripts, lib/pythonX.Y/site-packages -> ../../../bin.
+    match = _LAUNCHER_RECORD_PATH.fullmatch(path.replace("\\", "/"))
+    return bool(match) and match.group(1) not in {".", ".."} and not path.endswith(".pyi")
 
 
 def _is_stub_record_path(path: str, info_name: str) -> bool:
