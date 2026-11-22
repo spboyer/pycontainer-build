@@ -86,8 +86,12 @@ def test_no_path_validates_build_defaults_with_local_detection(offline, monkeypa
     assert cfg.base_image == "python:3.13-slim" and table is None
 
 
-def test_invalid_detected_project_metadata_is_a_diagnostic(offline, monkeypatch, capsys):
-    _write(offline / "pyproject.toml", '[project]\nname = "demo"\nrequires-python = 312\n')
+@pytest.mark.parametrize(
+    "content",
+    ['[project]\nname = "demo"\nrequires-python = 312\n', 'project = "invalid"\n'],
+)
+def test_invalid_detected_project_metadata_is_a_diagnostic(offline, monkeypatch, capsys, content):
+    _write(offline / "pyproject.toml", content)
 
     assert _run(monkeypatch, ["validate", "config"]) == 2
     assert "[project].requires-python: cannot detect the Python version" in capsys.readouterr().err
