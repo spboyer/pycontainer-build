@@ -35,13 +35,17 @@ been demonstrated against a real registry for this change.
   certificates, configure a timestamp authority and appropriate root certificate.
 
 ```bash
-# Keyless Cosign: supply an ambient OIDC identity in the environment.
+# Keyless Cosign: supply an ambient OIDC identity in the environment, plus the
+# certificate identity and issuer the signature must be verified against.
 pycontainer build --tag ghcr.io/example/app:v1 --push \
-  --sign --sign-provider cosign
+  --sign --sign-provider cosign \
+  --sign-certificate-identity 'https://github.com/example/app/.github/workflows/release.yml@refs/heads/main' \
+  --sign-certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# Cosign key reference; keep the key password in a secure environment.
+# Cosign key reference plus the public key used for verification; keep the key
+# password in a secure environment.
 pycontainer build --tag ghcr.io/example/app:v1 --push \
-  --sign --sign-provider cosign --sign-key ./cosign.key
+  --sign --sign-provider cosign --sign-key ./cosign.key --sign-verify-key ./cosign.pub
 
 # Notation named key, or a separately installed key plugin.
 pycontainer build --tag ghcr.io/example/app:v1 --push \
@@ -69,7 +73,11 @@ sign-key = "release-key"
 Invoke the build with `--push`; `--no-sign` disables signing even when the file
 enables it. For a Notation plugin use `sign-plugin` and `sign-key-id` instead of
 `sign-key`. A Cosign key may be a file path or a supported key reference such
-as `env://KEY_VARIABLE`; omit it for keyless OIDC. `COSIGN_REPOSITORY` is
+as `env://KEY_VARIABLE`; omit it for keyless OIDC. Cosign key mode requires
+`sign-verify-key` (a public key path or the same KMS/PKCS#11 reference); keyless
+mode requires both `sign-certificate-identity` and
+`sign-certificate-oidc-issuer`. Notation rejects these three options and uses
+its configured trust policy instead. `COSIGN_REPOSITORY` is
 rejected to prevent silently redirecting signature storage.
 For PKCS#11 keys, put the PIN in `COSIGN_PKCS11_PIN`, not the key URI.
 Notation plugin configurations requiring `--plugin-config` can be registered
@@ -90,8 +98,19 @@ stages each platform manifest and signs the published **top-level image index**,
 not the local layout's `index.json` or an
 individual platform manifest. The signer receives the effective
 `registry/repository@sha256:...`, including a `--registry` override, and is
-not invoked with a mutable tag. It must exit successfully; the subject is
-rechecked before any requested tag is written. The CLI prints the signed
+not invoked with a mutable tag. It must exit successfully.
+
+The same provider then verifies the signature on that exact digest before any
+tag moves. Cosign runs `cosign verify` with `--key=<sign-verify-key>`, or with
+the configured `--certificate-identity` and `--certificate-oidc-issuer`.
+Notation first reads `notation policy show` and requires exactly one applicable
+trust-policy statement (an exact `registryScopes` match, otherwise a `["*"]`
+statement) with verification level `strict` and no overrides; it then requires
+`notation verify` to report `Successfully verified signature for <subject>`,
+and rejects a trust policy that changes during verification. A verification
+failure, timeout or unexpected output stops the push: no requested tag is
+written, though the staged subject and signature artifacts may remain. The
+subject is then rechecked before any requested tag is written. The CLI prints the signed
 digest unless `--no-progress` is set; programmatic callers can read
 `builder.signed_ref` after this point.
 
@@ -106,7 +125,7 @@ do not use them as image tags. Referrers-tag fallback updates can race with
 other writers and lose signatures; native registry referrers or external
 coordination are safer.
 
-Only after signing are requested tags written, one at a time, and each is read
+Only after signing and verification are requested tags written, one at a time, and each is read
 back against the signed digest. Failures report acknowledged writes, an
 unknown or mismatched outcome, and tags not attempted, as well as blob results,
 acknowledged manifest writes and previously verified manifests. These are
@@ -128,7 +147,10 @@ notation verify ghcr.io/example/app@sha256:<digest>
 ```
 
 Notation verification uses its configured trust policy and trust store.
-Provider success during the build is not independent verification. A valid
+Build-time verification uses the trust configuration supplied to the build; it
+is not independent verification by the consumer. These verification command
+lines and Notation output strings are covered by hermetic tests only and have
+not yet been exercised against real providers or registries. A valid
 signature authenticates an artifact only under the verifier's policy; it does
 not establish that an image is free of vulnerabilities or safe to run.
 

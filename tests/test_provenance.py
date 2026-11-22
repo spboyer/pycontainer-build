@@ -373,7 +373,8 @@ def _signed_builder(tmp_path, monkeypatch, registry, attestor, platform="linux/a
     monkeypatch.setattr(ImageBuilder, "_pull_base_image", _observed_base)
     builder = ImageBuilder(_config(
         tmp_path, context, include_paths=["app.py"], platform=platform, sign=True,
-        sign_provider="cosign", attest_provenance=True, provenance_verify_key="cosign.pub",
+        sign_provider="cosign", sign_key="cosign.key", sign_verify_key="cosign.pub",
+        attest_provenance=True,
     ))
     builder.build()
     _use_registry(monkeypatch, registry)
@@ -392,7 +393,7 @@ def test_signed_push_attests_published_digest_before_tags(tmp_path, monkeypatch,
     digest = builder.index_digest or builder.manifest_digest
     subject = f"registry.example/team/app@{digest}"
     attest_index = registry.events.index(("attest", subject))
-    assert registry.events.index(("sign", subject)) < attest_index
+    assert registry.events.index(("sign", subject)) < registry.events.index(("verify", subject)) < attest_index
     kind = "index" if builder.index_digest else "manifest"
     assert registry.events.index((kind, "v1")) > attest_index
     assert attestor.statements == [builder.provenance_statement]
@@ -441,19 +442,21 @@ def test_attestation_rejects_push_to_a_different_repository(tmp_path, monkeypatc
     assert registry.events == [] and attestor.statements == []
 
 
+COSIGN_KEY = {
+    "attest_provenance": True, "sign": True, "sign_provider": "cosign",
+    "sign_key": "cosign.key", "sign_verify_key": "cosign.pub",
+}
+
+
 @pytest.mark.parametrize("options, message", [
     ({"attest_provenance": True}, "sign = true"),
     ({"attest_provenance": True, "sign": True, "sign_provider": "notation", "sign_key": "k"}, "Notation"),
-    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign"}, "either"),
-    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
-      "provenance_verify_key": "k", "provenance_certificate_identity": "i",
+    ({**COSIGN_KEY, "provenance_verify_key": "k", "provenance_certificate_identity": "i",
       "provenance_certificate_oidc_issuer": "o"}, "either"),
-    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
-      "provenance_certificate_identity": "i"}, "either"),
+    ({**COSIGN_KEY, "provenance_certificate_identity": "i"}, "either"),
     ({"provenance_verify_key": "cosign.pub"}, "require attest_provenance"),
     ({"provenance": "yes"}, "boolean"),
-    ({"attest_provenance": True, "sign": True, "sign_provider": "cosign",
-      "provenance_verify_key": "-----BEGIN PRIVATE KEY-----"}, "secret material"),
+    ({**COSIGN_KEY, "provenance_verify_key": "-----BEGIN PRIVATE KEY-----"}, "secret material"),
 ])
 def test_invalid_provenance_configuration_is_rejected(options, message):
     with pytest.raises(ValueError, match=message):
@@ -462,10 +465,21 @@ def test_invalid_provenance_configuration_is_rejected(options, message):
 
 def test_completeness_and_attestation_imply_provenance():
     assert BuildConfig(provenance_require_complete=True).provenance is True
-    assert BuildConfig(
+    assert BuildConfig(**COSIGN_KEY).provenance is True
+
+
+def test_attestation_verifier_defaults_to_signature_trust_policy():
+    keyed = BuildConfig(**COSIGN_KEY)
+    assert keyed.provenance_verify_key == "cosign.pub"
+    assert keyed.provenance_certificate_identity is None
+    keyless = BuildConfig(
         sign=True, sign_provider="cosign", attest_provenance=True,
-        provenance_certificate_identity="i", provenance_certificate_oidc_issuer="o",
-    ).provenance is True
+        sign_certificate_identity="i", sign_certificate_oidc_issuer="o",
+    )
+    assert (keyless.provenance_verify_key, keyless.provenance_certificate_identity,
+            keyless.provenance_certificate_oidc_issuer) == (None, "i", "o")
+    explicit = BuildConfig(**COSIGN_KEY, provenance_verify_key="other.pub")
+    assert explicit.provenance_verify_key == "other.pub"
 
 
 def _run_cli(monkeypatch, *args):
@@ -480,7 +494,8 @@ def test_cli_rejects_provenance_dry_run_and_unpushed_attestation(tmp_path, monke
     with pytest.raises(SystemExit):
         _run_cli(
             monkeypatch, "build", "--context", str(tmp_path), "--sign", "--sign-provider",
-            "cosign", "--attest-provenance", "--provenance-verify-key", "cosign.pub",
+            "cosign", "--sign-key", "cosign.key", "--sign-verify-key", "cosign.pub",
+            "--attest-provenance",
         )
     assert "requires --push" in capsys.readouterr().err
 

@@ -67,6 +67,9 @@ class BuildConfig:
     sign_timestamp_url: Optional[str] = None
     sign_timestamp_root_cert: Optional[str] = None
     sign_signature_format: Optional[str] = None
+    sign_verify_key: Optional[str] = None
+    sign_certificate_identity: Optional[str] = None
+    sign_certificate_oidc_issuer: Optional[str] = None
     provenance: bool = False
     provenance_require_complete: bool = False
     attest_provenance: bool = False
@@ -120,6 +123,7 @@ class BuildConfig:
         self._validate_references(
             "sign_key", "sign_plugin", "sign_key_id",
             "sign_timestamp_url", "sign_timestamp_root_cert", "sign_signature_format",
+            "sign_verify_key", "sign_certificate_identity", "sign_certificate_oidc_issuer",
         )
         if self.sign_provider == "cosign":
             if any(
@@ -130,6 +134,29 @@ class BuildConfig:
                 )
             ):
                 raise ValueError("Cosign does not use Notation plugin, timestamp, or format options.")
+            keyless_trust = (self.sign_certificate_identity, self.sign_certificate_oidc_issuer)
+            if self.sign_key is not None:
+                if self.sign_verify_key is None or any(keyless_trust):
+                    raise ValueError(
+                        "Cosign key signing requires sign_verify_key, the public key used to "
+                        "verify the signature, and no keyless certificate options."
+                    )
+            elif self.sign_verify_key is not None or not all(keyless_trust):
+                raise ValueError(
+                    "Cosign keyless signing requires sign_certificate_identity and "
+                    "sign_certificate_oidc_issuer for verification."
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.sign_verify_key, self.sign_certificate_identity,
+                self.sign_certificate_oidc_issuer,
+            )
+        ):
+            raise ValueError(
+                "Notation verification uses its trust policy; Cosign verification "
+                "options are not supported."
+            )
         elif (
             (self.sign_key is None) == (self.sign_plugin is None)
             or (self.sign_plugin is None) != (self.sign_key_id is None)
@@ -194,6 +221,11 @@ class BuildConfig:
                 "attest_provenance requires sign = true with sign_provider = cosign; "
                 "Notation has no in-toto attestation path."
             )
+        if all(getattr(self, name) is None for name in verifier_names):
+            # Default to the signature trust policy so the same key is not configured twice.
+            self.provenance_verify_key = self.sign_verify_key
+            self.provenance_certificate_identity = self.sign_certificate_identity
+            self.provenance_certificate_oidc_issuer = self.sign_certificate_oidc_issuer
         identity = self.provenance_certificate_identity
         issuer = self.provenance_certificate_oidc_issuer
         if (self.provenance_verify_key is None) == (identity is None and issuer is None) or (

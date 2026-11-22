@@ -24,8 +24,8 @@ pycontainer build --tag ghcr.io/user/app:v1 --include-deps --provenance-require-
 
 # Sign, attest and verify the published digest before moving tags
 pycontainer build --tag ghcr.io/user/app:v1 --include-deps --push `
-  --sign --sign-provider cosign --sign-key cosign.key `
-  --attest-provenance --provenance-verify-key cosign.pub
+  --sign --sign-provider cosign --sign-key cosign.key --sign-verify-key cosign.pub `
+  --attest-provenance
 
 # Independently verify later (key, or keyless identity and issuer)
 pycontainer verify-provenance ghcr.io/user/app@sha256:<digest> --key cosign.pub --require-complete
@@ -40,12 +40,16 @@ Provenance cannot be combined with `--dry-run`.
 `--attest-provenance` requires `--push` and `--sign --sign-provider cosign`.
 Notation has no in-toto attestation path and is rejected. The verifier policy
 is mandatory: either `provenance_verify_key`, or both a certificate identity
-and an OIDC issuer. The order on push is: publish by digest, sign, attest,
-verify the attestation with the configured policy and confirm the verified
-statement is exactly the one just attested, re-read the published manifest
-digest, then move tags. If attestation or verification fails, no requested tag
-is attempted. `COSIGN_REPOSITORY` is rejected so that verification cannot be
-silently redirected to another repository.
+and an OIDC issuer. When none of the provenance policy options is set, it
+defaults to the signature trust policy (`sign_verify_key`, or
+`sign_certificate_identity` and `sign_certificate_oidc_issuer`). The order on
+push is: publish by digest, sign, verify the signature, attest, verify the
+attestation with the configured policy and confirm the verified statement is
+exactly the one just attested, re-read the published manifest digest, then
+move tags. If attestation or verification fails, no requested tag is attempted.
+A push target in a different repository from the statement subject is rejected
+before anything is uploaded. `COSIGN_REPOSITORY` is rejected so that
+verification cannot be silently redirected to another repository.
 
 ### How the v1 statement is attached
 

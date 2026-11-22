@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 VERSION_TIMEOUT_SECONDS = 10
 SIGN_TIMEOUT_SECONDS = 300
+VERIFY_TIMEOUT_SECONDS = 300
 COSIGN_MIN_VERSION = (2, 6, 1)
 COSIGN_MAX_VERSION = (4, 0, 0)
 NOTATION_MIN_VERSION = (1, 3, 2)
@@ -71,10 +72,12 @@ class Signer:
     timestamp_url: Optional[str]
     timestamp_root_cert: Optional[str]
     signature_format: Optional[str]
+    verify_key: Optional[str] = None
+    certificate_identity: Optional[str] = None
+    certificate_oidc_issuer: Optional[str] = None
 
     def sign(self, subject: str) -> None:
-        if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", subject):
-            raise SigningError("Signing requires an immutable sha256 image reference.")
+        _require_immutable_subject(subject, "Signing")
         args = [self.executable, "sign"]
         if self.provider == "cosign":
             args.extend(["--yes", "--upload=true"])
@@ -109,6 +112,89 @@ class Signer:
                 f"{self.provider} exited with status {result.returncode}; "
                 "check its registry authentication and signing configuration."
             )
+
+    def verify(self, subject: str) -> None:
+        """Verify the signature on the exact digest with the configured trust inputs."""
+        _require_immutable_subject(subject, "Verification")
+        if self.provider == "cosign":
+            args = [self.executable, "verify"]
+            if self.key:
+                args.append(f"--key={self.verify_key}")
+            else:
+                args.extend([
+                    f"--certificate-identity={self.certificate_identity}",
+                    f"--certificate-oidc-issuer={self.certificate_oidc_issuer}",
+                ])
+            self._run_verifier([*args, "--", subject])
+            return
+        repository = subject.rsplit("@", 1)[0]
+        policy = self._strict_notation_policy(repository)
+        output = self._run_verifier([self.executable, "verify", "--", subject], capture=True)
+        expected = f"Successfully verified signature for {subject}"
+        if expected not in (line.strip() for line in output.splitlines()):
+            raise SigningError(f"notation did not report successful verification of {subject}.")
+        if self._strict_notation_policy(repository) != policy:
+            raise SigningError("The Notation trust policy changed during verification.")
+
+    def _run_verifier(self, args, capture: bool = False) -> str:
+        try:
+            result = subprocess.run(
+                args, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, text=capture, errors="replace" if capture else None,
+                timeout=VERIFY_TIMEOUT_SECONDS, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise SigningError(f"{self.provider} signature verification timed out.") from None
+        except OSError:
+            raise SigningError(f"Unable to run {self.provider} signature verification.") from None
+        if result.returncode:
+            raise SigningError(
+                f"{self.provider} signature verification exited with status "
+                f"{result.returncode}; check its trust configuration and registry access."
+            )
+        return result.stdout if capture else ""
+
+    def _strict_notation_policy(self, repository: str) -> dict:
+        """Return the trust policy after requiring a strict statement for the repository."""
+        try:
+            result = subprocess.run(
+                [self.executable, "policy", "show"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                errors="replace", timeout=VERSION_TIMEOUT_SECONDS, check=False,
+            )
+            policy = json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            policy = None
+        statements = policy.get("trustPolicies") if isinstance(policy, dict) else None
+        if not isinstance(statements, list):
+            statements = []
+        statements = [item for item in statements if isinstance(item, dict)]
+        scopes_valid = all(
+            isinstance(item.get("registryScopes"), list)
+            and all(isinstance(scope, str) for scope in item["registryScopes"])
+            for item in statements
+        )
+        applicable = (
+            [item for item in statements if repository in item["registryScopes"]]
+            or [item for item in statements if item["registryScopes"] == ["*"]]
+        ) if scopes_valid else []
+        verification = applicable[0].get("signatureVerification") if len(applicable) == 1 else None
+        if (
+            not isinstance(verification, dict)
+            or verification.get("level") != "strict"
+            or "override" in verification
+        ):
+            raise SigningError(
+                f"Notation verification requires one strict trust policy statement "
+                f"without overrides for {repository}."
+            )
+        return policy
+
+
+def _require_immutable_subject(subject: str, action: str) -> None:
+    if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", subject):
+        raise SigningError(f"{action} requires an immutable sha256 image reference.")
 
 
 def _find_executable(provider: str) -> Optional[str]:
@@ -150,4 +236,6 @@ def create_signer(config: "BuildConfig") -> Signer:
     return Signer(
         provider, executable, config.sign_key, config.sign_plugin, config.sign_key_id,
         config.sign_timestamp_url, config.sign_timestamp_root_cert, config.sign_signature_format,
+        config.sign_verify_key, config.sign_certificate_identity,
+        config.sign_certificate_oidc_issuer,
     )

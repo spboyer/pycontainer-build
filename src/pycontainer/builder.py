@@ -1108,6 +1108,15 @@ class ImageBuilder:
                 f"not attempted: {', '.join(tag_refs)}."
             ) from None
 
+        try:
+            signer.verify(subject)
+        except SigningError as error:
+            raise SigningError(
+                f"Verifying the signature of {subject} failed: {error} "
+                f"{publication_details()} Signature artifacts may remain. "
+                f"Requested image tags not attempted: {', '.join(tag_refs)}."
+            ) from None
+
         if attestor is not None:
             def publish_attestation(bundle: bytes) -> None:
                 manifest, referrer_blobs=slsa.referrer_manifest(

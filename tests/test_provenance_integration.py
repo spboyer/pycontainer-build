@@ -57,8 +57,8 @@ def test_real_cosign_attests_and_independently_verifies_provenance(tmp_path):
         sign=True,
         sign_provider="cosign",
         sign_key=key,
+        sign_verify_key=public_key,
         attest_provenance=True,
-        provenance_verify_key=public_key,
     )
     builder = ImageBuilder(config)
     builder.build()
