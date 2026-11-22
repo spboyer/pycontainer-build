@@ -97,7 +97,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
+    def fake_request(method, url, headers=None, max_response_bytes=None):
         requests.append((method, url, headers))
         return 200, body, {"Docker-Content-Digest": digest}
 
@@ -204,7 +204,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         return Response(b'{"token":"exchanged-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
 
     status, body, _=client._make_request(
@@ -254,7 +254,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
         raise _http_error(request.full_url, 403)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
 
     with pytest.raises(
@@ -300,7 +300,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
         return _Response(b'{"token":"access-token"}')
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
@@ -528,7 +528,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
     client = RegistryClient("registry.example", "team/app", auth_token="token")
     monkeypatch.setattr(client, "initiate_blob_upload", lambda: location)
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
 
     assert client.upload_blob_monolithic(digest, source)
@@ -563,7 +563,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
         return _Response(status=201)
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
 
     client.upload_blob_monolithic(
@@ -611,7 +611,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
         raise TimeoutError("not included in public error")
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client._open_url", fake_urlopen
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append

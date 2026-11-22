@@ -186,6 +186,12 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .cache import LayerCache
+from .remote_cache import (
+    RegistryLayerCache,
+    RemoteCacheError,
+    app_layer_cache_key,
+    parse_cache_spec,
+)
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -245,6 +251,20 @@ class ImageBuilder:
             self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
         else:
             self.cache=None
+        self.remote_cache_from=None
+        self.remote_cache_to=None
+        if not self.dry_run:
+            if config.cache_from and config.use_cache:
+                self.remote_cache_from=RegistryLayerCache(
+                    parse_cache_spec(config.cache_from, "cache_from")
+                )
+            if config.cache_to:
+                ref=parse_cache_spec(config.cache_to, "cache_to")
+                self.remote_cache_to=(
+                    self.remote_cache_from
+                    if self.remote_cache_from and self.remote_cache_from.ref==ref
+                    else RegistryLayerCache(ref)
+                )
 
     def build(self):
         if self.dry_run:
@@ -567,6 +587,10 @@ class ImageBuilder:
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
+        if self.config.cache_from:
+            print(f"  Cache From: {self.config.cache_from}")
+        if self.config.cache_to:
+            print(f"  Cache To: {self.config.cache_to}")
 
     def _create_deps_layer(
         self,
@@ -688,36 +712,85 @@ class ImageBuilder:
             )
         )
 
+        identity=None
+        if self.cache or self.remote_cache_from or self.remote_cache_to:
+            identity=(self.cache or LayerCache()).files_identity(
+                files, self.config.workdir, self.config.reproducible
+            )
+
+        layer=None
         if self.cache:
-            cached=self.cache.get_layer(
+            layer=self._app_layer_from_local_cache(layers_dir, files, identity)
+        if layer is None and self.remote_cache_from:
+            layer=self._app_layer_from_remote_cache(layers_dir, files, identity)
+        if layer is None:
+            layer=self._write_app_layer(layers_dir, files)
+        if self.remote_cache_to:
+            self._export_app_layer(layer, files, identity)
+        return layer
+
+    def _app_layer_from_local_cache(self, layers_dir, files, identity):
+        cached=self.cache.get_layer(
+            files,
+            workdir=self.config.workdir,
+            reproducible=self.config.reproducible,
+            identity=identity,
+        )
+        if not cached:
+            return None
+        digest, cache_path=cached
+        final=layers_dir/digest.split(":",1)[1]
+        tmp=_create_temporary_file(layers_dir,"app-cache")
+        try:
+            with cache_path.open("rb") as source, tmp.open("wb") as target:
+                shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
+                target.flush()
+                os.fsync(target.fileno())
+            actual_digest, size = _hash_file(tmp)
+            if actual_digest != digest:
+                raise LayerIntegrityError(
+                    f"Cached layer hashes to {actual_digest}, not {digest}."
+                )
+            _publish_content_addressed(tmp, final, digest, size)
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar",
+                digest,
+                size,
+                str(final),
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _app_layer_from_remote_cache(self, layers_dir, files, identity):
+        fetched=self.remote_cache_from.fetch(app_layer_cache_key(identity), layers_dir)
+        if not fetched:
+            return None
+        digest, path, size=fetched
+        if self.cache:
+            self.cache.store_layer(
                 files,
+                digest,
+                path,
                 workdir=self.config.workdir,
                 reproducible=self.config.reproducible,
+                identity=identity,
             )
-            if cached:
-                digest, cache_path=cached
-                final=layers_dir/digest.split(":",1)[1]
-                tmp=_create_temporary_file(layers_dir,"app-cache")
-                try:
-                    with cache_path.open("rb") as source, tmp.open("wb") as target:
-                        shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
-                        target.flush()
-                        os.fsync(target.fileno())
-                    actual_digest, size = _hash_file(tmp)
-                    if actual_digest != digest:
-                        raise LayerIntegrityError(
-                            f"Cached layer hashes to {actual_digest}, not {digest}."
-                        )
-                    _publish_content_addressed(tmp, final, digest, size)
-                    return OCILayer(
-                        "application/vnd.oci.image.layer.v1.tar",
-                        digest,
-                        size,
-                        str(final),
-                    )
-                finally:
-                    tmp.unlink(missing_ok=True)
+        return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
 
+    def _export_app_layer(self, layer, files, identity):
+        current=LayerCache().files_identity(
+            files, self.config.workdir, self.config.reproducible
+        )
+        if current!=identity:
+            raise RemoteCacheError(
+                "Application sources changed during the build; refusing to export "
+                "a remote cache record that may not match its key."
+            )
+        self.remote_cache_to.store(
+            app_layer_cache_key(identity), layer.digest, Path(layer.tar_path), layer.size
+        )
+
+    def _write_app_layer(self, layers_dir, files):
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
         try:

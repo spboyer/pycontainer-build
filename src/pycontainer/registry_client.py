@@ -42,11 +42,37 @@ class RegistryAuthenticationError(RegistryRequestError):
     """Raised when registry credentials cannot be exchanged or applied."""
 
 
+class RegistryNotFoundError(RegistryRequestError):
+    """Raised when a requested registry manifest does not exist."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Prevent forwarding registry authorization across redirects."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _origin(url: str) -> Tuple[str, str]:
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme.lower(), parsed.netloc.lower()
+
+
+class SameOriginAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but keep Authorization only on the exact same origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and _origin(req.full_url) != _origin(newurl):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+_CONTROL_OPENER = urllib.request.build_opener(SameOriginAuthRedirect())
+
+
+def _open_url(request: urllib.request.Request, timeout: float):
+    return _CONTROL_OPENER.open(request, timeout=timeout)
 
 
 def _safe_url(url: str) -> str:
@@ -176,9 +202,7 @@ class RegistryClient:
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
-                ) as response:
+                with _open_url(request, self.timeout) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
             except urllib.error.HTTPError as error:
@@ -236,6 +260,7 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_response_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
         method = method.upper()
         retry_safe = method in {"GET", "HEAD"}
@@ -252,10 +277,17 @@ class RegistryClient:
                 url, data=data, headers=request_headers, method=method
             )
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.timeout
-                ) as response:
-                    return response.status, response.read(), dict(response.headers)
+                with _open_url(request, self.timeout) as response:
+                    if max_response_bytes is None:
+                        body = response.read()
+                    else:
+                        body = response.read(max_response_bytes + 1)
+                        if len(body) > max_response_bytes:
+                            raise RegistryRequestError(
+                                f"{method} response from {_safe_url(url)} exceeded "
+                                f"{max_response_bytes} bytes."
+                            )
+                    return response.status, body, dict(response.headers)
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 if (
@@ -276,6 +308,7 @@ class RegistryClient:
                             data,
                             headers,
                             retry_auth=False,
+                            max_response_bytes=max_response_bytes,
                         )
                 if (
                     retry_safe
@@ -405,6 +438,7 @@ class RegistryClient:
         reference: str,
         expected_digest: Optional[str] = None,
         expected_size: Optional[int] = None,
+        max_size: Optional[int] = None,
     ) -> Tuple[Dict, str]:
         """Pull manifest, returning its decoded JSON and registry digest."""
         if expected_digest is not None:
@@ -424,8 +458,13 @@ class RegistryClient:
             )
         }
         status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
+            "GET",
+            url,
+            headers=headers,
+            max_response_bytes=expected_size if expected_size is not None else max_size,
         )
+        if status == 404:
+            raise RegistryNotFoundError(f"Manifest {reference} was not found.")
         if status != 200:
             body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
             raise RegistryRequestError(
@@ -467,6 +506,21 @@ class RegistryClient:
             )
         return manifest, digest or body_digest
 
+    def _open_redirected_blob(self, url: str, location: Optional[str]):
+        if not location:
+            raise RegistryRequestError(
+                "Registry blob redirect did not include a Location."
+            )
+        target = urllib.parse.urljoin(url, location)
+        if urllib.parse.urlsplit(target).scheme.lower() != "https":
+            raise RegistryRequestError(
+                "Registry blob redirect must use HTTPS; refusing "
+                f"{_safe_url(target)}."
+            )
+        return urllib.request.urlopen(
+            urllib.request.Request(target), timeout=self.timeout
+        )
+
     def _open_blob_response(self, url: str):
         request = urllib.request.Request(
             url, headers=self._authorization_headers(url)
@@ -479,26 +533,12 @@ class RegistryClient:
                 raise
             location = error.headers.get("Location")
             error.close()
-            if not location:
-                raise RegistryRequestError(
-                    "Registry blob redirect did not include a Location."
-                ) from error
-            target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return self._open_redirected_blob(url, location)
 
         if response.status in REDIRECT_STATUSES:
             location = response.headers.get("Location")
             response.close()
-            if not location:
-                raise RegistryRequestError(
-                    "Registry blob redirect did not include a Location."
-                )
-            target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return self._open_redirected_blob(url, location)
         return response
 
     def _download_blob_once(

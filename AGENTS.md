@@ -13,6 +13,7 @@ daemon without discussing the trade-off first.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
+- `remote_cache.py`: experimental registry-backed application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
@@ -36,6 +37,15 @@ content, normalized relative paths, workdir, and reproducibility settings.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError`; missing
 or corrupt blobs are discarded and rebuilt.
+
+`--cache-from`/`--cache-to type=registry,ref=<registry>/<repo>` share only the
+app layer through `RegistryClient`, using versioned keys over the local file
+identity, layer format and builder Python version. Push access to the cache
+repository defines the trusted writers; digests prove integrity, not
+provenance. Import failures warn and rebuild; export publishes blobs before
+the tag and fails explicitly. Control-plane redirects drop `Authorization`
+across origins, and blob redirects must be HTTPS and carry no credentials.
+S3, Azure Blob and GCS backends remain open in #61 and #34.
 
 ## Setup and verified checks
 

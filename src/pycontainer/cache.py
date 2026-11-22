@@ -144,6 +144,15 @@ class LayerCache:
         ).encode("utf-8")
         return f"v{_CACHE_KEY_VERSION}:sha256:{hashlib.sha256(serialized).hexdigest()}"
 
+    def files_identity(
+        self,
+        files: List[Tuple[Path, Path]],
+        workdir: str = "/app",
+        reproducible: bool = True,
+    ) -> str:
+        """Return the versioned source identity used as the local cache key."""
+        return self._compute_files_digest(files, workdir, reproducible)
+
     @contextmanager
     def _index_lock(self):
         with file_lock(self.lock_file):
@@ -245,12 +254,15 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        identity: Optional[str] = None,
     ) -> Optional[Tuple[str, Path]]:
         if not self.enabled:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = identity or self._compute_files_digest(
+            files, workdir, reproducible
+        )
         with self._index_lock():
             entries = self._load_index()
             entry = entries.get(files_digest)
@@ -284,6 +296,7 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        identity: Optional[str] = None,
     ) -> Path:
         layer_path = Path(layer_path)
         if not self.enabled:
@@ -295,7 +308,9 @@ class LayerCache:
             raise CacheIntegrityError(
                 f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
             )
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = identity or self._compute_files_digest(
+            files, workdir, reproducible
+        )
         blob_path = self._blob_path(digest)
 
         with self._index_lock():

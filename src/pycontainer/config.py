@@ -20,6 +20,8 @@ class BuildConfig:
     use_cache: bool = True
     cache_dir: Optional[str] = None
     max_cache_size_mb: int = 5000
+    cache_from: Optional[str] = None
+    cache_to: Optional[str] = None
     labels: Optional[Dict[str, str]] = None
     user: Optional[str] = None
     cmd: Optional[List[str]] = None
@@ -52,6 +54,18 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+        if self.cache_from is not None or self.cache_to is not None:
+            from .remote_cache import parse_cache_spec
+
+            for name in ("cache_from", "cache_to"):
+                value = getattr(self, name)
+                if value is not None:
+                    parse_cache_spec(value, name)
+            if not self.reproducible:
+                raise ValueError(
+                    "cache_from and cache_to require reproducible builds; "
+                    "non-reproducible layers embed host timestamps and ownership."
+                )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

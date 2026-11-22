@@ -364,6 +364,44 @@ exclude-defaults = true
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
+- `--cache-from type=registry,ref=REGISTRY/REPO` — Import the application
+  layer from a registry cache repository (disabled by `--no-cache`)
+- `--cache-to type=registry,ref=REGISTRY/REPO` — Export the application layer
+  to a registry cache repository
+
+**Registry remote cache (experimental)**: only the application layer is
+shared; the dependency layer and base image are not cached remotely. Records
+are OCI artifacts tagged `app-<key>` in the cache repository, where the key is
+a SHA-256 over the record schema, layer format, tar settings, builder Python
+version, and the same file identity used by the local cache (file content,
+relative paths, workdir, reproducibility). Remote caching requires
+reproducible builds. The same settings are available in `[build]` as
+`cache-from` and `cache-to`; `ref` must not include a tag or digest. Only
+`type=registry` is supported; S3, Azure Blob and GCS backends are tracked in
+#61 and #34.
+
+Trust boundary: a digest proves that a blob was not altered in transit, not
+who produced it. Every principal with push access to the cache repository is a
+trusted writer whose layers are copied verbatim into your images. Use a
+dedicated cache repository that only trusted CI jobs can push to, and give
+pull-request or fork builds pull-only access. Records are not signed.
+
+Import is best-effort: a missing record is a quiet miss, and an invalid record,
+integrity failure, auth or network error logs a warning and rebuilds the layer
+locally. Export errors fail the build. Manifests and configs are size-bounded,
+layers are limited to 4 GiB and verified by digest and size, credentials come
+from the cache registry's own provider, and `Authorization` is never forwarded
+to a different origin or to redirected blob storage. Export uploads blobs
+first and the tag last; identical concurrent writers produce identical
+records, while differing writers are last-writer-wins. An interrupted export
+leaves untagged blobs that readers never see. Some registries may reject the
+custom artifact and config media types.
+
+```bash
+pycontainer build --tag myapp:ci --push \
+  --cache-from type=registry,ref=ghcr.io/org/myapp-cache \
+  --cache-to type=registry,ref=ghcr.io/org/myapp-cache
+```
 
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`

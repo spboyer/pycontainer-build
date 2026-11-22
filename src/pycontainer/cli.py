@@ -4,6 +4,7 @@ from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
+from .remote_cache import RemoteCacheError
 
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
@@ -35,6 +36,8 @@ def main():
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
+    b.add_argument("--cache-from",help="Import the app layer from a registry cache: type=registry,ref=REGISTRY/REPOSITORY")
+    b.add_argument("--cache-to",help="Export the app layer to a registry cache: type=registry,ref=REGISTRY/REPOSITORY")
     b.add_argument(
         "--include-deps",
         action="store_true",
@@ -93,6 +96,8 @@ def main():
         'exclude_defaults': args.exclude_defaults,
         'use_cache': args.use_cache,
         'cache_dir': args.cache_dir,
+        'cache_from': args.cache_from,
+        'cache_to': args.cache_to,
         'include_deps': args.include_deps,
         'requirements_file': args.requirements_file,
         'verbose': args.verbose,
@@ -122,7 +127,10 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     builder=ImageBuilder(cfg)
-    out=builder.build()
+    try:
+        out=builder.build()
+    except RemoteCacheError as exc:
+        parser.exit(1, f"error: {exc}\n")
     print("Built:", out)
     
     if args.push:
