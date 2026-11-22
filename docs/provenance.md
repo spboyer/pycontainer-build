@@ -63,12 +63,14 @@ exact bytes, and pushes the bundle itself as an OCI 1.1 referrer of the image
 digest, in the layout cosign uses: an empty `{}` config, one bundle layer, and
 `dev.sigstore.bundle.content=dsse-envelope` and
 `dev.sigstore.bundle.predicateType` annotations. `cosign verify-attestation
---new-bundle-format` then discovers and verifies it.
+--new-bundle-format` then verifies an attestation containing those exact
+statement bytes under the configured policy.
 
-The registry must support the OCI Referrers API. The referrers tag-schema
-fallback (`sha256-<digest>`) is not written; on registries without the
-Referrers API, verification finds no attestation and the push fails closed
-before any tag moves. cosign v2 only discovers bundle referrers with
+The referrers tag-schema fallback (`sha256-<digest>`) is not written.
+pycontainer does not independently confirm that the newly published referrer
+appears in the registry's Referrers API. cosign may verify an existing matching
+attestation instead, so successful verification does not prove that the new
+referrer is discoverable. cosign v2 only discovers bundle referrers with
 `--new-bundle-format`; v3 discovers them by default.
 
 ## Build type v1
