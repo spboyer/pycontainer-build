@@ -1,4 +1,6 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
+from contextlib import nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -186,6 +188,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .cache import LayerCache
+from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -199,7 +202,29 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): 
+    def __init__(self, config: BuildConfig):
+        self._history = (
+            BuildHistory(config.history_dir)
+            if config.record_history and not config.dry_run
+            else None
+        )
+        self._history_timer = (
+            ContextVar("pycontainer_build_history", default=None)
+            if self._history else None
+        )
+        if self._history:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            timing = BuildTiming()
+            try:
+                with timing.phase("initialization"):
+                    self._initialize(config)
+            except BaseException:
+                self._record_failed_history(timing, config)
+                raise
+        else:
+            self._initialize(config)
+
+    def _initialize(self, config: BuildConfig):
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -246,14 +271,48 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _record_failed_history(self, timing, config):
+        try:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            self._history.append(timing.record("failed"))
+        except BaseException as error:
+            # Recording must never replace the original build failure.
+            logger.error("Build history could not be saved or confirmed: %s", error)
+
+    def _time_history_phase(self, name):
+        timing = self._history_timer.get() if self._history_timer else None
+        return timing.phase(name) if timing else nullcontext()
+
     def build(self):
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
             return self.config.tag
 
-        with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+        timing = BuildTiming() if self._history else None
+        token = self._history_timer.set(timing) if timing else None
+        try:
+            try:
+                if self._history:
+                    self._history.validate_location(
+                        self.config.context_dir, self.config.output_dir
+                    )
+                with output_directory_lock(self.config.output_dir):
+                    result = self._build_image()
+            except BaseException:
+                if timing:
+                    self._record_failed_history(timing, self.config)
+                raise
+
+            if timing:
+                self._history.validate_location(
+                    self.config.context_dir, self.config.output_dir
+                )
+                self._history.append(timing.record("success"))
+            return result
+        finally:
+            if timing:
+                self._history_timer.reset(token)
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -262,7 +321,8 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
-        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        with self._time_history_phase("base_image"):
+            base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
@@ -273,12 +333,14 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
+            with self._time_history_phase("dependencies"):
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                )
             if deps_layer: app_layers.append(deps_layer)
         
-        app_layer=self._create_app_layer(layers_dir, include)
+        with self._time_history_phase("application"):
+            app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(app_layer)
         
         all_layers=base_layers+app_layers
@@ -351,16 +413,17 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(
-                Path(self.config.context_dir),
-                sbom_path,
-                format=(
-                    self.config.generate_sbom
-                    if isinstance(self.config.generate_sbom, str)
-                    else "spdx"
-                ),
-                package_inventory=getattr(self, "_staged_packages", []),
-            )
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
             logger.info(f"✓ SBOM saved to {sbom_path}")
         
         return self.config.tag

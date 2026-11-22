@@ -35,6 +35,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    record_history: bool = False
+    history_dir: Optional[str] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
