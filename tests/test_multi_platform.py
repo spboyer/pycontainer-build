@@ -3,6 +3,8 @@ import gzip
 import hashlib
 import io
 import json
+import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -306,6 +308,51 @@ def test_compressed_base_diff_id_mismatch_fails_before_publication(tmp_path, mon
     assert not (out / "index.json").exists()
     assert not any(path.is_file() for path in (out / "refs").rglob("*"))
     assert not hasattr(builder, "index_digest")
+
+
+def _select_layout_reference(layout, reference):
+    """Resolve a reference the way OCI image-layout tools do: exact ref.name match."""
+    matches = [
+        m for m in layout["manifests"]
+        if m.get("annotations", {}).get("org.opencontainers.image.ref.name") == reference
+    ]
+    assert len(matches) == 1, f"{reference!r} matched {len(matches)} descriptors"
+    return matches[0]
+
+
+def test_every_configured_tag_is_selectable_in_index_layout(tmp_path, monkeypatch):
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(),
+        tags=["stable", "registry.example/team/app:prod"],
+    )
+    builder.build()
+    out = tmp_path / "out"
+    layout = json.loads((out / "index.json").read_text())
+    references = builder.config.all_tags()
+
+    assert len(references) == 3
+    assert [
+        m["annotations"]["org.opencontainers.image.ref.name"] for m in layout["manifests"]
+    ] == references
+    for reference in references:
+        descriptor = _select_layout_reference(layout, reference)
+        assert descriptor["mediaType"] == INDEX_TYPE
+        assert descriptor["digest"] == builder.index_digest
+        assert descriptor["size"] == builder.index_size
+        tag = reference.rsplit(":", 1)[1]
+        assert (out / "refs" / "tags" / tag).read_text() == builder.index_digest
+
+
+@pytest.mark.skipif(shutil.which("skopeo") is None, reason="Skopeo is not installed")
+def test_skopeo_selects_every_index_layout_tag(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), tags=["stable"])
+    builder.build()
+    for reference in builder.config.all_tags():
+        result = subprocess.run(
+            ["skopeo", "inspect", "--raw", f"oci:{tmp_path / 'out'}:{reference}"],
+            check=True, capture_output=True, timeout=30,
+        )
+        assert _digest(result.stdout) == builder.index_digest
 
 
 def test_push_order_is_blobs_manifests_index_then_tags(tmp_path, monkeypatch):

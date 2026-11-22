@@ -60,3 +60,11 @@ attempt and records confirmed successes as they happen. If a tag push fails,
 the error reports confirmed pushes, the failed or unknown-outcome reference,
 and references not attempted, regardless of progress output; tags are not
 rolled back. A single `--tag` behaves exactly as before.
+
+For multi-platform builds, the layout `index.json` has one image-index
+descriptor per configured tag. Each has the same digest and size, and an
+`org.opencontainers.image.ref.name` annotation holding the full configured
+reference (for example `registry.example/team/app:stable`). Because several
+descriptors exist, select with an explicit reference such as
+`oci:<layout>:registry.example/team/app:stable`. Hermetic tests check this
+descriptor shape; a Skopeo selection test runs only when Skopeo is installed.
