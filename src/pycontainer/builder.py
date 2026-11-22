@@ -190,6 +190,7 @@ from .cache import LayerCache
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
+    install_locked_requirements,
     install_requirements,
     staged_packages,
     stage_virtualenv,
@@ -690,22 +691,16 @@ class ImageBuilder:
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
                 )
-                locked_requirements = stage_root / "locked-requirements.txt"
-                locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
-                try:
-                    install_requirements(
-                        locked_requirements,
-                        site_packages,
-                        ctx,
-                        os_name,
-                        arch,
-                        version,
-                        self.config.base_image,
-                        base_config,
-                        locked=True,
-                    )
-                finally:
-                    locked_requirements.unlink(missing_ok=True)
+                install_locked_requirements(
+                    selection.requirement_sets(),
+                    site_packages,
+                    ctx,
+                    os_name,
+                    arch,
+                    version,
+                    self.config.base_image,
+                    base_config,
+                )
             elif source_kind == "requirements":
                 install_requirements(
                     ctx / requirements_relative,

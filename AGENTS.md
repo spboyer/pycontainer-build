@@ -153,7 +153,11 @@ source distributions and cross-compilation are not supported.
 Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
 markers for the target (never the host) and installs the selection through
-`install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+`install_locked_requirements`: one isolated pip run per recorded package
+index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
+ignored), merged only when files are byte-identical. A format that cannot
+establish a package's index fails closed (PDM allows one effective index).
+Plain requirements keep ambient pip configuration.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`. Non-registry sources fail; never add an
 unconstrained fallback. Real lock fixtures live in `tests/fixtures/lockfiles`

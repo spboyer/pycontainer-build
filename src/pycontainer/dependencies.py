@@ -189,7 +189,8 @@ def install_requirements(
         )
 
     destination.mkdir(parents=True, exist_ok=True)
-    locked_options = ["--no-deps", "--require-hashes"] if locked else []
+    # Locked installs use only the generated --index-url: no pip config files or PIP_* options.
+    locked_options = ["--isolated", "--no-deps", "--require-hashes"] if locked else []
     command = [
         sys.executable,
         "-m",
@@ -209,6 +210,9 @@ def install_requirements(
         str(requirements),
     ]
     environment = dict(os.environ)
+    if locked:
+        environment = {key: value for key, value in environment.items() if not key.upper().startswith("PIP_")}
+        environment["PIP_CONFIG_FILE"] = os.devnull
     environment.update(
         {
             "TMP": str(destination.parent),
@@ -264,6 +268,52 @@ def install_requirements(
     _drop_external_record_entries(destination)
 
     _check_stage_limits(destination.parent)
+
+
+def install_locked_requirements(
+    requirement_sets: Iterable[Tuple[str, str]],
+    destination: Path,
+    context_dir: Path,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_image: str,
+    base_config: Optional[dict],
+) -> None:
+    """Install each recorded index's packages from that index alone, then merge them."""
+    requirement_sets = list(requirement_sets)
+    stage_root = destination.parent
+    for number, (_, text) in enumerate(requirement_sets):
+        requirements = stage_root / f"locked-requirements-{number}.txt"
+        target = destination if len(requirement_sets) == 1 else stage_root / f"locked-site-{number}"
+        requirements.write_text(text, encoding="utf-8")
+        try:
+            install_requirements(
+                requirements, target, context_dir, os_name, arch, python_version,
+                base_image, base_config, locked=True,
+            )
+        finally:
+            requirements.unlink(missing_ok=True)
+        if target != destination:
+            _merge_site_packages(target, destination)
+            shutil.rmtree(target)
+    destination.mkdir(parents=True, exist_ok=True)
+
+
+def _merge_site_packages(source: Path, destination: Path) -> None:
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif target.exists():
+            if target.read_bytes() != path.read_bytes():
+                raise RuntimeError(
+                    f"Locked packages from different indexes both install {relative.as_posix()}."
+                )
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, target)
 
 
 def _drop_external_record_entries(site_packages: Path) -> None:

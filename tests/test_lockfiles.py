@@ -1,19 +1,34 @@
 import hashlib
+import http.server
 import json
 import logging
+import re
 import shutil
 import tarfile
+import threading
+import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.dependencies import validate_requirements
+from pycontainer.dependencies import (
+    _merge_site_packages,
+    install_locked_requirements,
+    validate_requirements,
+)
 from pycontainer.lockfiles import (
+    LockedPackage,
     LockfileError,
+    LockSelection,
+    _finalize,
     detect_lockfile,
     load_lockfile,
+    pdm_content_hash,
+    poetry_content_hash,
+    preflight_lockfile,
     target_environment,
 )
 from test_dependency_staging import _builder, _write_wheel
@@ -63,9 +78,13 @@ def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind):
     assert _selected(selection) == EXPECTED_311
     assert all(package.hashes for package in selection.packages)
     assert selection.index_urls == ()
-    rendered = selection.render_requirements()
-    assert "iniconfig==2.0.0 --hash=sha256:" in rendered
-    assert rendered == load_lockfile(context, Path(lock_name), PY311).render_requirements()
+    assert {package.index for package in selection.packages} == {None}
+    sets = selection.requirement_sets()
+    assert [url for url, _ in sets] == ["https://pypi.org/simple"]
+    assert "--index-url https://pypi.org/simple\n" in sets[0][1]
+    assert "extra-index-url" not in sets[0][1]
+    assert "iniconfig==2.0.0 --hash=sha256:" in sets[0][1]
+    assert sets == load_lockfile(context, Path(lock_name), PY311).requirement_sets()
 
 
 @pytest.mark.parametrize("kind", ["uv", "pdm", "poetry"])
@@ -196,6 +215,154 @@ def test_unsupported_or_unverifiable_lock_entries_fail(tmp_path, entry, message)
         load_lockfile(context, Path("Pipfile.lock"), PY311)
 
 
+PRIVATE = "https://private.example.invalid/simple"
+
+
+def _poetry_with_source(tmp_path, priority, locked_source=True, declared=True):
+    context = _copy(tmp_path, "poetry")
+    manifest = context / "pyproject.toml"
+    if declared:
+        manifest.write_text(
+            manifest.read_text()
+            + f'\n[[tool.poetry.source]]\nname = "private"\nurl = "{PRIVATE}"\npriority = "{priority}"\n'
+        )
+    lock_path = context / "poetry.lock"
+    lock = lock_path.read_text(encoding="utf-8")
+    if locked_source:
+        lock = lock.replace(
+            'name = "click"\n',
+            f'name = "click"\nsource = {{ type = "legacy", url = "{PRIVATE}", reference = "private" }}\n',
+            1,
+        )
+    lock = re.sub(
+        r'content-hash = "[0-9a-f]+"',
+        f'content-hash = "{poetry_content_hash(tomllib.loads(manifest.read_text()))}"',
+        lock,
+    )
+    lock_path.write_text(lock, encoding="utf-8")
+    return context
+
+
+def test_poetry_records_each_packages_source(tmp_path):
+    context = _poetry_with_source(tmp_path, "supplemental")
+
+    selection = load_lockfile(context, Path("poetry.lock"), PY311)
+
+    indexes = {package.name: package.index for package in selection.packages}
+    assert indexes.pop("click") == PRIVATE
+    assert set(indexes.values()) == {None}
+    assert [url for url, _ in selection.requirement_sets()] == ["https://pypi.org/simple", PRIVATE]
+
+
+def test_poetry_source_missing_from_manifest_is_stale(tmp_path):
+    context = _poetry_with_source(tmp_path, "supplemental", declared=False)
+
+    with pytest.raises(LockfileError, match="out of date.*poetry lock"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+def test_poetry_package_without_source_fails_when_pypi_is_disabled(tmp_path):
+    context = _poetry_with_source(tmp_path, "primary")
+
+    with pytest.raises(LockfileError, match="PyPI is not a configured Poetry source"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+def _pipenv_sources(tmp_path, private_first=False):
+    context = _copy(tmp_path, "pipenv")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    private = {"name": "private", "url": PRIVATE, "verify_ssl": True}
+    lock["_meta"]["sources"].insert(0 if private_first else 1, private)
+    lock["default"]["click"]["index"] = "private"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    return context
+
+
+@pytest.mark.parametrize("private_first", [False, True])
+def test_pipenv_maps_package_indexes_and_default_source(tmp_path, private_first):
+    selection = load_lockfile(_pipenv_sources(tmp_path, private_first), Path("Pipfile.lock"), PY311)
+
+    indexes = {package.name: package.index for package in selection.packages}
+    assert indexes.pop("click") == PRIVATE
+    assert indexes.pop("iniconfig") is None
+    # Packages without an index come from Pipenv's default (first) source.
+    assert set(indexes.values()) == {PRIVATE if private_first else None}
+
+
+def test_pipenv_search_all_sources_cannot_establish_provenance(tmp_path):
+    context = _pipenv_sources(tmp_path)
+    pipfile = context / "Pipfile"
+    pipfile.write_text(pipfile.read_text() + "\n[pipenv]\ninstall_search_all_sources = true\n")
+
+    with pytest.raises(LockfileError, match="anyio records no index"):
+        load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+
+def _pdm_with_sources(tmp_path, *sources):
+    context = _copy(tmp_path, "pdm")
+    manifest = context / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text()
+        + "".join(f'\n[[tool.pdm.source]]\nname = "{name}"\nurl = "{url}"\n' for name, url in sources)
+    )
+    lock_path = context / "pdm.lock"
+    lock_path.write_text(
+        re.sub(
+            r'content_hash = "sha256:[0-9a-f]+"',
+            f'content_hash = "sha256:{pdm_content_hash(tomllib.loads(manifest.read_text()))}"',
+            lock_path.read_text(encoding="utf-8"),
+        ),
+        encoding="utf-8",
+    )
+    return context
+
+
+def test_pdm_single_replacement_index_applies_to_every_package(tmp_path):
+    context = _pdm_with_sources(tmp_path, ("pypi", PRIVATE))
+
+    selection = load_lockfile(context, Path("pdm.lock"), PY311)
+
+    assert {package.index for package in selection.packages} == {PRIVATE}
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_multiple_indexes_fail_closed_including_preflight(tmp_path, preflight):
+    context = _pdm_with_sources(tmp_path, ("private", PRIVATE))
+
+    with pytest.raises(LockfileError, match="single effective index"):
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+
+
+def test_pdm_toml_index_settings_are_rejected(tmp_path):
+    context = _copy(tmp_path, "pdm")
+    (context / "pdm.toml").write_text(f'[pypi]\nurl = "{PRIVATE}"\n')
+
+    with pytest.raises(LockfileError, match=r"pdm.toml \[pypi\]"):
+        load_lockfile(context, Path("pdm.lock"), PY311)
+
+
+def test_uv_records_each_packages_registry(tmp_path):
+    context = _write_uv_project(tmp_path / "uv", registry=PRIVATE)
+
+    selection = load_lockfile(context, Path("uv.lock"), PY311)
+
+    assert [(package.name, package.index) for package in selection.packages] == [("fixture-dep", PRIVATE)]
+
+
+def test_package_selected_from_two_indexes_fails():
+    packages = [
+        LockedPackage("demo", "1.0", ("sha256:" + "0" * 64,), None),
+        LockedPackage("demo", "1.0", ("sha256:" + "1" * 64,), PRIVATE),
+    ]
+
+    with pytest.raises(LockfileError, match="more than one package index"):
+        _finalize(packages, "uv.lock")
+
+
 def _write_uv_project(
     context, wheel=None, *, registry="https://pypi.org/simple", digest=None, declare_index=True
 ):
@@ -254,7 +421,7 @@ def test_index_credentials_must_be_placeholders(tmp_path):
     )
     selection = load_lockfile(placeholder, Path("uv.lock"), PY311)
     assert selection.index_urls == ("https://${INDEX_USER}:${INDEX_TOKEN}@example.com/simple",)
-    assert "--extra-index-url https://${INDEX_USER}" in selection.render_requirements()
+    assert "--index-url https://${INDEX_USER}" in selection.requirement_sets()[0][1]
 
 
 @pytest.mark.parametrize(
@@ -292,11 +459,96 @@ def test_uv_lock_without_wheels_fails(tmp_path):
         load_lockfile(context, Path("uv.lock"), PY311)
 
 
-def _offline_wheelhouse(monkeypatch, context):
-    wheel = _write_wheel(context / "wheelhouse")
-    monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
-    return wheel
+class _SimpleIndex:
+    """Loopback PEP 503 index that records every request path."""
+
+    def __init__(self, wheels=()):
+        self.wheels = {}
+        self.requests = []
+        for wheel in wheels:
+            self.add(wheel)
+        index = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                index.requests.append(self.path)
+                parts = [part for part in self.path.split("?", 1)[0].split("/") if part]
+                body, content_type = None, "text/html"
+                if len(parts) == 2 and parts[0] == "simple":
+                    links = [
+                        f'<a href="/files/{wheel.name}#sha256={hashlib.sha256(wheel.read_bytes()).hexdigest()}">'
+                        f"{wheel.name}</a>"
+                        for name, wheel in index.wheels.items()
+                        if name == parts[1]
+                    ]
+                    if links:
+                        body = ("<html><body>" + "".join(links) + "</body></html>").encode()
+                elif len(parts) == 2 and parts[0] == "files":
+                    wheel = next((w for w in index.wheels.values() if w.name == parts[1]), None)
+                    if wheel:
+                        body, content_type = wheel.read_bytes(), "application/octet-stream"
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/simple"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def add(self, wheel):
+        self.wheels[wheel.name.split("-", 1)[0].replace("_", "-")] = wheel
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def indexes():
+    servers = []
+
+    def create(*wheels):
+        servers.append(_SimpleIndex(wheels))
+        return servers[-1]
+
+    yield create
+    for server in servers:
+        server.close()
+
+
+def _named_wheel(directory, name):
+    module = name.replace("-", "_")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{module}-1.0-py3-none-any.whl"
+    files = {
+        f"{module}/__init__.py": b"",
+        f"{module}-1.0.dist-info/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n\n".encode(),
+        f"{module}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    files[f"{module}-1.0.dist-info/RECORD"] = "".join(f"{item},,\n" for item in [*files, f"{module}-1.0.dist-info/RECORD"]).encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        for item, content in files.items():
+            archive.writestr(zipfile.ZipInfo(item, (2020, 1, 1, 0, 0, 0)), content)
+    return path
+
+
+def _ambient_pip(monkeypatch, tmp_path, rogue_url, wheelhouse):
+    """Point every ambient pip channel at an unauthorized source."""
+    config = tmp_path / "pip.conf"
+    config.write_text(f"[global]\nindex-url = {rogue_url}\nextra-index-url = {rogue_url}\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    monkeypatch.setenv("PIP_INDEX_URL", rogue_url)
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", rogue_url)
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    monkeypatch.setenv("pip_no_index", "1")
 
 
 def _layer_names(layer):
@@ -304,10 +556,12 @@ def _layer_names(layer):
         return archive.getnames()
 
 
-def test_locked_build_installs_hashed_target_selection_reproducibly(tmp_path, monkeypatch):
+def test_locked_build_installs_only_from_recorded_index_reproducibly(tmp_path, monkeypatch, indexes):
     context = tmp_path / "context"
-    wheel = _offline_wheelhouse(monkeypatch, context)
-    _write_uv_project(context, wheel)
+    wheel = _write_wheel(context / "wheelhouse")
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=recorded.url)
     (context / "requirements.txt").write_text("unrelated-package==9.9\n")
 
     digests = []
@@ -322,20 +576,92 @@ def test_locked_build_installs_hashed_target_selection_reproducibly(tmp_path, mo
     assert "app/.python/site-packages/fixture_dep/__init__.py" in names
     assert not [name for name in names if "colorama" in name or name.endswith("requirements.txt")]
     assert digests[0] == digests[1]
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+    assert rogue.requests == []
     sbom = json.loads((Path(builder.config.output_dir) / "sbom.json").read_text())
     assert [(package["name"], package["versionInfo"]) for package in sbom["packages"]] == [
         ("fixture-dep", "1.0")
     ]
 
 
-def test_locked_build_rejects_artifact_hash_mismatch(tmp_path, monkeypatch):
+def test_locked_build_does_not_fall_back_to_another_source_with_the_same_hash(
+    tmp_path, monkeypatch, indexes
+):
     context = tmp_path / "context"
-    _offline_wheelhouse(monkeypatch, context)
-    _write_uv_project(context, digest="2" * 64)
+    wheel = _write_wheel(context / "wheelhouse")
+    recorded, rogue = indexes(), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=recorded.url)
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
 
     with pytest.raises(RuntimeError, match="must match their recorded hashes"):
         builder.build()
+    assert recorded.requests and rogue.requests == []
+
+
+def test_locked_build_rejects_artifact_hash_mismatch(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    recorded = indexes(_write_wheel(context / "wheelhouse"))
+    _write_uv_project(context, digest="2" * 64, registry=recorded.url)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(RuntimeError, match="must match their recorded hashes"):
+        builder.build()
+
+
+def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, indexes):
+    first = _write_wheel(tmp_path / "wheels")
+    second = _named_wheel(tmp_path / "wheels", "other-dep")
+    index_a, index_b = indexes(first, second), indexes(first, second)
+    _ambient_pip(monkeypatch, tmp_path, index_b.url, tmp_path / "wheels")
+    digest = lambda wheel: (f"sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",)
+    selection = LockSelection(
+        "uv",
+        Path("uv.lock"),
+        (
+            LockedPackage("fixture-dep", "1.0", digest(first), index_a.url),
+            LockedPackage("other-dep", "1.0", digest(second), index_b.url),
+        ),
+    )
+    site_packages = tmp_path / "stage" / "site-packages"
+    site_packages.parent.mkdir()
+
+    install_locked_requirements(
+        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None
+    )
+
+    assert {path.name for path in site_packages.iterdir()} >= {"fixture_dep", "other_dep"}
+    assert not [path for path in index_a.requests if "other" in path]
+    assert not [path for path in index_b.requests if "fixture" in path]
+    assert any("fixture" in path for path in index_a.requests)
+    assert any("other" in path for path in index_b.requests)
+
+
+def test_plain_requirements_keep_ambient_pip_configuration(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    configured = indexes(_write_wheel(tmp_path / "wheels"))
+    monkeypatch.setenv("PIP_INDEX_URL", configured.url)
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+
+    _builder(tmp_path, monkeypatch, context=context, include_deps=True).build()
+
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in configured.requests)
+
+
+def test_merging_index_installs_rejects_conflicting_files(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    for root, content in ((source, "same"), (destination, "same")):
+        (root / "namespace").mkdir(parents=True)
+        (root / "namespace" / "__init__.py").write_text(content)
+    (source / "namespace" / "module.py").write_text("new")
+    _merge_site_packages(source, destination)
+    assert (destination / "namespace" / "module.py").read_text() == "new"
+
+    (source / "namespace" / "__init__.py").write_text("different")
+    with pytest.raises(RuntimeError, match="different indexes both install namespace/__init__.py"):
+        _merge_site_packages(source, destination)
 
 
 def _source(tmp_path, context, **options):

@@ -382,11 +382,22 @@ an explicit error rather than falling back to an unconstrained install.
 uv registry URLs must match the current `[[tool.uv.index]]` declarations
 or the implicit PyPI index; settings from `uv.toml` and legacy index options
 are not supported.
-Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
-PyPI itself is left to your pip configuration so mirrors keep working, and
-pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
-Hashes verify the bytes, not which server supplied them. Index credentials must be `${VARIABLE}`
-placeholders, never literal secrets.
+Each package is installed only from the index its lock records, one pip run
+per index with `--isolated` and every `PIP_*` variable and pip config file
+ignored, so `PIP_INDEX_URL`, `pip.conf`, `--find-links` wheelhouses or another
+index serving the same hash cannot substitute an artifact. Per-package sources
+come from uv `source.registry`, Poetry `source` (none means PyPI, which must
+then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
+first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
+only with a single effective index (PyPI or one source named `pypi`), and
+`pdm.toml` `[pypi]` settings are rejected. To build through a PyPI mirror,
+relock against the mirror so the lock records it. The recorded index is
+trusted for the files its pages link to (PyPI serves them from
+files.pythonhosted.org), and hashes verify the bytes. Index credentials must
+be `${VARIABLE}` placeholders (expanded from the environment), netrc or
+keyring, never literal secrets; proxy and CA bundle variables such as
+`HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
+normal pip behavior, including your pip configuration.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
