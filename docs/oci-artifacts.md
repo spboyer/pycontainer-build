@@ -106,6 +106,11 @@ pulled = pull_artifact(client, "report", "dist/pulled",
   and moves no tags. Callers that build their own manifest bytes, for example
   attestation publishers, use it to avoid writing a temporary OCI layout.
   Blob HEAD checks confirm metadata only; they do not re-read the blob bytes.
+  **Precondition:** a staged file is hashed only when its blob is uploaded. If
+  the registry already reports a blob with the same digest and size, the local
+  file is not read, so callers that need proof of their local bytes must verify
+  them before calling. Its failures raise `ArtifactPublicationError` with a
+  `stage`; `push_artifact` keeps raising the underlying error types.
 - **`pull_artifact`** fetches the manifest under a 4 MiB bound and requires the
   exact OCI manifest `Content-Type`. It verifies the body digest against
   `Docker-Content-Digest`, the requested digest and `Content-Length`. It then
@@ -148,8 +153,8 @@ pull by tag or digest, but not discovery through this API.
 | `InvalidArtifactError` (`ValueError`) | Malformed input, manifest, subject, tag or layout reference |
 | `UnsupportedArtifactError` | Valid JSON that is not a generic artifact (for example a runnable image manifest, or the wrong `Content-Type`) |
 | `BlobIntegrityError` | Digest, size or embedded data mismatch, or a corrupt local or registry blob |
-| `RegistryRequestError` | HTTP failure, a response over its bound, or an unsafe redirect or pagination link, outside publication |
-| `ArtifactPublicationError` | Publication could not be confirmed. `stage` is `subject`, `blob`, `manifest`, `tag` or `referrers`, and the underlying registry or integrity error is chained as `__cause__`. For `tag`, `published_tags` lists the tags already moved |
+| `RegistryRequestError` | HTTP failure, a response over its bound, or an unsafe redirect or pagination link |
+| `ArtifactPublicationError` | Publication could not be confirmed. `stage` is `subject`, `blob`, `manifest`, `tag` or `referrers`. `push_artifact` raises it for tag failures (`published_tags` lists the tags already moved), an uploaded blob the registry does not expose, and a mismatched `OCI-Subject`; other `push_artifact` failures keep their original type. `publish_artifact_manifest` raises it for every registry, integrity or local I/O failure, with the original error chained as `__cause__`. `require_referrer` raises it with stage `referrers` for a 404 or a missing descriptor; malformed listings keep their own error types |
 
 ## Registry compatibility
 

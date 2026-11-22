@@ -435,10 +435,8 @@ def test_push_requires_existing_subject_unless_disabled(tmp_path, registry):
     _, client = registry
     subject = {"mediaType": MANIFEST, "digest": "sha256:" + "d" * 64, "size": 10}
     write_artifact_layout(tmp_path / "layout", _payload(tmp_path), ARTIFACT_TYPE, PAYLOAD_TYPE, subject=subject)
-    with pytest.raises(ArtifactPublicationError, match="HTTP 404") as error:
+    with pytest.raises(RegistryRequestError, match="HTTP 404"):
         push_artifact(client, tmp_path / "layout")
-    assert error.value.stage == STAGE_SUBJECT
-    assert isinstance(error.value.__cause__, RegistryRequestError)
     assert push_artifact(client, tmp_path / "layout", verify_subject=False).subject_status == SUBJECT_CONFIRMED
 
 
@@ -488,9 +486,8 @@ def test_manifest_and_tag_publication_failures_are_explicit(tmp_path, registry):
         push_artifact(client, tmp_path / "layout", tags=["ok", "ghost"])
     assert error.value.published_tags == ("ok", "ghost")
     server.fail_tags.add(artifact.descriptor.digest)
-    with pytest.raises(ArtifactPublicationError, match="HTTP 500") as error:
+    with pytest.raises(RegistryRequestError, match="HTTP 500"):
         push_artifact(client, tmp_path / "layout")
-    assert error.value.stage == STAGE_MANIFEST
 
 
 def test_existing_registry_blob_with_wrong_size_blocks_publication(tmp_path, registry):
@@ -498,10 +495,8 @@ def test_existing_registry_blob_with_wrong_size_blocks_publication(tmp_path, reg
     artifact = write_artifact_layout(tmp_path / "layout", _payload(tmp_path), ARTIFACT_TYPE, PAYLOAD_TYPE)
     server.blobs[artifact.payload.digest] = b"short"
     server.corrupt_blobs.add(artifact.payload.digest)
-    with pytest.raises(ArtifactPublicationError, match="Content-Length") as error:
+    with pytest.raises(BlobIntegrityError, match="Content-Length"):
         push_artifact(client, tmp_path / "layout")
-    assert error.value.stage == STAGE_BLOB
-    assert isinstance(error.value.__cause__, BlobIntegrityError)
     assert artifact.descriptor.digest not in server.manifests
 
 
@@ -549,6 +544,33 @@ def test_publish_manifest_requires_exactly_the_described_blobs(tmp_path, registr
     empty_payload, empty_blobs = _staged(tmp_path / "empty", b"{}")
     empty_data = build_artifact_manifest(ARTIFACT_TYPE, empty_payload)
     assert publish_artifact_manifest(client, empty_data, empty_blobs).descriptor.digest == _digest(empty_data)
+
+
+def test_publish_manifest_wraps_failures_with_stage(tmp_path, registry):
+    server, client = registry
+    payload, blobs = _staged(tmp_path)
+    missing = {"mediaType": MANIFEST, "digest": "sha256:" + "d" * 64, "size": 10}
+    with pytest.raises(ArtifactPublicationError, match="HTTP 404") as error:
+        publish_artifact_manifest(client, build_artifact_manifest(ARTIFACT_TYPE, payload, missing), blobs)
+    assert error.value.stage == STAGE_SUBJECT
+    assert isinstance(error.value.__cause__, RegistryRequestError)
+
+    data = build_artifact_manifest(ARTIFACT_TYPE, payload)
+    server.blobs[payload.digest] = b"no"
+    server.corrupt_blobs.add(payload.digest)
+    with pytest.raises(ArtifactPublicationError, match="Content-Length") as error:
+        publish_artifact_manifest(client, data, blobs)
+    assert error.value.stage == STAGE_BLOB
+    assert isinstance(error.value.__cause__, BlobIntegrityError)
+
+    del server.blobs[payload.digest]
+    server.corrupt_blobs.discard(payload.digest)
+    server.fail_tags.add(_digest(data))
+    with pytest.raises(ArtifactPublicationError, match="HTTP 500") as error:
+        publish_artifact_manifest(client, data, blobs)
+    assert error.value.stage == STAGE_MANIFEST
+    assert isinstance(error.value.__cause__, RegistryRequestError)
+    assert _digest(data) not in server.manifests
 
 
 def _listing(*descriptors, status=REFERRERS_SUPPORTED):

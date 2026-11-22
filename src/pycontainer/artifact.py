@@ -7,6 +7,7 @@ import os
 import re
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Tuple
@@ -551,14 +552,15 @@ def push_artifact(
     manifest_data = _read_bounded(
         _blob_path(layout, artifact.descriptor.digest), artifact.descriptor.size, "Artifact manifest"
     )
-    published = publish_artifact_manifest(
+    published = _publish_by_digest(
         client,
         manifest_data,
         [
             (EMPTY_DIGEST, len(EMPTY_CONFIG), _blob_path(layout, EMPTY_DIGEST)),
             (artifact.payload.digest, artifact.payload.size, artifact.payload_path),
         ],
-        verify_subject=verify_subject,
+        verify_subject,
+        wrap_errors=False,
     )
     digest, size = published.descriptor.digest, published.descriptor.size
     moved = []
@@ -594,9 +596,36 @@ def publish_artifact_manifest(
 
     ``blobs`` must describe exactly the empty config and the payload as
     ``(digest, size, path)``. The manifest digest is computed from the bytes
-    given, which are uploaded unchanged. No tags are moved. Registry failures
-    raise :class:`ArtifactPublicationError` with ``stage`` set.
+    given, which are uploaded unchanged. No tags are moved. Registry, integrity
+    and local I/O failures raise :class:`ArtifactPublicationError` with
+    ``stage`` set and the original error chained as ``__cause__``.
+
+    Precondition: staged files are hashed only when a blob is uploaded. If the
+    registry already reports a blob with the same digest and size, the local
+    file is not read, so callers that need proof of their local bytes must
+    verify them first.
     """
+    return _publish_by_digest(client, manifest_data, blobs, verify_subject, wrap_errors=True)
+
+
+@contextmanager
+def _publication_stage(stage: str, message: str, wrap: bool):
+    try:
+        yield
+    except (RegistryRequestError, BlobIntegrityError, OSError) as error:
+        if not wrap:
+            raise
+        raise ArtifactPublicationError(f"{message}: {error}", stage=stage) from error
+
+
+def _publish_by_digest(
+    client: RegistryClient,
+    manifest_data: bytes,
+    blobs: Iterable[Tuple[str, int, Path]],
+    verify_subject: bool,
+    *,
+    wrap_errors: bool,
+) -> ArtifactPushResult:
     if not isinstance(manifest_data, bytes) or len(manifest_data) > MAX_MANIFEST_BYTES:
         raise InvalidArtifactError(f"Artifact manifest must be bytes of at most {MAX_MANIFEST_BYTES}.")
     manifest = parse_artifact_manifest(manifest_data)
@@ -615,33 +644,29 @@ def publish_artifact_manifest(
     digest = "sha256:" + hashlib.sha256(manifest_data).hexdigest()
     size = len(manifest_data)
     subject = manifest.subject
-    errors = (RegistryRequestError, BlobIntegrityError, OSError)
     if subject and verify_subject:
-        try:
+        with _publication_stage(
+            STAGE_SUBJECT, f"Artifact subject {subject.digest} could not be verified", wrap_errors
+        ):
             client.verify_manifest_descriptor(
                 subject.digest, subject.digest, subject.size, subject.media_type
             )
-        except errors as error:
-            raise ArtifactPublicationError(
-                f"Artifact subject {subject.digest} could not be verified: {error}",
-                stage=STAGE_SUBJECT,
-            ) from error
     for blob_digest, (blob_size, blob_path) in staged.items():
-        try:
-            if not client.blob_descriptor_matches(blob_digest, blob_size):
+        with _publication_stage(
+            STAGE_BLOB, f"Artifact blob {blob_digest} could not be published", wrap_errors
+        ):
+            exposed = client.blob_descriptor_matches(blob_digest, blob_size)
+            if not exposed:
                 client.upload_blob_monolithic(blob_digest, blob_path)
-                if not client.blob_descriptor_matches(blob_digest, blob_size):
-                    raise BlobIntegrityError(f"Registry did not expose uploaded blob {blob_digest}.")
-        except errors as error:
+                exposed = client.blob_descriptor_matches(blob_digest, blob_size)
+        if not exposed:
             raise ArtifactPublicationError(
-                f"Artifact blob {blob_digest} could not be published: {error}", stage=STAGE_BLOB
-            ) from error
-    try:
+                f"Registry did not expose uploaded blob {blob_digest}.", stage=STAGE_BLOB
+            )
+    with _publication_stage(
+        STAGE_MANIFEST, f"Artifact manifest {digest} could not be published", wrap_errors
+    ):
         headers = client.put_manifest(digest, manifest_data, OCI_MANIFEST_MEDIA_TYPE)
-    except errors as error:
-        raise ArtifactPublicationError(
-            f"Artifact manifest {digest} could not be published: {error}", stage=STAGE_MANIFEST
-        ) from error
     subject_status = None
     if subject:
         reported = _header(headers, "OCI-Subject")
@@ -651,12 +676,10 @@ def publish_artifact_manifest(
                 stage=STAGE_SUBJECT,
             )
         subject_status = SUBJECT_UNCONFIRMED if reported is None else SUBJECT_CONFIRMED
-    try:
+    with _publication_stage(
+        STAGE_MANIFEST, f"Artifact manifest {digest} could not be verified", wrap_errors
+    ):
         client.verify_manifest_descriptor(digest, digest, size, OCI_MANIFEST_MEDIA_TYPE)
-    except errors as error:
-        raise ArtifactPublicationError(
-            f"Artifact manifest {digest} could not be verified: {error}", stage=STAGE_MANIFEST
-        ) from error
     descriptor = Descriptor(OCI_MANIFEST_MEDIA_TYPE, digest, size, manifest.artifact_type)
     return ArtifactPushResult(_reference(client, digest), descriptor, (), subject_status)
 
