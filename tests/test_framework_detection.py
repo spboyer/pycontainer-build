@@ -287,19 +287,50 @@ def test_function_local_web_apps_do_not_create_importable_candidates(tmp_path):
     assert entrypoint[1] == "api:app"
 
 
-@pytest.mark.parametrize(
-    ("package", "constructor"),
-    [("fastapi", "FastAPI"), ("flask", "Flask")],
-)
-def test_web_factory_without_module_binding_requires_explicit_command(
-    tmp_path, package, constructor
-):
+def test_fastapi_factory_without_module_binding_requires_explicit_command(tmp_path):
     write_file(
         tmp_path, "api.py",
-        f"from {package} import {constructor}\n"
-        f"def factory():\n    return {constructor}()\n",
+        "from fastapi import FastAPI\ndef factory():\n    return FastAPI()\n",
     )
     with pytest.raises(ValueError, match="explicit entrypoint"):
+        detect_framework(tmp_path)
+
+
+FLASK_RUN = ["flask", "run", "--host=0.0.0.0", "--port=5000"]
+
+
+def test_flask_app_factory_uses_flask_run_discovery(tmp_path):
+    write_file(
+        tmp_path, "app.py",
+        "from flask import Flask\ndef create_app():\n"
+        "    app = Flask(__name__)\n    return app\n",
+    )
+    assert detect_framework(tmp_path) == ("Flask", FLASK_RUN, [5000])
+
+
+def test_multiple_flask_instances_share_one_flask_run_entrypoint(tmp_path):
+    write_file(tmp_path, "app.py", "from flask import Flask\napp = Flask(__name__)\n")
+    write_file(tmp_path, "other.py", "from flask import Flask\nbp = Flask('x')\n")
+    assert detect_framework(tmp_path) == ("Flask", FLASK_RUN, [5000])
+
+
+def test_mounted_fastapi_sub_application_is_not_a_root_candidate(tmp_path):
+    write_file(
+        tmp_path, "main.py",
+        "from fastapi import FastAPI\napp = FastAPI()\napi = FastAPI()\n"
+        "app.mount('/api', api)\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "FastAPI"
+    assert entrypoint[1] == "main:app"
+
+
+def test_unmounted_fastapi_applications_remain_ambiguous(tmp_path):
+    write_file(
+        tmp_path, "main.py",
+        "from fastapi import FastAPI\napp = FastAPI()\napi = FastAPI()\n",
+    )
+    with pytest.raises(ValueError, match="Multiple FastAPI"):
         detect_framework(tmp_path)
 
 
@@ -429,17 +460,11 @@ def test_selected_files_still_reject_a_resolved_path_outside_context(tmp_path, m
         detect_framework(context, files=[source])
 
 
-@pytest.mark.parametrize(
-    ("name", "source"),
-    [
-        ("FastAPI", "from fastapi import FastAPI\napp = FastAPI()\n"),
-        ("Flask", "from flask import Flask\napp = Flask(__name__)\n"),
-    ],
-)
-def test_multiple_legacy_web_apps_require_explicit_selection(tmp_path, name, source):
+def test_multiple_fastapi_apps_require_explicit_selection(tmp_path):
+    source = "from fastapi import FastAPI\napp = FastAPI()\n"
     write_file(tmp_path, "first.py", source)
     write_file(tmp_path, "second.py", source)
-    with pytest.raises(ValueError, match=f"Multiple {name}"):
+    with pytest.raises(ValueError, match="Multiple FastAPI"):
         detect_framework(tmp_path)
 
 

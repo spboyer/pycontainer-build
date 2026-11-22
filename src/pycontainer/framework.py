@@ -183,6 +183,8 @@ def _detect_framework(
         relative = path.relative_to(ctx).as_posix()
         module = ".".join(path.relative_to(ctx).with_suffix("").parts)
         fastapi_variables, fastapi_constructed = _web_app_details(tree, "FastAPI")
+        mounted = _mounted_names(tree)
+        fastapi_variables = [name for name in fastapi_variables if name not in mounted]
         if fastapi_constructed and not fastapi_variables:
             problems["FastAPI"] = (
                 f"Cannot determine an importable FastAPI entrypoint in {relative}; "
@@ -194,13 +196,9 @@ def _detect_framework(
                 ["uvicorn", f"{module}:{variable}", "--host", ALL_INTERFACES, "--port", "8000"],
                 [8000],
             ))
-        flask_variables, flask_constructed = _web_app_details(tree, "Flask")
-        if flask_constructed and not flask_variables:
-            problems["Flask"] = (
-                f"Cannot determine an importable Flask entrypoint in {relative}; "
-                "specify an explicit entrypoint or command."
-            )
-        for _ in flask_variables:
+        # `flask run` discovers module-level apps and factories itself, so every
+        # Flask construction maps to the same single entrypoint.
+        if _web_app_details(tree, "Flask")[1] and not candidates["Flask"]:
             candidates["Flask"].append(_Detection(
                 "Flask", ["flask", "run", "--host=0.0.0.0", "--port=5000"], [5000]
             ))
@@ -653,6 +651,23 @@ def _web_app_details(tree, constructor):
         _is_constructor(node, modules, classes, {constructor}) for node in ast.walk(tree)
     )
     return variables, constructed
+
+
+def _mounted_names(tree):
+    """Return names passed as sub-applications to another object's ``mount``."""
+    mounted = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "mount"
+        ):
+            continue
+        owner = node.func.value.id if isinstance(node.func.value, ast.Name) else None
+        for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
+            if isinstance(arg, ast.Name) and arg.id != owner:
+                mounted.add(arg.id)
+    return mounted
 
 
 def _web_app_variables(tree, constructor):
