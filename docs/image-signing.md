@@ -4,8 +4,10 @@ Image signing is experimental and strictly opt-in. The core package adds no
 runtime dependency or daemon: install the optional provider CLI separately.
 Cosign versions `>=2.6.1,<4.0.0` and Notation versions `>=1.3.2,<2.0.0` pass
 the version preflight; this is not a claim that every version or registry has
-been exercised. The signing and independent verification paths have not yet
-been demonstrated against a real registry for this change.
+been exercised. Cosign key-mode signing and build-time signature verification
+have been exercised against `ttl.sh` with v2.6.1 and v3.1.4 (through the
+stacked provenance test in #219); Notation and keyless signing have not been
+validated against a real registry.
 
 ## Prerequisites and use
 
@@ -148,11 +150,12 @@ notation verify ghcr.io/example/app@sha256:<digest>
 
 Notation verification uses its configured trust policy and trust store.
 Build-time verification uses the trust configuration supplied to the build; it
-is not independent verification by the consumer. These verification command
-lines and Notation output strings are covered by hermetic tests only and have
-not yet been exercised against real providers or registries. A valid
-signature authenticates an artifact only under the verifier's policy; it does
-not establish that an image is free of vulnerabilities or safe to run.
+is not independent verification by the consumer. A separate `cosign verify`
+with a public key succeeded against `ttl.sh` using v3.1.4 with the transparency
+log disabled. Keyless Cosign and Notation verification have not been exercised
+against real providers or registries. A valid signature authenticates an
+artifact only under the verifier's policy; it does not establish that an image
+is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
