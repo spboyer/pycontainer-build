@@ -43,6 +43,20 @@ and runtime startup. Per-sample peak RSS includes Python startup/imports;
 build work, or the transfer. Compare only matching environments and fixture
 settings; no timing threshold is enforced.
 
+The `registry-network-*` cases run a separate-process loopback registry with
+injected per-request delay (`--request-delay-ms`) and bandwidth
+(`--bandwidth-mbit`, `0` for unlimited, shared or `--bandwidth-scope
+per-connection`). For each `--layer-layouts` entry (`COUNTxMIB` or
+`MIB+MIB+...`) and `--network-repetitions` sample, they time the real
+sequential base pull, local build, cold push and repeat push, then interleave
+benchmark-only `RegistryClient` probes with one and `--probe-workers` workers.
+Every sample uses fresh repositories and unique blob digests, so registry and
+local caches are cold. The 1-worker probe calibrates the probe against the
+product path; the projected saving is an upper bound for concurrent transfers,
+not a measured product speedup. The delay approximates one round trip per HTTP
+request; real HTTPS without connection reuse pays several. Pass
+`--layer-layouts` with no value to skip these cases.
+
 For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
 start a Docker daemon, and allow the builder to pull the selected registry base
 image. The script imports the generated OCI layout into Docker and starts a container:
