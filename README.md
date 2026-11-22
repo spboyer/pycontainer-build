@@ -340,6 +340,9 @@ pycontainer build \
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
   distributions, cross-compilation, and lockfile resolution are not supported.
+  Generated Linux console scripts use UTF-8 and LF line endings on every host,
+  including Windows, and retain executable mode in the dependency layer.
+  Copied application files are not normalized.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
