@@ -94,10 +94,10 @@ Compatibility boundary:
   do not record it, so pass `--shell` when the base image changed its shell.
 - The shell must exist in the target image. A distroless base produces a
   warning because it typically has no shell; prefer exec form there.
-- A `CMD`-only import is combined with the entrypoint auto-detected at build
-  time, so a shell-form `CMD` becomes arguments to that entrypoint. Use
-  `ENTRYPOINT` (or set `entrypoint`) when the command must run on its own
-  (tracked in #206).
+- A `CMD`-only import does not get an auto-detected or framework entrypoint:
+  like Docker, the image keeps the base image's `Entrypoint` (if any) and runs
+  the imported `CMD` under it. Set `entrypoint` to run `cmd` as its arguments.
+  Exec-form `ENTRYPOINT []` / `CMD []` clear the base image's value.
 
 To check a converted shell-form command in a real runtime (Linux/WSL with
 Skopeo and a running Docker daemon; not part of the default tests or CI):

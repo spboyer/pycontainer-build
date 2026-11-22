@@ -121,7 +121,7 @@ def apply_framework_defaults(
     
     framework, entrypoint, ports=detection
     
-    if not config.entrypoint:
+    if config.entrypoint is None and config.cmd is None:
         config.entrypoint=entrypoint
     
     if not config.exposed_ports and ports:
