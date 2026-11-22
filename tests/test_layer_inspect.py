@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from pycontainer import local_image
 from pycontainer.layer_inspect import inspect_image, render_text, run_inspect
 from pycontainer.local_image import OCI_GZIP_LAYER, OCI_TAR_LAYER
 
@@ -287,6 +288,21 @@ def test_multi_platform_index_requires_explicit_platform(tmp_path):
     assert "no exact manifest for linux/s390x" in error_of(f"oci:{tmp_path / 'img'}", platform="linux/s390x")
 
 
+def test_nested_index_over_entry_limit_fails_without_report(tmp_path, monkeypatch):
+    image = Image(tmp_path / "img")
+    image.image([tar(("a", b"1"))])
+    descriptor = image.descriptors[0]
+    nested = {"schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": [descriptor, descriptor]}
+    nested_descriptor = image.blob(json.dumps(nested).encode(), INDEX_TYPE)
+    (image.root / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [nested_descriptor]}))
+    monkeypatch.setattr(local_image, "MAX_INDEX_ENTRIES", 1)
+
+    output, code = run_inspect(f"oci:{image.root}", as_json=True)
+    assert code == 1
+    assert output.startswith("error: ")
+    assert "more than 1" in output
+
+
 def test_platform_must_match_single_image(tmp_path):
     image = layout(tmp_path, tar(("a", b"1")), platform=False)
     assert "does not match" in error_of(image, platform="linux/arm64")
@@ -313,6 +329,25 @@ def test_docker_archive_inspection_reports_platform_and_keeps_json_clean(tmp_pat
     assert "Loading" not in capsys.readouterr().out
     assert "does not match" in error_of(image, platform="linux/arm64")
     assert inspect_image(image, platform="linux/amd64")["filesystem"]["files"] == 1
+
+
+def test_oversized_docker_layer_rejected_before_staging(tmp_path, monkeypatch):
+    layer = tar(("a", b"1"))
+    image = docker_archive(tmp_path / "oversized.tar", [layer])
+    monkeypatch.setattr(local_image, "MAX_LAYER_UNCOMPRESSED_BYTES", len(layer) - 1)
+    staged = []
+    original = local_image._stage_stream
+
+    def track_staging(stream, destination, digest, size, description):
+        staged.append(description)
+        return original(stream, destination, digest, size, description)
+
+    monkeypatch.setattr(local_image, "_stage_stream", track_staging)
+    output, code = run_inspect(image, as_json=True)
+    assert code == 1
+    assert output.startswith("error: ")
+    assert "exceeds" in output
+    assert "Docker archive layer 1" not in staged
 
 
 # --- safe archive handling and explicit errors ---------------------------
