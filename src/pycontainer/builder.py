@@ -403,6 +403,7 @@ class ImageBuilder:
 
         platforms=self.config.target_platforms()
         self._resolved_base_reference=None
+        self._local_base_snapshot=None
         self._app_layer=None
         if len(platforms)>1:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
@@ -464,6 +465,7 @@ class ImageBuilder:
 
         index_digest, index_size=self._write_image_index(layers_dir, images)
         _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
+        self._verify_local_base_unchanged(layers_dir)
 
         _atomic_write_bytes(
             output/'oci-layout',
@@ -604,12 +606,37 @@ class ImageBuilder:
         with open_local_image_source(
             local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
         ) as source:
+            self._pin_local_base_snapshot(getattr(source, "snapshot_digest", None))
             base_layers, base_config = self._read_base_image(
                 source, None, layers_dir, os_name, arch
             )
             verify_layer_diff_ids(base_layers, base_config)
             self._base_image_name=source.source_name
         return base_layers, base_config
+
+    def _pin_local_base_snapshot(self, snapshot: Optional[str]) -> None:
+        """Require every platform to select from the same local layout index."""
+        if snapshot is None:
+            return
+        pinned=getattr(self, "_local_base_snapshot", None)
+        if pinned is None:
+            self._local_base_snapshot=snapshot
+        elif snapshot != pinned:
+            raise LocalImageError(
+                f"Local base image {self.config.base_image} changed during the "
+                f"multi-platform build (index {pinned[:19]}... became {snapshot[:19]}...); "
+                "rebuild once the layout is stable."
+            )
+
+    def _verify_local_base_unchanged(self, layers_dir: Path) -> None:
+        """Re-read a pinned local layout index before publishing the image index."""
+        if getattr(self, "_local_base_snapshot", None) is None:
+            return
+        local=parse_local_image_reference(self.config.base_image)
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), None, None
+        ) as source:
+            self._pin_local_base_snapshot(getattr(source, "snapshot_digest", None))
 
     def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Resolve and validate a base image through a registry or local source."""

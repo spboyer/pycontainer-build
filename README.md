@@ -597,9 +597,13 @@ wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
-a failed platform leaves earlier tags untouched. Push uploads blobs, then
-platform manifests and the index by digest, and moves tags last. SBOM
-generation is not yet supported for index builds. A local single-platform
+a failed platform leaves earlier tags untouched. A local `oci:` base must
+keep the same layout `index.json` for every platform and until publication;
+a change fails the build instead of mixing base versions. Push uploads blobs, then
+platform manifests and the index by digest, and moves tags last. Registry v2
+has no atomic multi-tag update: tags are pushed one at a time, so if a later
+tag fails, earlier tags in the same push may already point at the new index.
+SBOM generation is not yet supported for index builds. A local single-platform
 `docker-archive:` base cannot satisfy an index build. Pip still evaluates
 dependency environment markers such as `platform_machine` against the build
 host for every cross-target build, so marker-dependent requirements may be

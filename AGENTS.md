@@ -152,7 +152,9 @@ source distributions, lockfiles and cross-compilation are not supported.
 Comma-separated `platform` values build an OCI image index for exactly
 `linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own
 base selection and dependency layer, and tags move only after the whole index
-verifies. Hermetic index tests do not prove per-architecture runtime startup.
+verifies. A local `oci:` base must keep the same layout `index.json` across
+platforms. Multi-tag registry pushes are not atomic: a later tag failure can
+leave earlier tags moved. Hermetic index tests do not prove per-architecture runtime startup.
 Dependency environment markers (for example `platform_machine`) are still
 evaluated against the build host for any cross-target build; see #142.
 
