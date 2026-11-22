@@ -406,7 +406,7 @@ class ImageBuilder:
         platforms=self.config.target_platforms()
         self._resolved_base_reference=None
         self._resolved_base_from_tag=False
-        self._base_image_tag_verified=False
+        self._base_image_tag_verified=None
         self._local_base_snapshot=None
         self._app_layer=None
         if len(platforms)>1:
@@ -964,9 +964,13 @@ class ImageBuilder:
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
         # Local annotations/tags and any digest reference are identity claims, not
         # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        # Later platforms are pulled by the pinned index digest; they inherit tag
+        # provenance only when that digest was resolved from the initial tag pull.
+        # None means no registry pull recorded provenance (for example, a stub).
         base_image_tag_verified = (
             parse_local_image_reference(self.config.base_image) is None
             and "@" not in self.config.base_image
+            and getattr(self, "_base_image_tag_verified", None) is not False
         )
         version = target_python_version(
             base_image_name, base_config,
