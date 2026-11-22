@@ -438,7 +438,9 @@ class OCILayoutSource:
     def _select(self) -> List[Dict]:
         descriptors = self._descriptors()
         if self.reference.digest:
-            return [d for d in descriptors if d["digest"] == self.reference.digest]
+            return self._unique(
+                [d for d in descriptors if d["digest"] == self.reference.digest]
+            )
         if self.reference.reference:
             wanted = self.reference.reference
             matches = [d for d in descriptors if wanted in _descriptor_aliases(d)]
@@ -448,8 +450,34 @@ class OCILayoutSource:
                 and wanted in _descriptor_aliases(self.index)
             ):
                 matches = descriptors
-            return matches
+            return self._unique(matches)
         return descriptors
+
+    def _unique(self, matches: List[Dict]) -> List[Dict]:
+        """Collapse selected descriptors that repeat one manifest under several names."""
+        unique: Dict[Tuple[str, Optional[str]], Dict] = {}
+        for descriptor in matches:
+            platform = descriptor.get("platform")
+            key = (
+                descriptor["digest"],
+                json.dumps(platform, sort_keys=True) if platform is not None else None,
+            )
+            existing = unique.get(key)
+            if existing is None:
+                unique[key] = descriptor
+                continue
+            if (existing["size"], existing["mediaType"]) != (
+                descriptor["size"], descriptor["mediaType"]
+            ):
+                raise LocalImageError(
+                    f"OCI layout {self.root} has conflicting descriptors for "
+                    f"{descriptor['digest']}."
+                )
+            if _image_name(existing.get("annotations")) != _image_name(
+                descriptor.get("annotations")
+            ):
+                unique[key] = {k: v for k, v in existing.items() if k != "annotations"}
+        return list(unique.values())
 
     def _available(self) -> str:
         names = sorted(
