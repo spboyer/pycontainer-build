@@ -211,6 +211,41 @@ def test_index_credentials_must_be_placeholders(tmp_path):
     assert "--extra-index-url https://${INDEX_USER}" in selection.render_requirements()
 
 
+@pytest.mark.parametrize(
+    "registry, message",
+    [
+        ("https://example.com/simple?token=hunter2", "literal credentials or query"),
+        ("https://example.com/simple\n-r /outside/requirements.txt", "control characters"),
+    ],
+)
+def test_index_urls_reject_query_secrets_and_injected_directives(tmp_path, registry, message):
+    context = _write_uv_project(tmp_path / "ctx", registry=registry.replace("\n", "\\n"))
+
+    with pytest.raises(LockfileError, match=message):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_lock_missing_root_dependency_edge_fails(tmp_path):
+    context = _copy(tmp_path, "uv")
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8")
+    lock.write_text(text.replace('    { name = "click" },\n', "", 1), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="does not lock click"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_lock_without_wheels_fails(tmp_path):
+    context = _write_uv_project(tmp_path / "ctx")
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8")
+    sdist = f'sdist = {{ url = "https://example.invalid/fixture_dep-1.0.tar.gz", hash = "sha256:{"2" * 64}" }}\n'
+    lock.write_text(text.rsplit("wheels = ", 1)[0] + sdist, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="no locked wheels"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
 def _offline_wheelhouse(monkeypatch, context):
     wheel = _write_wheel(context / "wheelhouse")
     monkeypatch.setenv("PIP_NO_INDEX", "1")

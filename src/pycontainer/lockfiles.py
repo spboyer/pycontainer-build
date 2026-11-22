@@ -18,9 +18,13 @@ try:
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
 except ImportError:  # pragma: no cover - exercised when only pip is installed
-    from pip._vendor.packaging.markers import InvalidMarker, Marker
-    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
-    from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+    try:
+        from pip._vendor.packaging.markers import InvalidMarker, Marker
+        from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+    except ImportError:
+        Marker = Requirement = SpecifierSet = None
+        InvalidMarker = InvalidRequirement = InvalidSpecifier = ValueError
 
 
 LOCKFILE_KINDS = {
@@ -115,6 +119,8 @@ def load_lockfile(
         )
     if not path.is_file():
         raise LockfileError(f"Lockfile not found: {relative.as_posix()}")
+    if not path.resolve().is_relative_to(Path(context_dir).resolve()):
+        raise LockfileError(f"Lockfile must be inside the build context: {relative.as_posix()}")
     if path.stat().st_size > MAX_LOCKFILE_BYTES:
         raise LockfileError(f"Lockfile exceeds the {MAX_LOCKFILE_BYTES}-byte limit: {path.name}")
     if environment.get("python_full_version") is None:
@@ -122,6 +128,8 @@ def load_lockfile(
             "Lockfile staging needs the full target Python version; use a base image "
             "with PYTHON_VERSION=<major>.<minor>.<patch> metadata."
         )
+    if Marker is None:
+        raise LockfileError("Lockfile staging requires pip in the Python interpreter running pycontainer.")
     reader = {"poetry": _load_poetry, "pipenv": _load_pipenv, "pdm": _load_pdm, "uv": _load_uv}[kind]
     packages, indexes = reader(path, environment)
     return LockSelection(kind, Path(relative), _finalize(packages, path.name), tuple(indexes))
@@ -217,17 +225,20 @@ def _hashes(values: Iterable[str], source: str) -> Tuple[str, ...]:
 
 
 def _index_url(url: str, source: str) -> Optional[str]:
-    parts = urlsplit(str(url))
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
+    url = str(url)
+    if any(ord(char) < 0x21 or ord(char) == 0x7F for char in url):
+        raise LockfileError(f"Package index URL for {source} contains whitespace or control characters.")
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.fragment:
         raise LockfileError(f"Unsupported package index URL for {source}.")
-    if "@" in parts.netloc:
-        userinfo = parts.netloc.rsplit("@", 1)[0]
-        if any(_PLACEHOLDER.sub("", part) for part in userinfo.split(":", 1)):
-            raise LockfileError(
-                f"Package index URL for {source} contains literal credentials; use "
-                "${VARIABLE} placeholders or pip configuration instead."
-            )
-    normalized = str(url).rstrip("/")
+    userinfo = parts.netloc.rsplit("@", 1)[0].split(":", 1) if "@" in parts.netloc else []
+    query_values = [pair.split("=", 1)[-1] for pair in parts.query.split("&") if pair]
+    if any(_PLACEHOLDER.sub("", part) for part in [*userinfo, *query_values]):
+        raise LockfileError(
+            f"Package index URL for {source} contains literal credentials or query values; use "
+            "${VARIABLE} placeholders or pip configuration instead."
+        )
+    normalized = url.rstrip("/")
     return None if normalized.lower() in _PYPI_INDEXES else normalized
 
 
@@ -540,6 +551,34 @@ def _check_uv_fresh(lock: dict, root: dict, pyproject: dict, environment) -> Non
         raise _stale("uv.lock", "uv lock")
 
 
+def _check_uv_complete(pyproject: dict, environment, selected, visited) -> None:
+    """Fail when the locked root graph omits a manifest dependency for the target."""
+    versions: Dict[str, List[str]] = {}
+    for name, version in selected:
+        versions.setdefault(name, []).append(version)
+    for text in pyproject.get("project", {}).get("dependencies", []):
+        try:
+            requirement = Requirement(text)
+        except InvalidRequirement as exc:
+            raise LockfileError(f"Invalid requirement in pyproject.toml: {text!r}") from exc
+        marker = str(requirement.marker) if requirement.marker else None
+        if not _marker_applies(marker, environment, "pyproject.toml"):
+            continue
+        name = canonical_name(requirement.name)
+        matches = [v for v in versions.get(name, []) if requirement.specifier.contains(v, prereleases=True)]
+        extras = {canonical_name(extra) for extra in requirement.extras}
+        covered = {
+            canonical_name(extra)
+            for state_name, state_version, state_extras in visited
+            if state_name == name and state_version in matches
+            for extra in state_extras
+        }
+        if not matches or not extras <= covered:
+            raise LockfileError(
+                f"uv.lock does not lock {requirement} for the target environment; run `uv lock`."
+            )
+
+
 def _load_uv(path: Path, environment):
     lock = _read_toml(path)
     pyproject = _read_toml(_manifest(path, "pyproject.toml"))
@@ -584,6 +623,15 @@ def _load_uv(path: Path, environment):
             if dependency.get("version") in (None, entry.get("version"))
             and dependency.get("source") in (None, entry.get("source"))
         ]
+        if len(candidates) > 1:
+            candidates = [
+                entry
+                for entry in candidates
+                if any(
+                    _marker_applies(marker, environment, f"uv.lock package {name}")
+                    for marker in entry.get("resolution-markers", [None])
+                )
+            ]
         if len(candidates) != 1:
             raise LockfileError(f"uv.lock dependency {name} of {parent} does not identify one locked package.")
         entry = candidates[0]
@@ -599,6 +647,7 @@ def _load_uv(path: Path, environment):
             if extra not in optional:
                 raise LockfileError(f"uv.lock package {name} has no locked extra {extra!r}.")
             pending.extend((child, name) for child in optional[extra])
+    _check_uv_complete(pyproject, environment, selected, visited)
 
     packages, indexes = [], []
     for (name, _), entry in sorted(selected.items()):
@@ -611,7 +660,10 @@ def _load_uv(path: Path, environment):
             )
         indexes.append(_index_url(registry, f"uv.lock package {name}"))
         artifacts = list(entry.get("wheels", []))
-        if entry.get("sdist"):
-            artifacts.append(entry["sdist"])
+        if not artifacts:
+            raise LockfileError(
+                f"uv.lock package {name} {entry.get('version')} has no locked wheels; "
+                "source distributions are not supported."
+            )
         packages.append(_package(name, entry.get("version"), [item.get("hash") for item in artifacts], "uv.lock"))
     return packages, _ordered_unique(indexes)
