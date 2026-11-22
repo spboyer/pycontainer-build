@@ -143,13 +143,17 @@ def test_imported_empty_entrypoint_and_cmd_clear_base_values(tmp_path, monkeypat
     assert "Cmd" not in image
 
 
-def test_empty_cmd_keeps_distroless_shell_entrypoint_conversion():
+@pytest.mark.parametrize("cmd", [[], ["argument"]], ids=["clear-cmd", "set-cmd"])
+def test_distroless_explicit_shell_entrypoint_with_cmd_is_kept(cmd):
     base = copy.deepcopy(ENTRYPOINT_BASE)
     base["config"]["Labels"] = {"name": "distroless/python3"}
-    del base["config"]["Cmd"]
     shell = ["/bin/sh", "-c", "run"]
-    image = build_config_json("amd64", "linux", {}, "/app", shell, [], cmd=[], base_config=base)
-    assert image["config"]["Cmd"] == shell
+    image = build_config_json("amd64", "linux", {}, "/app", shell, [], cmd=cmd, base_config=base)
+    assert image["config"]["Entrypoint"] == shell
+    if cmd:
+        assert image["config"]["Cmd"] == cmd
+    else:
+        assert "Cmd" not in image["config"]
 
 
 def test_without_base_unset_entrypoint_is_omitted():

@@ -45,13 +45,11 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         cfg['config']['WorkingDir']=working_dir or base_config.get('config',{}).get('WorkingDir','/app')
         
         base_entrypoint=base_config.get('config',{}).get('Entrypoint')
-        shell_entrypoint_as_cmd=False
         if entrypoint == []:
             cfg['config'].pop('Entrypoint', None)
         elif entrypoint:
-            if is_distroless(base_config) and entrypoint and entrypoint[0] in ['/bin/sh','/bin/bash','sh','bash']:
+            if cmd is None and is_distroless(base_config) and entrypoint[0] in ['/bin/sh','/bin/bash','sh','bash']:
                 cfg['config']['Cmd']=entrypoint
-                shell_entrypoint_as_cmd=True
                 if base_entrypoint: cfg['config']['Entrypoint']=base_entrypoint
             else:
                 cfg['config']['Entrypoint']=entrypoint
@@ -59,8 +57,7 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
             cfg['config']['Entrypoint']=base_entrypoint
         
         if cmd: cfg['config']['Cmd']=cmd
-        elif cmd == []:
-            if not shell_entrypoint_as_cmd: cfg['config'].pop('Cmd', None)
+        elif cmd == []: cfg['config'].pop('Cmd', None)
         elif 'Cmd' in base_config.get('config',{}): cfg['config']['Cmd']=base_config['config']['Cmd']
         if user: cfg['config']['User']=user
         elif 'User' in base_config.get('config',{}): cfg['config']['User']=base_config['config']['User']
