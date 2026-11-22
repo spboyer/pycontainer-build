@@ -447,7 +447,8 @@ the wrong TOML type are reported as configuration errors.
 `[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
 The same keys, validation and CLI precedence apply. A file that defines both
 `[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
-one. Poetry-only keys such as `push` are reported as unknown by
+one. A file passed explicitly that defines neither table (for example a
+misspelled `[biuld]`) is an error, not a silent fall-back to defaults. Poetry-only keys such as `push` are reported as unknown by
 `pycontainer build`; use `--push` instead. See
 [Dockerfile import](docs/dockerfile-import.md).
 
@@ -468,7 +469,8 @@ pycontainer validate config -c pyproject.toml
 ```
 
 It exits 0 when every configuration is valid and 2 for invalid settings,
-missing files, conflicting tables or usage errors, and lists the registry,
+missing files, files without a `[build]` or `[tool.pycontainer]` table,
+conflicting tables or usage errors, and lists the registry,
 dependency-resolution and runtime checks it did not perform. A passing
 validation does not prove a build will succeed. See
 [configuration validation](docs/validate-config.md).

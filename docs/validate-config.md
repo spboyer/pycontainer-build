@@ -32,6 +32,10 @@ pycontainer validate config -c PATH [OVERRIDES]
 
 - Both supported layouts: `[build]` in `pycontainer.toml` and
   `[tool.pycontainer]` in `pyproject.toml`; a file defining both is rejected.
+- A named file that defines neither table (for example a misspelled `[biuld]`
+  or `[tool.pycontainer]` missing from `pyproject.toml`) is an error, not a
+  silent fall-back to defaults. `build --config` applies the same rule. Only
+  omitting every path validates the build defaults.
 - Missing files, malformed TOML, unknown keys, wrong TOML types and keys that
   normalize to the same setting.
 - Semantic checks shared with `build`: SBOM format, system package names, tag
@@ -48,7 +52,7 @@ a table field such as `[tool.pycontainer].platform`, a CLI option such as
 | Code | Meaning |
 |------|---------|
 | 0 | Every configuration is valid |
-| 2 | Invalid configuration, missing file, conflicting tables or usage error |
+| 2 | Invalid configuration, missing file, file without a supported table, conflicting tables or usage error |
 
 ## Not performed
 

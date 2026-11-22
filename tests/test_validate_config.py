@@ -182,3 +182,19 @@ def test_build_and_validate_share_checks(offline, monkeypatch, capsys, content, 
     assert message in capsys.readouterr().err
     assert _run(monkeypatch, ["build", "--config", path, *extra]) == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['[project]\nname = "demo"\n', "[biuld]\ntag = \"app:1\"\n", '[tool.pycontiner]\ntag = "app:1"\n', ""],
+)
+def test_explicit_file_without_a_supported_table_fails_in_build_and_validate(offline, monkeypatch, capsys, content):
+    path = _write(offline / "pycontainer.toml", content)
+    message = "defines neither [build] nor [tool.pycontainer]"
+
+    assert _run(monkeypatch, ["validate", "config", path]) == 2
+    assert f"error: {path}: " in (err := capsys.readouterr().err) and message in err
+    assert _run(monkeypatch, ["validate", "config", "-c", path]) == 2
+    assert message in capsys.readouterr().err
+    assert _run(monkeypatch, ["build", "--config", path]) == 2
+    assert message in capsys.readouterr().err
