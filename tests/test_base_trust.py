@@ -56,8 +56,11 @@ class _Registry:
     registry = "registry.example"
     repository = "team/base"
 
-    def __init__(self, *, index=False):
-        config = _encoded({"os": "linux", "architecture": "amd64", "config": {}})
+    def __init__(self, *, index=False, environment=None):
+        config = {"os": "linux", "architecture": "amd64", "config": {}}
+        if environment is not None:
+            config["config"]["Env"] = environment
+        config = _encoded(config)
         layer = b"application layer"
         self.blobs = {_digest(config): config, _digest(layer): layer}
         self.manifest = {
@@ -155,6 +158,49 @@ def test_required_trust_resolves_tag_once_and_verifies_before_base_blobs(
     assert config["architecture"] == "amd64"
     if index:
         assert client.events[2] == ("manifest", client.child_digest)
+
+
+@pytest.mark.parametrize(
+    ("environment", "error"),
+    [
+        ([], "Python ABI"),
+        (["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8"], "unverified"),
+    ],
+)
+def test_verified_digest_does_not_authenticate_tag_for_dependency_staging(
+    tmp_path, monkeypatch, environment, error
+):
+    client = _Registry(environment=environment)
+    client.registry = "registry-1.docker.io"
+    client.repository = "library/python"
+    monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+
+    def verify(policy, repository, digest, manifest, manifest_bytes, source):
+        assert repository == "docker.io/library/python"
+        assert digest == client.root_digest
+        source.verified = True
+
+    def unexpected_install(*args, **kwargs):
+        pytest.fail("dependency installation must not use an unverified tag")
+
+    monkeypatch.setattr(builder_module, "verify_base_image", verify)
+    monkeypatch.setattr(builder_module, "install_requirements", unexpected_install)
+    (tmp_path / "requirements.txt").write_text("fixture-dep==1.0\n")
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    builder = _builder(
+        tmp_path,
+        _policy(repository="docker.io/library/python"),
+        f"python:3.11-slim@{client.root_digest}",
+    )
+    _, config = builder._pull_base_image(layers_dir, "linux", "amd64")
+
+    assert client.verified
+    with pytest.raises(ValueError, match=error):
+        builder._create_deps_layer(
+            layers_dir, base_config=config, os_name="linux", arch="amd64"
+        )
 
 
 def test_failed_verification_never_reads_child_or_base_blobs(tmp_path, monkeypatch):
