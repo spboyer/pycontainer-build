@@ -89,7 +89,9 @@ and a running Docker daemon:
 `PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
 It pulls the selected base image, imports the generated layout into Docker, and
 starts a container. To test only dependency importability in the real target
-base image, without Skopeo, add `--dependency-layer-only`. These checks are not
+base image, without Skopeo, add `--dependency-layer-only`. To run an imported
+quoted shell-form `ENTRYPOINT` in that image, add `--shell-command` (optionally
+`--shell '["/bin/bash", "-c"]'`). These checks are not
 part of the default test suite or CI.
 
 There is no configured root formatter, linter, type checker, or timing gate.

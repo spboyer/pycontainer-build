@@ -35,7 +35,7 @@ class OCIIndex:
         if self.annotations: idx["annotations"]=self.annotations
         return idx
 
-def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None):
+def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None, stop_signal=None, volumes=None):
     """Build OCI config, optionally merging with base image config."""
     if base_config:
         cfg=deepcopy(base_config)
@@ -71,6 +71,11 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
     rootfs["diff_ids"]=[*rootfs.get("diff_ids", []), *(layer_diff_ids or [])]
     if exposed_ports:
         cfg["config"]["ExposedPorts"]={f"{p}/tcp":{} for p in exposed_ports}
+    if stop_signal:
+        cfg["config"]["StopSignal"]=stop_signal
+    if volumes:
+        merged_volumes=set(cfg["config"].get("Volumes") or {})|set(volumes)
+        cfg["config"]["Volumes"]={path:{} for path in sorted(merged_volumes)}
     return cfg
 
 def is_distroless(config: Dict) -> bool:
