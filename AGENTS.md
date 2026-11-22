@@ -99,7 +99,8 @@ squashed. Unrepresentable overlay cases raise `SquashError` rather than being
 approximated. `scripts/check_squash_equivalence.py` is the opt-in Docker
 equivalence check for plain versus squashed images (`--skopeo-image` runs
 Skopeo from a container). Run it from a Linux builder: dependency staging on a
-Windows host writes CRLF console-script shebangs that fail in Linux containers.
+Windows host writes CRLF console-script shebangs that fail in Linux containers
+([#225](https://github.com/spboyer/pycontainer-build/issues/225)).
 See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 There is no configured root formatter, linter, type checker, or timing gate.

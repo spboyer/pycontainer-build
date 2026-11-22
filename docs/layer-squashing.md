@@ -157,7 +157,8 @@ test suite or CI.
 Run the check from a Linux builder. On a Windows host, staged console scripts
 currently get CRLF shebangs, so the dependency's entrypoint fails in Linux
 containers whether or not you squash. That is a staging limitation, not a
-squash one. One way to run the check from Windows with Docker Desktop:
+squash one; see [#225](https://github.com/spboyer/pycontainer-build/issues/225).
+One way to run the check from Windows with Docker Desktop:
 
 ```powershell
 docker run --rm -v //var/run/docker.sock:/var/run/docker.sock -v "${PWD}:/src:ro" -w /src docker:cli `
