@@ -47,7 +47,7 @@ pipeline {
                                 set +x
                                 unset REGISTRY_TOKEN GITHUB_TOKEN
                                 . .ci-venv/bin/activate
-                                python -m pycontainer.cli build --tag "$IMAGE_REPOSITORY:$GIT_COMMIT" --base-image python:3.11-slim --platform linux/amd64 --context . --exclude .ci-venv --push --no-progress
+                                python .ci/pycontainer_ci.py build --tag "$IMAGE_REPOSITORY:$GIT_COMMIT" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$HOME/.pycontainer/cache" --exclude .ci-venv --exclude .ci --push --no-progress
                             '''
                         } else {
                             bat '''
@@ -56,7 +56,7 @@ pipeline {
                                 set "GITHUB_TOKEN="
                                 call .ci-venv\\Scripts\\activate.bat
                                 if errorlevel 1 exit /b 1
-                                python -m pycontainer.cli build --tag "%IMAGE_REPOSITORY%:%GIT_COMMIT%" --base-image python:3.11-slim --platform linux/amd64 --context . --exclude .ci-venv --push --no-progress
+                                python .ci\\pycontainer_ci.py build --tag "%IMAGE_REPOSITORY%:%GIT_COMMIT%" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "%USERPROFILE%\\.pycontainer\\cache" --exclude .ci-venv --exclude .ci --push --no-progress
                                 if errorlevel 1 exit /b 1
                             '''
                         }

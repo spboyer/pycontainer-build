@@ -26,7 +26,7 @@ build-image:
           echo "Release tags must be stable semantic versions, e.g. v1.2.3." >&2
           exit 1
         fi
-        python -m pycontainer.cli build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" --semver-tags --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --push --no-progress
+        python .ci/pycontainer_ci.py build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" --semver-tags --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --exclude .ci --push --no-progress
       else
-        python -m pycontainer.cli build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --push --no-progress
+        python .ci/pycontainer_ci.py build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --exclude .ci --push --no-progress
       fi

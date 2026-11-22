@@ -1,7 +1,8 @@
 # CircleCI
 
 Copy [circleci-config.yml](../../examples/ci/circleci-config.yml) to
-`.circleci/config.yml` in the application repository. This is a CircleCI 2.1
+`.circleci/config.yml` and [pycontainer_ci.py](../../examples/ci/pycontainer_ci.py)
+to `.ci/pycontainer_ci.py` in the application repository. This is a CircleCI 2.1
 **config example, not a published orb**. Orb publishing is deferred until
 publishing ownership and maintenance are established.
 
@@ -18,22 +19,31 @@ installs in a job-local venv from immutable merged commit
 package. Review pin updates when adopting newer releases. Each `run` step
 activates the venv independently.
 
-Builds push a `CIRCLE_SHA1` tag to `IMAGE_REPOSITORY`. Secrets are read through
-the supported environment auth provider; missing credentials fail before the
-build. Inherited `REGISTRY_TOKEN` and `GITHUB_TOKEN` are cleared so they cannot
-override the context's username/password binding. Do not enable shell tracing
-or print credentials. A fully qualified
-tag selects the registry, so no host-only `--registry` override is used.
+Builds push a `CIRCLE_SHA1` tag to `IMAGE_REPOSITORY`. The helper reads the
+context credentials and creates a temporary Docker config scoped to the
+destination registry. It removes generic credential variables from the builder
+process, preventing public base-image pulls from receiving push credentials.
+Missing credentials fail before the build. Do not enable shell tracing or
+print credentials. The helper rejects `--registry`, `--username` and
+`--password`; use a fully qualified tag. Other base registries must allow
+anonymous pulls. Pass `--context` and either `--cache-dir` or `--no-cache`
+explicitly so the helper can keep temporary credentials outside the context
+and cache. The builder also runs without an inherited Azure CLI login.
+
+The temporary config contains plaintext credentials and is removed on normal
+exit, including build failure. Abrupt termination can leave it on disk; use
+ephemeral executors and short-lived credentials.
 
 Cache restore/save uses the executor user's default
-`~/.pycontainer/cache` (`/home/circleci/.pycontainer/cache`). CircleCI caches
+`~/.pycontainer/cache` (`/home/circleci/.pycontainer/cache`), passed explicitly
+because the helper uses a temporary home for the builder. CircleCI caches
 are immutable: a per-revision save key and branch prefix restore the newest
 available cache. Bump the `v1` prefix to reset it. Restrict cache access to
 trusted builds; it contains application layer contents, not credentials.
 Cache misses rebuild normally. No remote Docker setup is needed; the executor
 is a container, but the builder does not use a Docker daemon.
 
-The app context is the repository root and excludes `.ci-venv`. Builds target
+The app context is the repository root and excludes `.ci-venv` and `.ci`. Builds target
 `linux/amd64` with `python:3.11-slim`. Add
 `--include-deps --requirements requirements.txt` if the app needs supported
 wheel-only staging; consult [dependency staging](../../README.md#explicit-configuration)

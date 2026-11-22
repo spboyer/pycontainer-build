@@ -27,7 +27,7 @@ jobs:
             : "${REGISTRY_PASSWORD:?Set REGISTRY_PASSWORD in the registry-push context}"
             unset REGISTRY_TOKEN GITHUB_TOKEN
             . .ci-venv/bin/activate
-            python -m pycontainer.cli build --tag "$IMAGE_REPOSITORY:$CIRCLE_SHA1" --base-image python:3.11-slim --platform linux/amd64 --context . --exclude .ci-venv --push --no-progress
+            python .ci/pycontainer_ci.py build --tag "$IMAGE_REPOSITORY:$CIRCLE_SHA1" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$HOME/.pycontainer/cache" --exclude .ci-venv --exclude .ci --push --no-progress
       - save_cache:
           key: pycontainer-linux-amd64-py311-v1-{{ .Branch }}-{{ .Revision }}
           paths:

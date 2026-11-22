@@ -1,7 +1,9 @@
 # Jenkins
 
-Copy [Jenkinsfile](../../examples/ci/Jenkinsfile) into the application
-repository and create a Pipeline from SCM or trusted multibranch pipeline.
+Copy [Jenkinsfile](../../examples/ci/Jenkinsfile) and
+[pycontainer_ci.py](../../examples/ci/pycontainer_ci.py) into the application
+repository, placing the latter at `.ci/pycontainer_ci.py`. Create a Pipeline
+from SCM or trusted multibranch pipeline.
 Install the Pipeline and Credentials Binding plugins and configure agent
 labels `linux` and/or `windows`. Select `AGENT_LABEL` when starting the job.
 Both paths require Python 3.11 (`python` on PATH), pip and Git. The Windows
@@ -20,8 +22,19 @@ credential binding.
 
 Only allow trusted branches/jobs to use this credential. Do not expose it
 to fork pull requests or unreviewed Jenkinsfiles; masking does not prevent
-malicious code from reading environment variables. Use isolated agents rather
-than sharing a credential-bearing host with untrusted jobs.
+malicious code from reading environment variables. Use isolated, ephemeral
+agents rather than sharing a credential-bearing host with untrusted jobs.
+
+The helper creates a temporary Docker config scoped to the destination
+registry and removes generic credential variables from the builder process,
+preventing public base-image pulls from receiving push credentials. It rejects
+`--registry`, `--username` and `--password`; use a fully qualified tag. Other
+base registries must allow anonymous pulls. Pass `--context` and either
+`--cache-dir` or `--no-cache` explicitly so the helper can keep temporary
+credentials outside the context and cache. The builder also runs without an
+inherited Azure CLI login. The temporary config contains
+plaintext credentials and is removed on normal exit, including build failure;
+an abruptly terminated process can leave it on disk.
 
 The builder installs from immutable merged commit
 `7bdec100c773d9a51e5aae63eb0d4456894ae43f`, not PyPI; review pin updates before
@@ -31,10 +44,11 @@ declarative checkout, supplies the image tag; do not add
 populate `env.GIT_COMMIT`. Shell or installation errors fail the stage,
 and credentials are not included in cache or image paths.
 
-The default `~/.pycontainer/cache` is used (`USERPROFILE` on Windows).
+The original `~/.pycontainer/cache` is passed explicitly (`USERPROFILE` on
+Windows) because the helper uses a temporary home for the builder process.
 Persistence depends on the agent's home directory; ephemeral agents start
 with a cold cache. This example does not add a Jenkins cache plugin.
-The repository root is the app context; `.ci-venv` is explicitly excluded.
+The repository root is the app context; `.ci-venv` and `.ci` are explicitly excluded.
 For supported wheel-only dependency staging, add
 `--include-deps --requirements requirements.txt` and consult
 [dependency staging](../../README.md#explicit-configuration). The base image and build

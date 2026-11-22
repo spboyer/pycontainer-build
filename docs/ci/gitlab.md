@@ -1,7 +1,8 @@
 # GitLab CI
 
 Copy [gitlab-ci.yml](../../examples/ci/gitlab-ci.yml) to `.gitlab-ci.yml`
-in your application repository. Enable the project's container registry and
+and [pycontainer_ci.py](../../examples/ci/pycontainer_ci.py) to
+`.ci/pycontainer_ci.py` in your application repository. Enable the project's container registry and
 protect the default branch and release tags. The example runs only for push
 pipelines on that protected branch or protected tags, not merge requests.
 Use a Linux runner supporting the `python:3.11` image.
@@ -20,7 +21,19 @@ override. Keep debug tracing (`CI_DEBUG_TRACE`) disabled and do not echo
 credentials. The job token has short-lived access to this project's registry;
 cross-project pushes need separately scoped credentials. Inherited
 `REGISTRY_TOKEN` and `GITHUB_TOKEN` are cleared so they cannot override the
-job's username/password binding.
+job's username/password binding. The helper places those credentials in a
+temporary Docker config scoped to the destination registry, then removes the
+generic credential variables from the builder process. This prevents a public
+base-image pull from receiving the push credentials. It does not support
+`--registry`, `--username` or `--password`; use a fully qualified tag instead.
+Pass `--context` and either `--cache-dir` or `--no-cache` explicitly so the
+helper can keep temporary credentials outside the context and cache. Other
+registries used for base images must allow anonymous pulls. The builder also
+runs without an inherited Azure CLI login.
+
+The temporary config contains plaintext credentials and is removed when the
+helper exits normally, including on build failure. Abrupt termination can leave
+it on disk; use ephemeral runners and short-lived credentials.
 
 Branch builds push the commit SHA. Tag pipelines accept stable versions such
 as `v1.2.3` or `1.2.3` and use `--semver-tags` to also push minor and major
@@ -29,7 +42,7 @@ is created.
 
 GitLab caches only project-relative paths. The example therefore relocates
 the default `~/.pycontainer/cache` to `.pycontainer-cache` with `--cache-dir`
-and excludes both that directory and `.ci-venv` from the image. Configure a
+and excludes that directory, `.ci-venv` and `.ci` from the image. Configure a
 runner cache backend for persistence and retain GitLab's protected/unprotected
 cache separation. Cache misses rebuild normally; credentials are never cached.
 
