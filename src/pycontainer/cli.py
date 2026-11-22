@@ -4,6 +4,17 @@ from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
+from .build_args import resolve_arguments
+
+class _BuildArgumentLogFilter(logging.Filter):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def filter(self, record):
+        record.msg = self.config.redact(record.getMessage())
+        record.args = ()
+        return True
 
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
@@ -20,6 +31,7 @@ def main():
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
+    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
     b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
     b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
     b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
@@ -107,8 +119,9 @@ def main():
 
     try:
         if args.config:
-            cfg=config_from_file(Path(args.config), cli_overrides)
+            cfg=config_from_file(Path(args.config), cli_overrides, args.build_arg)
         else:
+            resolve_arguments({}, args.build_arg)
             cfg=BuildConfig(**cli_overrides)
             if 'base_image' not in cli_overrides:
                 py_ver=detect_python_version(cfg.context_dir)
@@ -121,20 +134,32 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    builder=ImageBuilder(cfg)
-    out=builder.build()
-    print("Built:", out)
-    
-    if args.push:
-        password=args.password
-        if args.username and not password:
-            password=os.getenv('REGISTRY_PASSWORD')
-        builder.push(
-            registry_url=args.registry,
-            username=args.username,
-            password=password,
-            show_progress=not args.no_progress,
-        )
+    log_filter = _BuildArgumentLogFilter(cfg)
+    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    for handler in handlers:
+        handler.addFilter(log_filter)
+    try:
+        builder=ImageBuilder(cfg)
+        out=builder.build()
+        print("Built:", cfg.redact(str(out)))
+
+        if args.push:
+            password=args.password
+            if args.username and not password:
+                password=os.getenv('REGISTRY_PASSWORD')
+            builder.push(
+                registry_url=args.registry,
+                username=args.username,
+                password=password,
+                show_progress=not args.no_progress,
+            )
+    except (OSError, ValueError, RuntimeError) as exc:
+        if not cfg.build_args:
+            raise
+        parser.error(cfg.redact(str(exc)))
+    finally:
+        for handler in handlers:
+            handler.removeFilter(log_filter)
 
 if __name__=="__main__":
     main()

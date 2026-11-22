@@ -92,6 +92,19 @@ def test_rendered_toml_round_trips_and_validates():
     assert set(data) <= {f.name for f in fields(BuildConfig)}
 
 
+def test_import_preserves_runtime_dollars_when_loading_build_config(tmp_path):
+    from pycontainer.config_loader import config_from_file
+
+    result = import_dockerfile(
+        'FROM python:3.12\nENV PORT=8000\nCMD ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]\n'
+    )
+    path = tmp_path / "pyproject.toml"
+    path.write_text(render_toml(result.config))
+    config = config_from_file(path)
+    assert config.cmd == ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]
+    assert config.env == {"PORT": "8000"}
+
+
 def test_merge_replaces_only_pycontainer_tables():
     existing = '[project]\nname = "x"\n\n[tool.pycontainer]\ntag = "old"\n\n[tool.pycontainer.env]\nA = "1"\n\n[tool.ruff]\nline-length = 99\n'
     merged = merge_into_pyproject(existing, render_toml({"workdir": "/w"}))

@@ -246,9 +246,12 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _print(self, message: str):
+        print(self.config.redact(message))
+
     def build(self):
         if self.dry_run:
-            logger.info("DRY RUN: Would build image %s", self.config.tag)
+            logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
             self._show_build_plan()
             return self.config.tag
 
@@ -361,7 +364,7 @@ class ImageBuilder:
                 ),
                 package_inventory=getattr(self, "_staged_packages", []),
             )
-            logger.info(f"✓ SBOM saved to {sbom_path}")
+            logger.info(self.config.redact(f"✓ SBOM saved to {sbom_path}"))
         
         return self.config.tag
     
@@ -382,7 +385,7 @@ class ImageBuilder:
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        self._print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
             expected_digest=reference if reference.startswith("sha256:") else None,
@@ -526,7 +529,7 @@ class ImageBuilder:
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         
-        if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
+        if show_progress: self._print(f"Pushing to {registry}/{repo}:{tag}")
         
         for i, layer in enumerate(self.layers, 1):
             if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
@@ -543,26 +546,26 @@ class ImageBuilder:
         manifest_data=manifest_path.read_bytes()
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
-            if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
+            if show_progress: self._print(f"✓ Pushed {registry}/{repo}:{push_tag}")
         self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
 
         return f"{registry}/{repo}:{tag}"
     
     def _show_build_plan(self):
         """Display build plan for dry-run mode."""
-        print(f"Build Plan for {self.config.tag}:")
+        self._print(f"Build Plan for {self.config.tag}:")
         if len(self.config.all_tags())>1:
-            print(f"  Tags: {', '.join(self.config.all_tags())}")
-        print(f"  Base Image: {self.config.base_image}")
-        print(f"  Context: {self.config.context_dir}")
-        print(f"  Working Dir: {self.config.workdir}")
-        print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
+            self._print(f"  Tags: {', '.join(self.config.all_tags())}")
+        self._print(f"  Base Image: {self.config.base_image}")
+        self._print(f"  Context: {self.config.context_dir}")
+        self._print(f"  Working Dir: {self.config.workdir}")
+        self._print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
         if self.config.exposed_ports:
             print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:
-            print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
+            self._print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
-            print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+            self._print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
@@ -693,6 +696,7 @@ class ImageBuilder:
                 files,
                 workdir=self.config.workdir,
                 reproducible=self.config.reproducible,
+                namespace=self.config.cache_identity(),
             )
             if cached:
                 digest, cache_path=cached
@@ -749,6 +753,8 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    namespace=self.config.cache_identity(),
+                    record_source_files=not bool(self.config.build_args),
                 )
 
             return OCILayer(

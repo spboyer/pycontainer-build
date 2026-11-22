@@ -3,8 +3,9 @@ import types
 import tomllib
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig
+from .build_args import resolve_arguments
 
 
 BUILD_TABLE = "[build]"
@@ -103,7 +104,7 @@ def _format_type(expected_type: Any) -> str:
 
 
 def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
-    valid_fields = {field.name for field in fields(BuildConfig)}
+    valid_fields = {field.name for field in fields(BuildConfig) if field.init}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))
@@ -144,11 +145,16 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
     return merged
 
 
-def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
+def config_from_file(
+    path: Path,
+    cli_overrides: Optional[Dict] = None,
+    build_arg_overrides: Optional[List[str]] = None,
+) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
     table, file_config = _load_config_table(path)
     file_config = _normalize_config_keys(file_config, f"Config file {table}")
     _validate_config(file_config, table)
     config = merge_configs(file_config, cli_overrides or {})
     _validate_config(config)
+    config["build_args"] = resolve_arguments(config.get("build_args", {}), build_arg_overrides)
     return BuildConfig(**config)

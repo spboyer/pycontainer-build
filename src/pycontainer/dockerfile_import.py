@@ -329,7 +329,8 @@ def _toml_value(value: object) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return json.dumps(str(value), ensure_ascii=False)
+    # Imported Dockerfile values are already resolved; preserve runtime dollars.
+    return json.dumps(str(value).replace("$", "$$"), ensure_ascii=False)
 
 
 def _toml_key(key: str) -> str:

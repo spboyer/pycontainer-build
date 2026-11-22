@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, resolve_arguments
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
@@ -35,8 +36,19 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    build_args: Dict[str, BuildArgument] = field(default_factory=dict, repr=False)
+    _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
+        self._resolved_build_args = resolve_arguments(self.build_args)
+        for name in EXPANDABLE_FIELDS:
+            setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
+        try:
+            self._validate()
+        except ValueError as exc:
+            raise ValueError(self.redact(str(exc))) from None
+
+    def _validate(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
@@ -52,6 +64,36 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def redact(self, message: str) -> str:
+        """Keep build input values out of diagnostic output."""
+        import json
+        from urllib.parse import quote
+
+        representations = set()
+        for value in self._resolved_build_args.values():
+            if value:
+                representations.update((
+                    value, repr(value)[1:-1],
+                    json.dumps(value, ensure_ascii=False)[1:-1],
+                    json.dumps(value)[1:-1], quote(value, safe=""),
+                ))
+        for value in sorted(representations, key=len, reverse=True):
+            message = message.replace(value, "<redacted>")
+        return message
+
+    def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
+        import hashlib
+        import json
+
+        storage_fields = {"context_dir", "output_dir", "cache_dir"}
+        identity = {
+            name: getattr(self, name)
+            for name in EXPANDABLE_FIELDS if name not in storage_fields
+        }
+        identity["backend"] = backend
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""
