@@ -223,7 +223,7 @@ jobs:
                | .process.capabilities.permitted += $caps
                | .mounts += [{"destination": "/ov", "type": "bind", "source": $ov, "options": ["rbind", "rw"]}]' \
               --arg script "$script" --arg ov "$ov" \
-              --argjson caps '["CAP_SYS_ADMIN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_CHOWN"]' || { echo "spec failed"; return 1; }
+              --argjson caps '["CAP_SYS_ADMIN", "CAP_DAC_OVERRIDE"]' || { echo "spec failed"; return 1; }
             timeout 30 crun --root "$tmp/state-ov" run --bundle "$tmp/ovb" probe-ov </dev/null
             echo "crun run exit $?"
             crun --root "$tmp/state-ov" delete --force probe-ov >/dev/null 2>&1
@@ -236,6 +236,11 @@ jobs:
 
           crun_cgroup_limits() {
             command -v crun >/dev/null && command -v jq >/dev/null || { echo "crun or jq not found; skipped"; return 0; }
+            make_bundle crun "$tmp/nobus" '.process.args = ["/usr/bin/true"] | .linux.resources = {"pids": {"limit": 32}}' \
+              || { echo "spec failed"; return 1; }
+            env -u DBUS_SESSION_BUS_ADDRESS timeout 30 crun --cgroup-manager=systemd --root "$tmp/state-nobus" run --bundle "$tmp/nobus" probe-nobus </dev/null
+            echo "systemd cgroup manager without DBUS_SESSION_BUS_ADDRESS: exit $?"
+            crun --root "$tmp/state-nobus" delete --force probe-nobus >/dev/null 2>&1
             export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
             local st="$tmp/state-cg"
             make_bundle crun "$tmp/cg" \
@@ -258,6 +263,7 @@ jobs:
               || { echo "spec failed"; return 1; }
             timeout 60 crun --cgroup-manager=systemd --root "$tmp/state-oom" run --bundle "$tmp/oom" probe-oom </dev/null
             echo "256 MiB allocation under a 64 MiB limit: exit $? (137 means killed by the limit)"
+            echo "kernel OOM log: $(journalctl -k --since "-2 min" --no-pager 2>&1 | grep -iE 'oom-kill|Memory cgroup out of memory' | tail -n 2)"
             crun --root "$tmp/state-oom" delete --force probe-oom >/dev/null 2>&1
           }
 
