@@ -300,11 +300,14 @@ def _measure_worker(spec):
 
 
 def _invoke_worker(spec):
+    environment = {name: value for name, value in os.environ.items() if not name.upper().startswith("PIP_")}
+    environment["PIP_CONFIG_FILE"] = os.devnull
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker", json.dumps(spec)],
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
     return json.loads(result.stdout)
 
@@ -619,7 +622,7 @@ def run_benchmarks(args):
                 "python_tracemalloc_peak_bytes": "Python-tracked peak allocations during builder construction and measured work.",
                 "output_bytes": "App-layer tar bytes for app-only; total local OCI output file bytes for full builds.",
                 "cache_hits": "App-layer cache hits observed during the measured build.",
-                "dependency_cache_hits": "Verified dependency-layer cache entries found during the measured build; plain requirements also read ambient pip configuration once per build.",
+                "dependency_cache_hits": "Verified dependency-layer cache entries found during the measured build; worker PIP_* settings are cleared and pip config files disabled. Plain requirements still read pip configuration once per build.",
                 "registry_transfer": "Per-sample loopback synthetic registry upload/download; server storage and fixture generation are excluded from the measured worker process. These are not external registry throughput results.",
                 "timing_gates": "None; compare trends only across matching environments and fixture parameters.",
             },

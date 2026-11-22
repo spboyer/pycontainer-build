@@ -7,7 +7,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
+def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, monkeypatch):
+    pip_config = tmp_path / "pip.conf"
+    pip_config.write_text("[install]\nno-deps = true\n", encoding="utf-8")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(pip_config))
+    monkeypatch.setenv("PIP_NO_DEPS", "1")
     output = tmp_path / "benchmark.json"
     subprocess.run(
         [
