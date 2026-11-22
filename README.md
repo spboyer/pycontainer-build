@@ -398,11 +398,12 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   member sizes are checked before any selected image blobs are staged.
 - Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
   are not supported; extract or decompress them first.
-- Dependency staging recognizes official Python images by name. For OCI layouts
-  the name comes from the `io.containerd.image.name` or ref-name annotation
-  (often only a tag such as `3.11-slim`), so such images need
-  `PYTHON_IMPLEMENTATION`, `PYTHON_VERSION`, and `PYTHON_LIBC` in their config
-  for `--include-deps`.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
