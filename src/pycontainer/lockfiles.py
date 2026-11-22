@@ -274,6 +274,12 @@ def _index_url(url: str, source: str) -> Optional[str]:
             f"Package index URL for {source} contains literal credentials or query values; use "
             "${VARIABLE} placeholders, netrc or keyring instead."
         )
+    location = parts.netloc.rsplit("@", 1)[-1] + parts.path
+    if "$" in location or "%24" in location.lower():
+        raise LockfileError(
+            f"Package index URL for {source} uses a placeholder in its host or path; only "
+            "credentials and query values may be ${VARIABLE} placeholders."
+        )
     normalized = url.rstrip("/")
     return None if normalized.lower() in _PYPI_INDEXES else normalized
 

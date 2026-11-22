@@ -429,6 +429,8 @@ def test_index_credentials_must_be_placeholders(tmp_path):
     [
         ("https://example.com/simple?token=hunter2", "literal credentials or query"),
         ("https://example.com/simple\n-r /outside/requirements.txt", "control characters"),
+        ("https://${INDEX_HOST}/simple", "placeholder in its host or path"),
+        ("https://example.com/${INDEX_PATH}", "placeholder in its host or path"),
     ],
 )
 def test_index_urls_reject_query_secrets_and_injected_directives(tmp_path, registry, message):

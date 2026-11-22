@@ -394,8 +394,9 @@ only with a single effective index (PyPI or one source named `pypi`), and
 relock against the mirror so the lock records it. The recorded index is
 trusted for the files its pages link to (PyPI serves them from
 files.pythonhosted.org), and hashes verify the bytes. Index credentials must
-be `${VARIABLE}` placeholders (expanded from the environment), netrc or
-keyring, never literal secrets; proxy and CA bundle variables such as
+be `${VARIABLE}` placeholders in the URL's credentials or query values (never
+its host or path, which fix the source), netrc or keyring, never literal
+secrets; proxy and CA bundle variables such as
 `HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
 normal pip behavior, including your pip configuration.
 
