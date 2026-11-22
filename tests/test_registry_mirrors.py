@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import socket
+import ssl
 import sys
 import tarfile
 import threading
@@ -143,9 +144,11 @@ def _handler(state):
 
 
 @contextmanager
-def _serve():
+def _serve(tls_context=None):
     state = _Registry()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(state))
+    if tls_context is not None:
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -212,6 +215,43 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
     assert [path for _, path, _ in mir.requests][0] == "/v2/team/base/manifests/1"
     assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
     assert f"Served by: {mirror}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("trust_mirror", [True, False])
+def test_https_mirror_uses_configured_ca_or_falls_back(
+    tmp_path, mirror_auth, trust_mirror
+):
+    trustme = pytest.importorskip("trustme")
+    ca = trustme.CA()
+    server_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ca.issue_cert("127.0.0.1").configure_cert(server_context)
+    ca_file = tmp_path / "mirror-ca.pem"
+    ca.cert_pem.write_to_path(str(ca_file))
+    (tmp_path / "app.py").write_text("print('hi')\n")
+
+    with _serve() as (upstream, up), _serve(server_context) as (mirror, mir):
+        up.serve_image()
+        mir.serve_image()
+        builder = ImageBuilder(BuildConfig(
+            context_dir=str(tmp_path),
+            output_dir=str(tmp_path / "out"),
+            base_image=f"{upstream}/team/base:1",
+            insecure_registries=[upstream],
+            registry_ca_file=str(ca_file) if trust_mirror else None,
+            registry_mirrors={upstream: [mirror]},
+            use_cache=False,
+        ))
+        layers, config = _pull(builder, tmp_path)
+
+    assert config["os"] == "linux" and len(layers) == 1
+    if trust_mirror:
+        assert mir.requests
+        assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
+        assert up.requests == []
+    else:
+        assert mir.requests == []
+        assert up.requests
+        assert {auth for _, _, auth in up.requests} == {UPSTREAM_HEADER}
 
 
 def test_fallback_order_connection_404_5xx_then_upstream(tmp_path, mirror_auth, caplog):
