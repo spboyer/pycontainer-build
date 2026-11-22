@@ -472,6 +472,23 @@ dependency-resolution and runtime checks it did not perform. A passing
 validation does not prove a build will succeed. See
 [configuration validation](docs/validate-config.md).
 
+### Validating images offline
+
+`pycontainer validate image` verifies an existing OCI layout and reports
+best-practice findings without a registry or container daemon. Use
+`pycontainer build --validate --push` to run the same checks before publishing:
+
+```bash
+pycontainer validate image --output dist/image --format json
+pycontainer validate image --tag myapp:latest --platform linux/arm64
+pycontainer build --config pycontainer.toml --validate --push
+```
+
+Validation exits 0 below the requested severity threshold, 1 for findings at or
+above it, and 2 for usage, layout or integrity errors. Base-image provenance
+is reported as unknown, not inferred from labels. See the
+[image validation rules, suppression and limits](docs/validation.md).
+
 ---
 
 ## 🗺️ Roadmap

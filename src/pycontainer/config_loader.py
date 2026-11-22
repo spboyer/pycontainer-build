@@ -122,6 +122,22 @@ def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
 
     type_hints = get_type_hints(BuildConfig)
     for key, value in config.items():
+        if key == "validate":
+            nested_table = f"{table[:-1]}.validate]"
+            if not isinstance(value, dict):
+                raise ValueError(f"Invalid value for {nested_table}: expected a table.")
+            unknown = sorted(set(value) - {"ignore"})
+            if unknown:
+                raise ValueError(f"Unknown {nested_table} setting(s): {', '.join(unknown)}.")
+            ignores = value.get("ignore", [])
+            if not isinstance(ignores, list) or any(not isinstance(item, str) for item in ignores):
+                raise ValueError(f"Invalid value for {nested_table}.ignore: expected list[str].")
+            from .image_validation import validate_ignores
+            try:
+                validate_ignores(ignores)
+            except ValueError as exc:
+                raise ValueError(f"{nested_table}.ignore: {exc}") from None
+            continue
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):
             raise ValueError(

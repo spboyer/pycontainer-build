@@ -11,6 +11,8 @@ daemon without discussing the trade-off first.
 - `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
 - `effective_config.py`: pure resolver and semantic checks shared by `build`
   and the offline `validate config` command.
+- `image_validation.py`: offline all-reachable OCI descriptor verification and
+  image-config linting; base-image provenance remains unknown.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
