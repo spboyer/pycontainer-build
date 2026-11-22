@@ -149,8 +149,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -383,6 +383,8 @@ inside the base image.
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
 - Invalidates on file content changes (mtime + size checks)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
 
 ### Python API

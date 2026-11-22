@@ -1,10 +1,12 @@
 """Content-addressed application layer cache."""
 import hashlib
+import io
 import json
 import logging
 import os
 import shutil
 import stat
+import tarfile
 import tempfile
 import time
 from contextlib import contextmanager
@@ -17,7 +19,36 @@ from .fs_utils import file_lock
 
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
-_CACHE_KEY_VERSION = 2
+_CACHE_KEY_VERSION = 3
+
+
+def app_layer_arcname(workdir: str, relative_path: Path) -> str:
+    return f"{workdir.lstrip('/')}/{Path(relative_path).as_posix()}"
+
+
+def ordered_app_files(
+    files: List[Tuple[Path, Path]], reproducible: bool
+) -> List[Tuple[Path, Path]]:
+    if reproducible:
+        return sorted(files, key=lambda item: Path(item[1]).as_posix())
+    return list(files)
+
+
+def emitted_hardlinks(
+    ordered_files: List[Tuple[Path, Path]], members: List[tarfile.TarInfo]
+) -> Dict[str, str]:
+    """Map context-relative hardlink members to their context-relative targets."""
+    if len(ordered_files) != len(members):
+        raise RuntimeError("Application layer members do not match its source files")
+    relative_by_arcname = {
+        member.name: Path(relative).as_posix()
+        for (_, relative), member in zip(ordered_files, members)
+    }
+    return {
+        Path(relative).as_posix(): relative_by_arcname[member.linkname]
+        for (_, relative), member in zip(ordered_files, members)
+        if member.islnk()
+    }
 
 
 class CacheIndexError(RuntimeError):
@@ -91,18 +122,36 @@ class LayerCache:
     def _relative_path(path: Path) -> str:
         return Path(path).as_posix()
 
+    @staticmethod
+    def _probe_hardlinks(
+        ordered_files: List[Tuple[Path, Path]], workdir: str
+    ) -> Dict[str, str]:
+        """Predict the hardlinks tarfile emits for these files, in emission order."""
+        candidates = []
+        for abs_path, rel_path in ordered_files:
+            metadata = Path(abs_path).lstat()
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                candidates.append((abs_path, rel_path))
+        if len(candidates) < 2:
+            return {}
+        with tarfile.open(fileobj=io.BytesIO(), mode="w") as probe:
+            members = [
+                probe.gettarinfo(abs_path, arcname=app_layer_arcname(workdir, rel_path))
+                for abs_path, rel_path in candidates
+            ]
+        return emitted_hardlinks(candidates, members)
+
     def _compute_files_digest(
         self,
         files: List[Tuple[Path, Path]],
         workdir: str = "/app",
         reproducible: bool = True,
+        hardlinks: Optional[Dict[str, str]] = None,
     ) -> str:
         file_records = []
-        ordered_files = (
-            sorted(files, key=lambda item: self._relative_path(item[1]))
-            if reproducible
-            else files
-        )
+        ordered_files = ordered_app_files(files, reproducible)
+        if hardlinks is None:
+            hardlinks = self._probe_hardlinks(ordered_files, workdir)
         for abs_path, rel_path in ordered_files:
             abs_path = Path(abs_path)
             rel_name = self._relative_path(rel_path)
@@ -111,6 +160,7 @@ class LayerCache:
                 "path": rel_name,
                 "mode": stat.S_IMODE(metadata.st_mode),
                 "size": metadata.st_size,
+                "hardlink": hardlinks.get(rel_name),
             }
 
             if stat.S_ISLNK(metadata.st_mode):
@@ -284,6 +334,7 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        hardlinks: Optional[Dict[str, str]] = None,
     ) -> Path:
         layer_path = Path(layer_path)
         if not self.enabled:
@@ -295,7 +346,7 @@ class LayerCache:
             raise CacheIntegrityError(
                 f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
             )
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = self._compute_files_digest(files, workdir, reproducible, hardlinks)
         blob_path = self._blob_path(digest)
 
         with self._index_lock():
