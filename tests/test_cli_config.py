@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from pycontainer import cli
+from pycontainer import cli, effective_config
 
 
 def _run_cli(monkeypatch, argv):
@@ -29,6 +29,7 @@ def _capture_config(monkeypatch, argv):
 
 def test_cli_preserves_config_values_when_options_are_omitted(tmp_path, monkeypatch):
     context = tmp_path / "configured-context"
+    context.mkdir()
     context_value = context.as_posix()
     config_path = tmp_path / "pycontainer.toml"
     logging_levels = []
@@ -65,6 +66,8 @@ generate-sbom = true
 
 
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "from-cli").mkdir()
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         """
@@ -146,7 +149,7 @@ exclude-defaults = true
 
 
 def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
-    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.12")
+    monkeypatch.setattr(effective_config, "detect_python_version", lambda context: "3.12")
 
     config = _capture_config(monkeypatch, ["build"])
 
@@ -203,7 +206,7 @@ def test_cli_forwards_basic_credentials_without_logging_them(monkeypatch, capsys
             pushed.append(kwargs)
 
     monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
-    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.11")
+    monkeypatch.setattr(effective_config, "detect_python_version", lambda context: "3.11")
     _run_cli(
         monkeypatch,
         [

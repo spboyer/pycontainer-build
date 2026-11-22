@@ -144,11 +144,17 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
     return merged
 
 
-def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
-    """Create a validated BuildConfig from file values and explicit CLI overrides."""
+def load_validated_file_config(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Return the table label and normalized, type-checked settings from path."""
     table, file_config = _load_config_table(path)
     file_config = _normalize_config_keys(file_config, f"Config file {table}")
     _validate_config(file_config, table)
+    return table, file_config
+
+
+def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
+    """Create a validated BuildConfig from file values and explicit CLI overrides."""
+    _, file_config = load_validated_file_config(path)
     config = merge_configs(file_config, cli_overrides or {})
     _validate_config(config)
     return BuildConfig(**config)
