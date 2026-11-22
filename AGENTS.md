@@ -15,6 +15,10 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `system_packages.py`: system package declaration, inference and base-image
+  verification (warning only). `system_install.py`: fail-closed groundwork for
+  #31; it executes no package manager and has no callers until the #22
+  isolated executor exists.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.

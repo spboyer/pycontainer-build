@@ -84,5 +84,7 @@ show the same results on both architectures: Ubuntu 24.04.5, kernel 7.0
 
 - Alpine has no official package snapshot service, so pinned apk versions can
   disappear (#31).
-- Whether `apk add --simulate` output yields deterministic download URLs still
-  needs a fixture (#31).
+- Whether `apk add --simulate` output yields deterministic download URLs: it
+  does not list URLs, but `apk fetch --simulate --recursive --url` does,
+  offline; see
+  [the installation design](2026-11-22-system-package-installation.md) (#31).

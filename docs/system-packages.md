@@ -67,3 +67,17 @@ mapped. Detection needs a recognized base distro and is skipped otherwise.
   `Provides` is reported missing.
 - If the base distro cannot be determined, requirements are listed as
   unverified in a warning.
+
+## Planned installation (not available)
+
+Installing packages with the distro's own `apt` or `apk` is planned in #31.
+It must run inside the opt-in isolated execution backend from #22, never on
+the host, and that backend does not exist yet. No configuration option enables
+installation, and detected packages will never be installed implicitly.
+
+`pycontainer.system_install` contains only fail-closed groundwork that runs no
+package manager: checks for apt settings that weaken signature verification,
+parsers for offline resolution output, and a bounded HTTPS fetch limited to
+allowed hosts. See the
+[installation design](plans/2026-11-22-system-package-installation.md) for
+the planned flow, the trust boundaries and the remaining blockers.
