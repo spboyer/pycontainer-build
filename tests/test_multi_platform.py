@@ -285,6 +285,25 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         assert not any("native_" in name and arch not in name for name in names)
 
 
+def test_multi_platform_rejects_virtualenv_staging_before_publication(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "demo.py").write_text("X = 1\n")
+    staged = []
+    monkeypatch.setattr(builder_module, "stage_virtualenv", lambda *a, **k: staged.append(a))
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
+
+    with pytest.raises(ValueError, match="issues/180"):
+        builder.build()
+    assert staged == []
+    assert (out / "index.json").read_text() == "previous"
+    assert not (out / "refs" / "tags" / "v1").exists()
+
+
 def test_missing_platform_in_base_fails_without_replacing_existing_tags(tmp_path, monkeypatch):
     out = tmp_path / "out"
     (out / "refs" / "tags").mkdir(parents=True)

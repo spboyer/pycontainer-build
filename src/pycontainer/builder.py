@@ -217,6 +217,7 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
+VIRTUALENV_TARGET_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/180"
 
 
 @dataclass
@@ -938,6 +939,14 @@ class ImageBuilder:
             raise FileNotFoundError(
                 "Dependency staging was requested, but no supported virtualenv "
                 f"site-packages or {self.config.requirements_file!r} was found."
+            )
+        if not is_requirements and len(self.config.target_platforms()) > 1:
+            raise ValueError(
+                "Multi-platform builds cannot stage dependencies from a copied "
+                "virtualenv: its packages were resolved for the host, so "
+                "target-specific dependencies may be missing. Provide "
+                f"{self.config.requirements_file!r} for per-platform wheel "
+                f"resolution, or build one platform at a time. See {VIRTUALENV_TARGET_FOLLOW_UP}."
             )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
