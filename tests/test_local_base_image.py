@@ -592,3 +592,15 @@ def test_docker_archive_rejects_oversized_extended_header(tmp_path, offline):
     with pytest.raises(LocalImageError, match="extended header"):
         build(tmp_path, f"docker-archive:{archive}")
 
+
+def test_docker_archive_unspecified_target_exposes_platform(tmp_path):
+    from pycontainer.local_image import open_local_image_source
+
+    archive = tmp_path / "arm.tar"
+    docker_archive(archive, [(["base:arm"], "arm64", [layer_tar({"x": b"x"})])])
+    reference = parse_local_image_reference(f"docker-archive:{archive}")
+    layers = tmp_path / "layers"
+    with open_local_image_source(reference, layers, tmp_path / "out", None, None) as source:
+        assert source.platform == {"os": "linux", "architecture": "arm64"}
+    with pytest.raises(LocalImageError, match="does not match requested linux/amd64"):
+        open_local_image_source(reference, layers, tmp_path / "out", "linux", "amd64")

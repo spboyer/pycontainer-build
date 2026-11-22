@@ -132,11 +132,15 @@ def open_local_image_source(
     reference: LocalImageReference,
     layers_dir: Path,
     output_dir: Path,
-    os_name: str,
-    arch: str,
+    os_name: Optional[str],
+    arch: Optional[str],
     variant: Optional[str] = None,
 ):
-    """Open a local base image source after rejecting overlap with the output."""
+    """Open a local base image source after rejecting overlap with the output.
+
+    ``os_name=None`` and ``arch=None`` skip the Docker archive's early platform
+    check for inspection; callers must validate ``source.platform`` themselves.
+    """
     if _paths_overlap(reference.path, Path(output_dir)):
         raise LocalImageError(
             f"Local base image {reference.path} overlaps the build output "
@@ -605,14 +609,15 @@ class DockerArchiveSource:
         self,
         reference: LocalImageReference,
         layers_dir: Path,
-        os_name: str,
-        arch: str,
+        os_name: Optional[str],
+        arch: Optional[str],
         variant: Optional[str] = None,
     ):
         self.path = reference.path
         self.reference = reference
         self.layers_dir = layers_dir
         self.source_name = str(reference.path)
+        self.platform: Optional[Dict[str, str]] = None
         self._published: Dict[str, int] = {}
         if not self.path.is_file():
             raise LocalImageError(f"Docker archive {self.path} is not a file.")
@@ -826,7 +831,18 @@ class DockerArchiveSource:
             "layers": layers,
         }
 
-    def _check_platform(self, config: Dict, os_name: str, arch: str, variant: Optional[str]) -> None:
+    def _check_platform(self, config: Dict, os_name: Optional[str], arch: Optional[str], variant: Optional[str]) -> None:
+        self.platform = {
+            key: value
+            for key, value in (
+                ("os", config.get("os")),
+                ("architecture", config.get("architecture")),
+                ("variant", config.get("variant")),
+            )
+            if isinstance(value, str) and value
+        }
+        if os_name is None and arch is None:
+            return
         actual = (config.get("os"), config.get("architecture"))
         if actual != (os_name, arch) or (
             variant is not None and config.get("variant") != variant
