@@ -348,15 +348,18 @@ pycontainer build \
   glibc, or `musllinux_1_N` down to `musllinux_1_1` for musl. Official
   `python` tag-only registry pulls derive libc from the resolved tag (`alpine`
   tags use musl, others glibc). A codename token in such a tag raises the
-  libc version to the lowest one its release ever shipped:
+  libc version to the lowest one any official image under that tag can carry:
 
-  | Tag codename | Target libc | Source |
-  | --- | --- | --- |
-  | `jessie` / `stretch` / `buster` | glibc 2.19 / 2.24 / 2.28 | [sources.debian.org glibc](https://sources.debian.org/src/glibc/) |
-  | `bullseye` / `bookworm` | glibc 2.31 / 2.36 | same |
-  | `trixie` | glibc 2.40 (2.40-5 was published in trixie before 2.41) | same |
-  | `alpine3.0`-`alpine3.12` | musl 1.1 | [aports `main/musl/APKBUILD`](https://git.alpinelinux.org/aports/tree/main/musl/APKBUILD) on each `3.N-stable` branch |
-  | `alpine3.13`-`alpine3.23` | musl 1.2 | same |
+  | Tag codename | Target libc |
+  | --- | --- |
+  | `jessie` / `stretch` / `buster` | glibc 2.19 / 2.24 / 2.28 |
+  | `bullseye` / `bookworm` / `trixie` | glibc 2.31 / 2.36 / 2.41 |
+  | `alpine3.0`-`alpine3.12` | musl 1.1 |
+  | `alpine3.13`-`alpine3.24` | musl 1.2 |
+
+  Each row is pinned to immutable sources (content-addressed
+  snapshot.debian.org files, `docker-library/python` and Alpine `aports`
+  commit SHAs) in [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
 
   Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`, and
   unmapped codenames, keep the conservative `manylinux2014` or `musllinux_1_2`

@@ -34,16 +34,17 @@ _FLOOR_MUSL_MINOR = 2
 _LIBC_PATTERN = re.compile(r"(glibc)-2\.([1-9]\d?)|(musl)-1\.([1-9]\d?)")
 _ALPINE_TOKEN = re.compile(r"alpine3\.\d+")
 _SUPPORTED_LIBC_TEXT = "glibc-2.N (N 17-99) and musl-1.N (N 1-99)"
-# Lowest libc minor published for each release; see README "Dependency staging".
+# Lowest libc minor any official image with the codename tag can carry, pinned
+# to immutable sources in docs/libc-codename-mappings.md.
 _DEBIAN_GLIBC_MINOR = {
     "jessie": 19,
     "stretch": 24,
     "buster": 28,
     "bullseye": 31,
     "bookworm": 36,
-    "trixie": 40,
+    "trixie": 41,
 }
-_ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(24)}
+_ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
