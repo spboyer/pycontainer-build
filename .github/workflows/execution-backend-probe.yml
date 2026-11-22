@@ -1,0 +1,208 @@
+name: Execution backend host probe
+
+# Observational probe for the isolated execution backend design (#22, #31, #63).
+# It records host prerequisites on GitHub-hosted runners and never fails on a
+# missing prerequisite. It changes no host settings and installs nothing.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/execution-backend-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Host probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      PROBE_OS: ${{ matrix.os }}
+    steps:
+      - name: Record execution backend prerequisites
+        run: |
+          set +e
+          set +o pipefail
+          out="$RUNNER_TEMP/host-probe-$PROBE_OS.md"
+          tmp="$(mktemp -d "$RUNNER_TEMP/probe.XXXXXX")"
+
+          probe() {
+            local label="$1"; shift
+            printf '#### %s\n\n```text\n' "$label" >>"$out"
+            "$@" >>"$out" 2>&1
+            local rc=$?
+            printf '[exit %s]\n```\n\n' "$rc" >>"$out"
+          }
+
+          host_info() {
+            uname -srvm
+            . /etc/os-release && echo "$PRETTY_NAME"
+            echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+            id
+          }
+
+          apparmor_state() {
+            echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>&1)"
+            for f in /proc/sys/kernel/apparmor_restrict_unprivileged_userns \
+                     /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined \
+                     /proc/sys/kernel/unprivileged_userns_clone \
+                     /proc/sys/user/max_user_namespaces; do
+              echo "$f = $(cat "$f" 2>&1)"
+            done
+            echo "profiles:"
+            ls /etc/apparmor.d | grep -Ei '^(crun|runc|runsc|bwrap|unshare|podman|buildah|slirp4netns|pasta|passt|unprivileged_userns)$' \
+              || echo "no matching profiles"
+          }
+
+          userns_single() {
+            unshare --user --map-root-user sh -c '
+              id; cat /proc/self/uid_map
+              echo "apparmor label: $(cat /proc/self/attr/apparmor/current 2>/dev/null || cat /proc/self/attr/current)"
+              grep CapEff /proc/self/status'
+          }
+
+          userns_mount() {
+            mkdir -p "$tmp/m"
+            unshare --user --map-root-user --mount sh -c 'mount -t tmpfs probe "$1" && echo tmpfs-mount-ok' sh "$tmp/m"
+          }
+
+          overlay_userxattr() {
+            mkdir -p "$tmp/ov/l/d" "$tmp/ov/u" "$tmp/ov/w" "$tmp/ov/m"
+            echo base >"$tmp/ov/l/f"
+            unshare --user --map-root-user --mount sh -c '
+              mount -t overlay overlay -o "lowerdir=$1/l,upperdir=$1/u,workdir=$1/w,userxattr" "$1/m" || exit 1
+              echo overlay-userxattr-ok
+              rm "$1/m/f" && rm -r "$1/m/d" && mkdir "$1/m/d" && echo whiteout-and-opaque-ok
+              ls -la "$1/u"
+              getfattr -d -m - "$1/u/f" "$1/u/d" 2>&1' sh "$tmp/ov"
+          }
+
+          userns_multi() {
+            unshare --user --map-auto sh -c 'echo uid_map:; cat /proc/self/uid_map; echo gid_map:; cat /proc/self/gid_map'
+          }
+
+          subids() {
+            local u; u="$(id -un)"
+            grep -E "^(${u}|$(id -u)):" /etc/subuid /etc/subgid || echo "no subuid/subgid entries for ${u}"
+            wc -l /etc/subuid /etc/subgid
+            for b in newuidmap newgidmap getsubids; do
+              p="$(command -v "$b")" && ls -l "$p" || echo "$b: not found"
+            done
+            getcap /usr/bin/newuidmap /usr/bin/newgidmap 2>&1
+          }
+
+          cgroup_self() {
+            echo "fs: $(stat -fc %T /sys/fs/cgroup)"
+            echo "root controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+            echo "self: $(cat /proc/self/cgroup)"
+            local cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -n1)"
+            ls -ld "$cg"
+            echo "own controllers: $(cat "$cg/cgroup.controllers")"
+            echo "own subtree_control: $(cat "$cg/cgroup.subtree_control")"
+            if [ -w "$cg/cgroup.procs" ]; then echo "own cgroup.procs writable"; else echo "own cgroup.procs not writable"; fi
+          }
+
+          cgroup_user_slice() {
+            local u; u="$(id -u)"
+            local p="/sys/fs/cgroup/user.slice/user-$u.slice/user@$u.service"
+            ls -ld "$p"
+            echo "user@ controllers: $(cat "$p/cgroup.controllers" 2>&1)"
+            echo "user@ active: $(systemctl is-active "user@$u.service" 2>&1)"
+            loginctl show-user "$u" -p State -p Linger
+            systemctl show "user@$u.service" -p Delegate -p DelegateControllers
+            ls /etc/systemd/system/user@.service.d/ 2>&1
+            echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
+          }
+
+          cgroup_transient_scope() {
+            timeout 20 systemd-run --user --scope --quiet -p MemoryMax=64M -p TasksMax=32 \
+              sh -c 'cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$cg"; cat "$cg/memory.max" "$cg/pids.max"'
+          }
+
+          binfmt_handlers() {
+            ls /proc/sys/fs/binfmt_misc/
+            echo "status: $(cat /proc/sys/fs/binfmt_misc/status 2>&1)"
+            for f in /proc/sys/fs/binfmt_misc/*; do
+              case "${f##*/}" in register|status) continue ;; esac
+              echo "== ${f##*/}"
+              grep -E '^(enabled|interpreter|flags)' "$f"
+            done
+            ls /usr/lib/binfmt.d /etc/binfmt.d 2>&1
+            dpkg-query -W -f='${Package} ${Version}\n' 'qemu-user*' binfmt-support 2>&1
+          }
+
+          tool_availability() {
+            for b in crun runc runsc bwrap podman buildah docker containerd skopeo umoci pasta slirp4netns unshare newuidmap jq; do
+              p="$(command -v "$b")" || { echo "$b: not found"; continue; }
+              pkg="$(dpkg -S "$(readlink -f "$p")" 2>/dev/null | cut -d: -f1 | head -n1)"
+              echo "$b: $p (${pkg:-no dpkg owner}) :: $("$b" --version 2>&1 | head -n1)"
+            done
+          }
+
+          runtime_features() {
+            for b in runc crun; do
+              command -v "$b" >/dev/null || { echo "$b: not found"; continue; }
+              echo "== $b"
+              sha256sum "$(readlink -f "$(command -v "$b")")"
+              "$b" features >"$tmp/$b-features.json" 2>&1
+              echo "features exit $?"
+              jq -c '{ociVersionMin, ociVersionMax, namespaces: .linux.namespaces, seccomp: .linux.seccomp.enabled, cgroup: .linux.cgroup, mountExtensions: .linux.mountExtensions}' \
+                "$tmp/$b-features.json" 2>&1 || head -c 2000 "$tmp/$b-features.json"
+            done
+          }
+
+          # A throwaway rootless no-op container over a read-only bind of host /usr.
+          # Runtime state lives under $RUNNER_TEMP and the container is force-deleted.
+          rootless_noop() {
+            command -v jq >/dev/null || { echo "jq not found; skipped"; return 0; }
+            for b in runc crun; do
+              command -v "$b" >/dev/null || { echo "$b: not found"; continue; }
+              local bundle="$tmp/bundle-$b"
+              mkdir -p "$bundle/rootfs/usr" "$bundle/rootfs/proc" "$bundle/rootfs/dev" "$bundle/rootfs/sys" "$bundle/rootfs/tmp"
+              ln -s usr/bin "$bundle/rootfs/bin"
+              ln -s usr/lib "$bundle/rootfs/lib"
+              [ -e /usr/lib64 ] && ln -s usr/lib64 "$bundle/rootfs/lib64"
+              (cd "$bundle" && "$b" spec --rootless) || { echo "$b spec failed"; continue; }
+              jq '.process.terminal = false
+                  | .process.args = ["/usr/bin/sh", "-c", "id; cat /proc/self/uid_map; grep CapEff /proc/self/status"]
+                  | .mounts += [{"destination": "/usr", "type": "bind", "source": "/usr", "options": ["rbind", "ro"]}]' \
+                "$bundle/config.json" >"$bundle/config.tmp" && mv "$bundle/config.tmp" "$bundle/config.json"
+              echo "== $b run"
+              timeout 30 "$b" --root "$tmp/state-$b" run --bundle "$bundle" "probe-$b" </dev/null
+              echo "$b run exit $?"
+              "$b" --root "$tmp/state-$b" delete --force "probe-$b" >/dev/null 2>&1
+            done
+          }
+
+          printf '## Execution backend host probe: %s\n\nObservational only: no host settings changed, nothing installed.\n\n' "$PROBE_OS" >"$out"
+          probe "Host" host_info
+          probe "AppArmor user namespace restriction" apparmor_state
+          probe "Unprivileged user namespace (single-id map)" userns_single
+          probe "Mount inside user namespace (tmpfs)" userns_mount
+          probe "Overlay with userxattr, whiteout and opaque directory" overlay_userxattr
+          probe "Multi-id map via newuidmap (unshare --map-auto)" userns_multi
+          probe "subuid/subgid and id-map helpers" subids
+          probe "cgroup v2 (own cgroup)" cgroup_self
+          probe "cgroup v2 (user slice delegation)" cgroup_user_slice
+          probe "systemd --user transient scope with limits" cgroup_transient_scope
+          probe "binfmt_misc handlers" binfmt_handlers
+          probe "Runtime and helper availability" tool_availability
+          probe "OCI runtime features" runtime_features
+          probe "Rootless no-op container" rootless_noop
+
+          chmod -R u+rwX "$tmp" 2>/dev/null
+          rm -rf "$tmp" 2>/dev/null
+          cat "$out" >>"$GITHUB_STEP_SUMMARY"
+          cat "$out"
+          exit 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: execution-backend-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/host-probe-${{ matrix.os }}.md
+          retention-days: 30
