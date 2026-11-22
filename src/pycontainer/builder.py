@@ -187,6 +187,13 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .cache import LayerCache
+from .dependency_cache import (
+    MAX_INVENTORY_BYTES,
+    DependencyCacheMiss,
+    decode_inventory,
+    dependency_cache_key,
+    encode_inventory,
+)
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -682,6 +689,19 @@ class ImageBuilder:
             )
         version = target_python_version(self.config.base_image, base_config)
         layers_dir=Path(layers_dir)
+        cache_key = None
+        if self.cache:
+            try:
+                cache_key = self._dependency_cache_key(
+                    source_kind, source_value, base_config, os_name, arch, version
+                )
+            except DependencyCacheMiss as miss:
+                print(f"Dependency layer cache miss: {miss}.")
+            else:
+                cached_layer = self._cached_dependency_layer(layers_dir, cache_key)
+                if cached_layer:
+                    return cached_layer
+                print("Dependency layer cache miss: no verified entry for these inputs.")
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
@@ -761,11 +781,89 @@ class ImageBuilder:
                 final=layers_dir/digest.split(":",1)[1]
                 _publish_content_addressed(tmp, final, digest, size)
                 print(f"✓ Dependency layer created ({digest[:19]}...)")
+                if cache_key:
+                    self._store_dependency_layer(cache_key, digest, final, site_packages)
                 return OCILayer(
                     "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
                 )
             finally:
                 tmp.unlink(missing_ok=True)
+
+    def _dependency_cache_key(self, source_kind, source_value, base_config, os_name, arch, version):
+        ctx = Path(self.config.context_dir)
+        common = dict(
+            source_kind=source_kind,
+            context_dir=ctx,
+            os_name=os_name,
+            arch=arch,
+            python_version=version,
+            python_full_version=target_python_full_version(base_config),
+            base_image=self.config.base_image,
+            base_config=base_config,
+            workdir=self.config.workdir,
+            reproducible=self.config.reproducible,
+        )
+        if source_kind == "lock":
+            selection = self._lock_selection(base_config, os_name, arch)
+            return dependency_cache_key(
+                requirement_sets=selection.requirement_sets(),
+                lock_name=selection.path.as_posix(),
+                **common,
+            )
+        if source_kind == "requirements":
+            return dependency_cache_key(requirements=ctx / source_value, **common)
+        return dependency_cache_key(**common)
+
+    def _cached_dependency_layer(self, layers_dir, cache_key):
+        cached = self.cache.get_entry(cache_key.layer)
+        if not cached:
+            return None
+        content = self.cache.get_bytes(cache_key.inventory, MAX_INVENTORY_BYTES)
+        packages = decode_inventory(content, cached[0]) if content is not None else None
+        if packages is None:
+            return None
+        layer = self._publish_cached_layer(layers_dir, *cached, "deps-cache")
+        self._staged_packages = packages
+        self._dependency_site_packages = True
+        print(f"✓ Dependency layer cache hit ({layer.digest[:19]}...)")
+        return layer
+
+    def _store_dependency_layer(self, cache_key, digest, layer_path, site_packages):
+        try:
+            packages = staged_packages(site_packages, strict=True)
+        except (UnicodeDecodeError, ValueError):
+            print("Dependency layer not cached: staged package metadata is not strictly readable.")
+            return
+        # The layer is indexed first; a hit requires the inventory, so interruption here is a miss.
+        self.cache.store_entry(cache_key.layer, digest, layer_path, list(cache_key.source_files))
+        self.cache.store_bytes(
+            cache_key.inventory,
+            encode_inventory(digest, packages),
+            list(cache_key.source_files),
+        )
+
+    def _publish_cached_layer(self, layers_dir, digest, cache_path, label):
+        final=layers_dir/digest.split(":",1)[1]
+        tmp=_create_temporary_file(layers_dir,label)
+        try:
+            with cache_path.open("rb") as source, tmp.open("wb") as target:
+                shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
+                target.flush()
+                os.fsync(target.fileno())
+            actual_digest, size = _hash_file(tmp)
+            if actual_digest != digest:
+                raise LayerIntegrityError(
+                    f"Cached layer hashes to {actual_digest}, not {digest}."
+                )
+            _publish_content_addressed(tmp, final, digest, size)
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar",
+                digest,
+                size,
+                str(final),
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
@@ -785,28 +883,7 @@ class ImageBuilder:
                 reproducible=self.config.reproducible,
             )
             if cached:
-                digest, cache_path=cached
-                final=layers_dir/digest.split(":",1)[1]
-                tmp=_create_temporary_file(layers_dir,"app-cache")
-                try:
-                    with cache_path.open("rb") as source, tmp.open("wb") as target:
-                        shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
-                        target.flush()
-                        os.fsync(target.fileno())
-                    actual_digest, size = _hash_file(tmp)
-                    if actual_digest != digest:
-                        raise LayerIntegrityError(
-                            f"Cached layer hashes to {actual_digest}, not {digest}."
-                        )
-                    _publish_content_addressed(tmp, final, digest, size)
-                    return OCILayer(
-                        "application/vnd.oci.image.layer.v1.tar",
-                        digest,
-                        size,
-                        str(final),
-                    )
-                finally:
-                    tmp.unlink(missing_ok=True)
+                return self._publish_cached_layer(layers_dir, *cached, "app-cache")
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files

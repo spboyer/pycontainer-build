@@ -40,6 +40,8 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
         "local-full-build-no-op",
         "local-full-build-app-change",
         "local-full-build-dependency-change",
+        "dependency-layer-cold",
+        "dependency-layer-hit",
         "registry-blob-transfer-1MiB",
         "registry-blob-transfer-2MiB",
     }
@@ -48,6 +50,10 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
     assert cases["local-full-build-no-op"]["samples"][0]["cache_hits"] == 1
     assert cases["local-full-build-app-change"]["samples"][0]["cache_hits"] == 0
     assert cases["local-full-build-dependency-change"]["samples"][0]["cache_hits"] == 1
+    assert cases["local-full-build-dependency-change"]["samples"][0]["dependency_cache_hits"] == 0
+    assert cases["dependency-layer-cold"]["samples"][0]["dependency_cache_hits"] == 0
+    assert cases["dependency-layer-cold"]["samples"][0]["dependency_cache_lookups"] == 1
+    assert cases["dependency-layer-hit"]["samples"][0]["dependency_cache_hits"] == 1
     for size_mib in (1, 2):
         sample = cases[f"registry-blob-transfer-{size_mib}MiB"]["samples"][0]
         assert sample["uploaded_bytes"] == size_mib * 1024 * 1024

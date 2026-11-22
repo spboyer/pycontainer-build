@@ -180,7 +180,8 @@ def install_requirements(
     locked: bool = False,
 ) -> None:
     """Install requirements for the target; ``locked`` files are generated, hashed and complete."""
-    if not locked and not validate_requirements(requirements, context_dir):
+    hash_pinned = locked or validate_requirements(requirements, context_dir)
+    if not hash_pinned:
         logger.warning(
             "%s is not fully pinned with ==versions and --hash values, so the "
             "dependency layer is not reproducible. Use a lockfile or "
@@ -190,7 +191,9 @@ def install_requirements(
 
     destination.mkdir(parents=True, exist_ok=True)
     # Locked installs use only the generated --index-url: no pip config files or PIP_* options.
-    locked_options = ["--isolated", "--no-deps", "--require-hashes"] if locked else []
+    locked_options = ["--isolated", "--no-deps"] if locked else []
+    # Explicit hash-checking mode makes pip reject any unpinned transitive dependency.
+    hash_options = ["--require-hashes"] if hash_pinned else []
     command = [
         sys.executable,
         "-m",
@@ -201,6 +204,7 @@ def install_requirements(
         "--no-cache-dir",
         "--no-compile",
         *locked_options,
+        *hash_options,
         "--target",
         str(destination),
         *_target_options(
@@ -335,11 +339,25 @@ def _is_external_record_line(line: bytes) -> bool:
 
 def validate_requirements(requirements: Path, context_dir: Path) -> bool:
     """Validate includes and options; return whether every requirement is hash-pinned."""
+    return scan_requirements(requirements, context_dir)[0]
+
+
+RequirementsFile = Tuple[Path, bool, List[List[str]]]
+
+
+def scan_requirements(
+    requirements: Path, context_dir: Path
+) -> Tuple[bool, List[RequirementsFile]]:
+    """Validate a requirements tree; return hash-pinning and each file's tokenized lines.
+
+    Files are returned in visit order as ``(path, is_constraint, lines)``.
+    """
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     total_bytes = 0
     hash_pinned = True
+    scanned: List[RequirementsFile] = []
     while pending:
         path, is_constraint = pending.pop()
         if path in visited:
@@ -370,6 +388,8 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
         if continuation:
             raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
 
+        file_lines: List[List[str]] = []
+        scanned.append((path, is_constraint, file_lines))
         for line in logical_lines:
             try:
                 options = shlex.split(line, comments=True)
@@ -377,6 +397,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
                 raise ValueError(f"Invalid requirements syntax in {path}.") from exc
             if not options:
                 continue
+            file_lines.append(options)
             if not options[0].startswith("-"):
                 if not is_constraint:
                     hash_pinned = hash_pinned and _is_hash_pinned(options)
@@ -412,7 +433,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
                     )
                 included_path = (path.parent / include).resolve(strict=True)
                 pending.append((included_path, is_constraint or option.startswith(("-c", "--constraint"))))
-    return hash_pinned
+    return hash_pinned, scanned
 
 
 def _is_hash_pinned(options: List[str]) -> bool:

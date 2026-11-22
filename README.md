@@ -441,6 +441,23 @@ The cache automatically:
 - Invalidates on file content changes (mtime + size checks)
 - Evicts old entries using LRU when size limit reached (default: 5GB)
 
+**Dependency layer reuse.** A whole staged dependency layer is reused only when
+its complete target closure is provably hash-pinned: a lockfile selection, or
+requirements (including nested `-r`/`-c` files) where every requirement is
+`==`-pinned with `--hash`. A hit runs no pip and makes no index requests, and
+yields the same layer digest, DiffID and SBOM inventory as a fresh build.
+The key covers requirement/constraint/find-links content, target platform,
+pip target/ABI/libc tags, Python version and implementation, workdir, pip
+version, the installer backend and sanitized index identity. Plain requirements
+also key the host marker environment and allowlisted ambient pip settings;
+locked installs are `--isolated`. Credentials and userinfo placeholders are
+never stored. Anything that cannot be proven is an explicit miss printed as
+`Dependency layer cache miss: <reason>.`, including unpinned or unhashed
+requirements, `-e`, `--no-deps`, direct-URL constraints, `file:` find-links,
+virtualenv staging, `--no-reproducible`, unknown ambient pip settings, and any
+index or find-links URL with a query string (a query can select another
+tenant or feed). A hit reuses the artifacts selected when the entry was stored.
+
 ### Python API
 
 ```python

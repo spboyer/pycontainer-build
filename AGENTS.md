@@ -12,7 +12,8 @@ daemon without discussing the trade-off first.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
-- `cache.py`: optional local application-layer cache.
+- `cache.py`: optional local application- and dependency-layer cache.
+- `dependency_cache.py`: dependency-layer cache key, eligibility and inventory.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
@@ -36,6 +37,17 @@ content, normalized relative paths, workdir, and reproducibility settings.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError`; missing
 or corrupt blobs are discarded and rebuilt.
+
+A staged dependency layer is reused only for a provably hash-pinned closure
+(lock selection, or fully `==`/`--hash` requirements including nested inputs);
+everything unprovable is an explicit `DependencyCacheMiss` with a secret-free
+reason. Keys hold target tags, Python, workdir, pip version, sanitized index
+identity (no userinfo, placeholders or query values; query-bearing URLs miss),
+allowlisted ambient pip settings and host markers for plain requirements, and
+`INSTALLER_BACKEND`. A backend change that alters marker evaluation (e.g. #178's
+target-marker bootstrap) must bump `INSTALLER_BACKEND` and key its marker
+environment. The inventory entry is stored after the layer and must name its
+digest; a hit runs no pip and makes no network requests.
 
 ## Setup and verified checks
 
