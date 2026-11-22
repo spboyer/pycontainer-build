@@ -4,10 +4,11 @@ Image signing is experimental and strictly opt-in. The core package adds no
 runtime dependency or daemon: install the optional provider CLI separately.
 Cosign versions `>=2.6.1,<4.0.0` and Notation versions `>=1.3.2,<2.0.0` pass
 the version preflight; this is not a claim that every version or registry has
-been exercised. Cosign key-mode signing and build-time signature verification
-have been exercised against `ttl.sh` with v2.6.1 and v3.1.4 (through the
-stacked provenance test in #219); Notation and keyless signing have not been
-validated against a real registry.
+been exercised. Against `ttl.sh`, synthetic-base manifest and index builds
+passed Cosign key-mode signing and verification with v2.6.1 and v3.1.4 in
+stacked #219. Notation v1.3.2 named-key signing and verification also passed for
+both subjects with a self-signed test key and isolated strict trust policy.
+Cosign keyless, Notation plugin mode and other registries remain unverified.
 
 ## Prerequisites and use
 
@@ -152,10 +153,12 @@ Notation verification uses its configured trust policy and trust store.
 Build-time verification uses the trust configuration supplied to the build; it
 is not independent verification by the consumer. A separate `cosign verify`
 with a public key succeeded against `ttl.sh` using v2.6.1 and v3.1.4 with
-default transparency settings; a wrong key failed. Keyless Cosign and Notation
-verification have not been exercised against real providers or registries. A
-valid signature authenticates an artifact only under the verifier's policy;
-it does not establish that an image is free of vulnerabilities or safe to run.
+default transparency settings; a wrong key failed. Notation named-key
+signatures were independently verified with the strict test policy. A separate
+real-base multi-platform run in #219 failed during Cosign v3.1.4 signing before
+tag publication; its cause remains unconfirmed. A valid signature authenticates
+an artifact only under the verifier's policy; it does not establish that an
+image is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
