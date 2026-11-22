@@ -213,6 +213,40 @@ This is normal! pycontainer checks if blobs exist before uploading:
 
 This makes subsequent pushes much faster.
 
+### Registry errors, rate limits and quotas
+
+Registry failures report the operation, registry host, HTTP status and the
+OCI distribution error codes from the response body, for example:
+
+```text
+Manifest pull failed with HTTP 429 from registry-1.docker.io: TOOMANYREQUESTS:
+You have reached your pull rate limit. The registry rate limit was exceeded;
+it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
+100 remaining. Authenticate to the registry ...
+```
+
+- **`TOOMANYREQUESTS` / HTTP 429** (`RegistryRateLimitError`): the reset time
+  comes from `Retry-After`. Sign in (Docker Hub grants higher pull limits to
+  authenticated users), wait for the reset, or use a registry mirror. Only
+  safe reads (`GET`/`HEAD`) are retried, at most twice with delays capped at
+  5 seconds; when `Retry-After` is longer than that cap the build fails
+  immediately instead of retrying into the same limit. Uploads, upload
+  initiation and manifest `PUT`s are never retried.
+- **HTTP 413, 507, `*QUOTA*` codes or quota messages**
+  (`RegistryQuotaError`): the error names the rejected upload size. Free space
+  in the repository, raise its quota or reduce the image size.
+- **`DENIED` / `UNAUTHORIZED` / HTTP 401 or 403**: check that the credentials
+  can pull or push the repository. Some registries also report exhausted
+  quotas as `DENIED`.
+
+Run with `--verbose` to log Docker Hub style `RateLimit-Limit` and
+`RateLimit-Remaining` headers. A warning is printed once per registry client
+when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
+
+Error bodies are treated as untrusted: at most five errors are shown, each
+message is truncated, control characters are removed, and authorization
+values, tokens and the configured credentials are replaced with `[REDACTED]`.
+
 ## Authentication Priority
 
 pycontainer tries authentication methods in this order:

@@ -3,16 +3,18 @@ import base64
 import hashlib
 import http.client
 import json
+import logging
+import math
 import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import BinaryIO, Dict, Optional, Tuple, Union
+from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
 
 from .blob_store import (
     BlobIntegrityError,
@@ -32,6 +34,22 @@ TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_REPORTED_ERRORS = 5
+MAX_ERROR_TEXT_CHARS = 200
+LOW_RATE_LIMIT_REMAINING = 10
+QUOTA_STATUSES = {413, 507}
+
+logger = logging.getLogger(__name__)
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_AUTH_SCHEME_VALUE = re.compile(r"(?i)(bearer|basic)\s+[^\s\"',;]+")
+_SECRET_FIELD_VALUE = re.compile(
+    r"(?i)(\b(?:access_token|refresh_token|id_token|token|password|secret|"
+    r"authorization)\b\"?\s*[:=]\s*\"?)[^\"\s,}&]+"
+)
+_QUOTA_TEXT = re.compile(
+    r"(?i)quota|storage limit|storage capacity|insufficient storage|too large"
+)
 
 
 class RegistryRequestError(RuntimeError):
@@ -40,6 +58,22 @@ class RegistryRequestError(RuntimeError):
 
 class RegistryAuthenticationError(RegistryRequestError):
     """Raised when registry credentials cannot be exchanged or applied."""
+
+
+class RegistryRateLimitError(RegistryRequestError):
+    """Raised when a registry rejects requests because of a rate limit."""
+
+    def __init__(self, message: str, retry_after_seconds: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class RegistryQuotaError(RegistryRequestError):
+    """Raised when a registry rejects an upload for size or storage quota."""
+
+    def __init__(self, message: str, blob_size: Optional[int] = None):
+        super().__init__(message)
+        self.blob_size = blob_size
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -56,23 +90,195 @@ def _safe_url(url: str) -> str:
     )
 
 
-def _retry_delay(headers, attempt: int) -> float:
-    retry_after = headers.get("Retry-After") if headers else None
-    delay = None
-    if retry_after:
+def _header(headers, name: str) -> Optional[str]:
+    if not headers:
+        return None
+    value = headers.get(name)
+    if value is None:
+        lowered = name.lower()
+        for key, item in headers.items():
+            if key.lower() == lowered:
+                return item
+    return value
+
+
+def _retry_after_seconds(headers) -> Optional[float]:
+    """Return the uncapped Retry-After delay, or None when absent or malformed."""
+    retry_after = _header(headers, "Retry-After")
+    if not retry_after:
+        return None
+    retry_after = retry_after.strip()
+    try:
+        delay = float(retry_after)
+    except ValueError:
         try:
-            delay = float(retry_after)
-        except ValueError:
-            try:
-                retry_time = parsedate_to_datetime(retry_after)
-                if retry_time.tzinfo is None:
-                    retry_time = retry_time.replace(tzinfo=timezone.utc)
-                delay = (retry_time - datetime.now(timezone.utc)).total_seconds()
-            except (TypeError, ValueError, OverflowError):
-                delay = None
+            retry_time = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return None
+        if retry_time is None:
+            return None
+        if retry_time.tzinfo is None:
+            retry_time = retry_time.replace(tzinfo=timezone.utc)
+        delay = (retry_time - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(delay):
+        return None
+    return max(0.0, delay)
+
+
+def _retry_delay(headers, attempt: int) -> float:
+    delay = _retry_after_seconds(headers)
     if delay is None:
         delay = RETRY_BACKOFF_SECONDS * (2**attempt)
     return min(MAX_RETRY_DELAY_SECONDS, max(0.0, delay))
+
+
+def _should_retry(status: int, headers, attempt: int) -> bool:
+    """Retry transient statuses unless a rate limit outlasts the retry budget."""
+    if status not in RETRYABLE_STATUSES or attempt >= MAX_REQUEST_RETRIES:
+        return False
+    if status == 429:
+        delay = _retry_after_seconds(headers)
+        if delay is not None and delay > MAX_RETRY_DELAY_SECONDS:
+            return False
+    return True
+
+
+def _rate_limit_value(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    count = value.split(";", 1)[0].strip()
+    if not re.fullmatch(r"\d{1,12}", count):
+        return None
+    return int(count)
+
+
+def _rate_limit(headers) -> Tuple[Optional[int], Optional[int]]:
+    return (
+        _rate_limit_value(_header(headers, "RateLimit-Limit")),
+        _rate_limit_value(_header(headers, "RateLimit-Remaining")),
+    )
+
+
+def _format_size(size: int) -> str:
+    value = float(size)
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024
+        if value < 1024 or unit == "TiB":
+            return f"{size} bytes ({value:.1f} {unit})"
+    return f"{size} bytes"
+
+
+def _sanitize_text(text: str, secrets: Iterable[str], limit: int) -> str:
+    for secret in secrets:
+        text = text.replace(secret, "[REDACTED]")
+    text = _AUTH_SCHEME_VALUE.sub(r"\1 [REDACTED]", text)
+    text = _SECRET_FIELD_VALUE.sub(r"\1[REDACTED]", text)
+    text = " ".join(_CONTROL_CHARACTERS.sub(" ", text).split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
+
+
+def _registry_errors(body: bytes) -> Optional[List[Tuple[str, str]]]:
+    """Parse an OCI distribution error body into (code, message) pairs."""
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("errors"), list):
+        return None
+    entries = []
+    for entry in document["errors"]:
+        if not isinstance(entry, dict):
+            continue
+        code = entry.get("code")
+        message = entry.get("message")
+        entries.append(
+            (
+                code if isinstance(code, str) else "",
+                message if isinstance(message, str) else "",
+            )
+        )
+    return entries or None
+
+
+def _registry_error(
+    operation: str,
+    url: str,
+    status: int,
+    body: Optional[bytes],
+    headers,
+    secrets: Iterable[str] = (),
+    blob_size: Optional[int] = None,
+    repository: Optional[str] = None,
+    error_class=RegistryRequestError,
+) -> RegistryRequestError:
+    """Build an actionable error from an untrusted registry error response."""
+    secrets = [secret for secret in secrets if secret]
+    body = (body or b"")[:MAX_ERROR_BODY_BYTES]
+    host = urllib.parse.urlsplit(url).netloc or "registry"
+    entries = _registry_errors(body) if body else None
+    codes = set()
+    if entries:
+        parts = []
+        for code, message in entries[:MAX_REPORTED_ERRORS]:
+            code = _sanitize_text(code, secrets, 64).upper()
+            message = _sanitize_text(message, secrets, MAX_ERROR_TEXT_CHARS)
+            codes.add(code)
+            parts.append(f"{code}: {message}" if code and message else code or message)
+        if len(entries) > MAX_REPORTED_ERRORS:
+            parts.append(f"{len(entries) - MAX_REPORTED_ERRORS} more error(s) omitted")
+        detail = "; ".join(part for part in parts if part) or "(empty error list)"
+    elif body:
+        detail = _sanitize_text(
+            body.decode("utf-8", errors="replace"), secrets, MAX_ERROR_TEXT_CHARS
+        ) or "(empty response)"
+    else:
+        detail = "(empty response)"
+
+    message = f"{operation} failed with HTTP {status} from {host}: {detail}"
+    if status == 429 or "TOOMANYREQUESTS" in codes:
+        retry_after = _retry_after_seconds(headers)
+        if retry_after is None:
+            message += " The registry rate limit was exceeded and it did not report when the limit resets."
+        else:
+            seconds = math.ceil(retry_after)
+            reset_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            message += (
+                f" The registry rate limit was exceeded; it resets in about "
+                f"{seconds} second{'s' if seconds != 1 else ''} (at "
+                f"{reset_at.strftime('%Y-%m-%dT%H:%M:%SZ')})."
+            )
+        limit, remaining = _rate_limit(headers)
+        if remaining is not None:
+            message += f" Rate limit: {remaining} of {limit if limit is not None else 'unknown'} remaining."
+        message += (
+            " Authenticate to the registry (Docker Hub grants higher limits to "
+            "signed-in users), wait for the reset, or use a registry mirror."
+        )
+        return RegistryRateLimitError(message, retry_after)
+
+    if (
+        status in QUOTA_STATUSES
+        or any("QUOTA" in code for code in codes)
+        or _QUOTA_TEXT.search(detail)
+    ):
+        if blob_size is not None:
+            message += f" Upload size: {_format_size(blob_size)}."
+        message += (
+            " The registry rejected the upload as exceeding a size or storage "
+            "quota; free space in the repository, raise its quota, or reduce "
+            "the image size."
+        )
+        return RegistryQuotaError(message, blob_size)
+
+    if status in (401, 403) or codes & {"DENIED", "UNAUTHORIZED"}:
+        target = f" for {repository}" if repository else ""
+        message += (
+            f" Check that the credentials have pull or push permission{target}; "
+            "some registries also report exhausted quotas as DENIED."
+        )
+    return error_class(message)
 
 
 def _append_digest(url: str, digest: str) -> str:
@@ -112,6 +318,56 @@ class RegistryClient:
         self.timeout = timeout
         self.base_url = f"https://{self.registry}/v2"
         self._bearer_token = None
+        self._rate_limit_warned = False
+
+    def _secrets(self) -> List[str]:
+        values = [self._bearer_token, self.auth_token, self.password]
+        if self.username and self.password:
+            values.append(
+                base64.b64encode(
+                    f"{self.username}:{self.password}".encode()
+                ).decode()
+            )
+        return [value for value in values if value]
+
+    def _error(self, operation: str, url: str, status: int, body, headers, **kwargs):
+        return _registry_error(
+            operation,
+            url,
+            status,
+            body,
+            headers,
+            secrets=self._secrets(),
+            repository=self.repository,
+            **kwargs,
+        )
+
+    def _observe_rate_limit(self, headers, url: str) -> None:
+        """Log registry rate-limit headers and warn once when nearly exhausted."""
+        limit, remaining = _rate_limit(headers)
+        if limit is None and remaining is None:
+            return
+        host = urllib.parse.urlsplit(url).netloc
+        logger.debug(
+            "Registry %s rate limit: limit=%s remaining=%s",
+            host,
+            "unknown" if limit is None else limit,
+            "unknown" if remaining is None else remaining,
+        )
+        if remaining is None or self._rate_limit_warned:
+            return
+        threshold = LOW_RATE_LIMIT_REMAINING
+        if limit:
+            threshold = max(1, min(LOW_RATE_LIMIT_REMAINING, limit // 10))
+        if remaining <= threshold:
+            self._rate_limit_warned = True
+            logger.warning(
+                "Registry %s rate limit is nearly exhausted: %s of %s requests "
+                "remaining. Authenticate or reduce pulls to avoid HTTP 429 errors.",
+                host,
+                remaining,
+                "unknown" if limit is None else limit,
+            )
 
     def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
         """Parse Www-Authenticate header for OAuth2 challenge."""
@@ -182,14 +438,21 @@ class RegistryClient:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
             except urllib.error.HTTPError as error:
-                if (
-                    error.code in RETRYABLE_STATUSES
-                    and attempt < MAX_REQUEST_RETRIES
-                ):
+                if _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
                     continue
-                raise RegistryAuthenticationError(
-                    f"Registry bearer-token exchange failed with HTTP {error.code}."
+                try:
+                    error_body = error.read(MAX_ERROR_BODY_BYTES)
+                except OSError:
+                    error_body = b""
+                raise _registry_error(
+                    "Registry bearer-token exchange",
+                    url,
+                    error.code,
+                    error_body,
+                    error.headers,
+                    secrets=self._secrets(),
+                    error_class=RegistryAuthenticationError,
                 ) from error
             except (
                 urllib.error.URLError,
@@ -255,9 +518,12 @@ class RegistryClient:
                 with urllib.request.urlopen(
                     request, timeout=self.timeout
                 ) as response:
-                    return response.status, response.read(), dict(response.headers)
+                    response_headers = dict(response.headers)
+                    self._observe_rate_limit(response_headers, url)
+                    return response.status, response.read(), response_headers
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
+                self._observe_rate_limit(response_headers, url)
                 if (
                     error.code == 401
                     and retry_auth
@@ -277,11 +543,7 @@ class RegistryClient:
                             headers,
                             retry_auth=False,
                         )
-                if (
-                    retry_safe
-                    and error.code in RETRYABLE_STATUSES
-                    and attempt < MAX_REQUEST_RETRIES
-                ):
+                if retry_safe and _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
                     continue
                 try:
@@ -308,25 +570,20 @@ class RegistryClient:
     def blob_exists(self, digest: str) -> bool:
         """Check if blob exists in registry via HEAD request."""
         url = f"{self.base_url}/{self.repository}/blobs/{digest}"
-        status, body, _ = self._make_request("HEAD", url)
+        status, body, headers = self._make_request("HEAD", url)
         if status == 200:
             return True
         if status == 404:
             return False
-        detail = body.decode("utf-8", errors="replace")
-        raise RegistryRequestError(
-            f"Registry blob HEAD failed with HTTP {status}: {detail or '(empty response)'}"
-        )
+        raise self._error("Registry blob HEAD", url, status, body, headers)
 
-    def initiate_blob_upload(self) -> str:
+    def initiate_blob_upload(self, blob_size: Optional[int] = None) -> str:
         """Initiate blob upload and return its absolute upload URL."""
         url = f"{self.base_url}/{self.repository}/blobs/uploads/"
         status, body, headers = self._make_request("POST", url, data=b"")
         if status not in (200, 202):
-            detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
-                f"Failed to initiate blob upload (HTTP {status}): "
-                f"{detail or '(empty response)'}"
+            raise self._error(
+                "Blob upload initiation", url, status, body, headers, blob_size=blob_size
             )
         location = headers.get("Location") or headers.get("location")
         if not location:
@@ -345,21 +602,26 @@ class RegistryClient:
                 f"Local blob hashes to {actual_digest}, not requested digest {digest}."
             )
 
-        upload_url = self.initiate_blob_upload()
+        try:
+            upload_url = self.initiate_blob_upload()
+        except RegistryQuotaError as error:
+            if error.blob_size is not None:
+                raise
+            raise RegistryQuotaError(
+                f"{error} Upload size: {_format_size(size)}.", size
+            ) from error
         final_url = _append_digest(upload_url, digest)
         headers = {
             "Content-Type": "application/octet-stream",
             "Content-Length": str(size),
         }
         with blob_path.open("rb") as source:
-            status, body, _ = self._make_request(
+            status, body, response_headers = self._make_request(
                 "PUT", final_url, data=source, headers=headers
             )
         if status not in (201, 202):
-            detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
-                f"Blob upload failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+            raise self._error(
+                "Blob upload", final_url, status, body, response_headers, blob_size=size
             )
         return True
 
@@ -374,14 +636,17 @@ class RegistryClient:
         """Push manifest by tag or digest."""
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Content-Type": "application/vnd.oci.image.manifest.v1+json"}
-        status, body, _ = self._make_request(
+        status, body, response_headers = self._make_request(
             "PUT", url, data=manifest_data, headers=headers
         )
         if status not in (200, 201):
-            detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
-                f"Manifest push failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+            raise self._error(
+                "Manifest push",
+                url,
+                status,
+                body,
+                response_headers,
+                blob_size=len(manifest_data),
             )
         return True
 
@@ -389,14 +654,17 @@ class RegistryClient:
         """Push OCI index."""
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Content-Type": "application/vnd.oci.image.index.v1+json"}
-        status, body, _ = self._make_request(
+        status, body, response_headers = self._make_request(
             "PUT", url, data=index_data, headers=headers
         )
         if status not in (200, 201):
-            detail = body.decode("utf-8", errors="replace")
-            raise RegistryRequestError(
-                f"Index push failed with HTTP {status}: "
-                f"{detail or '(empty response)'}"
+            raise self._error(
+                "Index push",
+                url,
+                status,
+                body,
+                response_headers,
+                blob_size=len(index_data),
             )
         return True
 
@@ -427,10 +695,7 @@ class RegistryClient:
             "GET", url, headers=headers
         )
         if status != 200:
-            body_text = body.decode("utf-8", errors="replace") if body else "(empty response)"
-            raise RegistryRequestError(
-                f"Failed to pull manifest (HTTP {status}): {body_text}"
-            )
+            raise self._error("Manifest pull", url, status, body, response_headers)
         if not body:
             raise RegistryRequestError(
                 f"Registry returned an empty manifest response for {reference}."
@@ -448,7 +713,11 @@ class RegistryClient:
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
-            preview = body[:500].decode("utf-8", errors="replace")
+            preview = _sanitize_text(
+                body[:500].decode("utf-8", errors="replace"),
+                self._secrets(),
+                MAX_ERROR_TEXT_CHARS,
+            )
             raise RegistryRequestError(
                 f"Registry returned invalid manifest JSON: {error}\n"
                 f"Body preview: {preview}"
@@ -475,6 +744,7 @@ class RegistryClient:
         try:
             response = opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
+            self._observe_rate_limit(error.headers, url)
             if error.code not in REDIRECT_STATUSES:
                 raise
             location = error.headers.get("Location")
@@ -488,6 +758,7 @@ class RegistryClient:
                 urllib.request.Request(target), timeout=self.timeout
             )
 
+        self._observe_rate_limit(response.headers, url)
         if response.status in REDIRECT_STATUSES:
             location = response.headers.get("Location")
             response.close()
@@ -581,18 +852,22 @@ class RegistryClient:
                     )
                     return True
                 except urllib.error.HTTPError as error:
-                    if (
-                        error.code in RETRYABLE_STATUSES
-                        and attempt < MAX_REQUEST_RETRIES
-                    ):
+                    error_url = getattr(error, "url", None) or url
+                    if not self._is_registry_url(error_url):
+                        self._observe_rate_limit(error.headers, error_url)
+                    if _should_retry(error.code, error.headers, attempt):
                         time.sleep(_retry_delay(error.headers, attempt))
                         continue
-                    detail = error.read(MAX_ERROR_BODY_BYTES).decode(
-                        "utf-8", errors="replace"
-                    )
-                    raise RegistryRequestError(
-                        f"Blob download failed with HTTP {error.code}: "
-                        f"{detail or '(empty response)'}"
+                    try:
+                        error_body = error.read(MAX_ERROR_BODY_BYTES)
+                    except OSError:
+                        error_body = b""
+                    raise self._error(
+                        "Blob download",
+                        error_url,
+                        error.code,
+                        error_body,
+                        error.headers,
                     ) from error
                 except (
                     urllib.error.URLError,
