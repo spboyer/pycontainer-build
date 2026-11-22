@@ -141,6 +141,15 @@ def test_uv_lock_rejects_replaced_or_removed_index(tmp_path, manifest_index):
         load_lockfile(context, Path("uv.lock"), PY311)
 
 
+def test_uv_lock_accepts_declared_explicit_registry(tmp_path):
+    registry = "https://example.invalid/simple"
+    context = _write_uv_project(tmp_path / "uv", registry=registry)
+    manifest = context / "pyproject.toml"
+    manifest.write_text(manifest.read_text() + "explicit = true\n")
+
+    assert load_lockfile(context, Path("uv.lock"), PY311).index_urls == (registry,)
+
+
 def test_multiple_lockfiles_require_an_explicit_choice(tmp_path):
     context = _copy(tmp_path, "uv")
     shutil.copy(FIXTURES / "pdm" / "pdm.lock", context / "pdm.lock")
@@ -374,6 +383,13 @@ def test_dry_run_reports_dependency_source(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Dependency Source: lock (uv.lock)" in output
     assert "including uv marker freshness" in output
+
+
+def test_dry_run_can_preview_without_dependencies(tmp_path, capsys):
+    builder = ImageBuilder(BuildConfig(context_dir=str(tmp_path), include_deps=True, dry_run=True))
+
+    assert builder.build() == builder.config.tag
+    assert "no supported lockfile, virtualenv site-packages or requirements.txt" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))

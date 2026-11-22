@@ -605,7 +605,6 @@ def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
     allowed = {
         _index_url(index.get("url", ""), "tool.uv.index")
         for index in indexes
-        if not index.get("explicit")
     }
     if not any(index.get("default") for index in indexes):
         allowed.add(None)  # uv's implicit PyPI index

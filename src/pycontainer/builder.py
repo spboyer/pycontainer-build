@@ -576,13 +576,17 @@ class ImageBuilder:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.include_deps:
-            kind, value = self._dependency_source()
-            if kind == "lock":
-                preflight_lockfile(Path(self.config.context_dir), value)
-            described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
-            print(f"  Dependency Source: {kind} ({described})")
-            if kind == "lock":
-                print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
+            try:
+                kind, value = self._dependency_source()
+            except FileNotFoundError as error:
+                print(f"  Dependency Source: unresolved ({error})")
+            else:
+                if kind == "lock":
+                    preflight_lockfile(Path(self.config.context_dir), value)
+                described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
+                print(f"  Dependency Source: {kind} ({described})")
+                if kind == "lock":
+                    print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         print(f"  Use Cache: {self.config.use_cache}")
