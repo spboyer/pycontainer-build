@@ -46,6 +46,11 @@ jobs:
           PYTHONPATH: src
         run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
 
+      - name: Install optional pre-commit test tooling
+        run: uv pip install -r tests/pre-commit-requirements.txt
+      - name: Run hermetic pre-commit hook tests
+        run: uv run --locked --group test python -m pytest tests/test_pre_commit_hook.py -q
+
   package-smoke:
     name: Isolated wheel and sdist smoke test
     needs: tests
