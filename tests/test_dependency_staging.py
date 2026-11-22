@@ -33,6 +33,8 @@ BASE_CONFIG = {
         "Env": [
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHON_VERSION=3.11.8",
+            "PYTHON_IMPLEMENTATION=CPython",
+            "PYTHON_LIBC=glibc-2.17",
         ],
         "WorkingDir": "/",
     },
@@ -86,6 +88,24 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
             **options,
         )
     )
+
+
+def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("pip must not run"))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": ["PYTHON_VERSION=3.11.8"]},
+    }
+
+    with pytest.raises(ValueError, match="unverified or custom base image"):
+        builder._create_deps_layer(layers, base_config=base_config)
 
 
 def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):
@@ -460,7 +480,7 @@ def test_unverified_tag_plus_digest_rejects_before_pip(tmp_path, monkeypatch, ta
     with pytest.raises(ValueError, match="unverified"):
         install_requirements(
             requirements, tmp_path / "staged", tmp_path,
-            "linux", "amd64", "3.11", base_image, BASE_CONFIG,
+            "linux", "amd64", "3.11", base_image, _libc_config(),
         )
 
 
