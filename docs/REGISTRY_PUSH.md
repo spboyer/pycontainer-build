@@ -232,6 +232,70 @@ registry-ca-file = "corp-root-ca.pem"
 - Standard proxy environment variables apply to HTTP registries as they do
   to HTTPS ones.
 
+## Base-Image Registry Mirrors
+
+Base-image pulls can go through pull-through mirrors before the upstream
+registry. Mirrors never apply to `--push`, which always goes straight to the
+registry named in `--tag`.
+
+```bash
+pycontainer build --tag ghcr.io/me/app:v1 --base-image python:3.11-slim \
+  --registry-mirror docker.io=mirror.example.com \
+  --registry-mirror docker.io=backup.example.com:5000
+```
+
+```toml
+[build.registry_mirrors]
+"docker.io" = ["mirror.example.com", "backup.example.com:5000"]
+"ghcr.io" = ["ghcr-mirror.example.com"]
+```
+
+- Keys and values are `host[:port]` only: no scheme, path, or credentials.
+  `docker.io`, `index.docker.io`, and `registry-1.docker.io` are the same
+  upstream. A mirror keeps the upstream repository path; Docker Hub
+  official images keep the `library/` prefix (`library/python`). Path-prefixed
+  mirrors (for example Harbor proxy projects) are not supported.
+- Mirrors are tried in order, then the upstream. `--registry-mirror` for an
+  upstream replaces that upstream's list from `pycontainer.toml`; lists for
+  other upstreams are kept.
+- Mirrors use the same transport as any registry: HTTPS with
+  `--registry-ca-file` trust, or plain HTTP only when the mirror host is also
+  listed in `--insecure-registry`.
+- `--verbose` names the host(s) that served the pull (`Served by: ...`).
+
+### Fallback rules
+
+| Mirror response | Behavior |
+| --- | --- |
+| Connection failure (including TLS verification and an unreachable token realm) | Warn; skip this mirror for the rest of the pull |
+| HTTP 5xx after the normal retry budget (registry or token realm) | Warn; skip this mirror for the rest of the pull |
+| HTTP 401/403 (including token exchange) | Warn about mirror credentials; skip this mirror for the rest of the pull |
+| HTTP 404 | Warn; try the next host for this object only |
+| HTTP 429 or quota errors | Fail; no fallback |
+| Digest or size mismatch | Fail closed; no fallback, nothing published |
+| Refused credentials or token realm (for example credentials over HTTP) | Fail; no fallback |
+
+An error from the upstream, after every mirror is exhausted, is reported as
+it would be without mirrors.
+
+### Credentials and integrity
+
+- Each mirror gets credentials only for its own host: its exact Docker
+  config entry, Azure CLI for `*.azurecr.io`, or `GITHUB_TOKEN` for
+  `ghcr.io`. `REGISTRY_TOKEN`, `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`,
+  `--registry-*` flags, and upstream credentials are never sent to a mirror.
+  Upstream credentials are resolved only if the upstream is actually
+  contacted.
+- Manifests requested by digest and every config/layer blob are verified
+  against their descriptor digest and size, whichever host serves them.
+- A tag is resolved by the mirror that serves it. Pin base images by digest
+  (`python:3.11-slim@sha256:...`) if a mirror should not be trusted to
+  resolve tags.
+
+Tests use separate in-process loopback registries with synthetic
+credentials; no real mirror product (Docker Hub mirror, Harbor, Nexus,
+Artifactory, ACR cache rules) has been verified in CI.
+
 ## Programmatic Usage
 
 ```python

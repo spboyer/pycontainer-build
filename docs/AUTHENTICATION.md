@@ -196,6 +196,12 @@ pycontainer build --tag registry.example.com/app:v1 --push
 - HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
   rejected, and `Authorization` is dropped on cross-origin redirects. See
   [REGISTRY_PUSH.md](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
+- Base-image mirrors (`--registry-mirror`) resolve credentials with
+  `get_mirror_auth`, which uses only host-scoped sources (the mirror's own
+  Docker config entry, Azure CLI for `*.azurecr.io`, `GITHUB_TOKEN` for
+  `ghcr.io`). Generic `REGISTRY_*` variables, explicit flags, and upstream
+  credentials are never sent to a mirror. See
+  [REGISTRY_PUSH.md](REGISTRY_PUSH.md#base-image-registry-mirrors).
 
 ### Token Scopes
 - **GitHub**: Require minimum scope (`write:packages`)

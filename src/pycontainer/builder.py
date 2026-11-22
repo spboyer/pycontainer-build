@@ -1,7 +1,7 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig
+from .config import BuildConfig, canonical_registry
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -184,7 +184,8 @@ from .registry_client import (
     RegistryRequestError,
     parse_image_reference,
 )
-from .auth import get_registry_auth
+from .auth import get_mirror_auth, get_registry_auth
+from .registry_mirrors import MirroredPullClient
 from .cache import LayerCache
 from .sbom import generate_sbom
 from .dependencies import (
@@ -386,11 +387,26 @@ class ImageBuilder:
             )
         return client
 
+    def _base_image_client(self, registry: str, repo: str):
+        """Return a pull client that tries configured mirrors before upstream."""
+        def upstream_client():
+            return self._registry_client(registry, repo, get_registry_auth(registry))
+
+        mirrors=self.config.registry_mirrors.get(canonical_registry(registry), [])
+        if not mirrors:
+            return upstream_client()
+
+        def mirror_client(host):
+            return lambda: self._registry_client(host, repo, get_mirror_auth(host))
+
+        endpoints=[(host, mirror_client(host)) for host in mirrors]
+        endpoints.append((registry, upstream_client))
+        return MirroredPullClient(registry, endpoints)
+
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull base image from registry, return (base_layers, base_config)."""
         registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
-        client=self._registry_client(registry, repo, auth)
+        client=self._base_image_client(registry, repo)
         
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
@@ -511,6 +527,9 @@ class ImageBuilder:
             )
         
         print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        if self.verbose and isinstance(client, MirroredPullClient):
+            served=", ".join(client.serving_hosts) or "local blob store"
+            print(f"  Served by: {served}")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -563,6 +582,9 @@ class ImageBuilder:
         if len(self.config.all_tags())>1:
             print(f"  Tags: {', '.join(self.config.all_tags())}")
         print(f"  Base Image: {self.config.base_image}")
+        if self.config.registry_mirrors:
+            mirrors="; ".join(f"{k} -> {', '.join(v)}" for k,v in self.config.registry_mirrors.items())
+            print(f"  Base Image Mirrors: {mirrors}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
         print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")

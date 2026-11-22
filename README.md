@@ -383,6 +383,10 @@ exclude-defaults = true
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+- `--registry-mirror UPSTREAM=MIRROR` — Pull base images through `MIRROR`
+  before `UPSTREAM` (repeatable, tried in order; `[build.registry_mirrors]`).
+  Pushes never use mirrors, and mirrors never receive upstream credentials.
+  See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do

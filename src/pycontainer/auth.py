@@ -72,7 +72,7 @@ class DockerConfigAuthProvider(AuthProvider):
         auths=cfg.get('auths', {})
         
         # Docker Hub special cases
-        docker_hub_keys=['https://index.docker.io/v1/', 'index.docker.io', 'docker.io']
+        docker_hub_keys=['https://index.docker.io/v1/', 'index.docker.io', 'docker.io', 'registry-1.docker.io']
         if registry in docker_hub_keys or registry=='docker.io':
             for key in docker_hub_keys:
                 if key in auths:
@@ -179,6 +179,28 @@ def get_registry_auth(
         if credential_password:
             return RegistryAuth(bearer_token=credential_password)
 
+    return RegistryAuth()
+
+
+def get_mirror_auth(host: str) -> RegistryAuth:
+    """Resolve credentials scoped to exactly one mirror host.
+
+    Host-agnostic REGISTRY_* environment variables are deliberately ignored:
+    they usually belong to the upstream or push registry and must never be
+    sent to a mirror.
+    """
+    host = host.lower()
+    creds = DockerConfigAuthProvider().get_credentials(host)
+    if not creds and host.endswith(".azurecr.io"):
+        creds = AzureCLIAuthProvider().get_credentials(host)
+    if not creds and host == "ghcr.io" and os.getenv("GITHUB_TOKEN"):
+        return RegistryAuth(bearer_token=os.getenv("GITHUB_TOKEN"))
+    if creds:
+        username, password = creds
+        if username and password:
+            return RegistryAuth(username=username, password=password)
+        if password:
+            return RegistryAuth(bearer_token=password)
     return RegistryAuth()
 
 
