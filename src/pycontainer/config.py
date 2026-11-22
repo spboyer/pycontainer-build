@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
+
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
 
@@ -37,11 +39,15 @@ class BuildConfig:
     latest_tag: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
     index_annotations: Optional[Dict[str, str]] = None
+    release_notes_file: Optional[str] = None
+    release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
 
     def __post_init__(self):
+        from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
         self.validate_metadata()
+        validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(

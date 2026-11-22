@@ -4,6 +4,7 @@ from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .project import detect_python_version
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 
 def _metadata_argument(value: str) -> tuple[str, str]:
     key, separator, item = value.partition("=")
@@ -66,6 +67,8 @@ def main():
     b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
     b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
     b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
+    b.add_argument("--release-notes",dest="release_notes_file",metavar="FILE",help="Embed a UTF-8 release notes file (max 8 KiB after LF normalization) as an image label; relative to --context")
+    b.add_argument("--release-notes-label",dest="release_notes_label",metavar="KEY",help=f"Label key for --release-notes (default: {DEFAULT_RELEASE_NOTES_LABEL})")
     # --- import subcommand (Dockerfile migration) ---
     imp=sub.add_parser("import",help="Convert a Dockerfile to [tool.pycontainer] settings")
     imp.add_argument("dockerfile",help="Path to the Dockerfile")
@@ -114,6 +117,8 @@ def main():
         'labels': dict(args.labels) if args.labels is not None else None,
         'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
         'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
+        'release_notes_file': args.release_notes_file,
+        'release_notes_label': args.release_notes_label,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
@@ -133,7 +138,10 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    builder=ImageBuilder(cfg)
+    try:
+        builder=ImageBuilder(cfg)
+    except ReleaseNotesError as exc:
+        parser.error(str(exc))
     out=builder.build()
     print("Built:", out)
     
