@@ -99,6 +99,13 @@ pulled = pull_artifact(client, "report", "dist/pulled",
   - `unconfirmed`: the header was absent.
 
   A mismatched `OCI-Subject` raises an error.
+- **`publish_artifact_manifest`** runs steps 1-3 for manifest bytes that are
+  already serialized and blobs that are already staged, given as
+  `(digest, size, path)` for exactly the empty config and the payload. It
+  computes the manifest digest from the bytes given, uploads them unchanged,
+  and moves no tags. Callers that build their own manifest bytes, for example
+  attestation publishers, use it to avoid writing a temporary OCI layout.
+  Blob HEAD checks confirm metadata only; they do not re-read the blob bytes.
 - **`pull_artifact`** fetches the manifest under a 4 MiB bound and requires the
   exact OCI manifest `Content-Type`. It verifies the body digest against
   `Docker-Content-Digest`, the requested digest and `Content-Length`. It then
@@ -118,6 +125,13 @@ pulled = pull_artifact(client, "report", "dist/pulled",
   does not distinguish the two. It is reported as a status, not as an empty
   successful listing.
 - **Other statuses** and malformed responses raise explicit errors.
+- **`require_referrer`** checks that a just-published descriptor is
+  discoverable. It requests an unfiltered listing and matches digest, size and
+  `mediaType`, plus `artifactType` only when the listed entry includes it,
+  because that field is optional on index entries. A 404 fails immediately.
+  Only a supported listing that lacks the descriptor is retried, up to
+  `REFERRER_DISCOVERY_ATTEMPTS` (3) times with `REFERRER_DISCOVERY_DELAYS`
+  (1 s, then 2 s) between attempts. Malformed responses are not retried.
 - **Pagination:** `Link: rel="next"` is followed for at most 16 pages. Each
   next link must resolve to the same referrers path on the same registry
   origin, and repeated or off-path links are rejected.
@@ -134,8 +148,8 @@ pull by tag or digest, but not discovery through this API.
 | `InvalidArtifactError` (`ValueError`) | Malformed input, manifest, subject, tag or layout reference |
 | `UnsupportedArtifactError` | Valid JSON that is not a generic artifact (for example a runnable image manifest, or the wrong `Content-Type`) |
 | `BlobIntegrityError` | Digest, size or embedded data mismatch, or a corrupt local or registry blob |
-| `RegistryRequestError` | HTTP failure, a response over its bound, or an unsafe redirect or pagination link |
-| `ArtifactPublicationError` | A tag failed after the manifest was published. `published_tags` lists the tags already moved |
+| `RegistryRequestError` | HTTP failure, a response over its bound, or an unsafe redirect or pagination link, outside publication |
+| `ArtifactPublicationError` | Publication could not be confirmed. `stage` is `subject`, `blob`, `manifest`, `tag` or `referrers`, and the underlying registry or integrity error is chained as `__cause__`. For `tag`, `published_tags` lists the tags already moved |
 
 ## Registry compatibility
 

@@ -14,17 +14,25 @@ from pycontainer.artifact import (
     EMPTY_MEDIA_TYPE,
     REFERRERS_NOT_FOUND,
     SUBJECT_CONFIRMED,
+    REFERRERS_SUPPORTED,
+    STAGE_BLOB,
+    STAGE_MANIFEST,
+    STAGE_REFERRERS,
+    STAGE_SUBJECT,
     SUBJECT_UNCONFIRMED,
     ArtifactPublicationError,
     Descriptor,
     InvalidArtifactError,
+    ReferrersResult,
     UnsupportedArtifactError,
     build_artifact_manifest,
     list_referrers,
     parse_artifact_manifest,
+    publish_artifact_manifest,
     pull_artifact,
     push_artifact,
     read_artifact_layout,
+    require_referrer,
     write_artifact_layout,
 )
 from pycontainer.blob_store import BlobIntegrityError
@@ -427,8 +435,10 @@ def test_push_requires_existing_subject_unless_disabled(tmp_path, registry):
     _, client = registry
     subject = {"mediaType": MANIFEST, "digest": "sha256:" + "d" * 64, "size": 10}
     write_artifact_layout(tmp_path / "layout", _payload(tmp_path), ARTIFACT_TYPE, PAYLOAD_TYPE, subject=subject)
-    with pytest.raises(RegistryRequestError, match="HTTP 404"):
+    with pytest.raises(ArtifactPublicationError, match="HTTP 404") as error:
         push_artifact(client, tmp_path / "layout")
+    assert error.value.stage == STAGE_SUBJECT
+    assert isinstance(error.value.__cause__, RegistryRequestError)
     assert push_artifact(client, tmp_path / "layout", verify_subject=False).subject_status == SUBJECT_CONFIRMED
 
 
@@ -478,8 +488,9 @@ def test_manifest_and_tag_publication_failures_are_explicit(tmp_path, registry):
         push_artifact(client, tmp_path / "layout", tags=["ok", "ghost"])
     assert error.value.published_tags == ("ok", "ghost")
     server.fail_tags.add(artifact.descriptor.digest)
-    with pytest.raises(RegistryRequestError, match="HTTP 500"):
+    with pytest.raises(ArtifactPublicationError, match="HTTP 500") as error:
         push_artifact(client, tmp_path / "layout")
+    assert error.value.stage == STAGE_MANIFEST
 
 
 def test_existing_registry_blob_with_wrong_size_blocks_publication(tmp_path, registry):
@@ -487,9 +498,86 @@ def test_existing_registry_blob_with_wrong_size_blocks_publication(tmp_path, reg
     artifact = write_artifact_layout(tmp_path / "layout", _payload(tmp_path), ARTIFACT_TYPE, PAYLOAD_TYPE)
     server.blobs[artifact.payload.digest] = b"short"
     server.corrupt_blobs.add(artifact.payload.digest)
-    with pytest.raises(BlobIntegrityError, match="Content-Length"):
+    with pytest.raises(ArtifactPublicationError, match="Content-Length") as error:
         push_artifact(client, tmp_path / "layout")
+    assert error.value.stage == STAGE_BLOB
+    assert isinstance(error.value.__cause__, BlobIntegrityError)
     assert artifact.descriptor.digest not in server.manifests
+
+
+def _staged(tmp_path, payload=b"bundle"):
+    empty = tmp_path / "empty.json"
+    empty.write_bytes(b"{}")
+    body = tmp_path / "bundle.json"
+    body.write_bytes(payload)
+    descriptor = Descriptor(PAYLOAD_TYPE, _digest(payload), len(payload))
+    return descriptor, [(EMPTY_DIGEST, 2, empty), (descriptor.digest, descriptor.size, body)]
+
+
+def test_publish_manifest_uploads_exact_bytes_by_digest_without_tags(tmp_path, registry):
+    server, client = registry
+    base = write_artifact_layout(tmp_path / "base", _payload(tmp_path, b"base"), "application/vnd.example.base", PAYLOAD_TYPE)
+    push_artifact(client, tmp_path / "base")
+    payload, blobs = _staged(tmp_path)
+    manifest = json.loads(build_artifact_manifest(ARTIFACT_TYPE, payload, base.descriptor))
+    data = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    before = set(server.manifests)
+    result = publish_artifact_manifest(client, data, blobs)
+    assert result.descriptor.digest == _digest(data) and result.descriptor.size == len(data)
+    assert result.tags == () and result.subject_status == SUBJECT_CONFIRMED
+    assert set(server.manifests) - before == {_digest(data)}
+    assert server.manifests[_digest(data)][0] == data
+    assert require_referrer(client, base.descriptor.digest, result.descriptor).digest == _digest(data)
+
+
+def test_publish_manifest_requires_exactly_the_described_blobs(tmp_path, registry):
+    _, client = registry
+    payload, blobs = _staged(tmp_path)
+    data = build_artifact_manifest(ARTIFACT_TYPE, payload)
+    for bad in ([blobs[1]], [blobs[0], (payload.digest, payload.size + 1, blobs[1][2])]):
+        with pytest.raises(InvalidArtifactError):
+            publish_artifact_manifest(client, data, bad)
+    with pytest.raises(UnsupportedArtifactError):
+        publish_artifact_manifest(client, _manifest(layers=[]), blobs)
+    (tmp_path / "one").mkdir()
+    one, one_blobs = _staged(tmp_path / "one", b"x")
+    with pytest.raises(InvalidArtifactError, match="non-negative integer"):
+        publish_artifact_manifest(
+            client, build_artifact_manifest(ARTIFACT_TYPE, one), [one_blobs[0], (one.digest, True, one_blobs[1][2])]
+        )
+    (tmp_path / "empty").mkdir()
+    empty_payload, empty_blobs = _staged(tmp_path / "empty", b"{}")
+    empty_data = build_artifact_manifest(ARTIFACT_TYPE, empty_payload)
+    assert publish_artifact_manifest(client, empty_data, empty_blobs).descriptor.digest == _digest(empty_data)
+
+
+def _listing(*descriptors, status=REFERRERS_SUPPORTED):
+    return ReferrersResult(status, tuple(descriptors), False, 1)
+
+
+def test_require_referrer_is_fail_closed_and_bounded(monkeypatch):
+    target = Descriptor(MANIFEST, "sha256:" + "c" * 64, 42, ARTIFACT_TYPE)
+    subject = "sha256:" + "a" * 64
+    responses, sleeps = [], []
+    monkeypatch.setattr("pycontainer.artifact.list_referrers", lambda client, digest: responses.pop(0))
+
+    responses[:] = [_listing(status=REFERRERS_NOT_FOUND)]
+    with pytest.raises(ArtifactPublicationError, match="HTTP 404") as error:
+        require_referrer(None, subject, target, sleep=sleeps.append)
+    assert error.value.stage == STAGE_REFERRERS and sleeps == []
+
+    wrong_type = Descriptor(MANIFEST, target.digest, 42, "application/vnd.example.other")
+    wrong_size = Descriptor(MANIFEST, target.digest, 43, ARTIFACT_TYPE)
+    responses[:] = [_listing(), _listing(wrong_type), _listing(wrong_size)]
+    with pytest.raises(ArtifactPublicationError, match="after 3 attempts") as error:
+        require_referrer(None, subject, target, sleep=sleeps.append)
+    assert error.value.stage == STAGE_REFERRERS and sleeps == [1.0, 2.0] and responses == []
+
+    untyped = Descriptor(MANIFEST, target.digest, 42)
+    responses[:] = [_listing(), _listing(untyped)]
+    sleeps.clear()
+    assert require_referrer(None, subject, target, sleep=sleeps.append) == untyped
+    assert sleeps == [1.0]
 
 
 def test_oversized_manifest_response_is_rejected(tmp_path, registry, monkeypatch):

@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 from .blob_store import (
     HASH_CHUNK_SIZE,
@@ -65,12 +66,28 @@ class UnsupportedArtifactError(InvalidArtifactError):
     """Raised for valid OCI content outside the generic-artifact contract."""
 
 
-class ArtifactPublicationError(RuntimeError):
-    """Raised when registry publication cannot be confirmed."""
+STAGE_SUBJECT = "subject"
+STAGE_BLOB = "blob"
+STAGE_MANIFEST = "manifest"
+STAGE_TAG = "tag"
+STAGE_REFERRERS = "referrers"
 
-    def __init__(self, message: str, published_tags: Tuple[str, ...] = ()):
+REFERRER_DISCOVERY_ATTEMPTS = 3
+REFERRER_DISCOVERY_DELAYS = (1.0, 2.0)
+
+
+class ArtifactPublicationError(RuntimeError):
+    """Raised when registry publication cannot be confirmed.
+
+    ``stage`` names the step that failed: subject, blob, manifest, tag or referrers.
+    """
+
+    def __init__(
+        self, message: str, published_tags: Tuple[str, ...] = (), stage: Optional[str] = None
+    ):
         super().__init__(message)
         self.published_tags = tuple(published_tags)
+        self.stage = stage
 
 
 @dataclass(frozen=True)
@@ -531,35 +548,19 @@ def push_artifact(
     tags = tuple(dict.fromkeys(_check_tag(tag) for tag in tags))
     artifact = read_artifact_layout(layout_dir, reference, max_payload_bytes=max_payload_bytes)
     layout = Path(layout_dir)
-    subject = artifact.subject
-    if subject and verify_subject:
-        client.verify_manifest_descriptor(
-            subject.digest, subject.digest, subject.size, subject.media_type
-        )
-    for blob_digest, blob_size, blob_path in (
-        (EMPTY_DIGEST, len(EMPTY_CONFIG), _blob_path(layout, EMPTY_DIGEST)),
-        (artifact.payload.digest, artifact.payload.size, artifact.payload_path),
-    ):
-        if not client.blob_descriptor_matches(blob_digest, blob_size):
-            client.upload_blob_monolithic(blob_digest, blob_path)
-            if not client.blob_descriptor_matches(blob_digest, blob_size):
-                raise ArtifactPublicationError(
-                    f"Registry did not expose uploaded blob {blob_digest}."
-                )
     manifest_data = _read_bounded(
         _blob_path(layout, artifact.descriptor.digest), artifact.descriptor.size, "Artifact manifest"
     )
-    digest, size = artifact.descriptor.digest, artifact.descriptor.size
-    headers = client.put_manifest(digest, manifest_data, OCI_MANIFEST_MEDIA_TYPE)
-    subject_status = None
-    if subject:
-        reported = _header(headers, "OCI-Subject")
-        if reported is not None and reported.strip() != subject.digest:
-            raise ArtifactPublicationError(
-                "Registry reported an OCI-Subject that does not match the artifact subject."
-            )
-        subject_status = SUBJECT_UNCONFIRMED if reported is None else SUBJECT_CONFIRMED
-    client.verify_manifest_descriptor(digest, digest, size, OCI_MANIFEST_MEDIA_TYPE)
+    published = publish_artifact_manifest(
+        client,
+        manifest_data,
+        [
+            (EMPTY_DIGEST, len(EMPTY_CONFIG), _blob_path(layout, EMPTY_DIGEST)),
+            (artifact.payload.digest, artifact.payload.size, artifact.payload_path),
+        ],
+        verify_subject=verify_subject,
+    )
+    digest, size = published.descriptor.digest, published.descriptor.size
     moved = []
     for tag in tags:
         try:
@@ -568,7 +569,7 @@ def push_artifact(
             raise ArtifactPublicationError(
                 f"Artifact {digest} was published, but tag {tag!r} failed; "
                 f"tags already moved: {', '.join(moved) or 'none'}.",
-                tuple(moved),
+                tuple(moved), STAGE_TAG,
             ) from error
         moved.append(tag)
         try:
@@ -577,9 +578,87 @@ def push_artifact(
             raise ArtifactPublicationError(
                 f"Artifact {digest} was published, but tag {tag!r} could not be verified; "
                 f"tags possibly moved: {', '.join(moved)}.",
-                tuple(moved),
+                tuple(moved), STAGE_TAG,
             ) from error
-    return ArtifactPushResult(_reference(client, digest), artifact.descriptor, tags, subject_status)
+    return ArtifactPushResult(published.reference, published.descriptor, tags, published.subject_status)
+
+
+def publish_artifact_manifest(
+    client: RegistryClient,
+    manifest_data: bytes,
+    blobs: Iterable[Tuple[str, int, Path]],
+    *,
+    verify_subject: bool = True,
+) -> ArtifactPushResult:
+    """Publish serialized artifact manifest bytes and staged blobs by digest only.
+
+    ``blobs`` must describe exactly the empty config and the payload as
+    ``(digest, size, path)``. The manifest digest is computed from the bytes
+    given, which are uploaded unchanged. No tags are moved. Registry failures
+    raise :class:`ArtifactPublicationError` with ``stage`` set.
+    """
+    if not isinstance(manifest_data, bytes) or len(manifest_data) > MAX_MANIFEST_BYTES:
+        raise InvalidArtifactError(f"Artifact manifest must be bytes of at most {MAX_MANIFEST_BYTES}.")
+    manifest = parse_artifact_manifest(manifest_data)
+    staged = {}
+    for blob_digest, blob_size, blob_path in blobs:
+        if type(blob_size) is not int or blob_size < 0:
+            raise InvalidArtifactError(f"Blob {blob_digest} size must be a non-negative integer.")
+        if blob_digest in staged and staged[blob_digest][0] != blob_size:
+            raise InvalidArtifactError(f"Blob {blob_digest} is listed with conflicting sizes.")
+        staged.setdefault(blob_digest, (blob_size, Path(blob_path)))
+    required = {EMPTY_DIGEST: len(EMPTY_CONFIG), manifest.payload.digest: manifest.payload.size}
+    if {key: value[0] for key, value in staged.items()} != required:
+        raise InvalidArtifactError(
+            "Staged blobs must be exactly the empty config and the manifest payload with matching sizes."
+        )
+    digest = "sha256:" + hashlib.sha256(manifest_data).hexdigest()
+    size = len(manifest_data)
+    subject = manifest.subject
+    errors = (RegistryRequestError, BlobIntegrityError, OSError)
+    if subject and verify_subject:
+        try:
+            client.verify_manifest_descriptor(
+                subject.digest, subject.digest, subject.size, subject.media_type
+            )
+        except errors as error:
+            raise ArtifactPublicationError(
+                f"Artifact subject {subject.digest} could not be verified: {error}",
+                stage=STAGE_SUBJECT,
+            ) from error
+    for blob_digest, (blob_size, blob_path) in staged.items():
+        try:
+            if not client.blob_descriptor_matches(blob_digest, blob_size):
+                client.upload_blob_monolithic(blob_digest, blob_path)
+                if not client.blob_descriptor_matches(blob_digest, blob_size):
+                    raise BlobIntegrityError(f"Registry did not expose uploaded blob {blob_digest}.")
+        except errors as error:
+            raise ArtifactPublicationError(
+                f"Artifact blob {blob_digest} could not be published: {error}", stage=STAGE_BLOB
+            ) from error
+    try:
+        headers = client.put_manifest(digest, manifest_data, OCI_MANIFEST_MEDIA_TYPE)
+    except errors as error:
+        raise ArtifactPublicationError(
+            f"Artifact manifest {digest} could not be published: {error}", stage=STAGE_MANIFEST
+        ) from error
+    subject_status = None
+    if subject:
+        reported = _header(headers, "OCI-Subject")
+        if reported is not None and reported.strip() != subject.digest:
+            raise ArtifactPublicationError(
+                "Registry reported an OCI-Subject that does not match the artifact subject.",
+                stage=STAGE_SUBJECT,
+            )
+        subject_status = SUBJECT_UNCONFIRMED if reported is None else SUBJECT_CONFIRMED
+    try:
+        client.verify_manifest_descriptor(digest, digest, size, OCI_MANIFEST_MEDIA_TYPE)
+    except errors as error:
+        raise ArtifactPublicationError(
+            f"Artifact manifest {digest} could not be verified: {error}", stage=STAGE_MANIFEST
+        ) from error
+    descriptor = Descriptor(OCI_MANIFEST_MEDIA_TYPE, digest, size, manifest.artifact_type)
+    return ArtifactPushResult(_reference(client, digest), descriptor, (), subject_status)
 
 
 def pull_artifact(
@@ -693,3 +772,45 @@ def list_referrers(
     if artifact_type:
         descriptors = [item for item in descriptors if item.artifact_type == artifact_type]
     return ReferrersResult(REFERRERS_SUPPORTED, tuple(descriptors), filter_applied, pages)
+
+
+def require_referrer(
+    client: RegistryClient,
+    subject_digest: str,
+    descriptor: Descriptor,
+    *,
+    attempts: int = REFERRER_DISCOVERY_ATTEMPTS,
+    delays: Tuple[float, ...] = REFERRER_DISCOVERY_DELAYS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Descriptor:
+    """Require the OCI referrers API to list ``descriptor`` for ``subject_digest``.
+
+    Uses an unfiltered listing and matches digest, size and mediaType, plus
+    artifactType only when the listed entry includes it. HTTP 404 fails
+    immediately; only a supported listing that lacks the descriptor is retried,
+    up to ``attempts`` times. Raises ArtifactPublicationError(stage="referrers").
+    """
+    if type(attempts) is not int or attempts < 1 or len(delays) < attempts - 1:
+        raise ValueError("Referrer discovery needs at least one attempt and a delay between attempts.")
+    for attempt in range(attempts):
+        found = list_referrers(client, subject_digest)
+        if not found.supported:
+            raise ArtifactPublicationError(
+                f"Registry did not serve the OCI referrers API for {subject_digest} (HTTP 404).",
+                stage=STAGE_REFERRERS,
+            )
+        for item in found.manifests:
+            if (
+                item.digest == descriptor.digest
+                and item.size == descriptor.size
+                and item.media_type == descriptor.media_type
+                and (item.artifact_type is None or item.artifact_type == descriptor.artifact_type)
+            ):
+                return item
+        if attempt + 1 < attempts:
+            sleep(delays[attempt])
+    raise ArtifactPublicationError(
+        f"Referrers listing for {subject_digest} did not include {descriptor.digest} "
+        f"after {attempts} attempts.",
+        stage=STAGE_REFERRERS,
+    )
