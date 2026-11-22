@@ -198,9 +198,17 @@ separate.
   (`-r` and `-c` includes, comments included) is scanned before pip runs. URLs
   with a password, a bare username or token (other than `git@`), or a query
   parameter named like `token`, `key`, `secret`, `password`, `auth`, `sig` or
-  `credential` fail the build. Userinfo made only of `${VAR}` placeholders, or
-  a literal user with a `${VAR}` password, is allowed. The error names the file,
-  line and URL scheme and host only.
+  `credential` fail the build. URL path segments are also checked: known token
+  formats (GitHub `ghp_`/`github_pat_`, GitLab `glpat-`, PyPI `pypi-AgE…`,
+  Hugging Face `hf_`), the first path segment on `dl.cloudsmith.io` other than
+  `public` or `basic`, and, except on public source hosts such as `github.com`
+  and `pypi.org`, a whole path segment of 20+ alphanumerics that mixes upper
+  case, lower case and digits with frequent changes between them. Userinfo or
+  path segments made only of `${VAR}`
+  placeholders, or a literal user with a `${VAR}` password, are allowed; pip
+  expands placeholders anywhere on a requirements line, so
+  `https://dl.cloudsmith.io/${CLOUDSMITH_TOKEN}/org/repo/python/simple/` works.
+  The error names the file, line and URL scheme and host only.
 - **Shipped pip inputs are checked even without `--include-deps`.** Before the
   application layer is created (and before any cache lookup), included
   `requirements*.txt|.in`, `constraints*.txt|.in`, `pip.conf`, `pip.ini` and
@@ -230,22 +238,30 @@ separate.
 - **Errors are classified and redacted.** HTTP 401/403 failures name the
   supported credential sources, HTTP 407 points at proxy credentials, and
   connection or TLS failures say so. Excerpts are limited to a few pip lines
-  with URL userinfo, secret-like query values, known environment URL
-  credentials and expanded placeholder values replaced by `****`.
+  with URL userinfo, secret-like query values, detected URL path tokens, known
+  environment URL credentials and expanded placeholder values replaced by
+  `****`.
 
 ### Limits
 
-- Detection is pattern-based. Tokens embedded in URL paths, or credentials in
-  other source files (for example application config), are not detected;
-  keep secrets out of the build context.
+- Detection is pattern-based and best effort. The random-looking-segment check
+  misses a share of genuinely random tokens (in a synthetic sample, roughly
+  16% of 20-character and 7% of 40-character alphanumeric tokens), and it
+  ignores short, word-like, single-case or all-hex values. Path tokens in
+  positions without a host rule (for example Gemfury's
+  `pypi.fury.io/<token>/<user>/`) and credentials in other source files (for
+  example application config) may not be detected. Use `${VAR}` placeholders
+  for any URL path secret and keep secrets out of the build context.
 - Redaction covers values the builder can see: URL userinfo, secret-like query
-  parameters, `PIP_*`/proxy URL credentials and placeholder values. Values pip
-  reads from config files, netrc or keyring are redacted only where they
-  appear as URL userinfo; pip itself also masks passwords in URLs it logs.
+  parameters, detected URL path tokens, `PIP_*`/proxy URL credentials and
+  placeholder values. Values pip reads from config files, netrc or keyring are
+  redacted only where they appear in those URL positions; pip itself also
+  masks passwords in URLs it logs.
 - pip, keyring backends and the index are trusted. A malicious index or
   package is out of scope.
-- The tests use a loopback basic-auth index and synthetic secrets
-  (`tests/test_private_index.py`); they verify that those secrets do not
+- The tests use a loopback basic-auth index, a loopback index authenticated by
+  a URL path token, and synthetic secrets (`tests/test_private_index.py`);
+  they verify that those secrets do not
   appear in the OCI layout blobs (decompressed), SBOM, layer cache, standard
   output or errors. A second loopback origin on a different hostname verifies
   that index credentials (environment userinfo, netrc and placeholders) are not

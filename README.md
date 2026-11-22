@@ -365,8 +365,9 @@ pycontainer build \
   fails.
   Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
   `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
-  placeholders in the requirements file. Literal credentials in requirements
-  files are rejected, and host pip settings that could change target
+  placeholders in the requirements file, including in URL paths. Literal
+  credentials in requirements files (URL userinfo, secret-like query values
+  and recognized URL path tokens) are rejected, and host pip settings that could change target
   selection (for example `PIP_PLATFORM` or `PIP_NO_BINARY`) are ignored; see
   [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
 

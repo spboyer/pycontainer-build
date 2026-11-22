@@ -31,13 +31,17 @@ from test_dependency_staging import BASE_CONFIG, _builder, _write_wheel
 
 USER = "synthetic-user"
 SECRET = "synthetic-s3cret-147"
+# Synthetic random-looking tokens for indexes that authenticate by URL path.
+PATH_TOKEN = "sYn7HeT1cPaTh5ToK3n9Q2wE4rT6yU"
+WRONG_PATH_TOKEN = "wR0nG5yNtH3t1cP4tHt0K3nX8qZ2"
 
 
 class _Index:
-    def __init__(self, wheel: Path, artifact_url=None, redirect=False):
+    def __init__(self, wheel: Path, artifact_url=None, redirect=False, path_token=None):
         self.wheel = wheel
         self.artifact_url = artifact_url
         self.redirect = redirect
+        self.path_token = path_token
         self.authorized = 0
         self.rejected = 0
         expected = base64.b64encode(f"{USER}:{SECRET}".encode()).decode()
@@ -48,7 +52,14 @@ class _Index:
                 pass
 
             def do_GET(self):
-                if self.headers.get("Authorization") != f"Basic {expected}":
+                path = self.path
+                if index.path_token is None:
+                    authorized = self.headers.get("Authorization") == f"Basic {expected}"
+                else:
+                    prefix = f"/{index.path_token}"
+                    authorized = path.startswith(prefix + "/")
+                    path = path[len(prefix):] if authorized else path
+                if not authorized:
                     index.rejected += 1
                     self.send_response(401)
                     self.send_header("WWW-Authenticate", 'Basic realm="synthetic"')
@@ -56,13 +67,13 @@ class _Index:
                     self.end_headers()
                     return
                 index.authorized += 1
-                if index.redirect and self.path.startswith("/packages/"):
+                if index.redirect and path.startswith("/packages/"):
                     self.send_response(302)
-                    self.send_header("Location", f"{index.artifact_url}{self.path}")
+                    self.send_header("Location", f"{index.artifact_url}{path}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                body = index._body(self.path)
+                body = index._body(path)
                 if body is None:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")
@@ -72,7 +83,7 @@ class _Index:
                 self.send_header(
                     "Content-Type",
                     "text/html"
-                    if self.path.startswith("/simple/")
+                    if path.startswith("/simple/")
                     else "application/octet-stream",
                 )
                 self.send_header("Content-Length", str(len(body)))
@@ -87,9 +98,13 @@ class _Index:
         if path.rstrip("/") == "/simple/fixture-dep":
             digest = hashlib.sha256(self.wheel.read_bytes()).hexdigest()
             name = self.wheel.name
-            base = "" if self.redirect else (self.artifact_url or "")
+            if self.path_token is not None:
+                href = f"../../packages/{name}"
+            else:
+                base = "" if self.redirect else (self.artifact_url or "")
+                href = f"{base}/packages/{name}"
             return (
-                f'<html><body><a href="{base}/packages/{name}#sha256={digest}">{name}</a>'
+                f'<html><body><a href="{href}#sha256={digest}">{name}</a>'
                 "</body></html>"
             ).encode()
         if path == f"/packages/{self.wheel.name}":
@@ -98,6 +113,9 @@ class _Index:
 
     def url_with(self, userinfo):
         return self.url.replace("http://", f"http://{userinfo}@")
+
+    def url_with_path(self, segment):
+        return self.url.replace("/simple/", f"/{segment}/simple/")
 
     def __enter__(self):
         self.thread.start()
@@ -158,10 +176,12 @@ def _install(tmp_path, context):
     return {name for name, _ in staged_packages(destination)}
 
 
-def _assert_secret_absent(root: Path, *texts: str) -> None:
-    needles = [SECRET.encode(), base64.b64encode(f"{USER}:{SECRET}".encode())]
+def _assert_secret_absent(root: Path, *texts: str, secret: str = SECRET) -> None:
+    needles = [secret.encode()]
+    if secret == SECRET:
+        needles.append(base64.b64encode(f"{USER}:{SECRET}".encode()))
     for text in texts:
-        assert SECRET not in text
+        assert secret not in text
     for path in root.rglob("*"):
         if not path.is_file():
             continue
@@ -181,10 +201,16 @@ def _set_netrc(home, monkeypatch):
 
 def _set_keyring(home, monkeypatch):
     script = home / "fake_keyring.py"
+    # pip 26+ calls "keyring --mode=creds --output=json get URL USER" and reads JSON;
+    # older pip calls "keyring get URL USER" and reads the bare password.
     script.write_text(
-        "import sys\n"
-        f"if sys.argv[1:2] == ['get'] and sys.argv[-1] == {USER!r}:\n"
-        f"    print({SECRET!r})\n"
+        "import json, sys\n"
+        "args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]\n"
+        f"if args[:1] == ['get'] and args[-1] == {USER!r}:\n"
+        "    if '--mode=creds' in sys.argv:\n"
+        f"        print(json.dumps({{'username': {USER!r}, 'password': {SECRET!r}}}))\n"
+        "    else:\n"
+        f"        print({SECRET!r})\n"
         "else:\n"
         "    sys.exit(1)\n"
     )
@@ -307,6 +333,84 @@ def test_literal_credentials_in_included_constraints_are_rejected(tmp_path):
     assert SECRET not in str(error.value)
 
 
+@pytest.fixture
+def path_index(tmp_path):
+    with _Index(_write_wheel(tmp_path / "index-files"), path_token=PATH_TOKEN) as server:
+        yield server
+
+
+@pytest.mark.parametrize("shipped", [False, True])
+def test_literal_url_path_token_is_rejected_before_pip(
+    tmp_path, monkeypatch, home, path_index, shipped
+):
+    context = _context(
+        tmp_path,
+        f"--index-url {path_index.url_with_path(PATH_TOKEN)}\nfixture-dep==1.0\n",
+    )
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=not shipped)
+
+    with pytest.raises(ValueError, match="literal credentials at line 1") as error:
+        builder.build()
+
+    message = str(error.value)
+    assert PATH_TOKEN not in message and "${VAR}" in message
+    assert path_index.authorized == path_index.rejected == 0
+
+
+@pytest.mark.parametrize("source", ["environment", "placeholder"])
+def test_url_path_token_never_reaches_image_sbom_or_logs(
+    tmp_path, monkeypatch, capfd, home, path_index, source
+):
+    requirements = "fixture-dep==1.0\n"
+    if source == "environment":
+        monkeypatch.setenv("PIP_INDEX_URL", path_index.url_with_path(PATH_TOKEN))
+    else:
+        monkeypatch.setenv("PRIVATE_INDEX_PATH_TOKEN", PATH_TOKEN)
+        requirements = (
+            f"--index-url {path_index.url_with_path('${PRIVATE_INDEX_PATH_TOKEN}')}\n"
+            + requirements
+        )
+    builder = _builder(
+        tmp_path,
+        monkeypatch,
+        context=_context(tmp_path, requirements),
+        include_deps=True,
+        generate_sbom=True,
+    )
+
+    builder.build()
+
+    assert path_index.authorized >= 2
+    captured = capfd.readouterr()
+    _assert_secret_absent(
+        tmp_path / "output", captured.out, captured.err, secret=PATH_TOKEN
+    )
+
+
+@pytest.mark.parametrize("source", ["environment", "placeholder"])
+def test_wrong_url_path_token_error_is_redacted(
+    tmp_path, monkeypatch, capfd, home, path_index, source
+):
+    requirements = "fixture-dep==1.0\n"
+    if source == "environment":
+        monkeypatch.setenv("PIP_INDEX_URL", path_index.url_with_path(WRONG_PATH_TOKEN))
+    else:
+        monkeypatch.setenv("PRIVATE_INDEX_PATH_TOKEN", WRONG_PATH_TOKEN)
+        requirements = (
+            f"--index-url {path_index.url_with_path('${PRIVATE_INDEX_PATH_TOKEN}')}\n"
+            + requirements
+        )
+
+    with pytest.raises(RuntimeError, match="Authentication to a package index failed") as error:
+        _install(tmp_path, _context(tmp_path, requirements))
+
+    captured = capfd.readouterr()
+    for text in (str(error.value), captured.out, captured.err):
+        assert WRONG_PATH_TOKEN not in text
+    assert "/****/simple/" in str(error.value)
+    assert path_index.rejected >= 1
+
+
 def test_shipped_credentials_are_rejected_without_dependency_staging(
     tmp_path, monkeypatch
 ):
@@ -411,17 +515,22 @@ def test_host_pip_overrides_do_not_change_target_install(
     assert str(tmp_path / "prefix") not in output
 
 
-def test_installed_direct_url_credentials_are_rejected(tmp_path):
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://{USER}:{SECRET}@example.invalid/pkg.whl",
+        f"https://example.invalid/{PATH_TOKEN}/pkg.whl",
+    ],
+)
+def test_installed_direct_url_credentials_are_rejected(tmp_path, url):
     dist_info = tmp_path / "fixture_dep-1.0.dist-info"
     dist_info.mkdir()
-    (dist_info / "direct_url.json").write_text(
-        json.dumps({"url": f"https://{USER}:{SECRET}@example.invalid/pkg.whl"})
-    )
+    (dist_info / "direct_url.json").write_text(json.dumps({"url": url}))
 
     with pytest.raises(ValueError, match="records a URL with credentials") as error:
         reject_credentialed_direct_urls(tmp_path)
 
-    assert SECRET not in str(error.value)
+    assert SECRET not in str(error.value) and PATH_TOKEN not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -435,6 +544,24 @@ def test_installed_direct_url_credentials_are_rejected(tmp_path):
         ("https://${TOKEN}@example.invalid/simple", False),
         ("git+ssh://git@github.com/org/repo.git", False),
         ("https://example.invalid/simple?page=2", False),
+        (f"https://example.invalid/{PATH_TOKEN}/simple/", True),
+        ("https://example.invalid/ghp_ABCDEFGHIJKLMNOPQRSTuvwx1234/simple/", True),
+        ("https://dl.cloudsmith.io/AbCd1234EfGh5678/org/repo/python/simple/", True),
+        ("https://dl.cloudsmith.io/public/org/repo/python/simple/", False),
+        ("https://dl.cloudsmith.io/${CLOUDSMITH_TOKEN}/org/repo/python/simple/", False),
+        (f"https://example.invalid/{'0123456789abcdef' * 4}/pkg-1.0-py3-none-any.whl", False),
+        ("https://example.invalid/MyCompanyInternalLib2024/simple/", False),
+        ("https://example.invalid/AcmeDataSyncClient2024Beta/simple/", False),
+        (
+            "https://github.com/org/repo/releases/download/"
+            "V1234567890aBcDeFgHiJkLmNoPqRsT/pkg-1.0-py3-none-any.whl",
+            False,
+        ),
+        (
+            f"https://example.invalid/files/{PATH_TOKEN}-1.0-py3-none-any.whl",
+            False,
+        ),
+        ("https://example.invalid/550e8400-e29b-41d4-a716-446655440000/simple/", False),
     ],
 )
 def test_url_credential_detection(url, expected):
@@ -444,14 +571,16 @@ def test_url_credential_detection(url, expected):
 def test_redaction_removes_userinfo_query_tokens_and_known_values():
     text = (
         f"GET https://{USER}:{SECRET}@example.invalid/simple?token=abc123 "
-        f"and raw {SECRET} and encoded synthetic%2Fs3cret"
+        f"and raw {SECRET} and encoded synthetic%2Fs3cret "
+        f"and https://example.invalid/{PATH_TOKEN}/simple/fixture-dep/"
     )
 
     redacted = redact(text, [SECRET, "synthetic/s3cret"])
 
     assert SECRET not in redacted and "abc123" not in redacted
-    assert "synthetic%2Fs3cret" not in redacted
+    assert "synthetic%2Fs3cret" not in redacted and PATH_TOKEN not in redacted
     assert "https://****@example.invalid/simple?token=****" in redacted
+    assert "https://example.invalid/****/simple/fixture-dep/" in redacted
 
 
 def test_proxy_authentication_failures_are_classified():

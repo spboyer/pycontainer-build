@@ -23,6 +23,66 @@ _URL_ENVIRONMENT = (
     "all_proxy",
 )
 _MIN_SECRET_LENGTH = 4
+_KNOWN_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|glpat-[A-Za-z0-9_\-]{20,}|pypi-AgE[A-Za-z0-9_\-]{16,}|hf_[A-Za-z0-9]{20,})"
+)
+# Hosts that document a token as the first URL path segment, with public prefixes.
+_PATH_TOKEN_HOSTS = {"dl.cloudsmith.io": frozenset({"public", "basic"})}
+# Public source and artifact hosts that do not take credentials in URL paths;
+# release tags and file names there must not trip the opaque-segment heuristic.
+_PUBLIC_PATH_HOSTS = frozenset({
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+})
+_OPAQUE_SEGMENT = re.compile(r"[A-Za-z0-9]{20,}")
+# Random alphanumerics change class at ~62% of positions; CamelCase names at ~40%.
+_MIN_CLASS_CHANGE_RATIO = 0.5
+
+
+def _character_class(character: str) -> str:
+    if character.isdigit():
+        return "digit"
+    return "upper" if character.isupper() else "lower"
+
+
+def _is_opaque_token(segment: str) -> bool:
+    """A whole path segment of random-looking mixed-case alphanumerics."""
+    if not _OPAQUE_SEGMENT.fullmatch(segment):
+        return False
+    classes = [_character_class(character) for character in segment]
+    changes = sum(left != right for left, right in zip(classes, classes[1:]))
+    return len(set(classes)) == 3 and changes >= _MIN_CLASS_CHANGE_RATIO * (len(segment) - 1)
+
+
+def _secret_path_segments(host: str, segments: List[str]) -> Set[int]:
+    secret = set()
+    public = _PATH_TOKEN_HOSTS.get(host)
+    heuristic = host not in _PUBLIC_PATH_HOSTS
+    for position, raw in enumerate(segments):
+        segment = PLACEHOLDER.sub("", unquote(raw))
+        if not segment:
+            continue
+        if position == 0 and public is not None and segment.lower() not in public:
+            secret.add(position)
+        elif _KNOWN_TOKEN.search(segment) or (heuristic and _is_opaque_token(segment)):
+            secret.add(position)
+    return secret
+
+
+def _path_secret(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(_secret_path_segments(host, parts.path.split("/")[1:]))
 
 
 def _split_authority(url: str) -> Tuple[str, str, str]:
@@ -59,7 +119,7 @@ def url_has_credentials(url: str) -> bool:
     _, authority, _ = _split_authority(url)
     if "@" in authority and _userinfo_is_secret(authority.rsplit("@", 1)[0]):
         return True
-    return _secret_query(url)
+    return _secret_query(url) or _path_secret(url)
 
 
 def describe_url(url: str) -> str:
@@ -85,6 +145,13 @@ def _redact_url(match: "re.Match[str]") -> str:
         userinfo, host = authority.rsplit("@", 1)
         if _userinfo_is_secret(userinfo):
             authority = f"{REDACTED}@{host}"
+    query_start = re.search(r"[?#]", remainder)
+    cut = query_start.start() if query_start else len(remainder)
+    segments = remainder[:cut].split("/")
+    hostname = authority.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    for position in _secret_path_segments(hostname, segments[1:]):
+        segments[position + 1] = REDACTED
+    remainder = "/".join(segments) + remainder[cut:]
     remainder = re.sub(
         r"([?&])([^=&#\s]+)=([^&#\s]+)",
         lambda part: (
@@ -119,7 +186,11 @@ def known_secrets(
     }
     for name in _URL_ENVIRONMENT:
         for url in _URL.findall(environment.get(name, "")):
-            _, authority, _ = _split_authority(url)
+            _, authority, remainder = _split_authority(url)
+            host = authority.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+            segments = re.split(r"[?#]", remainder, maxsplit=1)[0].split("/")[1:]
+            for position in _secret_path_segments(host, segments):
+                secrets.update({segments[position], unquote(segments[position])})
             if "@" not in authority:
                 continue
             user, _, password = authority.rsplit("@", 1)[0].partition(":")

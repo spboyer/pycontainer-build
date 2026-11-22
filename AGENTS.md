@@ -171,7 +171,9 @@ The `_pip_target.py` bootstrap also filters host pip environment variables and c
 to index, authentication, TLS, proxy and timeout settings (see
 `dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if
 pip's config hook changes. Requirements graphs and shipped pip inputs with
-literal URL credentials are rejected; pip errors are redacted. See
+literal URL credentials (userinfo, secret-like query values, or recognized or
+random-looking URL path tokens; detection is pattern-based) are rejected; pip
+errors are redacted. See
 `docs/AUTHENTICATION.md#private-package-indexes` and
 `tests/test_private_index.py`, which uses a loopback index and synthetic
 secrets only.
