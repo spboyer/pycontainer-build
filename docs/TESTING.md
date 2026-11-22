@@ -32,6 +32,13 @@ Notation. They require explicit registry, key, OIDC identity and trust-policy
 configuration; see [image signing](image-signing.md#real-registry-tests).
 They do not run in the default suite or CI.
 
+The opt-in generic artifact test, `tests/test_artifact_integration.py`, pushes
+a subject and a referring OCI 1.1 artifact to the repository named in
+`PYCONTAINER_ARTIFACT_TEST_REPOSITORY`. It then pulls the referrer and lists
+referrers. If `oras` is installed, it also checks the result with ORAS. Hermetic
+coverage of the same flows, using a synthetic loopback registry, is in
+`tests/test_artifact.py`. See [OCI artifacts](oci-artifacts.md#real-registry-tests).
+
 The pull-request workflow checks Linux and Windows on Python 3.11 and 3.15.
 `uv run --locked --group build python scripts/smoke_distributions.py` builds
 wheel and sdist packages using the pinned build backend, installs each in a

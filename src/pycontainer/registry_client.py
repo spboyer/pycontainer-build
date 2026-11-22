@@ -303,6 +303,7 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_response_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
         if not _is_safe_https_url(url):
             sensitive_headers = any(
@@ -329,7 +330,15 @@ class RegistryClient:
             )
             try:
                 with _open_registry_request(request, timeout=self.timeout) as response:
-                    return response.status, response.read(), dict(response.headers)
+                    if max_response_bytes is None:
+                        return response.status, response.read(), dict(response.headers)
+                    body = response.read(max_response_bytes + 1)
+                    if len(body) > max_response_bytes:
+                        raise RegistryRequestError(
+                            f"{method} response from {_safe_url(url)} exceeded "
+                            f"{max_response_bytes} bytes."
+                        )
+                    return response.status, body, dict(response.headers)
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 if (
@@ -350,6 +359,7 @@ class RegistryClient:
                             data,
                             headers,
                             retry_auth=False,
+                            max_response_bytes=max_response_bytes,
                         )
                 if (
                     retry_safe
@@ -391,6 +401,27 @@ class RegistryClient:
         raise RegistryRequestError(
             f"Registry blob HEAD failed with HTTP {status}: {detail or '(empty response)'}"
         )
+
+    def blob_descriptor_matches(self, digest: str, size: int) -> bool:
+        """HEAD a blob; False if absent, True if its size and digest match."""
+        url = f"{self.base_url}/{self.repository}/blobs/{digest}"
+        status, body, headers = self._make_request("HEAD", url)
+        if status == 404:
+            return False
+        if status != 200:
+            detail = body.decode("utf-8", errors="replace")
+            raise RegistryRequestError(
+                f"Registry blob HEAD failed with HTTP {status}: {detail or '(empty response)'}"
+            )
+        normalized = {name.lower(): value for name, value in headers.items()}
+        length = (normalized.get("content-length") or "").strip()
+        reported = (normalized.get("docker-content-digest") or "").strip()
+        if length != str(size) or (reported and reported != digest):
+            raise BlobIntegrityError(
+                f"Registry blob {digest} reported Content-Length {length or '(missing)'} "
+                f"and digest {reported or '(missing)'}, expected size {size}."
+            )
+        return True
 
     def initiate_blob_upload(self) -> str:
         """Initiate blob upload and return its absolute upload URL."""
@@ -446,18 +477,82 @@ class RegistryClient:
 
     def push_manifest(self, reference: str, manifest_data: bytes) -> bool:
         """Push manifest by tag or digest."""
+        self.put_manifest(
+            reference, manifest_data, "application/vnd.oci.image.manifest.v1+json"
+        )
+        return True
+
+    def put_manifest(
+        self, reference: str, manifest_data: bytes, media_type: str
+    ) -> Dict[str, str]:
+        """PUT a manifest and return the registry response headers."""
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
-        headers = {"Content-Type": "application/vnd.oci.image.manifest.v1+json"}
-        status, body, _ = self._make_request(
-            "PUT", url, data=manifest_data, headers=headers
+        headers = {"Content-Type": media_type}
+        status, body, response_headers = self._make_request(
+            "PUT", url, data=manifest_data, headers=headers,
+            max_response_bytes=MAX_ERROR_BODY_BYTES * 16,
         )
         if status not in (200, 201):
-            detail = body.decode("utf-8", errors="replace")
+            detail = body[:MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace")
             raise RegistryRequestError(
                 f"Manifest push failed with HTTP {status}: "
                 f"{detail or '(empty response)'}"
             )
-        return True
+        return response_headers
+
+    def fetch_manifest_bytes(
+        self,
+        reference: str,
+        accept: str,
+        max_size: int,
+        expected_digest: Optional[str] = None,
+    ) -> Tuple[bytes, str, str]:
+        """GET exact manifest bytes with a size bound, returning digest and Content-Type."""
+        if expected_digest is not None:
+            digest_filename(expected_digest)
+        url = f"{self.base_url}/{self.repository}/manifests/{reference}"
+        status, body, response_headers = self._make_request(
+            "GET", url, headers={"Accept": accept}, max_response_bytes=max_size
+        )
+        if status != 200:
+            detail = body[:MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace")
+            raise RegistryRequestError(
+                f"Failed to pull manifest (HTTP {status}): {detail or '(empty response)'}"
+            )
+        normalized = {name.lower(): value for name, value in response_headers.items()}
+        content_length = normalized.get("content-length")
+        if content_length is not None and content_length.strip() != str(len(body)):
+            raise BlobIntegrityError(
+                f"Manifest Content-Length {content_length!r} does not match "
+                f"{len(body)} received bytes."
+            )
+        body_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+        reported = normalized.get("docker-content-digest")
+        if reported and reported != body_digest:
+            raise BlobIntegrityError(
+                f"Registry reported manifest digest {reported}, but its body hashes "
+                f"to {body_digest}."
+            )
+        if expected_digest is not None and body_digest != expected_digest:
+            raise BlobIntegrityError(
+                f"Downloaded manifest hashes to {body_digest}, expected {expected_digest}."
+            )
+        content_type = (normalized.get("content-type") or "").split(";", 1)[0].strip().lower()
+        return body, body_digest, content_type
+
+    def get_referrers(
+        self, url: str, max_size: int
+    ) -> Tuple[int, bytes, Dict[str, str]]:
+        """GET one referrers page; the URL must belong to this registry."""
+        if not self._is_registry_url(url):
+            raise RegistryRequestError(
+                "Referrers pagination must stay on the configured registry."
+            )
+        return self._make_request(
+            "GET", url,
+            headers={"Accept": "application/vnd.oci.image.index.v1+json"},
+            max_response_bytes=max_size,
+        )
 
     def push_index(self, reference: str, index_data: bytes) -> bool:
         """Push OCI index."""
@@ -597,7 +692,11 @@ class RegistryClient:
                     "Registry blob redirect did not include a Location."
                 )
             target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
+            if not _is_safe_https_url(target):
+                raise RegistryRequestError(
+                    "Registry blob redirects must use HTTPS without embedded credentials."
+                )
+            return _open_registry_request(
                 urllib.request.Request(target), timeout=self.timeout
             )
         return response
