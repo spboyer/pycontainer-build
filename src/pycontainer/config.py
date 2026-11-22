@@ -12,7 +12,7 @@ class BuildConfig:
     workdir: str = "/app"
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = field(default_factory=dict)
-    exposed_ports: List[int] = field(default_factory=list)
+    exposed_ports: Optional[List[int]] = None
     include_paths: Optional[List[str]] = None
     exclude_paths: List[str] = field(default_factory=list)
     exclude_defaults: bool = True

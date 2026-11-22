@@ -1,4 +1,4 @@
-import argparse, os, logging, sys
+import argparse, configparser, os, logging, sys
 from pathlib import Path
 from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
@@ -121,7 +121,10 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    builder=ImageBuilder(cfg)
+    try:
+        builder=ImageBuilder(cfg)
+    except (ValueError, FileNotFoundError, configparser.Error) as exc:
+        parser.error(str(exc))
     out=builder.build()
     print("Built:", out)
     

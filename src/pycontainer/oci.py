@@ -45,7 +45,7 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         cfg['config']['WorkingDir']=working_dir or base_config.get('config',{}).get('WorkingDir','/app')
         
         base_entrypoint=base_config.get('config',{}).get('Entrypoint')
-        if entrypoint:
+        if entrypoint is not None:
             if is_distroless(base_config) and entrypoint and entrypoint[0] in ['/bin/sh','/bin/bash','sh','bash']:
                 cfg['config']['Cmd']=entrypoint
                 if base_entrypoint: cfg['config']['Entrypoint']=base_entrypoint
@@ -54,7 +54,7 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         elif base_entrypoint:
             cfg['config']['Entrypoint']=base_entrypoint
         
-        if cmd: cfg['config']['Cmd']=cmd
+        if cmd is not None: cfg['config']['Cmd']=cmd
         elif 'Cmd' in base_config.get('config',{}): cfg['config']['Cmd']=base_config['config']['Cmd']
         if user: cfg['config']['User']=user
         elif 'User' in base_config.get('config',{}): cfg['config']['User']=base_config['config']['User']
@@ -65,11 +65,11 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         cfg={"architecture":architecture,"os":os_name,"config":{"Env":[f"{k}={v}" for k,v in env.items()],"WorkingDir":working_dir,"Entrypoint":entrypoint}}
         if labels: cfg['config']['Labels']=labels
         if user: cfg['config']['User']=user
-        if cmd: cfg['config']['Cmd']=cmd
+        if cmd is not None: cfg['config']['Cmd']=cmd
     rootfs=cfg.setdefault("rootfs", {})
     rootfs["type"]=rootfs.get("type", "layers")
     rootfs["diff_ids"]=[*rootfs.get("diff_ids", []), *(layer_diff_ids or [])]
-    if exposed_ports:
+    if exposed_ports is not None:
         cfg["config"]["ExposedPorts"]={f"{p}/tcp":{} for p in exposed_ports}
     return cfg
 

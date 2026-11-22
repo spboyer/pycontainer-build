@@ -257,6 +257,23 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
+def _logical_requirement_lines(path):
+    continuation = ""
+    start_line = 1
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not continuation:
+            start_line = line_number
+        if raw_line.rstrip().endswith("\\"):
+            continuation += raw_line.rstrip()[:-1] + " "
+        else:
+            yield start_line, continuation + raw_line
+            continuation = ""
+    if continuation:
+        raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
+
+
 def validate_requirements(requirements: Path, context_dir: Path) -> None:
     context_root = context_dir.resolve()
     pending = [requirements.resolve(strict=True)]
@@ -281,18 +298,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
 
-        logical_lines = []
-        continuation = ""
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            if raw_line.rstrip().endswith("\\"):
-                continuation += raw_line.rstrip()[:-1] + " "
-                continue
-            logical_lines.append(continuation + raw_line)
-            continuation = ""
-        if continuation:
-            raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
-
-        for line in logical_lines:
+        for _, line in _logical_requirement_lines(path):
             try:
                 options = shlex.split(line, comments=True)
             except ValueError as exc:

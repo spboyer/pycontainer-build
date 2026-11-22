@@ -162,7 +162,7 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Distroless detection** — Auto-handles shell-less base images
 
 **Production Features** (Phase 4):
-- ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
+- ✅ **Framework auto-detection** — FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, and Celery
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
 - ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
@@ -298,10 +298,14 @@ Install from VS Code Marketplace or command palette:
 By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
-- **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
-- **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
+- **Entry point**: A detected framework, then a supported project script module or `python -m app`
+- **Include paths**: `src/`, `app/`, `package/`, root Python files, and project metadata; notebook files are included when Jupyter is declared
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`
+
+[Framework detection](docs/framework-detection.md) documents commands,
+precedence, ambiguous projects, explicit overrides, and Jupyter authentication.
+Detection does not install dependencies or execute application code.
 
 ### Explicit Configuration
 
@@ -479,7 +483,7 @@ separate output directory or retry after the current build finishes.
 
 ### ✅ **Phase 4: Polish & Production Readiness** (COMPLETE)
 
-- [x] Framework auto-detection (FastAPI, Flask, Django)
+- [x] Framework auto-detection (FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, Celery)
 - [x] `pycontainer.toml` configuration schema
 - [x] SBOM (Software Bill of Materials) generation
 - [x] Reproducible builds (deterministic layer creation)
@@ -531,7 +535,7 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 Known limitations and future enhancements:
 
-- **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
+- **Framework detection** — Static heuristics cannot infer every dynamic factory or entrypoint; configure ambiguous projects explicitly
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 
 Multi-platform base images select an exact OS/architecture/variant match.

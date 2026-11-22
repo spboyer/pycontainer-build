@@ -359,9 +359,11 @@ jq '.config' dist/image/blobs/sha256/<config-digest>
 pycontainer build --tag myapp:latest --dry-run --verbose | grep -i "entry"
 
 # Override with explicit entry point
-pycontainer build \
-  --tag myapp:latest \
-  --entrypoint '["python", "-m", "myapp.cli"]'
+cat > pycontainer.toml << 'EOF'
+[build]
+entrypoint = ["python", "-m", "myapp.cli"]
+EOF
+pycontainer build --tag myapp:latest --config pycontainer.toml
 ```
 
 ### Use Case 3: Testing SBOM Generation
@@ -401,6 +403,10 @@ echo '[project]\nname="flask-test"\nversion="0.1.0"' > pyproject.toml
 pycontainer build --tag flask-test:latest --dry-run --verbose
 # Should show: "Detected framework: flask"
 ```
+
+For Celery, Jupyter, Streamlit, and Gradio detection, including precedence,
+ambiguous entrypoints, and Jupyter authentication, see
+[Framework detection](framework-detection.md).
 
 ### Use Case 5: Testing Cache Behavior
 
@@ -541,16 +547,14 @@ pycontainer build --tag myapp:latest --verbose
 
 #### Issue: "No entry point detected"
 
-**Solution**: Explicitly specify entry point or add to `pyproject.toml`:
+**Solution**: Explicitly specify the entrypoint in `pycontainer.toml`:
 
-```bash
-# Option 1: CLI flag
-pycontainer build --tag myapp:latest --entrypoint '["python", "-m", "myapp"]'
-
-# Option 2: Add to pyproject.toml
-[project.scripts]
-myapp = "myapp.cli:main"
+```toml
+[build]
+entrypoint = ["python", "-m", "myapp"]
 ```
+
+Then run `pycontainer build --tag myapp:latest --config pycontainer.toml`.
 
 #### Issue: "Base image pull failed"
 

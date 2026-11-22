@@ -221,6 +221,7 @@ class ImageBuilder:
                 context_dir,
                 exclude_paths=self.context_excludes,
                 exclude_defaults=config.exclude_defaults,
+                requirements_file=config.requirements_file,
             )
         )
         self.dependency_excludes=tuple(
@@ -238,6 +239,15 @@ class ImageBuilder:
             self.context_include_paths,
             self.context_excludes,
             exclude_defaults=False,
+            files=(
+                path
+                for path, _ in iter_files(
+                    context_dir,
+                    self.context_include_paths,
+                    exclude_paths=self.context_excludes,
+                    exclude_defaults=False,
+                )
+            ),
         )
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
@@ -268,7 +278,9 @@ class ImageBuilder:
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
         
-        entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
+        entry = self.config.entrypoint
+        if entry is None and self.config.cmd is None:
+            entry = detect_entrypoint(self.config.context_dir)
         include = self.context_include_paths
 
         app_layers=[]
@@ -556,9 +568,18 @@ class ImageBuilder:
         print(f"  Base Image: {self.config.base_image}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
-        print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
-        if self.config.exposed_ports:
-            print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
+        if self.config.entrypoint is None:
+            entrypoint = (
+                "<inherited from base>" if self.config.cmd is not None else "<auto-detect>"
+            )
+        else:
+            entrypoint = " ".join(self.config.entrypoint) or "<cleared>"
+        print(f"  Entrypoint: {entrypoint}")
+        if self.config.cmd is not None:
+            print(f"  Command: {' '.join(self.config.cmd) or '<cleared>'}")
+        if self.config.exposed_ports is not None:
+            ports = ", ".join(map(str, self.config.exposed_ports)) or "<cleared>"
+            print(f"  Exposed Ports: {ports}")
         if self.config.env:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
