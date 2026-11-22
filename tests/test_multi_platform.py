@@ -37,12 +37,14 @@ def _base_layer(arch: str):
 class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
-    def __init__(self, platforms=("amd64", "arm64")):
+    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
         for arch in platforms:
             layer, diff_id = _base_layer(arch)
+            if arch == wrong_diff_id_arch:
+                diff_id = _digest(b"not the layer content")
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
@@ -259,6 +261,17 @@ def test_missing_platform_in_base_fails_without_replacing_existing_tags(tmp_path
         builder.build()
     assert (out / "index.json").read_text() == "previous"
     assert (out / "refs" / "tags" / "v1").read_text() == "previous"
+    assert not hasattr(builder, "index_digest")
+
+
+def test_compressed_base_diff_id_mismatch_fails_before_publication(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(wrong_diff_id_arch="arm64"))
+
+    with pytest.raises(LayerIntegrityError, match="linux/arm64.*DiffID"):
+        builder.build()
+    assert not (out / "index.json").exists()
+    assert not any(path.is_file() for path in (out / "refs").rglob("*"))
     assert not hasattr(builder, "index_digest")
 
 

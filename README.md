@@ -412,7 +412,8 @@ exclude-defaults = true
 - `--config FILE` — Load settings from `pycontainer.toml`
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
-  `linux/arm64` or `linux/arm/v7`)
+  `linux/arm64` or `linux/arm/v7`), or `linux/amd64,linux/arm64` to build an
+  OCI image index
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
@@ -583,6 +584,25 @@ otherwise specify it explicitly. Missing targets and inconsistent image
 metadata fail before base layers are downloaded. Base-image references may
 include a registry port or an immutable `@sha256:...` digest. Platform
 selection writes target metadata; it does not cross-compile dependencies.
+
+Multi-platform image indexes (`--platform linux/amd64,linux/arm64` or TOML
+`platform = "linux/amd64,linux/arm64"`) are limited to those two targets;
+`linux/arm/v7` is tracked in [#119](https://github.com/spboyer/pycontainer-build/issues/119) and other targets are rejected. Each
+platform is built in isolation: it selects its own base manifest (registry
+builds re-select from the first resolved base-index digest), stages its own
+wheel-only dependency layer, and shares the byte-identical application layer
+(its cache key needs no platform input; dependency layers are never cached).
+The output `index.json` and tag refs point at the image index only after
+every platform manifest, config, platform field and DiffID has been verified;
+a failed platform leaves earlier tags untouched. Push uploads blobs, then
+platform manifests and the index by digest, and moves tags last. SBOM
+generation is not yet supported for index builds. A local single-platform
+`docker-archive:` base cannot satisfy an index build. Pip still evaluates
+dependency environment markers such as `platform_machine` against the build
+host for every cross-target build, so marker-dependent requirements may be
+wrong for a target ([#142](https://github.com/spboyer/pycontainer-build/issues/142)). These are hermetic
+layout and protocol checks; they are not evidence that each image starts on
+its architecture, and `scripts/check_runtime_image.py` remains single-platform.
 
 ---
 

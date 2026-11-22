@@ -149,6 +149,12 @@ must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
 `PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
+Comma-separated `platform` values build an OCI image index for exactly
+`linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own
+base selection and dependency layer, and tags move only after the whole index
+verifies. Hermetic index tests do not prove per-architecture runtime startup.
+Dependency environment markers (for example `platform_machine`) are still
+evaluated against the build host for any cross-target build; see #142.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

@@ -197,6 +197,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .local_image import (
+    LocalImageError,
     check_local_image_bounds,
     open_local_image_source,
     parse_local_image_reference,
@@ -244,7 +245,9 @@ def _read_verified_blob(layers_dir: Path, digest: str, size: int, description: s
     return content
 
 
-def _verify_platform_image(layers_dir: Path, image: PlatformImage) -> None:
+def _verify_platform_image(
+    layers_dir: Path, image: PlatformImage, check_diff_ids: bool = False
+) -> None:
     """Check manifest, config, platform, layer and DiffID agreement for one image."""
     target = "/".join(
         image.platform[key]
@@ -297,10 +300,22 @@ def _verify_platform_image(layers_dir: Path, image: PlatformImage) -> None:
             raise LayerIntegrityError(
                 f"{target} layer {position} blob {layer.digest} is missing or corrupt."
             )
+    if check_diff_ids:
+        # Compressed base layers need decompression; done once, before publication.
+        try:
+            verify_layer_diff_ids(image.layers, config)
+        except (BlobIntegrityError, LocalImageError) as error:
+            raise LayerIntegrityError(
+                f"{target} layer DiffIDs their content: {error}"
+            ) from error
 
 
 def _verify_image_index(
-    layers_dir: Path, index_digest: str, index_size: int, images: List[PlatformImage]
+    layers_dir: Path,
+    index_digest: str,
+    index_size: int,
+    images: List[PlatformImage],
+    check_diff_ids: bool = False,
 ) -> None:
     """Check that an index blob references exactly the verified platform images."""
     index = json.loads(
@@ -321,7 +336,7 @@ def _verify_image_index(
     if len(set(platforms)) != len(platforms):
         raise LayerIntegrityError("Image index contains duplicate platforms.")
     for image in images:
-        _verify_platform_image(layers_dir, image)
+        _verify_platform_image(layers_dir, image, check_diff_ids)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
@@ -448,7 +463,7 @@ class ImageBuilder:
             images.append(self._build_platform_image(layers_dir, platform))
 
         index_digest, index_size=self._write_image_index(layers_dir, images)
-        _verify_image_index(layers_dir, index_digest, index_size, images)
+        _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
 
         _atomic_write_bytes(
             output/'oci-layout',
