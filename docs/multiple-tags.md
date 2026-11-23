@@ -68,3 +68,7 @@ reference (for example `registry.example/team/app:stable`). Because several
 descriptors exist, select with an explicit reference such as
 `oci:<layout>:registry.example/team/app:stable`. Hermetic tests check this
 descriptor shape; a Skopeo selection test runs only when Skopeo is installed.
+The normalized local reference can differ from the input spelling, and
+registry-valid tags such as `_dev`, `v1_`, or `v1..2` may not be valid OCI
+reference selectors. [#185](https://github.com/spboyer/pycontainer-build/pull/185)
+tracks consistent, collision-safe local names; registry pushes are unaffected.
