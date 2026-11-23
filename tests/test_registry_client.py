@@ -860,7 +860,7 @@ def test_missing_manifest_error_redacts_registry_credentials(monkeypatch):
     _patch_urlopen(
         monkeypatch,
         lambda request, _count: (_ for _ in ()).throw(
-            _http_error(request.full_url, 404)
+            _http_error(request.full_url, 404, body=b"synthetic-untrusted-body")
         ),
     )
 
@@ -869,6 +869,8 @@ def test_missing_manifest_error_redacts_registry_credentials(monkeypatch):
 
     assert token not in str(error.value)
     assert token not in "".join(traceback.format_exception(error.value))
+    assert "synthetic-untrusted-body" not in str(error.value)
+    assert error.value.status == 404
 
 
 def test_denied_manifest_push_reports_operation_and_permission_hint(

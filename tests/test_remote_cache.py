@@ -638,6 +638,20 @@ def test_full_build_uses_remote_layer(tmp_path, registry, monkeypatch):
     assert (Path(reader.config.output_dir) / "index.json").is_file()
 
 
+def test_remote_cache_bypasses_base_image_mirrors(tmp_path, registry, monkeypatch):
+    mirrors = {CACHE_HOST: ["mirror.example"]}
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC, registry_mirrors=mirrors)
+    cold = _app_layer(writer, tmp_path, "writer")
+
+    reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC, registry_mirrors=mirrors)
+    _forbid_tar_build(monkeypatch)
+    warm = _app_layer(reader, tmp_path, "reader")
+
+    assert warm.digest == cold.digest
+    assert registry.requests
+    assert all(host == CACHE_HOST for host, *_ in registry.requests)
+
+
 @pytest.mark.parametrize("export_fails", [False, True])
 def test_remote_export_records_build_outcome(tmp_path, registry, export_fails):
     history_dir = tmp_path / "history"
