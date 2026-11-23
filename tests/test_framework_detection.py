@@ -153,6 +153,32 @@ def test_jupyter_respects_explicit_includes_and_exclusions(tmp_path):
     assert detect_framework(tmp_path, include_paths=["."], exclude_paths=["notebooks"]) is None
 
 
+def test_conda_prefix_notebooks_are_neither_detected_nor_shipped(tmp_path):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "jupyterlab\n")
+    (context / "env" / "conda-meta").mkdir(parents=True)
+    write_file(context, "env/host.ipynb", "{}")
+    options = dict(include_paths=["."], exclude_defaults=False)
+
+    assert detect_framework(context, **options) is None
+
+    write_file(context, "notebooks/research.ipynb", "{}")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"),
+        use_cache=False, **options,
+    )
+    builder = ImageBuilder(config)
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    layer = builder._create_app_layer(layers_dir, builder.context_include_paths)
+
+    assert config.entrypoint[:2] == ["jupyter", "lab"]
+    with tarfile.open(layer.tar_path) as archive:
+        names = archive.getnames()
+    assert "app/notebooks/research.ipynb" in names
+    assert "app/env/host.ipynb" not in names
+
+
 @pytest.mark.parametrize(
     "source", ["import streamlit as st\n", "from streamlit import title\n"]
 )
@@ -559,6 +585,8 @@ def test_security_registry_and_framework_settings_survive_config_roundtrip(tmp_p
     config = BuildConfig(
         security={"kubernetes": {"read_only_root_filesystem": True}},
         insecure_registries=["LOCALHOST:5000"],
+        stop_signal="SIGINT",
+        volumes=["/data"],
         exposed_ports=ports,
     )
     apply_framework_defaults(config, tmp_path)
@@ -567,6 +595,8 @@ def test_security_registry_and_framework_settings_survive_config_roundtrip(tmp_p
     apply_framework_defaults(restored, tmp_path)
     assert restored.security == config.security
     assert restored.insecure_registries == ["localhost:5000"]
+    assert restored.stop_signal == "SIGINT"
+    assert restored.volumes == ["/data"]
     assert restored.labels["framework"] == "streamlit"
     assert restored.entrypoint[0] == "streamlit"
     assert restored.exposed_ports == ([8501] if ports is None else [])
