@@ -193,6 +193,7 @@ from .local_image import (
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
@@ -341,13 +342,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',

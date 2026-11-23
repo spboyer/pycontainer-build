@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
-from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, resolve_arguments
+from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 
@@ -73,20 +73,7 @@ class BuildConfig:
 
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""
-        import json
-        from urllib.parse import quote
-
-        representations = set()
-        for value in self._resolved_build_args.values():
-            if value:
-                representations.update((
-                    value, repr(value)[1:-1],
-                    json.dumps(value, ensure_ascii=False)[1:-1],
-                    json.dumps(value)[1:-1], quote(value, safe=""),
-                ))
-        for value in sorted(representations, key=len, reverse=True):
-            message = message.replace(value, "<redacted>")
-        return message
+        return redact_values(message, self._resolved_build_args.values())
 
     def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
         import hashlib
