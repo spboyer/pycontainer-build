@@ -1,4 +1,5 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -75,21 +76,6 @@ def _atomic_write_bytes(destination: Path, content: bytes) -> None:
         os.replace(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
-
-
-def parse_platform(platform: str) -> Tuple[str, str]:
-    """Parse a platform string into its OS and architecture components."""
-    parts = platform.split("/")
-    if (
-        len(parts) not in (2, 3)
-        or any(not part for part in parts)
-        or any(part.strip() != part for part in parts)
-    ):
-        raise ValueError(
-            f"Invalid platform format: {platform}. Expected 'os/arch[/variant]' "
-            "(e.g., 'linux/amd64' or 'linux/arm/v7')."
-        )
-    return parts[0], parts[1]
 
 
 def parse_platform_variant(platform: str) -> Optional[str]:
@@ -176,7 +162,7 @@ def _select_index_descriptor(
         f"Base image has multiple manifests matching {target}; specify an exact "
         f"variant. Available platforms: {available_text}."
     )
-from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
+from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json, parse_platform
 from .project import detect_entrypoint, default_include_paths, find_dependencies
 from .framework import apply_framework_defaults
 from .registry_client import (
@@ -207,22 +193,15 @@ class ImageBuilder:
             if config.cache_dir
             else default_cache_dir
         )
-        self.context_excludes=context_exclude_paths(
+        ordinary_excludes=context_exclude_paths(
             context_dir,
             output_dir=config.output_dir,
             cache_dir=cache_dir,
             exclude_paths=config.exclude_paths,
             exclude_defaults=config.exclude_defaults,
-        )+config._conditional_excludes
-        self.context_include_paths=(
-            config.include_paths
-            if config.include_paths is not None
-            else default_include_paths(
-                context_dir,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=config.exclude_defaults,
-            )
         )
+        self.ordinary_context_excludes=ordinary_excludes
+        self.context_excludes=ordinary_excludes+config._conditional_excludes
         self.dependency_excludes=tuple(
             exclude
             for exclude in self.context_excludes
@@ -230,19 +209,13 @@ class ImageBuilder:
                 config.exclude_defaults
                 and exclude in VIRTUALENV_EXCLUDES
                 and exclude not in config.exclude_paths
+                and exclude not in config._conditional_excludes
             )
         )
-        self.context_files=select_context_files(
-            context_dir,
-            self.context_include_paths,
-            self.context_excludes,
-            config._conditional_includes,
-        )
-        self.config=apply_framework_defaults(
-            config,
-            context_dir,
-            files=[path for path, _ in self.context_files],
-        )
+        self.config=config
+        self._framework_before=None
+        self._framework_after=None
+        self._refresh_context_selection()
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
         if config.use_cache and not self.dry_run:
@@ -253,7 +226,60 @@ class ImageBuilder:
     def _print(self, message: str):
         print(self.config.redact(message))
 
+    def _refresh_context_selection(self):
+        config=self.config
+        fields=("entrypoint", "exposed_ports", "labels")
+        if self._framework_before is not None:
+            for name in ("entrypoint", "exposed_ports"):
+                if getattr(config, name) == self._framework_after[name]:
+                    setattr(config, name, deepcopy(self._framework_before[name]))
+            before=self._framework_before["labels"]
+            after=self._framework_after["labels"]
+            if config.labels is not None and before != after:
+                before_labels=before or {}
+                after_labels=after or {}
+                if (
+                    "framework" in after_labels
+                    and config.labels.get("framework") == after_labels["framework"]
+                ):
+                    if "framework" in before_labels:
+                        config.labels["framework"]=before_labels["framework"]
+                    else:
+                        config.labels.pop("framework", None)
+                    if not config.labels and before is None:
+                        config.labels=None
+        context_dir=Path(config.context_dir)
+        self.context_include_paths=(
+            config.include_paths
+            if config.include_paths is not None
+            else default_include_paths(
+                context_dir,
+                exclude_paths=self.ordinary_context_excludes,
+                exclude_defaults=config.exclude_defaults,
+            )
+        )
+        self.context_files=select_context_files(
+            context_dir,
+            self.context_include_paths,
+            self.context_excludes,
+            config._conditional_includes,
+        )
+        self._framework_before={name: deepcopy(getattr(config, name)) for name in fields}
+        apply_framework_defaults(
+            config,
+            context_dir,
+            files=[path for path, _ in self.context_files],
+        )
+        self._framework_after={name: deepcopy(getattr(config, name)) for name in fields}
+
+    def _entrypoint(self):
+        return self.config.entrypoint or detect_entrypoint(
+            self.config.context_dir,
+            files={relative for _, relative in self.context_files},
+        )
+
     def build(self):
+        self._refresh_context_selection()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
             self._show_build_plan()
@@ -275,7 +301,7 @@ class ImageBuilder:
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
         
-        entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
+        entry = self._entrypoint()
         include = self.context_include_paths
 
         app_layers=[]
@@ -563,7 +589,7 @@ class ImageBuilder:
         self._print(f"  Base Image: {self.config.base_image}")
         self._print(f"  Context: {self.config.context_dir}")
         self._print(f"  Working Dir: {self.config.workdir}")
-        self._print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
+        self._print(f"  Entrypoint: {' '.join(self._entrypoint())}")
         if self.config.exposed_ports:
             print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:
@@ -742,6 +768,8 @@ class ImageBuilder:
                     arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
+                        if tarinfo.issym() and os.name == "nt":
+                            tarinfo.linkname=tarinfo.linkname.replace("\\", "/")
                         tarinfo.mtime=0
                         tarinfo.uid=0
                         tarinfo.gid=0
@@ -753,7 +781,11 @@ class ImageBuilder:
                         else:
                             tar.addfile(tarinfo)
                     else:
-                        tar.add(abs_path,arcname=arc)
+                        def normalize_link(info):
+                            if info.issym() and os.name == "nt":
+                                info.linkname=info.linkname.replace("\\", "/")
+                            return info
+                        tar.add(abs_path,arcname=arc,filter=normalize_link)
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)

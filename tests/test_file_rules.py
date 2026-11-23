@@ -1,5 +1,7 @@
 """Conditional file rules: grammar, selection precedence, boundaries and identity."""
+import json
 import os
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -164,6 +166,13 @@ def test_multi_target_rules_are_rejected_even_when_inactive(when):
         )
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64/", "linux/amd64/v8/extra", " linux/amd64"])
+def test_rules_reject_invalid_target_platform(platform):
+    with pytest.raises(ValueError, match="Invalid platform format"):
+        BuildConfig(platform=platform, file_rules=[DEV_TOOLS],
+                    build_args={"BUILD_MODE": "production"})
+
+
 CLI_OVERRIDES = ["--platform", "linux/arm64", "--build-arg", "BUILD_MODE=dev"]
 CLI_ENTRY_POINTS = {
     "build": ["build"],
@@ -233,6 +242,29 @@ def test_excludes_win_over_overlapping_includes(tmp_path):
         {"when": 'BUILD_MODE == "production"', "exclude": "app.py"},
     ]
     assert _selected(_config(context, tmp_path, rules)) == ["debug_tools/inspect.py"]
+
+
+def test_conditional_excludes_do_not_expand_default_selection(tmp_path):
+    context = tmp_path / "context"
+    (context / "src").mkdir(parents=True)
+    (context / "src" / "app.py").write_text("print('app')")
+    (context / "pyproject.toml").write_text("[project]\nname = 'app'\n")
+    (context / "unrelated.txt").write_text("unrelated")
+    rules = [{"when": 'BUILD_MODE == "production"', "exclude": ["src", "pyproject.toml"]}]
+    assert _selected(_config(context, tmp_path, rules, include_paths=None)) == []
+
+
+def test_conditional_virtualenv_exclude_applies_to_dependencies(tmp_path):
+    context = _context(tmp_path)
+    package = context / ".venv" / "lib" / "site-packages" / "package.py"
+    package.parent.mkdir(parents=True)
+    package.write_text("dependency")
+    (context / "requirements.txt").write_text("flask")
+    rule = {"when": 'BUILD_MODE == "production"', "exclude": "**/.venv"}
+    builder = ImageBuilder(_config(context, tmp_path, [rule], include_deps=True))
+    assert [rel.as_posix() for _, rel in find_dependencies(
+        context, exclude_paths=builder.dependency_excludes, exclude_defaults=False
+    )] == ["requirements.txt"]
 
 
 def test_default_excludes_remain_unless_opted_out(tmp_path):
@@ -306,6 +338,84 @@ def test_dry_run_tar_and_discovery_share_one_selection(tmp_path, capsys):
         assert sorted(archive.getnames()) == [f"app/{name}" for name in expected]
 
 
+def test_repeated_builds_refresh_selection_and_framework_defaults(tmp_path, capsys):
+    context = _context(tmp_path)
+    config = _config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"},
+                     dry_run=True, verbose=True)
+    builder = ImageBuilder(config)
+    api = context / "debug_tools" / "api.py"
+    api.write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    builder.build()
+    assert config.entrypoint[1] == "debug_tools.api:app"
+    assert "debug_tools/api.py" in capsys.readouterr().out
+
+    config.labels["service"] = "custom"
+    api.unlink()
+    worker = context / "debug_tools" / "worker.py"
+    worker.write_text("from flask import Flask\napp = Flask(__name__)\n")
+    builder.build()
+    assert config.entrypoint[0] == "flask"
+    assert config.labels == {"service": "custom", "framework": "flask"}
+    plan = capsys.readouterr().out
+    assert "debug_tools/worker.py" in plan
+    assert "debug_tools/api.py" not in plan
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    with tarfile.open(builder._create_app_layer(layers).tar_path) as archive:
+        assert "app/debug_tools/worker.py" in archive.getnames()
+        assert "app/debug_tools/api.py" not in archive.getnames()
+
+    config.entrypoint = ["custom-command"]
+    worker.unlink()
+    builder.build()
+    assert config.entrypoint == ["custom-command"]
+    assert config.labels == {"service": "custom"}
+
+
+def test_repeated_real_builds_refresh_selection_and_cache(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    config = _config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"},
+                     use_cache=True, cache_dir=str(tmp_path / "cache"))
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image",
+        lambda *args: ([], {"config": {}, "rootfs": {"type": "layers", "diff_ids": []}}),
+    )
+    builder.build()
+    initial = builder.layers[-1].digest
+    (context / "debug_tools" / "new.py").write_text("value = 1\n")
+    builder.build()
+    updated = builder.layers[-1]
+    assert updated.digest != initial
+    with tarfile.open(updated.tar_path) as archive:
+        assert "app/debug_tools/new.py" in archive.getnames()
+    builder.build()
+    assert builder.layers[-1].digest == updated.digest
+
+
+def test_excluded_pyproject_is_not_used_for_entrypoint(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "app"\n[project.scripts]\nrun = "secret_module"\n'
+    )
+    (context / "secret_module.py").write_text("print('secret')\n")
+    rule = {"when": 'BUILD_MODE == "production"', "exclude": "pyproject.toml"}
+    builder = ImageBuilder(_config(
+        context, tmp_path, [rule],
+        include_paths=["app.py", "pyproject.toml", "secret_module.py"],
+    ))
+    monkeypatch.setattr(
+        builder, "_pull_base_image",
+        lambda *args: ([], {"config": {}, "rootfs": {"type": "layers", "diff_ids": []}}),
+    )
+    builder.build()
+    manifest = json.loads(
+        (tmp_path / "out" / "blobs" / "sha256" /
+         builder.config_digest.split(":", 1)[1]).read_text()
+    )
+    assert manifest["config"]["Entrypoint"] == ["python", "-m", "app"]
+
+
 def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys):
     context = _context(tmp_path)
     for name, text in {
@@ -346,6 +456,16 @@ def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys
     with pytest.raises(ValueError, match="Conda environment"):
         _selected(_config(context, tmp_path, explicit,
                           build_args={"BUILD_MODE": "dev"}))
+
+
+def test_exclusion_precedes_conda_root_validation(tmp_path):
+    context = _context(tmp_path)
+    (context / "conda_env" / "conda-meta").mkdir(parents=True)
+    rules = [
+        {"when": 'BUILD_MODE == "production"', "include": "conda_env/**"},
+        {"when": 'BUILD_MODE == "production"', "exclude": "conda_env"},
+    ]
+    assert _selected(_config(context, tmp_path, rules)) == ["app.py"]
 
 
 def test_same_size_same_time_edit_changes_cached_layer(tmp_path):
@@ -416,16 +536,61 @@ def test_unsafe_conditional_symlinks_are_rejected(tmp_path, kind):
         ImageBuilder(_config(context, tmp_path, [rule]))
 
 
-def test_in_context_file_symlink_is_kept_as_link(tmp_path):
+@pytest.mark.parametrize("reproducible", [False, True])
+def test_in_context_file_symlink_is_kept_as_link(tmp_path, reproducible):
     context = _context(tmp_path)
-    _symlink(context / "debug_tools" / "alias.py", context / "app.py")
-    config = _config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"})
+    _symlink(context / "debug_tools" / "alias.py", Path("..") / "app.py")
+    config = _config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"},
+                     reproducible=reproducible)
     builder = ImageBuilder(config)
     assert "debug_tools/alias.py" in _selected(config)
     layers = tmp_path / "layers"
     layers.mkdir()
     with tarfile.open(builder._create_app_layer(layers).tar_path) as archive:
-        assert archive.getmember("app/debug_tools/alias.py").issym()
+        link = archive.getmember("app/debug_tools/alias.py")
+        assert link.issym()
+        assert link.linkname.replace("\\", "/") == "../app.py"
+        assert "\\" not in link.linkname
+
+
+@pytest.mark.parametrize("kind", ["absolute", "excluded"])
+def test_selected_link_must_target_selected_image_file(tmp_path, kind):
+    context = _context(tmp_path)
+    target = context / "app.py"
+    link_target = target if kind == "absolute" else Path("..") / "app.py"
+    _symlink(context / "debug_tools" / "alias.py", link_target)
+    rules = [DEV_TOOLS]
+    include = ["app.py"] if kind == "absolute" else []
+    with pytest.raises(ValueError, match="symlink"):
+        _selected(_config(context, tmp_path, rules, include_paths=include,
+                          build_args={"BUILD_MODE": "dev"}))
+
+
+def test_ordinary_include_rejects_dangling_symlink(tmp_path):
+    context = _context(tmp_path)
+    _symlink(context / "broken.py", Path("missing.py"))
+    with pytest.raises(ValueError, match="symlink.*dangling"):
+        _selected(_config(context, tmp_path, [], include_paths=["broken.py"]))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions only")
+@pytest.mark.parametrize("include", ["alias/**", "**"])
+def test_junction_outside_context_is_never_traversed(tmp_path, include):
+    context = _context(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(context / "alias"), str(outside)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    rule = {"when": 'BUILD_MODE == "production"', "include": include}
+    if include == "alias/**":
+        with pytest.raises(ValueError, match="symlink|junction"):
+            _selected(_config(context, tmp_path, [rule]))
+    else:
+        assert "alias/secret.txt" not in _selected(_config(context, tmp_path, [rule]))
 
 
 def test_cli_rejects_malformed_rule_before_builder(tmp_path, monkeypatch, capsys):

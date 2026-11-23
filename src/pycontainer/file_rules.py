@@ -3,6 +3,7 @@ import re
 from typing import Dict, List, Tuple, Union
 
 from .fs_utils import relative_context_path
+from .oci import parse_platform
 
 FileRule = Dict[str, Union[str, List[str]]]
 RULE_KEYS = {"when", "include", "exclude"}
@@ -93,10 +94,8 @@ def evaluate_file_rules(
             "file_rules require a single target platform; comma-separated targets "
             "are unsupported until rules and application layers are evaluated per target."
         )
-    parts = platform.split("/") if isinstance(platform, str) else []
-    if len(parts) < 2 or not parts[0] or not parts[1]:
-        raise ValueError("file_rules require a target platform of the form os/arch.")
-    values = {**arguments, "target.os": parts[0], "target.arch": parts[1]}
+    os_name, arch = parse_platform(platform)
+    values = {**arguments, "target.os": os_name, "target.arch": arch}
     includes, excludes = [], []
     for number, rule in enumerate(rules, 1):
         where = f"file_rules[{number}]"

@@ -1,6 +1,22 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+
+
+def parse_platform(platform: str) -> Tuple[str, str]:
+    """Parse a platform string into its OS and architecture components."""
+    parts = platform.split("/") if isinstance(platform, str) else []
+    if (
+        len(parts) not in (2, 3)
+        or any(not part for part in parts)
+        or any(part.strip() != part for part in parts)
+    ):
+        raise ValueError(
+            f"Invalid platform format: {platform}. Expected 'os/arch[/variant]' "
+            "(e.g., 'linux/amd64' or 'linux/arm/v7')."
+        )
+    return parts[0], parts[1]
+
 
 @dataclass
 class OCILayer:

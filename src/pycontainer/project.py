@@ -21,9 +21,9 @@ def detect_python_version(context_dir):
             if match: return match.group(1)
     return "3.11"
 
-def detect_entrypoint(context_dir):
+def detect_entrypoint(context_dir, *, files=None):
     ctx=Path(context_dir); py=ctx/'pyproject.toml'
-    if py.exists():
+    if (files is None or Path("pyproject.toml") in files) and py.exists():
         data=tomllib.loads(py.read_text())
         proj=data.get("project",{}); scripts=proj.get("scripts") or {}
         if scripts:

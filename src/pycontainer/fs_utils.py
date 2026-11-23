@@ -2,6 +2,7 @@ import errno
 import fnmatch
 import hashlib
 import os
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
@@ -134,22 +135,38 @@ def context_exclude_paths(
     return tuple(dict.fromkeys(excludes))
 
 
+def _is_directory_link(path):
+    """Detect directory links, including Windows junctions on Python 3.11."""
+    if not path.is_dir():
+        return False
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return path.is_symlink() or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
 def _check_root_links(base, relative):
-    """Reject include roots reached through a directory symlink."""
+    """Reject include roots reached through a directory link."""
     current = Path(base)
     for index, part in enumerate(relative.parts):
         current = current / part
-        if current.is_symlink() and (
-            index < len(relative.parts) - 1 or current.is_dir()
+        if _is_directory_link(current) or (
+            current.is_symlink() and index < len(relative.parts) - 1
         ):
             raise ValueError(
-                f"Include path {relative.as_posix()!r} traverses a symlinked "
-                "directory; directory symlinks are never followed."
+                f"Include path {relative.as_posix()!r} traverses a symlink or "
+                "junction directory; directory links are never followed."
             )
 
 
 def _check_selected_link(base, path, relative):
     """Require a selected file symlink to resolve to a file inside the context."""
+    link_target = os.readlink(path)
+    windows_target = PureWindowsPath(link_target)
+    if os.path.isabs(link_target) or windows_target.drive or windows_target.root:
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} must use a relative target."
+        )
     try:
         target = path.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -210,9 +227,7 @@ def iter_files(
         excludes.extend(exclude_paths)
 
     def selected(path, relative):
-        if match_patterns is None:
-            return path.is_file()
-        if not path_is_excluded(relative, match_patterns):
+        if match_patterns is not None and not path_is_excluded(relative, match_patterns):
             return False
         if path.is_symlink():
             _check_selected_link(base, path, relative)
@@ -222,6 +237,8 @@ def iter_files(
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
         absolute = base / relative
+        if path_is_excluded(relative, excludes):
+            continue
         _check_root_links(base, relative)
         _check_conda_root(base, relative)
         if absolute.is_dir():
@@ -234,6 +251,7 @@ def iter_files(
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
+                    and not _is_directory_link(root_path / directory)
                     and not is_conda_prefix(root_path / directory)
                 )
                 for filename in sorted(filenames):
@@ -247,7 +265,7 @@ def iter_files(
                     ):
                         seen.add(relative_name)
                         yield child, child_relative
-        elif absolute.is_file() or (match_patterns is not None and absolute.is_symlink()):
+        elif absolute.is_file() or absolute.is_symlink():
             child_relative = absolute.relative_to(base)
             relative_name = child_relative.as_posix()
             if (
@@ -284,6 +302,16 @@ def select_context_files(base, include_paths, excludes, conditional_includes=())
             if relative.as_posix() not in seen
         ]
         files.extend(sorted(added, key=lambda item: item[1].as_posix()))
+    selected_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
+    for path, relative in files:
+        if path.is_symlink():
+            _check_selected_link(base, path, relative)
+            target = os.path.normcase(os.path.abspath(path.parent / os.readlink(path)))
+            if target not in selected_paths:
+                raise ValueError(
+                    f"Selected symlink {relative.as_posix()!r} must target "
+                    "another selected file."
+                )
     return files
 
 

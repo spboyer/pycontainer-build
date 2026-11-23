@@ -553,13 +553,15 @@ include. That covers active exclude rules, `exclude-paths`, the default
 exclusions (so a `tests/**` rule needs `--no-default-excludes`), and the output
 and cache directories, which are always excluded. Conda environment prefixes
 (directories containing `conda-meta/`) are also always pruned, and an include
-path or rule rooted inside one fails; host Conda environments are never copied
-into the image. The selection is computed
-once and shared by framework detection, `--dry-run` (which reports the count and,
+path or rule rooted inside one fails unless that root is already excluded; host
+Conda environments are never copied into the image. The selection is refreshed
+once per build and shared by framework detection, `--dry-run` (which reports the count and,
 with `-v`, each path), the app layer and the cache key; active rule sets are part
-of the cache identity. Conditionally selected symlinks must resolve to a file
-inside the context; dangling, cyclic, escaping or directory links are rejected.
-Any include root that passes through a symlinked directory is rejected.
+of the cache identity. Selected file symlinks must use a relative target and
+resolve to another selected file inside the context; dangling, cyclic, absolute,
+escaping or unselected targets are rejected. Directory links and Windows
+junctions are never traversed; an include root through one is rejected unless
+the root is already excluded.
 
 ---
 
