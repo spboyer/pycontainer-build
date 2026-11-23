@@ -156,6 +156,17 @@ def test_target_platform_rules(tmp_path, platform, expected):
     ]
 
 
+def test_target_rules_allow_literal_config_without_build_arguments(tmp_path, capsys):
+    context = _context(tmp_path)
+    rules = [{"when": 'target.arch == "amd64"', "include": "native/amd64.so"}]
+    config = _config(context, tmp_path, rules, build_args=None, verbose=True,
+                     dry_run=True, cmd=["echo ${PORT} $$"])
+    builder = ImageBuilder(config)
+    builder.build()
+    assert config.cmd == ["echo ${PORT} $$"]
+    assert "native/amd64.so" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("when", ['target.arch == "arm64"', 'BUILD_MODE == "dev"'])
 def test_multi_target_rules_are_rejected_even_when_inactive(when):
     with pytest.raises(ValueError, match="single target platform"):

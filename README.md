@@ -494,6 +494,8 @@ SBOM formats, system-package declarations and other settings do not expand.
 `$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
 are not rescanned, defaults do not reference other arguments, and no host
 environment lookup, expression evaluation or shell execution occurs.
+Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
+without it, existing literal dollar expressions are preserved.
 
 Arguments are **not secrets** and are not automatically runtime environment
 variables. Only explicit interpolation into persisted image fields (including
