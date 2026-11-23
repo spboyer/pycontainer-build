@@ -34,8 +34,13 @@ Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
 content, normalized relative paths, workdir, and reproducibility settings.
 Index updates are locked and atomically replaced; cache blobs are verified
-before reuse. A malformed index raises an explicit `CacheIndexError`; missing
-or corrupt blobs are discarded and rebuilt.
+before reuse. A malformed index raises an explicit `CacheIndexError` with a
+remediation message; missing or corrupt blobs are discarded and rebuilt. A
+saved `--cache-dir` can be restored to another absolute path and checkout on
+the same OS (`tests/test_cache_portability.py`); source modes are part of the
+key, so Windows and Linux caches are not interchangeable. The non-gating
+`cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
+cross-OS restore outcomes.
 
 ## Setup and verified checks
 
@@ -92,6 +97,11 @@ starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
 part of the default test suite or CI.
 
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
+
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
@@ -134,7 +144,6 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- CLI defaults can overwrite TOML settings.
 - PyPI installation of this project returned HTTP 404 during the 2026-11-19
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
@@ -193,3 +202,22 @@ Roadmap: `spboyer/pycontainer-build#66`. Reuse existing issues before opening
 another; do not close duplicate candidates without preserving their scope.
 Keep fixes separate from the documentation audit. Commit on a feature branch
 using conventional commit messages; never put credentials in code or issues.
+
+
+<!-- github-knowledge-base-start -->
+## Knowledge Base
+
+### Purpose
+
+This repository uses the Knowledge Base at [https://github.com/spboyer/pycontainer-build](https://github.com/spboyer/pycontainer-build) on branch `main`.
+
+### Required behavior
+
+1. Before changing code, read `docs/index.md` from that branch.
+2. Use the index to open only the knowledge files relevant to the task.
+3. If the index is unavailable, stop and report that the Knowledge Base could not be loaded.
+
+### Source of truth
+
+Generated knowledge tracks the code. When the knowledge and code disagree, trust the code.
+<!-- github-knowledge-base-end -->
