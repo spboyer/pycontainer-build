@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import threading
+import traceback
 import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -165,8 +166,8 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
-        requests.append((method, url, headers))
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        requests.append((method, url, headers, max_response_bytes))
         return 200, body, {"Docker-Content-Digest": digest}
 
     monkeypatch.setattr(client, "_make_request", fake_request)
@@ -179,6 +180,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
         requests[0][2]["Accept"]
     )
+    assert requests[0][3] == len(body)
 
     with pytest.raises(BlobIntegrityError, match="size"):
         client.pull_manifest(digest, expected_size=len(body) + 1)
@@ -798,12 +800,36 @@ def test_malformed_retry_after_uses_bounded_backoff(monkeypatch, retry_after):
         client.pull_manifest("latest")
 
     assert len(requests) == MAX_REQUEST_RETRIES + 1
-    assert all(0 <= delay <= 5 for delay in delays)
-    if retry_after == "-5":
-        assert error.value.retry_after_seconds == 0
-    else:
-        assert error.value.retry_after_seconds is None
-        assert "did not report when the limit resets" in str(error.value)
+    assert delays == [0.25, 0.5]
+    assert error.value.retry_after_seconds is None
+    assert "did not report when the limit resets" in str(error.value)
+
+
+@pytest.mark.parametrize("retry_after", ["1000000000000", "1e100"])
+def test_large_retry_after_remains_actionable(monkeypatch, retry_after):
+    client = RegistryClient("registry.example", "team/app")
+    requests, delays = _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 429, {"Retry-After": retry_after})
+        ),
+    )
+
+    with pytest.raises(RegistryRateLimitError) as error:
+        client.pull_manifest("latest")
+
+    assert error.value.retry_after_seconds == float(retry_after)
+    assert f"resets in about {int(float(retry_after))} seconds" in str(error.value)
+    assert "Authenticate" in str(error.value)
+    assert len(requests) == 1
+    assert delays == []
+
+
+def test_past_retry_after_date_has_no_delay():
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    retry_after = past.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    assert _retry_delay({"Retry-After": retry_after}, 0) == 0
 
 
 @pytest.mark.parametrize("operation", ["initiate", "blob", "manifest", "index"])
@@ -836,6 +862,39 @@ def test_write_requests_are_never_retried_on_rate_limit(
     write_methods = [r.get_method() for r in requests if r.get_method() in {"PUT", "POST"}]
     assert len(write_methods) == len(requests)
     assert len(requests) == (2 if operation == "blob" else 1)
+    assert delays == []
+
+
+@pytest.mark.parametrize("rate_limited", [False, True])
+def test_manifest_write_replays_only_for_bearer_challenge(monkeypatch, rate_limited):
+    client = RegistryClient("registry.example", "team/app")
+
+    def handler(request, _count):
+        if not request.full_url.startswith(client.base_url):
+            return _Response(b'{"token": "synthetic-token"}')
+        if not request.get_header("Authorization"):
+            raise _http_error(
+                request.full_url,
+                401,
+                {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+            )
+        assert request.get_header("Authorization") == "Bearer synthetic-token"
+        if rate_limited:
+            raise _http_error(request.full_url, 429, {"Retry-After": "1"})
+        return _Response(status=201)
+
+    requests, delays = _patch_urlopen(monkeypatch, handler)
+    if rate_limited:
+        with pytest.raises(RegistryRateLimitError):
+            client.push_manifest("latest", b"{}")
+    else:
+        assert client.push_manifest("latest", b"{}")
+
+    assert [request.get_method() for request in requests] == ["PUT", "GET", "PUT"]
+    assert [request.data for request in requests if request.get_method() == "PUT"] == [
+        b"{}",
+        b"{}",
+    ]
     assert delays == []
 
 
@@ -903,6 +962,102 @@ def test_error_bodies_are_truncated_sanitized_and_redacted(monkeypatch):
     assert "..." in message
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        'password="marker-first marker-second"',
+        'password="marker-first marker-second',
+        'password="marker-first\\\nmarker-second"',
+        "'password': 'marker-first marker-second'",
+        'token="marker-first marker-second"',
+        'authorization="marker-first marker-second"',
+        "username='marker-first marker-second'",
+    ],
+)
+def test_error_body_redacts_complete_credential_fields(monkeypatch, detail):
+    client = RegistryClient("registry.example", "team/app")
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 403, body=_errors_body(("DENIED", detail)))
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "marker-first" not in str(error.value)
+    assert "marker-second" not in str(error.value)
+    assert "[REDACTED]" in str(error.value)
+
+
+def test_error_body_redacts_overlapping_credentials_and_username(monkeypatch):
+    client = RegistryClient(
+        "registry.example",
+        "team/app",
+        auth_token="credential-prefix-distinct-suffix",
+        username="sensitive-user",
+        password="sensitive-password",
+    )
+    client._bearer_token = "credential-prefix"
+    body = _errors_body(
+        ("DENIED", "Identity sensitive-user used credential-prefix-distinct-suffix")
+    )
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 403, body=body)
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "sensitive-user" not in str(error.value)
+    assert "distinct-suffix" not in str(error.value)
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_error_body_redacts_credentials_and_query_in_urls(monkeypatch, structured):
+    client = RegistryClient("registry.example", "team/app")
+    detail = (
+        "See https://marker-user:marker-password@storage.example/layer"
+        "?sig=marker-signature&token=marker-token"
+    )
+    body = _errors_body(("DENIED", detail)) if structured else detail.encode()
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 400, body=body)
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "storage.example/layer" in str(error.value)
+    for secret in ("marker-user", "marker-password", "marker-signature", "marker-token"):
+        assert secret not in str(error.value)
+
+
+def test_error_body_redacts_malformed_url(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    detail = "See https://marker-user:marker-password@[broken/path?sig=marker-signature"
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 400, body=detail.encode())
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "[REDACTED URL]" in str(error.value)
+    for secret in ("marker-user", "marker-password", "marker-signature"):
+        assert secret not in str(error.value)
+
+
 def test_malformed_and_oversized_error_json_is_summarized(monkeypatch):
     client = RegistryClient("registry.example", "team/app")
     many = _errors_body(*[("DENIED", f"entry {index} " + "m" * 400) for index in range(8)])
@@ -925,6 +1080,91 @@ def test_malformed_and_oversized_error_json_is_summarized(monkeypatch):
     assert "entry 5" not in message
     assert "3 more error(s)" in message
     assert len(message) < 2000
+
+
+def test_deeply_nested_error_body_is_summarized(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 400, body=b"[" * 4096)
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "HTTP 400" in str(error.value)
+    assert "..." in str(error.value)
+    assert len(str(error.value)) < 1000
+
+
+@pytest.mark.parametrize(
+    ("code", "detail", "error_type", "hint"),
+    [
+        ("TOOMANYREQUESTS", "slow down", RegistryRateLimitError, "rate limit"),
+        ("DENIED", "storage quota exceeded", RegistryQuotaError, "quota"),
+        ("DENIED", "access forbidden", RegistryRequestError, "permission"),
+    ],
+)
+def test_omitted_distribution_error_still_controls_classification(
+    monkeypatch, code, detail, error_type, hint
+):
+    client = RegistryClient("registry.example", "team/app")
+    body = _errors_body(*([("UNKNOWN", "failure")] * 5), (code, detail))
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 400, body=body)
+        ),
+    )
+
+    with pytest.raises(error_type) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert hint in str(error.value).lower()
+    assert "1 more error(s) omitted" in str(error.value)
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_quota_classification_uses_full_sanitized_message(monkeypatch, structured):
+    client = RegistryClient(
+        "registry.example", "team/app", username="a", password="pw"
+    )
+    detail = "x" * 250 + "storage quota exceeded"
+    body = _errors_body(("DENIED", detail)) if structured else detail.encode()
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 403, body=body)
+        ),
+    )
+
+    with pytest.raises(RegistryQuotaError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert "registry.example" in str(error.value)
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_credentials_mentioning_quota_do_not_trigger_quota_classification(
+    monkeypatch, structured
+):
+    client = RegistryClient("registry.example", "team/app")
+    detail = 'password="storage quota exceeded"'
+    body = _errors_body(("DENIED", detail)) if structured else detail.encode()
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 403, body=body)
+        ),
+    )
+
+    with pytest.raises(RegistryRequestError) as error:
+        client.push_manifest("latest", b"{}")
+
+    assert not isinstance(error.value, RegistryQuotaError)
+    assert "storage quota exceeded" not in str(error.value)
 
 
 def test_malformed_manifest_preview_is_redacted(monkeypatch):
@@ -1022,6 +1262,196 @@ def test_token_exchange_rate_limit_reports_reset_without_echoing_secrets(
     assert len(requests) == 2
 
 
+@pytest.mark.parametrize("userinfo", ["synthetic-user:synthetic-password@", ""])
+def test_token_exchange_redacts_url_credentials_and_http_error_traceback(
+    monkeypatch, userinfo
+):
+    client = RegistryClient("registry.example", "team/app")
+    reason_token = "synthetic-status-token"
+    headers = Message()
+    headers["Retry-After"] = "120"
+
+    def fake_urlopen(request, timeout):
+        if request.full_url.startswith(client.base_url):
+            challenge = Message()
+            challenge["Www-Authenticate"] = (
+                f'Bearer realm="https://{userinfo}auth.example/token"'
+            )
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                f"Bearer {reason_token}",
+                challenge,
+                io.BytesIO(b""),
+            )
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            f"Bearer {reason_token}",
+            headers,
+            io.BytesIO(b""),
+        )
+
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    expected = RegistryAuthenticationError if userinfo else RegistryRateLimitError
+    with pytest.raises(expected) as error:
+        client.pull_manifest("latest")
+
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "auth.example" in str(error.value)
+    for secret in ("synthetic-user", "synthetic-password", reason_token):
+        assert secret not in str(error.value)
+        assert secret not in rendered
+
+
+def test_invalid_token_challenge_hides_http_error_traceback(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    reason_token = "synthetic-challenge-token"
+    headers = Message()
+    headers["Www-Authenticate"] = 'Bearer service="registry.example"'
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 401, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    with pytest.raises(RegistryAuthenticationError, match="token realm") as error:
+        client.pull_manifest("latest")
+
+    assert reason_token not in "".join(traceback.format_exception(error.value))
+
+
+def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
+    tmp_path, monkeypatch, caplog
+):
+    redirect = "https://storage.example/blob?token=synthetic-query-token"
+    reason_token = "synthetic-status-token"
+
+    class Opener:
+        def open(self, request, timeout):
+            raise _http_error(request.full_url, 307, {"Location": redirect})
+
+    def fake_urlopen(request, timeout):
+        headers = Message()
+        headers["Retry-After"] = "120"
+        headers["RateLimit-Remaining"] = "0"
+        raise urllib.error.HTTPError(
+            request.full_url, 429, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+        )
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        with pytest.raises(RegistryRateLimitError) as error:
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "storage.example" in str(error.value)
+    assert "storage.example" in caplog.text
+    for secret in ("synthetic-query-token", reason_token):
+        assert secret not in str(error.value)
+        assert secret not in caplog.text
+        assert secret not in rendered
+
+
+def test_missing_blob_redirect_location_hides_http_error_traceback(
+    tmp_path, monkeypatch
+):
+    reason_token = "synthetic-redirect-token"
+
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                307,
+                f"Bearer {reason_token}",
+                Message(),
+                io.BytesIO(b""),
+            )
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+
+    with pytest.raises(RegistryRequestError, match="did not include a Location") as error:
+        client.pull_blob(digest, tmp_path / "blob", 1)
+
+    assert reason_token not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize("operation", ["manifest", "token", "blob", "push"])
+def test_network_error_traceback_does_not_expose_credentials(
+    tmp_path, monkeypatch, operation
+):
+    token = "synthetic-network-token"
+    username = "synthetic-network-user"
+    client = RegistryClient(
+        "registry.example",
+        f"{username}/app",
+        auth_token=token,
+        username=username,
+    )
+    delays = []
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.URLError(f"Bearer {token}")
+
+    monkeypatch.setattr(client._opener, "open", fail)
+    monkeypatch.setattr(client, "_open_blob_response", fail)
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
+    error_type = (
+        RegistryAuthenticationError if operation == "token" else RegistryRequestError
+    )
+
+    with pytest.raises(error_type) as error:
+        if operation == "manifest":
+            client.pull_manifest(f"latest-{token}")
+        elif operation == "token":
+            client._get_bearer_token({"realm": "https://auth.example/token"})
+        elif operation == "blob":
+            digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+            client.pull_blob(digest, tmp_path / "blob", 1)
+        else:
+            client.push_manifest(f"latest-{token}", b"{}")
+
+    assert "URLError" in str(error.value)
+    for secret in (token, username):
+        assert secret not in str(error.value)
+        assert secret not in "".join(traceback.format_exception(error.value))
+    assert len(delays) == (0 if operation == "push" else MAX_REQUEST_RETRIES)
+
+
+@pytest.mark.parametrize("operation", ["network", "response"])
+def test_url_encoded_credentials_are_redacted(monkeypatch, operation):
+    token = "synthetic/token+secret"
+    encoded_token = urllib.parse.quote(token, safe="").lower()
+    url = f"https://registry.example/path/{encoded_token}"
+    client = RegistryClient("registry.example", "team/app", auth_token=token)
+
+    def fail(request, timeout):
+        if operation == "network":
+            raise urllib.error.URLError("synthetic failure")
+        raise _http_error(
+            request.full_url, 400, body=f"Failed at {url}".encode()
+        )
+
+    monkeypatch.setattr(client._opener, "open", fail)
+    with pytest.raises(RegistryRequestError) as error:
+        if operation == "network":
+            client._make_request("PUT", url, data=b"")
+        else:
+            client.push_manifest("latest", b"{}")
+
+    assert token not in str(error.value)
+    assert encoded_token not in str(error.value)
+    assert encoded_token not in "".join(traceback.format_exception(error.value))
+    assert "[REDACTED]" in str(error.value)
+
+
 def test_pull_blob_rate_limit_fails_fast_and_observes_redirect_headers(
     tmp_path, monkeypatch, caplog
 ):
@@ -1041,13 +1471,10 @@ def test_pull_blob_rate_limit_fails_fast_and_observes_redirect_headers(
                 _errors_body(("TOOMANYREQUESTS", "slow down")),
             )
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     delays = []
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
