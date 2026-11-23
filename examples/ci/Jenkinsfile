@@ -1,0 +1,68 @@
+// Copy to Jenkinsfile in the application repository.
+pipeline {
+    agent { label "${params.AGENT_LABEL}" }
+    parameters {
+        choice(name: 'AGENT_LABEL', choices: ['linux', 'windows'], description: 'Agent with Python 3.11 and Git on PATH')
+    }
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+    }
+    environment {
+        IMAGE_REPOSITORY = 'registry.example.com/team/app'
+    }
+    stages {
+        // The implicit declarative checkout sets env.GIT_COMMIT for the image tag.
+        stage('Install builder') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh '''
+                            set -eu
+                            python -m venv .ci-venv
+                            . .ci-venv/bin/activate
+                            python -m pip install --no-deps "git+https://github.com/spboyer/pycontainer-build.git@7bdec100c773d9a51e5aae63eb0d4456894ae43f"
+                        '''
+                    } else {
+                        bat '''
+                            @echo off
+                            python -m venv .ci-venv
+                            if errorlevel 1 exit /b 1
+                            call .ci-venv\\Scripts\\activate.bat
+                            if errorlevel 1 exit /b 1
+                            python -m pip install --no-deps "git+https://github.com/spboyer/pycontainer-build.git@7bdec100c773d9a51e5aae63eb0d4456894ae43f"
+                            if errorlevel 1 exit /b 1
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Build and push') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'container-registry', usernameVariable: 'REGISTRY_USERNAME', passwordVariable: 'REGISTRY_PASSWORD')]) {
+                    script {
+                        if (isUnix()) {
+                            sh '''
+                                set -eu
+                                set +x
+                                unset REGISTRY_TOKEN GITHUB_TOKEN
+                                . .ci-venv/bin/activate
+                                python .ci/pycontainer_ci.py build --tag "$IMAGE_REPOSITORY:$GIT_COMMIT" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$HOME/.pycontainer/cache" --exclude .ci-venv --exclude .ci --push --no-progress
+                            '''
+                        } else {
+                            bat '''
+                                @echo off
+                                set "REGISTRY_TOKEN="
+                                set "GITHUB_TOKEN="
+                                call .ci-venv\\Scripts\\activate.bat
+                                if errorlevel 1 exit /b 1
+                                python .ci\\pycontainer_ci.py build --tag "%IMAGE_REPOSITORY%:%GIT_COMMIT%" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "%USERPROFILE%\\.pycontainer\\cache" --exclude .ci-venv --exclude .ci --push --no-progress
+                                if errorlevel 1 exit /b 1
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
