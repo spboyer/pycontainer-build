@@ -640,8 +640,8 @@ from the cache registry's own provider, and control-plane redirects strip
 `Authorization` across origins. Redirected blob storage receives no registry
 credentials. A registry can direct credential exchange to its advertised token
 service, so trust both the cache registry and its token service. Every blob
-redirect must use HTTPS and contain no URL credentials, even when the cache
-registry itself is explicitly configured for HTTP. When remote caching is enabled,
+redirect hop must contain no URL credentials and use HTTPS; the only exception
+is an exact-host `--insecure-registry` redirecting over HTTP to its own origin. When remote caching is enabled,
 generated and cached tars are checked against the original source identity and
 sources are rechecked; mismatched cached layers are rebuilt. Export verifies
 blob presence even when the tag is current, then uploads any missing blobs

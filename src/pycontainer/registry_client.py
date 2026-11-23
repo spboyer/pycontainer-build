@@ -43,6 +43,7 @@ MAX_ERROR_TEXT_CHARS = 200
 LOW_RATE_LIMIT_REMAINING = 10
 QUOTA_STATUSES = {413, 507}
 SENSITIVE_HEADERS = ("Authorization", "Proxy-Authorization", "Cookie")
+BLOB_REGISTRY_ATTRIBUTE = "_pycontainer_blob_registry"
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,18 @@ def _join_url(source_url: str, location: str, insecure: bool = False) -> str:
     return target
 
 
+def _check_blob_redirect(registry_url: str, target_url: str, insecure: bool) -> None:
+    """Allow plain HTTP blob hops only back to an explicitly insecure registry."""
+    if urllib.parse.urlsplit(target_url).scheme.lower() == "https":
+        return
+    if insecure and _origin(target_url) == _origin(registry_url):
+        return
+    raise RegistryRequestError(
+        "Registry blob redirects must use HTTPS unless they stay on the "
+        "explicitly insecure registry's own origin."
+    )
+
+
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     """Follow redirects without downgrades or cross-origin authorization."""
 
@@ -218,8 +231,15 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _check_transport(req.full_url, newurl, self.insecure)
+        blob_registry = getattr(req, BLOB_REGISTRY_ATTRIBUTE, None)
+        if blob_registry is not None:
+            _check_blob_redirect(blob_registry, newurl, self.insecure)
         new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_request is not None and _origin(req.full_url) != _origin(newurl):
+        if new_request is not None and blob_registry is not None:
+            setattr(new_request, BLOB_REGISTRY_ATTRIBUTE, blob_registry)
+        if new_request is not None and (
+            blob_registry is not None or _origin(req.full_url) != _origin(newurl)
+        ):
             for key, _value in new_request.header_items():
                 if any(key.lower() == header.lower() for header in SENSITIVE_HEADERS):
                     new_request.remove_header(key)
@@ -1154,12 +1174,12 @@ class RegistryClient:
 
     def _open_blob_redirect(self, url: str, location: str):
         target = _join_url(url, location, self.insecure)
-        if urllib.parse.urlsplit(target).scheme.lower() != "https":
-            raise RegistryRequestError("Registry blob redirects must use HTTPS.")
-        # Storage receives no registry credentials, even on the same origin.
-        return self._opener.open(
-            urllib.request.Request(target), timeout=self.timeout
-        )
+        _check_blob_redirect(self.base_url, target, self.insecure)
+        # Storage receives no registry credentials, even on the same origin;
+        # SafeRedirect applies the same blob policy to every later hop.
+        request = urllib.request.Request(target)
+        setattr(request, BLOB_REGISTRY_ATTRIBUTE, self.base_url)
+        return self._opener.open(request, timeout=self.timeout)
 
     def _download_blob_once(
         self,

@@ -50,6 +50,7 @@ class _Registry:
         self.blob_redirect = None
         self.token_realm = None
         self.token_response = None
+        self.routes = {}
 
 
 def _handler(state):
@@ -73,7 +74,9 @@ def _handler(state):
 
         def do_GET(self):
             self._record()
-            if (
+            if self.path in state.routes:
+                self._send(*state.routes[self.path])
+            elif (
                 state.token_realm
                 and self.headers.get("Authorization") != "Bearer acquired-token"
             ):
@@ -333,6 +336,87 @@ def test_cross_origin_redirect_drops_authorization():
 
     assert source.requests[0][2] == "Bearer secret"
     assert target.requests[0][2] is None
+
+
+def _blob_redirect_fixture(state, first_location):
+    content = b"redirected-layer"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    state.routes[f"/v2/team/app/blobs/{digest}"] = (
+        307, b"", {"Location": first_location}
+    )
+    return content, digest
+
+
+def test_insecure_loopback_pull_blob_follows_relative_same_origin_redirect(tmp_path):
+    with _serve() as (port, state):
+        content, digest = _blob_redirect_fixture(state, "/storage/blob")
+        state.routes["/storage/blob"] = (200, content)
+        client = RegistryClient(
+            f"127.0.0.1:{port}", "team/app", auth_token="secret", insecure=True
+        )
+        assert client.pull_blob(digest, tmp_path / "blob", len(content))
+
+    assert (tmp_path / "blob").read_bytes() == content
+    assert [(path, auth) for _method, path, auth in state.requests] == [
+        (f"/v2/team/app/blobs/{digest}", "Bearer secret"),
+        ("/storage/blob", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "allowed"),
+    [
+        ("/storage/first", "/storage/final", True),
+        ("/storage/first", "{secure}/final", True),
+        ("{secure}/first", "{secure}/final", True),
+        ("{other}/blob", None, False),
+        ("/storage/first", "{other}/final", False),
+        ("/storage/first", "http://localhost:{port}/storage/final", False),
+        ("/storage/first", "http://user:pw@127.0.0.1:{port}/storage/final", False),
+        ("{secure}/first", "http://127.0.0.1:{port}/storage/final", False),
+    ],
+)
+def test_insecure_pull_blob_redirect_policy_applies_to_every_hop(
+    tmp_path, certificate_authority, first, second, allowed
+):
+    server_context, ca_file = certificate_authority
+    with _serve() as (port, state), _serve() as (other_port, other), _serve(
+        server_context
+    ) as (secure_port, secure):
+        names = {
+            "port": port,
+            "other": f"http://127.0.0.1:{other_port}",
+            "secure": f"https://127.0.0.1:{secure_port}",
+        }
+        content, digest = _blob_redirect_fixture(state, first.format(**names))
+        for server in (state, other, secure):
+            server.routes["/storage/final"] = server.routes["/final"] = (200, content)
+            if second is not None:
+                server.routes["/storage/first"] = server.routes["/first"] = (
+                    302, b"", {"Location": second.format(**names)}
+                )
+        client = RegistryClient(
+            f"127.0.0.1:{port}",
+            "team/app",
+            auth_token="secret",
+            insecure=True,
+            ca_file=ca_file,
+        )
+        if allowed:
+            assert client.pull_blob(digest, tmp_path / "blob", len(content))
+            assert (tmp_path / "blob").read_bytes() == content
+        else:
+            with pytest.raises(RegistryRequestError):
+                client.pull_blob(digest, tmp_path / "blob", len(content))
+            assert not (tmp_path / "blob").exists()
+
+    assert state.requests[0][2] == "Bearer secret"
+    redirected = state.requests[1:] + other.requests + secure.requests
+    assert all(auth is None for _method, _path, auth in redirected)
+    assert allowed or not any(
+        path.endswith("final") for _method, path, _auth in redirected
+    )
+    assert allowed or other.requests == []
 
 
 @pytest.mark.parametrize(

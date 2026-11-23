@@ -64,7 +64,8 @@ provenance. Import failures warn and rebuild; remote caching validates the tar
 against its source identity and rechecks sources. Mismatched cached layers are
 rebuilt; export publishes blobs before the tag and fails explicitly.
 Control-plane redirects drop `Authorization`
-across origins, and blob redirects must be HTTPS and carry no credentials.
+across origins. Blob redirects carry no credentials, and every hop must be HTTPS
+unless it stays on an explicitly insecure registry's own origin.
 Cache connections honor the same custom CA and exact-host HTTP opt-in as image
 pulls and pushes; HTTP credentials are restricted to loopback hosts.
 Cache auth excludes unscoped `REGISTRY_TOKEN` and `REGISTRY_USERNAME`/

@@ -59,7 +59,10 @@ challenge can direct credential exchange to a token service on another origin;
 trust both the cache registry and its advertised token service.
 Cache connections honor `--registry-ca-file` and the exact-host
 `--insecure-registry` opt-in. Credentials are sent over HTTP only to loopback
-hosts, and blob redirects always use HTTPS without registry credentials.
+hosts. Blob redirects never carry registry credentials and every hop must use
+HTTPS, except that an exact-host `--insecure-registry` may redirect over HTTP
+to its own origin (same scheme, host and port). Cross-origin HTTP hops,
+HTTPS-to-HTTP downgrades and URL credentials are rejected on every hop.
 
 ## Components
 
@@ -368,7 +371,9 @@ separate.
   `RegistryAuthenticationError` before secrets leave the process.
 - HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
   rejected. `Authorization`, `Proxy-Authorization` and `Cookie` are dropped on
-  cross-origin redirects; blob storage redirects are credential-free.
+  cross-origin redirects; blob storage redirects are credential-free on every
+  hop and use HTTPS unless they stay on an explicitly insecure registry's own
+  origin.
 - Embedded URL credentials are rejected and error URLs omit userinfo/query
   secrets. Registry connections ignore environment/system proxies.
 - Concurrent initial bearer challenges share token acquisition and replay once;
