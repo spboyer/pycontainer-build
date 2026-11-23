@@ -337,7 +337,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
 - `--include-deps` — Stage importable dependencies from a venv or install a
   requirements file as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
@@ -385,6 +385,56 @@ pycontainer build \
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
   establish the Python ABI. These metadata checks apply to requirements and
   virtualenv staging alike.
+
+### Local base images
+
+`--base-image` (and `base_image` in `[build]`) can read a base image from disk
+without a registry, credentials, or a Docker daemon:
+
+```bash
+# OCI image layout (for example `skopeo copy docker://python:3.11-slim oci:base:3.11-slim`)
+pycontainer build --tag app:v1 --base-image oci:./base:3.11-slim
+pycontainer build --tag app:v1 --base-image oci:./base@sha256:<manifest-digest>
+
+# A previous pycontainer output is itself an OCI layout
+pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./dist/v2
+
+# Uncompressed `docker save` archive (legacy and Docker 25+ formats)
+pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). For a single-entry index,
+  either annotation on the index itself can also identify the entry. The
+  reference may be omitted when the layout holds one image, or a set of images
+  that all carry platform metadata. Nested image indexes use the same exact
+  OS/architecture/variant selection as registry pulls.
+- `docker-archive:<path>[:<repo-tag>]` selects a `manifest.json` entry by
+  `RepoTags`, normalized like registry references (`python:3.11-slim` matches
+  `docker.io/library/python:3.11-slim`). The tag may be omitted when the archive
+  holds one image.
+- The path ends at the first `:` after an optional Windows drive prefix, so
+  paths containing `:` are not supported. Relative paths resolve against the
+  current directory, and the source must not overlap `--output`.
+- Every blob is checked against its digest and size, and every base layer is
+  checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
+  more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+  Each OCI index, including nested indexes, is limited to 1,000 entries.
+  Layers are limited to 64 GiB (including decompressed content); Docker archive
+  member sizes are checked before any selected image blobs are staged.
+- Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
+  are not supported; extract or decompress them first.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
@@ -502,8 +552,18 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -666,6 +726,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 
