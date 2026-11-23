@@ -171,6 +171,7 @@ class BuildConfig:
     requirements_file: Optional[str] = None
     lockfile: Optional[str] = None
     use_lockfile: bool = True
+    strip_type_stubs: bool = False
     verbose: bool = False
     dry_run: bool = False
     platform: str = "linux/amd64"
