@@ -891,9 +891,11 @@ def test_tag_changed_between_index_writes_reports_confirmed_tags(
     assert "latest" not in published
 
 
+@pytest.mark.parametrize("scan", [False, True])
 def test_tag_changed_between_manifest_writes_reports_confirmed_tags(
-    release_repo, tmp_path, monkeypatch
+    release_repo, tmp_path, monkeypatch, scan
 ):
+    from contextlib import contextmanager
     from pycontainer import builder as builder_module
     from pycontainer.auth import RegistryAuth
 
@@ -905,6 +907,14 @@ def test_tag_changed_between_manifest_writes_reports_confirmed_tags(
         builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
     )
     builder.build()
+    builder.config.scan = scan
+
+    @contextmanager
+    def scanned_image(output, digest, config):
+        yield output, {"digest": digest}
+
+    if scan:
+        monkeypatch.setattr("pycontainer.scanning.scanned_image", scanned_image)
     published = []
     real_git = tags_module._git
 
