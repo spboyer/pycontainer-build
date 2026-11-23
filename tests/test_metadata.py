@@ -86,7 +86,7 @@ def _mock_base_image(monkeypatch, base_config, config_bytes=None):
     monkeypatch.setattr("pycontainer.builder.RegistryClient", FakeRegistryClient)
     monkeypatch.setattr(
         "pycontainer.builder.get_registry_auth",
-        lambda registry: SimpleNamespace(
+        lambda registry, **kwargs: SimpleNamespace(
             bearer_token=None, username=None, password=None
         ),
     )

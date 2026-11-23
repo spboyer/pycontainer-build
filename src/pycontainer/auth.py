@@ -62,12 +62,21 @@ class AuthProvider(ABC):
         pass
 
 class EnvironmentAuthProvider(AuthProvider):
-    """Read credentials from environment variables."""
+    """Read credentials from environment variables.
+
+    REGISTRY_TOKEN, REGISTRY_USERNAME and REGISTRY_PASSWORD are not scoped to a
+    registry; set include_generic_environment=False for requests that must not
+    receive destination credentials.
+    """
+
+    def __init__(self, *, include_generic_environment: bool = True):
+        self.include_generic_environment=include_generic_environment
     
     def get_credentials(self, registry: str) -> Optional[Tuple[str, str]]:
-        user=os.getenv('REGISTRY_USERNAME')
-        pwd=os.getenv('REGISTRY_PASSWORD')
-        if user and pwd: return (user, pwd)
+        if self.include_generic_environment:
+            user=os.getenv('REGISTRY_USERNAME')
+            pwd=os.getenv('REGISTRY_PASSWORD')
+            if user and pwd: return (user, pwd)
         
         if _is_ghcr_registry(registry):
             token=os.getenv('GITHUB_TOKEN')
@@ -78,7 +87,9 @@ class EnvironmentAuthProvider(AuthProvider):
     def get_token(self, registry: str) -> Optional[str]:
         if _is_ghcr_registry(registry):
             return os.getenv('GITHUB_TOKEN')
-        return os.getenv('REGISTRY_TOKEN')
+        if self.include_generic_environment:
+            return os.getenv('REGISTRY_TOKEN')
+        return None
 
 class DockerConfigAuthProvider(AuthProvider):
     """Read credentials from ~/.docker/config.json."""
@@ -194,10 +205,14 @@ class ChainAuthProvider(AuthProvider):
             if token: return token
         return None
 
-def get_default_auth_provider() -> AuthProvider:
+def get_default_auth_provider(
+    *, include_generic_environment: bool = True
+) -> AuthProvider:
     """Return default auth provider chain."""
     return ChainAuthProvider([
-        EnvironmentAuthProvider(),
+        EnvironmentAuthProvider(
+            include_generic_environment=include_generic_environment
+        ),
         DockerConfigAuthProvider(),
         AzureCLIAuthProvider()
     ])
@@ -209,6 +224,7 @@ def get_registry_auth(
     bearer_token: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    include_generic_environment: bool = True,
 ) -> RegistryAuth:
     """Resolve registry credentials without treating a password as a bearer token."""
     if bearer_token:
@@ -220,7 +236,9 @@ def get_registry_auth(
     if password:
         return RegistryAuth(bearer_token=password)
 
-    provider=get_default_auth_provider()
+    provider=get_default_auth_provider(
+        include_generic_environment=include_generic_environment
+    )
 
     token=provider.get_token(registry)
     if token:

@@ -22,7 +22,7 @@ from ._venv_closure import (
     _canonical_extras,
     _walk as _walk_marker,
 )
-from .dependencies import _read_staged_distributions
+from .dependencies import _MARKER_MACHINES, _read_staged_distributions, validate_target_platform
 from .fs_utils import context_file_path
 
 try:
@@ -55,7 +55,6 @@ _DEFAULT_PIPFILE_SOURCE = {"name": "pypi", "url": "https://pypi.org/simple", "ve
 _HASH_LENGTHS = {"sha256": 64, "sha384": 96, "sha512": 128}
 _UNKNOWN_MARKER_VARIABLES = ("platform_release", "platform_version")
 _PLACEHOLDER = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
-_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
 _PIPFILE_MARKERS = {
     "implementation_name", "implementation_version", "os_name", "platform_machine",
     "platform_python_implementation", "platform_release", "platform_system", "platform_version",
@@ -121,16 +120,19 @@ def detect_lockfile(context_dir: Path) -> Optional[str]:
 
 
 def target_environment(
-    os_name: str, arch: str, python_version: str, python_full_version: Optional[str]
+    os_name: str, arch: str, python_version: str, python_full_version: Optional[str],
+    *, variant: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     """Marker values for the target image; unknown values stay ``None``."""
-    if os_name != "linux" or arch not in _MACHINES:
-        raise LockfileError(f"Lockfile staging does not support target {os_name}/{arch}.")
+    try:
+        validate_target_platform(os_name, arch, variant)
+    except ValueError as exc:
+        raise LockfileError(str(exc)) from exc
     return {
         "implementation_name": "cpython",
         "implementation_version": python_full_version,
         "os_name": "posix",
-        "platform_machine": _MACHINES[arch],
+        "platform_machine": _MARKER_MACHINES[arch],
         "platform_python_implementation": "CPython",
         "platform_release": None,
         "platform_system": "Linux",
