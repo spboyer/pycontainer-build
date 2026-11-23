@@ -476,18 +476,66 @@ def render_toml(config: Dict[str, object]) -> str:
 
 def merge_into_pyproject(existing: str, snippet: str) -> str:
     """Replace any [tool.pycontainer*] tables in existing text with snippet."""
+    # Keep float tokens comparable, including NaN, when checking unrelated values.
+    original = tomllib.loads(existing, parse_float=lambda value: (value,))
     kept: List[str] = []
+    trailing: List[str] = []
     skipping = False
-    for line in existing.splitlines():
-        header = re.match(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$", line)
-        if header:
-            table = header.group(1).replace('"', "").replace(" ", "")
-            skipping = table == TABLE_NAME or table.startswith(TABLE_NAME + ".")
-        if not skipping:
+    lines = existing.split("\n")
+    segment_start = 0
+
+    def complete_prefix(start: int, end: int) -> bool:
+        prefix = "\n".join(lines[start:end]) + ("\n" if end > start else "")
+        try:
+            tomllib.loads(prefix)
+        except tomllib.TOMLDecodeError:
+            return False
+        return True
+
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            try:
+                header = tomllib.loads(line.rstrip("\r"))
+            except tomllib.TOMLDecodeError:
+                header = None
+            if header is not None:
+                tool = header.get("tool")
+                is_target = isinstance(tool, dict) and "pycontainer" in tool
+                if is_target != skipping:
+                    # A header-like line inside a multiline value has an incomplete prefix.
+                    is_header = complete_prefix(segment_start, index)
+                    if not is_header and segment_start:
+                        # Array-of-tables fragments may need earlier context.
+                        is_header = complete_prefix(0, index)
+                    if is_header:
+                        if skipping:
+                            kept.extend(trailing)
+                        trailing.clear()
+                        skipping = is_target
+                        segment_start = index
+        if skipping:
+            if not line.strip() or line.lstrip().startswith("#"):
+                trailing.append(line)
+            else:
+                trailing.clear()
+        else:
             kept.append(line)
+    if skipping:
+        kept.extend(trailing)
     base = "\n".join(kept).rstrip()
     merged = (base + "\n\n" if base else "") + snippet
-    tomllib.loads(merged)
+    try:
+        updated = tomllib.loads(merged, parse_float=lambda value: (value,))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Cannot safely merge [tool.pycontainer]: {exc}") from exc
+    for data in (original, updated):
+        tool = data.get("tool")
+        if isinstance(tool, dict):
+            tool.pop("pycontainer", None)
+            if not tool:
+                data.pop("tool")
+    if original != updated:
+        raise ValueError("Cannot safely merge [tool.pycontainer] without changing unrelated TOML.")
     return merged
 
 

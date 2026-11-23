@@ -28,12 +28,13 @@ def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
             raise ValueError("The [build] configuration must be a TOML table.")
         found.append((BUILD_TABLE, data['build']))
     if 'tool' in data:
-        if not isinstance(data['tool'], dict):
+        tool = data['tool']
+        if not isinstance(tool, dict) and 'build' not in data:
             raise ValueError("The [tool] configuration must be a TOML table.")
-        if 'pycontainer' in data['tool']:
-            if not isinstance(data['tool']['pycontainer'], dict):
+        if isinstance(tool, dict) and 'pycontainer' in tool:
+            if not isinstance(tool['pycontainer'], dict):
                 raise ValueError("The [tool.pycontainer] configuration must be a TOML table.")
-            found.append((TOOL_TABLE, data['tool']['pycontainer']))
+            found.append((TOOL_TABLE, tool['pycontainer']))
 
     if len(found) > 1:
         raise ValueError(
@@ -147,8 +148,6 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
 def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
     table, file_config = _load_config_table(path)
-    file_config = _normalize_config_keys(file_config, f"Config file {table}")
-    _validate_config(file_config, table)
     config = merge_configs(file_config, cli_overrides or {})
-    _validate_config(config)
+    _validate_config(config, table)
     return BuildConfig(**config)
