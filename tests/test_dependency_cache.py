@@ -2,16 +2,19 @@
 import base64
 import csv
 import hashlib
+import http.server
 import io
 import json
 import multiprocessing
 import os
 import shutil
 import sys
+import threading
 import tomllib
 import zipfile
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -46,11 +49,20 @@ SECRET = "hunter2-secret"
 @pytest.fixture(autouse=True)
 def _no_ambient_pip(monkeypatch):
     for name in [
-        name for name in os.environ if name.upper().startswith(("PIP_", "PYTHON"))
+        name for name in os.environ
+        if name.upper().startswith(("PIP_", "PYTHON"))
+        or name.upper() in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
     ]:
         monkeypatch.delenv(name)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NETRC", os.devnull)
     monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
-    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", lambda: [])
+    monkeypatch.setattr(dependency_cache, "_system_proxies", lambda: {})
+    monkeypatch.setattr(
+        dependency_cache, "ambient_pip_settings",
+        lambda environment: dependency_cache.AmbientPipSnapshot((), (), (), dict(environment)),
+    )
 
 
 def _sha(path):
@@ -146,6 +158,365 @@ def test_hash_pinned_requirements_hit_reuses_identical_layer_without_pip(
     assert Path(second.layers[0].tar_path).read_bytes() == Path(first.layers[0].tar_path).read_bytes()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_requirements_changed_during_install_cannot_poison_cache(tmp_path, monkeypatch, nested):
+    context = _project(tmp_path)
+    requirements = context / "requirements.txt"
+    original = requirements.read_text()
+    alternate = _named_wheel(context / "wheelhouse", "alternate-dep")
+    changed = f"alternate-dep==1.0 --hash=sha256:{_sha(alternate)}\n"
+    if nested:
+        nested_dir = context / "nested"
+        nested_dir.mkdir()
+        requirements.write_text("--no-index\n--find-links ./wheelhouse\n-r nested/deps.txt\n")
+        requirements = nested_dir / "deps.txt"
+        original = original.splitlines()[2] + "\n"
+        requirements.write_text(original)
+    else:
+        changed = "--no-index\n--find-links ./wheelhouse\n" + changed
+    install = builder_module.install_requirements
+
+    def install_with_changed_requirements(*args, **kwargs):
+        requirements.write_text(changed)
+        try:
+            return install(*args, **kwargs)
+        finally:
+            requirements.write_text(original)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder_module, "install_requirements", install_with_changed_requirements)
+        _builder(tmp_path, monkeypatch, context, "changing").build()
+
+    rebuilt = _builder(tmp_path, monkeypatch, context, "rebuilt")
+    rebuilt.build()
+
+    assert _image(rebuilt)[3] == [("fixture-dep", "1.0")]
+
+
+def test_find_links_changed_during_install_cannot_poison_cache(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    wheel = next((context / "wheelhouse").iterdir())
+    original = wheel.read_bytes()
+    alternate = _write_wheel(tmp_path / "alternate", function="alternate").read_bytes()
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0 "
+        f"--hash=sha256:{hashlib.sha256(original).hexdigest()} "
+        f"--hash=sha256:{hashlib.sha256(alternate).hexdigest()}\n"
+    )
+    expected = _builder(tmp_path, monkeypatch, context, "uncached", use_cache=False)
+    expected.build()
+    install = builder_module.install_requirements
+
+    def install_with_changed_wheel(*args, **kwargs):
+        wheel.write_bytes(alternate)
+        try:
+            return install(*args, **kwargs)
+        finally:
+            wheel.write_bytes(original)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder_module, "install_requirements", install_with_changed_wheel)
+        _builder(tmp_path, monkeypatch, context, "changing").build()
+
+    rebuilt = _builder(tmp_path, monkeypatch, context, "rebuilt")
+    rebuilt.build()
+
+    assert rebuilt.layers[0].digest == expected.layers[0].digest
+
+
+def test_changed_find_links_during_snapshot_misses_without_storing(tmp_path, monkeypatch, capsys):
+    context = _project(tmp_path)
+    wheel = next((context / "wheelhouse").iterdir())
+    original = wheel.read_bytes()
+    alternate = _write_wheel(tmp_path / "alternate", function="alternate").read_bytes()
+    materialize = builder_module.materialize_requirements_snapshot
+
+    def snapshot_with_changed_wheel(*args, **kwargs):
+        wheel.write_bytes(alternate)
+        try:
+            return materialize(*args, **kwargs)
+        finally:
+            wheel.write_bytes(original)
+
+    monkeypatch.setattr(
+        builder_module, "materialize_requirements_snapshot", snapshot_with_changed_wheel
+    )
+    _builder(tmp_path, monkeypatch, context, "changing").build()
+
+    assert "local find-links changed while being snapshotted" in capsys.readouterr().out
+    assert not _dependency_keys(tmp_path / "cache")
+
+
+@pytest.mark.parametrize(
+    "limit, reason",
+    [("MAX_STAGED_BYTES", "size limit"), ("MAX_STAGED_FILES", "file limit")],
+)
+def test_oversized_input_snapshot_is_an_explicit_miss(tmp_path, monkeypatch, capsys, limit, reason):
+    context = _project(tmp_path)
+    monkeypatch.setattr(dependency_cache, limit, 0)
+
+    _builder(tmp_path, monkeypatch, context, "out").build()
+
+    assert f"local input snapshot exceeds its {reason}" in capsys.readouterr().out
+    assert not _dependency_keys(tmp_path / "cache")
+
+
+def test_unverifiable_pip_configuration_snapshot_is_an_explicit_miss(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project(tmp_path)
+    monkeypatch.setattr(
+        dependency_cache,
+        "ambient_pip_settings",
+        lambda environment: dependency_cache.AmbientPipSnapshot(
+            (), (), (("index-url", "https://example.invalid/simple"),), dict(environment)
+        ),
+    )
+
+    _builder(tmp_path, monkeypatch, context, "out").build()
+
+    assert "pip configuration snapshot could not be verified" in capsys.readouterr().out
+    assert not _dependency_keys(tmp_path / "cache")
+
+
+@pytest.mark.parametrize("source", ["config", "environment"])
+def test_pip_index_changed_during_install_cannot_poison_cache(
+    tmp_path, monkeypatch, indexes, source
+):  # noqa: F811
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    first_wheel = _write_wheel(tmp_path / "first", function="first")
+    second_wheel = _write_wheel(tmp_path / "second", function="second")
+    first_index, second_index = indexes(first_wheel), indexes(second_wheel)
+    (context / "requirements.txt").write_text(
+        "fixture-dep==1.0 "
+        f"--hash=sha256:{_sha(first_wheel)} --hash=sha256:{_sha(second_wheel)}\n"
+    )
+    config = tmp_path / "pip.conf"
+    if source == "config":
+        config.write_text(f"[global]\nindex-url = {first_index.url}\n")
+        monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    else:
+        monkeypatch.setenv("PIP_INDEX_URL", first_index.url)
+    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
+    expected = _builder(tmp_path, monkeypatch, context, "uncached", use_cache=False)
+    expected.build()
+    install = builder_module.install_requirements
+
+    def install_with_changed_index(*args, **kwargs):
+        if source == "config":
+            config.write_text(f"[global]\nindex-url = {second_index.url}\n")
+        else:
+            monkeypatch.setenv("PIP_INDEX_URL", second_index.url)
+        try:
+            return install(*args, **kwargs)
+        finally:
+            if source == "config":
+                config.write_text(f"[global]\nindex-url = {first_index.url}\n")
+            else:
+                monkeypatch.setenv("PIP_INDEX_URL", first_index.url)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder_module, "install_requirements", install_with_changed_index)
+        _builder(tmp_path, monkeypatch, context, "changing").build()
+
+    rebuilt = _builder(tmp_path, monkeypatch, context, "rebuilt")
+    rebuilt.build()
+
+    assert rebuilt.layers[0].digest == expected.layers[0].digest
+
+
+@pytest.mark.parametrize("proxy_setting", ["PIP_PROXY", "HTTP_PROXY"])
+def test_changed_proxy_routing_cannot_reuse_a_different_pinned_wheel(
+    tmp_path, monkeypatch, capsys, proxy_setting
+):
+    class PackageProxy:
+        def __init__(self, wheel):
+            self.wheel = wheel
+            self.requests = []
+            proxy = self
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    path = urlsplit(self.path).path
+                    proxy.requests.append(path)
+                    if path.startswith("/simple/"):
+                        body = (
+                            f'<a href="http://fixture.invalid/files/{proxy.wheel.name}">'
+                            f"{proxy.wheel.name}</a>"
+                        ).encode()
+                        content_type = "text/html"
+                    elif path.startswith("/files/"):
+                        body, content_type = proxy.wheel.read_bytes(), "application/octet-stream"
+                    else:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_):
+                    pass
+
+            self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self.url = f"http://127.0.0.1:{self.server.server_port}"
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+        def close(self):
+            self.server.shutdown()
+            self.server.server_close()
+
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    wheels = [_write_wheel(tmp_path / name, function=name) for name in ("first", "second")]
+    hashes = " ".join(f"--hash=sha256:{_sha(wheel)}" for wheel in wheels)
+    (context / "requirements.txt").write_text(f"fixture-dep==1.0 {hashes}\n")
+    proxies = [PackageProxy(wheel) for wheel in wheels]
+    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
+    monkeypatch.setenv("PIP_INDEX_URL", "http://fixture.invalid/simple")
+    monkeypatch.setenv("PIP_TRUSTED_HOST", "fixture.invalid")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    try:
+        monkeypatch.setenv(proxy_setting, proxies[0].url)
+        first = _builder(tmp_path, monkeypatch, context, "first")
+        first.build()
+        first_output = capsys.readouterr().out
+
+        monkeypatch.setenv(proxy_setting, proxies[1].url)
+        second = _builder(tmp_path, monkeypatch, context, "second")
+        second.build()
+        second_output = capsys.readouterr().out
+
+        assert "Dependency layer cache miss: a proxy" in first_output
+        assert "Dependency layer cache miss: a proxy" in second_output
+        assert first.layers[0].digest != second.layers[0].digest
+        assert all(proxy.requests for proxy in proxies)
+        assert not _dependency_keys(tmp_path / "cache")
+    finally:
+        for proxy in proxies:
+            proxy.close()
+
+
+def test_index_auth_routing_cannot_reuse_another_pinned_wheel(tmp_path, monkeypatch, capsys):
+    wheels = {
+        name: _write_wheel(tmp_path / name, function=name) for name in ("first", "second")
+    }
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            credentials = self.headers.get("Authorization", "")
+            expected = {
+                f"Basic {base64.b64encode(f'{name}:{SECRET}'.encode()).decode()}": name
+                for name in wheels
+            }
+            name = expected.get(credentials)
+            if name is None:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
+                self.end_headers()
+                return
+            requests.append(name)
+            wheel = wheels[name]
+            if self.path.startswith("/simple/"):
+                body = f'<a href="/files/{wheel.name}">{wheel.name}</a>'.encode()
+                content_type = "text/html"
+            elif self.path.startswith("/files/"):
+                body, content_type = wheel.read_bytes(), "application/octet-stream"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    hashes = " ".join(f"--hash=sha256:{_sha(wheel)}" for wheel in wheels.values())
+    (context / "requirements.txt").write_text(f"fixture-dep==1.0 {hashes}\n")
+    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
+    try:
+        builds = []
+        for name in wheels:
+            monkeypatch.setenv(
+                "PIP_INDEX_URL", f"http://{name}:{SECRET}@127.0.0.1:{server.server_port}/simple"
+            )
+            build = _builder(tmp_path, monkeypatch, context, name)
+            build.build()
+            builds.append(build)
+        output = capsys.readouterr().out
+        assert output.count("credentials can change the effective package source") == 2
+        assert builds[0].layers[0].digest != builds[1].layers[0].digest
+        assert set(requests) == set(wheels)
+        assert "Dependency layer cache hit" not in output
+        assert SECRET not in output
+        assert not _dependency_keys(tmp_path / "cache")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cache_preserves_pip_configuration_precedence(tmp_path, monkeypatch, indexes):  # noqa: F811
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    config_wheel = _write_wheel(tmp_path / "config-wheel", function="config")
+    env_wheel = _write_wheel(tmp_path / "env-wheel", function="environment")
+    config_index, env_index = indexes(config_wheel), indexes(env_wheel)
+    (context / "requirements.txt").write_text(
+        "fixture-dep==1.0 "
+        f"--hash=sha256:{_sha(config_wheel)} --hash=sha256:{_sha(env_wheel)}\n"
+    )
+    config = tmp_path / "pip.conf"
+    config.write_text(f"[install]\nindex-url = {config_index.url}\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    monkeypatch.setenv("PIP_INDEX_URL", env_index.url)
+    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
+
+    expected = _builder(tmp_path, monkeypatch, context, "uncached", use_cache=False)
+    expected.build()
+    cached = _builder(tmp_path, monkeypatch, context, "cached")
+    cached.build()
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "hit")
+    hit.build()
+
+    assert not config_index.requests and env_index.requests
+    assert cached.layers[0].digest == hit.layers[0].digest == expected.layers[0].digest
+
+
+def test_nested_find_links_fallback_is_snapshotted(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    wheel = next((context / "wheelhouse").iterdir())
+    nested = context / "nested"
+    nested.mkdir()
+    (context / "requirements.txt").write_text("-r nested/deps.txt\n")
+    (nested / "deps.txt").write_text(
+        f"--no-index\n--find-links wheelhouse\nfixture-dep==1.0 --hash=sha256:{_sha(wheel)}\n"
+    )
+
+    first = _builder(tmp_path, monkeypatch, context, "first")
+    first.build()
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "hit")
+    hit.build()
+
+    assert _image(first) == _image(hit)
+
+
 def test_pythonpath_customization_cannot_reuse_an_existing_dependency_layer(
     tmp_path, monkeypatch, capsys
 ):
@@ -217,12 +588,12 @@ def test_context_pip_module_cannot_hide_ambient_pip_settings(tmp_path, monkeypat
     (context / "pip.py").write_text("")
     monkeypatch.chdir(context)
     monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
-    monkeypatch.setenv("PIP_INDEX_URL", f"https://user:{SECRET}@first.invalid/simple")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://first.invalid/simple")
 
     first = _builder(tmp_path, monkeypatch, context, "first")
     first.build()
     capsys.readouterr()
-    monkeypatch.setenv("PIP_INDEX_URL", f"https://user:{SECRET}@second.invalid/simple")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://second.invalid/simple")
 
     second = _builder(tmp_path, monkeypatch, context, "second")
     second.build()
@@ -232,6 +603,36 @@ def test_context_pip_module_cannot_hide_ambient_pip_settings(tmp_path, monkeypat
     assert SECRET not in output
     assert _image(second) == _image(first)
     assert len(_dependency_keys(tmp_path / "cache")) == 4
+
+
+def test_cache_hit_checks_nested_requirements_for_shipped_credentials(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project(tmp_path)
+    nested = context / "custom" / "pip-input.in"
+    nested.parent.mkdir()
+    nested.write_text((context / "requirements.txt").read_text())
+    (context / "requirements.txt").write_text("-r custom/pip-input.in\n")
+    include_paths = ["app.py", "requirements.txt", "custom"]
+    _builder(tmp_path, monkeypatch, context, "first", include_paths=include_paths).build()
+    capsys.readouterr()
+
+    lookup = ImageBuilder._cached_dependency_layer
+
+    def add_credentials_after_lookup(self, *args, **kwargs):
+        layer = lookup(self, *args, **kwargs)
+        if layer:
+            nested.write_text(
+                nested.read_text()
+                + f"--extra-index-url https://user:{SECRET}@example.invalid/simple\n"
+            )
+        return layer
+
+    monkeypatch.setattr(ImageBuilder, "_cached_dependency_layer", add_credentials_after_lookup)
+    with pytest.raises(ValueError, match="pip-input.in contains a URL with literal credentials") as error:
+        _builder(tmp_path, monkeypatch, context, "second", include_paths=include_paths).build()
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert SECRET not in str(error.value)
 
 
 def test_locked_build_hit_makes_no_index_requests(tmp_path, monkeypatch, indexes):  # noqa: F811
@@ -252,11 +653,13 @@ def test_locked_build_hit_makes_no_index_requests(tmp_path, monkeypatch, indexes
     assert _image(second) == _image(first)
 
 
-def _pipenv_with_optional_missing_extra(tmp_path, indexes):
+def _pipenv_with_optional_extra(
+    tmp_path, indexes, requires=("missing-child>=1.0; extra == 'feature'",)
+):
     index = indexes()
     context = _write_pipenv_project(
         tmp_path / "context",
-        requires=["missing-child>=1.0; extra == 'feature'"],
+        requires=requires,
         extras=["feature"],
         registry=index.url,
     )
@@ -275,24 +678,161 @@ def _pipenv_with_optional_missing_extra(tmp_path, indexes):
     return context, update_manifest, with_extra, without_extra
 
 
-def test_locked_cache_keys_manifest_extras_for_wheel_closure(
+def test_locked_cache_freezes_proxy_absence_during_install(tmp_path, monkeypatch, indexes, capsys):
+    context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
+    install = builder_module.install_locked_requirements
+
+    def install_after_proxy_change(*args, **kwargs):
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        try:
+            return install(*args, **kwargs)
+        finally:
+            monkeypatch.delenv("HTTP_PROXY", raising=False)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder_module, "install_locked_requirements", install_after_proxy_change)
+        first = _builder(tmp_path, monkeypatch, context, "first")
+        first.build()
+    capsys.readouterr()
+
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "hit")
+    hit.build()
+
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert _image(hit) == _image(first)
+
+
+def test_locked_cache_uses_the_manifest_that_selected_its_packages(tmp_path, monkeypatch, indexes):
+    context, update_manifest, with_extra, without_extra = _pipenv_with_optional_extra(
+        tmp_path, indexes
+    )
+    update_manifest(without_extra)
+    _builder(tmp_path, monkeypatch, context, "warm").build()
+    existing = _dependency_keys(tmp_path / "cache")
+    assert existing
+    update_manifest(with_extra)
+    roots = builder_module._locked_verification_roots
+
+    def roots_after_manifest_change(*args, **kwargs):
+        update_manifest(without_extra)
+        try:
+            return roots(*args, **kwargs)
+        finally:
+            update_manifest(with_extra)
+
+    monkeypatch.setattr(builder_module, "_locked_verification_roots", roots_after_manifest_change)
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        _builder(tmp_path, monkeypatch, context, "changing").build()
+    assert _dependency_keys(tmp_path / "cache") == existing
+
+
+def test_locked_build_without_cache_verifies_the_selected_manifest(
     tmp_path, monkeypatch, indexes
+):
+    context, update_manifest, _, without_extra = _pipenv_with_optional_extra(tmp_path, indexes)
+    install = builder_module.install_locked_requirements
+
+    def install_before_manifest_change(*args, **kwargs):
+        result = install(*args, **kwargs)
+        update_manifest(without_extra)
+        return result
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install_before_manifest_change)
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        _builder(tmp_path, monkeypatch, context, "uncached", use_cache=False).build()
+
+
+def test_locked_cache_keys_manifest_extras_for_wheel_closure(
+    tmp_path, monkeypatch, indexes, capsys
 ):  # noqa: F811
-    context, update_manifest, with_extra, without_extra = _pipenv_with_optional_missing_extra(
+    context, update_manifest, with_extra, without_extra = _pipenv_with_optional_extra(
         tmp_path, indexes
     )
     update_manifest(without_extra)
     _builder(tmp_path, monkeypatch, context, "initial").build()
+    capsys.readouterr()
     update_manifest(with_extra)
 
     with pytest.raises(LockfileError, match="marker-root.*missing-child"):
         _builder(tmp_path, monkeypatch, context, "changed").build()
+    output = capsys.readouterr().out
+    assert "Dependency layer cache miss: no verified entry" in output
+    assert "Dependency layer cache hit" not in output
+
+
+def test_locked_cache_hits_only_the_matching_requested_extras(
+    tmp_path, monkeypatch, indexes, capsys
+):  # noqa: F811
+    context, update_manifest, with_extra, without_extra = _pipenv_with_optional_extra(
+        tmp_path, indexes, requires=()
+    )
+    with_feature = _builder(tmp_path, monkeypatch, context, "with-feature")
+    with_feature.build()
+    capsys.readouterr()
+
+    update_manifest(without_extra)
+    without_feature = _builder(tmp_path, monkeypatch, context, "without-feature")
+    without_feature.build()
+    assert "Dependency layer cache miss: no verified entry" in capsys.readouterr().out
+    assert with_feature.layers[0].digest == without_feature.layers[0].digest
+
+    update_manifest(with_extra)
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "with-feature-again")
+    hit.build()
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert _image(hit) == _image(with_feature)
+
+
+def test_locked_cache_rejects_manifest_symlink_outside_context(
+    tmp_path, monkeypatch, indexes
+):  # noqa: F811
+    context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
+    _builder(tmp_path, monkeypatch, context, "initial").build()
+
+    manifest = context / "Pipfile"
+    external = tmp_path / "external-Pipfile"
+    external.write_bytes(manifest.read_bytes())
+    manifest.unlink()
+    try:
+        manifest.symlink_to(external)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"Cannot create a file symlink: {error}")
+
+    _forbid_install(monkeypatch)
+    with pytest.raises(LockfileError, match="(?i)(manifest|pipfile|context)"):
+        _builder(tmp_path, monkeypatch, context, "symlinked").build()
+
+
+def test_locked_cache_rechecks_manifest_containment_after_lookup(tmp_path, monkeypatch, indexes):
+    context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
+    _builder(tmp_path, monkeypatch, context, "initial").build()
+    manifest = context / "Pipfile"
+    external = tmp_path / "external-Pipfile"
+    lookup = ImageBuilder._cached_dependency_layer
+
+    def replace_manifest_after_lookup(self, *args, **kwargs):
+        layer = lookup(self, *args, **kwargs)
+        if layer:
+            manifest.rename(external)
+            try:
+                manifest.symlink_to(external)
+            except (OSError, NotImplementedError) as error:
+                pytest.skip(f"Cannot create a file symlink: {error}")
+        return layer
+
+    monkeypatch.setattr(ImageBuilder, "_cached_dependency_layer", replace_manifest_after_lookup)
+    with pytest.raises(LockfileError, match="inside the build context"):
+        _builder(tmp_path, monkeypatch, context, "hit").build()
 
 
 def test_locked_cache_verifies_the_manifest_roots_used_for_its_key(
     tmp_path, monkeypatch, indexes
 ):  # noqa: F811
-    context, update_manifest, _, without_extra = _pipenv_with_optional_missing_extra(
+    context, update_manifest, _, without_extra = _pipenv_with_optional_extra(
         tmp_path, indexes
     )
     install = builder_module.install_locked_requirements
@@ -447,7 +987,9 @@ INPUT_CHANGES = {
     "ambient index": lambda c, m: m.setattr(
         dependency_cache,
         "ambient_pip_settings",
-        lambda: [[":env:", "index-url", "https://other.example.invalid/simple"]],
+        lambda environment: dependency_cache.AmbientPipSnapshot(
+            (("index-url", "https://other.example.invalid/simple"),), (), (), dict(environment)
+        ),
     ),
     "installer backend": lambda c, m: m.setattr(dependency_cache, "INSTALLER_BACKEND", "other"),
 }
@@ -471,7 +1013,29 @@ def test_every_layer_affecting_input_changes_the_key(tmp_path, monkeypatch, chan
         {"python_version": "3.12", "python_full_version": "3.12.1"},
         {"python_full_version": "3.11.9"},
         {"workdir": "/srv"},
-        {"base_image": "python:3.11-alpine"},
+        {
+            "base_image": "python:3.11-alpine",
+            "base_config": {
+                "config": {
+                    "Env": [
+                        "PYTHON_IMPLEMENTATION=CPython",
+                        "PYTHON_VERSION=3.11.8",
+                        "PYTHON_LIBC=musl-1.2",
+                    ]
+                }
+            },
+        },
+        {
+            "base_config": {
+                "config": {
+                    "Env": [
+                        "PYTHON_IMPLEMENTATION=CPython",
+                        "PYTHON_VERSION=3.11.8",
+                        "PYTHON_LIBC=glibc-2.28",
+                    ]
+                }
+            },
+        },
         {
             "base_image": "example.invalid/custom:1",
             "base_config": {
@@ -490,6 +1054,21 @@ def test_target_tag_set_python_and_workdir_change_the_key(tmp_path, overrides):
     context = _project(tmp_path)
 
     assert _key(context, **overrides) != _key(context)
+
+
+def test_cache_key_includes_every_target_platform_tag(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    original_options = dependency_cache._target_options
+    before = _key(context)
+
+    def add_compatible_platform(*args, **kwargs):
+        return original_options(*args, **kwargs) + [
+            "--platform",
+            "manylinux_2_28_x86_64",
+        ]
+
+    monkeypatch.setattr(dependency_cache, "_target_options", add_compatible_platform)
+    assert _key(context) != before
 
 
 def test_relocated_context_keeps_the_key(tmp_path):
@@ -528,6 +1107,88 @@ def test_relative_pip_config_does_not_affect_locked_cache_identity(monkeypatch):
     assert _lock_key("https://pypi.org/simple") == expected
 
 
+@pytest.mark.parametrize("name", ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"])
+@pytest.mark.parametrize("source_kind", ["requirements", "lock"])
+def test_proxy_environment_is_a_secret_free_cache_miss(tmp_path, monkeypatch, name, source_kind):
+    context = _project(tmp_path)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setenv(name, f"http://user:{SECRET}@proxy.invalid")
+
+    with pytest.raises(DependencyCacheMiss, match="a proxy") as error:
+        _key(context) if source_kind == "requirements" else _lock_key("https://pypi.org/simple")
+
+    assert SECRET not in str(error.value)
+
+
+def test_system_proxy_is_a_secret_free_cache_miss(monkeypatch):
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setattr(
+        dependency_cache, "_system_proxies", lambda: {"https": f"http://user:{SECRET}@proxy.invalid"}
+    )
+    with pytest.raises(DependencyCacheMiss, match="a proxy") as error:
+        _lock_key("https://pypi.org/simple")
+    assert SECRET not in str(error.value)
+
+
+def test_proxy_bypassed_for_all_hosts_remains_cacheable(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    expected = _key(context)
+    monkeypatch.setenv("HTTP_PROXY", f"http://user:{SECRET}@proxy.invalid")
+    monkeypatch.setenv("NO_PROXY", "*")
+
+    assert _key(context) == expected
+
+
+def test_locked_cache_ignores_pip_proxy_that_locked_installs_strip(monkeypatch):
+    expected = _lock_key("https://pypi.org/simple")
+    monkeypatch.setenv("PIP_PROXY", f"http://user:{SECRET}@proxy.invalid")
+    assert _lock_key("https://pypi.org/simple") == expected
+
+
+@pytest.mark.parametrize("source_kind", ["requirements", "lock"])
+def test_cache_misses_when_netrc_is_configured(tmp_path, monkeypatch, source_kind):
+    context = _project(tmp_path)
+    monkeypatch.setenv("NETRC", str(tmp_path / SECRET))
+    with pytest.raises(DependencyCacheMiss, match="netrc credentials") as error:
+        _key(context) if source_kind == "requirements" else _lock_key("https://pypi.org/simple")
+    assert SECRET not in str(error.value)
+
+
+def test_cache_disables_later_default_netrc_for_an_eligible_install(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("NETRC")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    key = dependency_cache_key(
+        **KEY_DEFAULTS, context_dir=context, requirements=context / "requirements.txt"
+    )
+    (home / ".netrc").write_text("machine example.invalid login first password token\n")
+
+    assert key.environment["NETRC"] == os.devnull
+    with pytest.raises(DependencyCacheMiss, match="netrc credentials"):
+        _key(context)
+
+
+@pytest.mark.parametrize(
+    "setting,value,reason",
+    [
+        ("PIP_CLIENT_CERT", "client.pem", "client certificate"),
+        ("PIP_KEYRING_PROVIDER", "subprocess", "keyring"),
+    ],
+)
+def test_ambient_authentication_settings_cause_secret_free_miss(
+    tmp_path, monkeypatch, setting, value, reason
+):
+    monkeypatch.setenv(setting, str(tmp_path / SECRET) if setting == "PIP_CLIENT_CERT" else value)
+    with pytest.raises(DependencyCacheMiss, match=reason) as error:
+        ambient_pip_settings()
+    assert SECRET not in str(error.value)
+
+
 def test_python_image_metadata_does_not_disable_locked_cache(monkeypatch):
     expected = _lock_key("https://pypi.org/simple")
     monkeypatch.setenv("PYTHON_VERSION", "3.11.9")
@@ -543,6 +1204,13 @@ def test_locked_cache_keys_the_verification_backend():
     assert _lock_key(url, lock_verifier="pip-vendored") != _lock_key(
         url, lock_verifier="packaging:26.0"
     )
+
+
+def test_secret_bearing_index_path_is_not_cacheable():
+    url = f"https://dl.cloudsmith.io/{SECRET}/simple"
+    with pytest.raises(DependencyCacheMiss) as error:
+        _lock_key(url)
+    assert SECRET not in str(error.value)
 
 
 def test_locked_cache_rejects_a_shadowed_verification_backend(tmp_path, monkeypatch):
@@ -577,7 +1245,13 @@ def test_cache_key_tracks_the_installer_target_marker_environment(
     assert key() != before
 
 
-@pytest.mark.parametrize("old_backend", ["pip-target-v1", "pip-target-v2", "pip-target-v3"])
+@pytest.mark.parametrize(
+    "old_backend",
+    [
+        "pip-target-v1", "pip-target-v2", "pip-target-v3", "pip-target-v4",
+        "pip-target-v5", "pip-target-v6", "pip-target-v7", "pip-target-v8",
+    ],
+)
 def test_cache_does_not_reuse_previous_installer_backends(tmp_path, monkeypatch, old_backend):
     context = _project(tmp_path)
     current_backend = dependency_cache.INSTALLER_BACKEND
@@ -625,7 +1299,14 @@ def test_unknown_full_version_cannot_reuse_known_marker_environment(
     unknown = _builder(tmp_path, monkeypatch, context, "unknown")
     unknown_config = {
         **BASE_CONFIG,
-        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11"]},
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [
+                "PYTHON_VERSION=3.11",
+                "PYTHON_IMPLEMENTATION=CPython",
+                "PYTHON_LIBC=glibc-2.17",
+            ],
+        },
     }
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
@@ -650,17 +1331,30 @@ def test_unverified_base_cannot_reuse_a_trusted_dependency_layer(
         tmp_path, monkeypatch, context, "unverified",
         base_image="python:3.11-slim@sha256:" + "a" * 64,
     )
+    unverified_config = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11.8"]},
+    }
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], unverified_config),
+    )
     with pytest.raises(ValueError, match="Python ABI"):
         unverified.build()
 
     assert "Dependency layer cache hit" not in capsys.readouterr().out
 
 
-def test_index_credentials_are_dropped_but_never_alias_query_routing():
+def test_index_credentials_and_query_routing_are_explicit_misses():
     plain = _lock_key("https://pkgs.example.invalid/simple")
 
-    assert _lock_key("https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple") == plain
-    assert _lock_key(f"https://user:{SECRET}@pkgs.example.invalid/simple") == plain
+    for url in (
+        "https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple",
+        f"https://user:{SECRET}@pkgs.example.invalid/simple",
+    ):
+        with pytest.raises(DependencyCacheMiss, match="credentials can change") as miss:
+            _lock_key(url)
+        assert SECRET not in str(miss.value) and "INDEX_TOKEN" not in str(miss.value)
     assert _lock_key("https://pkgs.example.invalid/other/simple") != plain
     for url in (
         "https://pkgs.example.invalid/simple?",
@@ -673,6 +1367,8 @@ def test_index_credentials_are_dropped_but_never_alias_query_routing():
         assert "tenant" not in str(miss.value) and "INDEX_TOKEN" not in str(miss.value)
     with pytest.raises(DependencyCacheMiss, match="placeholder in its host or path"):
         _lock_key("https://${INDEX_HOST}/simple")
+    with pytest.raises(DependencyCacheMiss, match="fragment"):
+        _lock_key("https://pkgs.example.invalid/simple#tenant")
     with pytest.raises(DependencyCacheMiss, match="not hash-pinned"):
         _lock_key("https://pkgs.example.invalid/simple", "fixture-dep==1.0")
 
@@ -730,6 +1426,19 @@ def test_utf16_file_used_as_requirement_and_constraint_is_checked_in_both_roles(
         (
             "--find-links file:///wheels\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
             "file: URL find-links",
+        ),
+        (
+            "--find-links file:/wheels\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
+            "file: URL find-links",
+        ),
+        (
+            "--index-url file:///index\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
+            "non-HTTP index",
+        ),
+        (
+            "--find-links https://pkgs.example.invalid/wheels#sha256=abc\n"
+            "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
+            "fragment or ambiguous comment",
         ),
         (
             "--index-url https://${HOST}/simple\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
@@ -961,8 +1670,11 @@ def test_cache_metadata_and_output_never_contain_credentials(tmp_path, monkeypat
     monkeypatch.setattr(
         dependency_cache,
         "ambient_pip_settings",
-        lambda: parse_pip_config(
-            f":env:.extra-index-url='https://user:{SECRET}@ambient.example.invalid/simple'\n"
+        lambda environment: dependency_cache.AmbientPipSnapshot(
+            (("extra-index-url", "https://ambient.example.invalid/simple"),),
+            ({":env:.extra-index-url": f"https://user:{SECRET}@ambient.example.invalid/simple"},),
+            (("extra-index-url", f"https://user:{SECRET}@ambient.example.invalid/simple"),),
+            dict(environment),
         ),
     )
     context = _project(tmp_path)
@@ -974,21 +1686,17 @@ def test_cache_metadata_and_output_never_contain_credentials(tmp_path, monkeypat
     )
 
     _builder(tmp_path, monkeypatch, context, "first").build()
-    _forbid_install(monkeypatch)
     _builder(tmp_path, monkeypatch, context, "second").build()
 
     output = capsys.readouterr().out
-    assert "Dependency layer cache hit" in output
-    cache_dir = tmp_path / "cache"
-    inventory = LayerCache(cache_dir).get_bytes(_inventory_key(cache_dir), 1024 * 1024)
-    cache_text = (cache_dir / "index.json").read_text() + inventory.decode()
-    for text in (output, cache_text):
-        assert SECRET not in text and "INDEX_TOKEN" not in text and "user:" not in text
+    assert output.count("credentials can change the effective package source") == 2
+    assert not _dependency_keys(tmp_path / "cache")
+    assert SECRET not in output and "INDEX_TOKEN" not in output and "user:" not in output
 
 
 def test_parse_pip_config_keys_sanitized_settings_and_rejects_unprovable_ones():
     rows = parse_pip_config(
-        f":env:.index-url='https://u:{SECRET}@Pkgs.Example.invalid/simple/'\n"
+        ":env:.index-url='https://Pkgs.Example.invalid/simple/'\n"
         "global.timeout='60'\n"
         ":env:.config-file='/etc/pip.conf'\n"
         "install.only-binary=':all:'\n"
@@ -1001,6 +1709,9 @@ def test_parse_pip_config_keys_sanitized_settings_and_rejects_unprovable_ones():
     for line, reason in [
         (":env:.constraint='/tmp/c.txt'", "constraint is not provably keyed"),
         ("global.find-links='/wheels'", "local files"),
+        (f":env:.index-url='https://u:{SECRET}@example.invalid/simple'", "credentials can change"),
+        ("global.client-cert='/tmp/client.pem'", "client certificate"),
+        ("global.keyring-provider='subprocess'", "keyring"),
         ("global.index-url='https://example.invalid/simple?feed=a'", "query string"),
         ("global.only-binary='${PKGS}'", "cannot be keyed"),
         ("not a config line", "could not be parsed"),
@@ -1016,17 +1727,43 @@ def test_real_ambient_pip_config_is_read_and_sanitized(tmp_path, monkeypatch):
     for name in [name for name in os.environ if name.upper().startswith("PIP_")]:
         monkeypatch.delenv(name)
     monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
-    monkeypatch.setenv("PIP_INDEX_URL", f"https://u:{SECRET}@pkgs.example.invalid/caf\u00e9")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pkgs.example.invalid/caf\u00e9")
     startup = tmp_path / "pythonpath"
     startup.mkdir()
     (startup / "sitecustomize.py").write_text("print('unexpected startup hook')\n")
     monkeypatch.setenv("PYTHONPATH", str(startup))
 
-    rows = dependency_cache.ambient_pip_settings()
+    rows = dependency_cache.ambient_pip_settings().identity
 
-    assert [":env:", "index-url", "https://pkgs.example.invalid/caf\u00e9"] in rows
+    assert any(
+        name.endswith(":env:.index-url") and value == "https://pkgs.example.invalid/caf\u00e9"
+        for name, value in rows
+    )
     assert SECRET not in json.dumps(rows)
     assert metadata.version("pip")
+
+
+def test_shadowed_pip_config_query_is_an_explicit_miss(tmp_path, monkeypatch):
+    config = tmp_path / "pip.conf"
+    config.write_text("[global]\nindex-url = https://example.invalid/simple?feed=private\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://example.invalid/simple")
+
+    with pytest.raises(DependencyCacheMiss, match="query string") as error:
+        ambient_pip_settings()
+
+    assert "private" not in str(error.value)
+
+
+def test_pip_config_proxy_is_a_secret_free_cache_miss(tmp_path, monkeypatch):
+    config = tmp_path / "pip.conf"
+    config.write_text(f"[global]\nproxy = http://user:{SECRET}@proxy.invalid\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+
+    with pytest.raises(DependencyCacheMiss, match="a proxy") as error:
+        ambient_pip_settings()
+
+    assert SECRET not in str(error.value)
 
 
 def test_undecodable_pip_configuration_is_an_explicit_miss(monkeypatch):

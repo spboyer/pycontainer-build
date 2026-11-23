@@ -60,18 +60,39 @@ A staged dependency layer is reused only for a provably hash-pinned closure
 (lock selection, or fully `==`/`--hash` requirements including nested inputs);
 everything unprovable is an explicit `DependencyCacheMiss` with a secret-free
 reason. Keys hold target tags, Python, workdir, pip version, sanitized index
-identity (no userinfo, placeholders or query values; query-bearing URLs miss),
+identity (URLs with userinfo, credential-bearing paths or query values miss),
 the installer's exact target marker environment, locked manifest roots/extras
 and verifier backend, allowlisted ambient pip settings for plain requirements,
 and `INSTALLER_BACKEND`. Nonempty Python startup overrides (such as
 `PYTHONPATH`) are explicit misses even for locked installs; pip and the config
 probe ignore `PYTHONPATH`, but the builder process may not. A relative
-`PIP_CONFIG_FILE` is a miss for plain requirements. A backend change that alters
-staged output or verification must bump `INSTALLER_BACKEND`; marker changes
-must also key the marker environment. The inventory entry is stored after the
-layer and must name its digest; a hit runs no pip install and makes no network
-requests. Plain requirements still read the local pip configuration before
-lookup.
+`PIP_CONFIG_FILE` is a miss for plain requirements. Plain requirements read
+pip's local configuration through the installed pip parser before lookup. On a
+miss, the installer uses private snapshots of keyed requirements, verified
+local find-links files, pip configuration and environment; snapshots are
+bounded by the staged size/file limits and removed after use. Unsupported or
+unsafe snapshots are explicit misses followed by uncached installs. Do not
+include their credentials in cache metadata or image layers. The snapshot
+protects cache identity, not all other image layers against concurrent context
+edits; see `README.md` for eligibility limits.
+
+HTTP(S), all-protocol and system proxies are explicit misses unless all hosts
+are bypassed; a configured pip proxy also makes plain requirements miss.
+Eligible locked installs use the key's captured no-proxy environment so a
+later proxy change cannot alter the installed source under that key.
+Netrc credentials, client certificates and explicit keyring providers are
+also misses; eligible installs disable netrc to prevent later authentication
+changes from altering the source selected under the key.
+
+A backend change that alters staged output or verification must bump
+`INSTALLER_BACKEND`; marker changes must also key the marker environment.
+Derive locked manifest roots and extras from the same manifest snapshot used
+for package selection; use those full-selection roots for cache keys and
+verification, including uncached installs. Recheck manifest containment
+before verification and after a cache hit. Preserve scanned requirement paths
+on hits for app-layer credential checks. The inventory entry is stored after
+the layer and must name its digest; a hit runs no pip install and makes no
+network requests.
 
 ## Setup and verified checks
 

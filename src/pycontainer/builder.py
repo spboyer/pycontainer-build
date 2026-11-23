@@ -218,6 +218,7 @@ from .dependency_cache import (
     decode_inventory,
     dependency_cache_key,
     encode_inventory,
+    materialize_requirements_snapshot,
 )
 from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
@@ -225,6 +226,7 @@ from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     _LOCKFILE_STAGING_PREFIX,
+    PipConfigurationSnapshotError,
     create_console_entrypoints,
     install_locked_requirements,
     install_requirements,
@@ -1341,7 +1343,20 @@ class ImageBuilder:
             else:
                 cached_layer = self._cached_dependency_layer(layers_dir, cache_key)
                 if cached_layer:
-                    if source_kind == "requirements":
+                    if source_kind == "lock":
+                        selection = self._lock_selection(
+                            base_config, os_name, arch, variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                        )
+                        _locked_verification_roots(
+                            selection,
+                            ctx,
+                            target_environment(
+                                os_name, arch, version, target_python_full_version(base_config),
+                                variant=variant,
+                            ),
+                        )
+                    elif source_kind == "requirements":
                         self._requirement_files = [
                             ctx / path for path in cache_key.source_files
                         ]
@@ -1370,6 +1385,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    environment_snapshot=cache_key.environment if cache_key else None,
                 )
                 verify_locked_installation(
                     selection,
@@ -1382,18 +1398,66 @@ class ImageBuilder:
                     verification_roots=verification_roots,
                 )
             elif source_kind == "requirements":
-                self._requirement_files = install_requirements(
-                    ctx / requirements_relative,
-                    site_packages,
-                    ctx,
-                    os_name,
-                    arch,
-                    version,
-                    base_image_name,
-                    base_config,
-                    variant=variant,
-                    base_image_tag_verified=base_image_tag_verified,
+                snapshot_dir = (
+                    tempfile.TemporaryDirectory(prefix="pycontainer-inputs-")
+                    if cache_key else nullcontext(None)
                 )
+                with snapshot_dir as temporary:
+                    requirement_path = ctx / requirements_relative
+                    snapshot_options = {}
+                    if cache_key:
+                        snapshot = cache_key.requirements_snapshot
+                        if snapshot is None:
+                            raise RuntimeError("Dependency cache key has no requirements snapshot.")
+                        snapshot_root = Path(temporary)
+                        try:
+                            materialize_requirements_snapshot(snapshot, snapshot_root)
+                        except DependencyCacheMiss as miss:
+                            print(f"Dependency layer cache miss: {miss}.")
+                            cache_key = None
+                        else:
+                            requirement_path = snapshot_root / requirements_relative
+                            snapshot_options = {
+                                "requirements_context": snapshot_root,
+                                "environment_snapshot": snapshot.ambient.environment,
+                                "pip_configuration": {
+                                    "configuration": snapshot.ambient.configuration,
+                                    "ordered": snapshot.ambient.ordered,
+                                },
+                            }
+                    try:
+                        self._requirement_files = install_requirements(
+                            requirement_path,
+                            site_packages,
+                            ctx,
+                            os_name,
+                            arch,
+                            version,
+                            base_image_name,
+                            base_config,
+                            variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                            **snapshot_options,
+                        )
+                    except PipConfigurationSnapshotError as miss:
+                        if not cache_key:
+                            raise
+                        print(f"Dependency layer cache miss: {miss}.")
+                        cache_key = None
+                        self._requirement_files = install_requirements(
+                            ctx / requirements_relative,
+                            site_packages,
+                            ctx,
+                            os_name,
+                            arch,
+                            version,
+                            base_image_name,
+                            base_config,
+                            variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                        )
+                    if cache_key:
+                        self._requirement_files = [ctx / path for path in cache_key.source_files]
             else:
                 stage_virtualenv(
                     deps_paths,

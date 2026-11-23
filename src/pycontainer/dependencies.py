@@ -15,7 +15,7 @@ import tempfile
 import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Mapping, Optional, Tuple
 
 from .credentials import (
     PLACEHOLDER,
@@ -57,6 +57,7 @@ _VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
 _CLOSURE_HEADERS = ("Metadata-Version", "Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
 _MARKER_ERROR_EXIT = 86
 _PATCH_ERROR_EXIT = 87
+_SNAPSHOT_ERROR_EXIT = 88
 _MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
 _FLOOR_GLIBC_PREFIX = "manylinux2014_"
 _MIN_GLIBC_MINOR = 17
@@ -139,6 +140,10 @@ _LOCKED_AUTH_HINT = (
     "credentials through ${VAR} placeholders in the lock's index URL or "
     ".netrc (or NETRC)."
 )
+
+
+class PipConfigurationSnapshotError(Exception):
+    """The cached install's pip configuration could not be safely frozen."""
 
 
 def _base_image_parts(base_image: str) -> Tuple[str, str]:
@@ -467,6 +472,9 @@ def install_requirements(
     *,
     locked: bool = False,
     base_image_tag_verified: bool = False,
+    requirements_context: Optional[Path] = None,
+    environment_snapshot: Optional[Mapping[str, str]] = None,
+    pip_configuration: Optional[dict] = None,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
     target_options = _target_options(
@@ -474,7 +482,9 @@ def install_requirements(
         base_image_tag_verified=base_image_tag_verified,
         variant=variant,
     )
-    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
+    _, requirement_files, hash_pinned = _scan_requirements(
+        requirements, requirements_context or context_dir
+    )
     if not locked and not hash_pinned:
         logger.warning(
             "%s is not fully pinned with ==versions and --hash values, so the "
@@ -521,13 +531,20 @@ def install_requirements(
         str(requirements),
     ]
     environment = (
-        _locked_pip_environment(destination.parent)
+        _locked_pip_environment(destination.parent, environment_snapshot)
         if locked
-        else _pip_environment(destination.parent)
+        else _pip_environment(destination.parent, environment_snapshot)
     )
+    if pip_configuration is not None:
+        environment["PIP_CONFIG_FILE"] = os.devnull
     # pip logs index HTTP failures only at debug level, so keep its debug log in
     # host temp space (never the tarred stage) to classify authentication errors.
     with tempfile.TemporaryDirectory(prefix="pycontainer-pip-") as diagnostics:
+        if pip_configuration is not None:
+            snapshot_file = Path(diagnostics) / "configuration.json"
+            snapshot_file.write_text(json.dumps(pip_configuration), encoding="utf-8")
+            marker_config["configuration_snapshot"] = str(snapshot_file)
+            command[5] = json.dumps(marker_config)
         pip_log = Path(diagnostics) / "pip.log"
         with open(Path(diagnostics) / "stderr.txt", "w+b") as pip_errors:
             try:
@@ -563,6 +580,15 @@ def install_requirements(
         pip_debug = _read_tail(pip_log, _PIP_STDERR_LIMIT) if returncode else ""
 
     secrets = known_secrets(environment, _placeholder_names(requirement_files))
+    if pip_configuration is not None:
+        for values in pip_configuration["configuration"]:
+            for name, value in values.items():
+                setting = name.partition(".")[2].upper().replace("-", "_")
+                if setting in {"INDEX_URL", "EXTRA_INDEX_URL", "FIND_LINKS", "PROXY"}:
+                    secrets.update(known_secrets({f"PIP_{setting}": value}))
+    if returncode == _SNAPSHOT_ERROR_EXIT and pip_configuration is not None:
+        _read_marker_error(error_file)
+        raise PipConfigurationSnapshotError("the pip configuration snapshot could not be verified")
     if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
         details = redact(_read_marker_error(error_file), secrets)
         if returncode == _MARKER_ERROR_EXIT:
@@ -603,10 +629,12 @@ def install_requirements(
     return requirement_files
 
 
-def _pip_environment(temporary_dir: Path) -> dict:
+def _pip_environment(
+    temporary_dir: Path, source_environment: Optional[Mapping[str, str]] = None
+) -> dict:
     environment = {}
     ignored = []
-    for name, value in os.environ.items():
+    for name, value in (os.environ if source_environment is None else source_environment).items():
         upper = name.upper()
         if upper.startswith(("PIP_", "_PIP_")) and upper not in _PIP_ENVIRONMENT_ALLOWED:
             ignored.append(upper)
@@ -627,11 +655,13 @@ def _pip_environment(temporary_dir: Path) -> dict:
     return environment
 
 
-def _locked_pip_environment(temporary_dir: Path) -> dict:
+def _locked_pip_environment(
+    temporary_dir: Path, source_environment: Optional[Mapping[str, str]] = None
+) -> dict:
     """Environment for a locked install: no host PIP_* settings or pip config files."""
     environment = {
         name: value
-        for name, value in os.environ.items()
+        for name, value in (os.environ if source_environment is None else source_environment).items()
         if not name.upper().startswith(("PIP_", "_PIP_"))
     }
     environment.update(
@@ -648,9 +678,7 @@ def _locked_pip_environment(temporary_dir: Path) -> dict:
 def _placeholder_names(requirement_files: Iterable[Path]) -> List[str]:
     names = set()
     for path in requirement_files:
-        names.update(
-            PLACEHOLDER.findall(path.read_text(encoding="utf-8", errors="replace"))
-        )
+        names.update(PLACEHOLDER.findall(_decode_requirements(path.read_bytes(), errors="replace")))
     return sorted(names)
 
 
@@ -763,6 +791,7 @@ def install_locked_requirements(
     *,
     variant: Optional[str] = None,
     base_image_tag_verified: bool = False,
+    environment_snapshot: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Install each recorded index's packages from that index alone, then merge them."""
     requirement_sets = list(requirement_sets)
@@ -776,6 +805,7 @@ def install_locked_requirements(
                 requirements, target, context_dir, os_name, arch, python_version,
                 base_image, base_config, variant=variant, locked=True,
                 base_image_tag_verified=base_image_tag_verified,
+                environment_snapshot=environment_snapshot,
             )
             if target != destination:
                 _merge_site_packages(target, destination)
@@ -831,11 +861,7 @@ def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     return data.decode("utf-8-sig", errors)
 
 
-def _read_requirements_text(path: Path) -> str:
-    return _decode_requirements(path.read_bytes())
-
-
-RequirementsFile = Tuple[Path, bool, List[List[str]]]
+RequirementsFile = Tuple[Path, bool, List[List[str]], bytes]
 
 
 def _inspect_requirements(
@@ -874,7 +900,8 @@ def _inspect_requirements(
                     f"{MAX_REQUIREMENTS_BYTES}-byte limit."
                 )
 
-        text = _read_requirements_text(path)
+        content = path.read_bytes()
+        text = _decode_requirements(content)
         reject_literal_credentials(path, text, context_root)
         logical_lines = []
         continuation = ""
@@ -888,7 +915,7 @@ def _inspect_requirements(
             raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
 
         file_lines: List[List[str]] = []
-        scanned.append((path, constraint, file_lines))
+        scanned.append((path, constraint, file_lines, content))
         for line in logical_lines:
             try:
                 options = shlex.split(line, comments=True)
@@ -956,7 +983,7 @@ def _scan_requirements(
     hash_pinned, roots, scanned = _inspect_requirements(
         requirements, context_dir, check_overrides, constraints
     )
-    return roots, sorted({path for path, _, _ in scanned}), hash_pinned
+    return roots, sorted({path for path, _, _, _ in scanned}), hash_pinned
 
 
 def validate_requirements(

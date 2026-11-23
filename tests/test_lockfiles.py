@@ -80,6 +80,52 @@ def _selected(selection):
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_selection_keeps_its_manifest_roots(tmp_path, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    roots, source = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+    replacement = "[packages]\n" if kind == "pipenv" else '[project]\nname = "replacement"\n'
+    (context / manifest_name).write_text(replacement, encoding="utf-8")
+    retained, retained_source = lockfile_module._locked_verification_roots(selection, context, PY311)
+
+    assert tuple(map(str, retained)) == tuple(map(str, roots))
+    assert retained_source == source
+    with pytest.raises(LockfileError, match="roots changed after dependency selection"):
+        verify_locked_installation(
+            selection, context, tmp_path / "site", PY311, verification_roots=([], source)
+        )
+    incomplete = LockSelection(selection.kind, selection.path, selection.packages)
+    with pytest.raises(LockfileError, match="missing its manifest-root snapshot"):
+        verify_locked_installation(incomplete, context, tmp_path / "site", PY311)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_reader_uses_the_manifest_captured_for_roots(tmp_path, monkeypatch, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    manifest_path = context / manifest_name
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    reader = getattr(lockfile_module, f"_load_{kind}")
+
+    def read_after_manifest_change(path, environment, context_dir, manifest=None):
+        manifest_path.write_text("[packages]\n", encoding="utf-8")
+        try:
+            return reader(path, environment, context_dir, manifest)
+        finally:
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    monkeypatch.setattr(lockfile_module, f"_load_{kind}", read_after_manifest_change)
+    selection = load_lockfile(context, Path(lock_name), PY311)
+
+    assert _selected(selection) == EXPECTED_311
+    roots, _ = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
 @pytest.mark.parametrize("target_kind", ["outside", "dangling"])
 @pytest.mark.parametrize("operation", ["preflight", "load", "verify"])
 def test_lock_manifest_link_cannot_leave_context_or_dangle(tmp_path, kind, target_kind, operation):
@@ -2197,7 +2243,7 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     )
     assert all(
         {key.upper(): value for key, value in env.items() if key.upper().startswith("PIP_")}
-        == {"PIP_CONFIG_FILE": os.devnull, "PIP_IGNORE_REQUIRES_PYTHON": "0"}
+        == {"PIP_CONFIG_FILE": os.devnull}
         for env in environments
     )
     assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
@@ -2389,7 +2435,7 @@ def _bypass_locked_pip_isolation(monkeypatch, key):
     monkeypatch.setattr(
         dependencies,
         "_locked_pip_environment",
-        lambda temporary_dir: {
+        lambda temporary_dir, _source_environment=None: {
             **os.environ,
             **{name: str(temporary_dir) for name in ("TMP", "TEMP", "TMPDIR")},
         },

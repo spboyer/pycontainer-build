@@ -22,6 +22,7 @@ import runpy
 
 MARKER_ERROR_EXIT = 86
 PATCH_ERROR_EXIT = 87
+SNAPSHOT_ERROR_EXIT = 88
 
 
 class TargetMarkerError(Exception):
@@ -78,6 +79,33 @@ def _pin_pip_configuration(allowed_keys):
         raise TargetMarkerError("pip configuration pinning self-test failed")
 
 
+def _freeze_pip_configuration(snapshot):
+    from pip._internal.cli import parser
+    from pip._internal.commands import create_command
+
+    original_items = parser.ConfigOptionParser._get_ordered_configuration_items
+
+    class FrozenConfiguration:
+        def items(self):
+            return enumerate(snapshot["configuration"])
+
+    def configuration_items(self):
+        configuration = self.config
+        self.config = FrozenConfiguration()
+        try:
+            yield from original_items(self)
+        finally:
+            self.config = configuration
+
+    parser.ConfigOptionParser._get_ordered_configuration_items = configuration_items
+    probe = create_command("install").parser
+    probe.config.load()
+    if list(probe._get_ordered_configuration_items()) != [
+        tuple(item) for item in snapshot["ordered"]
+    ]:
+        raise TargetMarkerError("pip configuration snapshot self-test failed")
+
+
 def main():
     config = json.loads(sys.argv[1])
     pip_args = sys.argv[2:]
@@ -130,6 +158,14 @@ def main():
             raise TargetMarkerError("target marker self-test failed")
 
         _pin_pip_configuration(set(config["allowed_config_keys"]))
+        if "configuration_snapshot" in config:
+            try:
+                with open(config["configuration_snapshot"], encoding="utf-8") as source:
+                    _freeze_pip_configuration(json.load(source))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, TargetMarkerError):
+                with open(config["error_file"], "w", encoding="utf-8") as error_file:
+                    error_file.write("pip configuration snapshot could not be verified\n")
+                sys.exit(SNAPSHOT_ERROR_EXIT)
     except Exception as exc:
         with open(config["error_file"], "w", encoding="utf-8") as error_file:
             error_file.write(f"pip could not be pinned to the target: {exc}\n")
