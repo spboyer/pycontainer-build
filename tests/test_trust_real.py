@@ -1,6 +1,9 @@
 """Opt-in verification with real public registries and external verifiers."""
+import base64
+import json
 import os
 from pathlib import Path
+import tempfile
 
 import pytest
 
@@ -66,9 +69,14 @@ def _exercise_builder(tmp_path, monkeypatch, image, policy, *, reject=False):
     monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "empty-docker"))
     monkeypatch.setenv("REGISTRY_AUTH_FILE", str(tmp_path / "empty-auth.json"))
+    original_pull_blob = RegistryClient.pull_blob
 
     def stop_before_blob(self, blob_digest, destination, expected_size):
-        assert observed == [f"{repository}@{digest}"]
+        if not observed:
+            # Signature evidence blobs are fetched before the verifier runs.
+            assert "pycontainer-trust-" in str(destination)
+            return original_pull_blob(self, blob_digest, destination, expected_size)
+        assert len(observed) == 1 and not observed[0].startswith(repository)
         raise _BaseBlobReached
 
     monkeypatch.setattr(RegistryClient, "pull_blob", stop_before_blob)
@@ -194,3 +202,118 @@ def test_real_notation_expired_signer_fails_before_base_blobs(tmp_path, monkeypa
     }
     state = _exercise_notation_builder(tmp_path, monkeypatch, RATIFY, policy, reject=True)
     assert state["signature_blobs"] == 1
+
+
+def _mirror_manifest(source, target, reference, expected=None):
+    manifest, digest, body = source.pull_manifest_bytes(reference, expected_digest=expected)
+    target.manifest(reference, body, manifest["mediaType"])
+    target.manifest(digest, body, manifest["mediaType"])
+    return manifest, digest
+
+
+def _mirror_blobs(source, target, descriptors):
+    with tempfile.TemporaryDirectory() as directory:
+        for descriptor in descriptors:
+            path = Path(directory) / descriptor["digest"].replace(":", "-")
+            source.pull_blob(descriptor["digest"], path, descriptor["size"])
+            target.blob(path.read_bytes())
+
+
+def _private_mirror(image, provider):
+    """Copy real public signature evidence into a Basic-auth loopback registry."""
+    from test_trust_private_registry import _Server
+    from pycontainer import trust_notation
+
+    registry, repository = image[0].split("/", 1)
+    source = RegistryClient(registry, repository)
+    server = _Server(repository=repository)
+    manifest, digest = _mirror_manifest(source, server, image[1], image[1])
+    for child in manifest.get("manifests", []):
+        _mirror_manifest(source, server, child["digest"], child["digest"])
+    if provider == "cosign":
+        signatures, _ = _mirror_manifest(source, server, f"sha256-{digest[7:]}.sig")
+        _mirror_blobs(source, server, [signatures["config"], *signatures["layers"]])
+    else:
+        index, body = source.pull_referrers(digest, trust_notation._SIGNATURE, 4 << 20)
+        server.routes[f"/v2/{repository}/referrers/{digest}"] = (
+            200, body, {"Content-Type": index["mediaType"]})
+        for descriptor in index["manifests"]:
+            signature, _ = _mirror_manifest(source, server, descriptor["digest"], descriptor["digest"])
+            _mirror_blobs(source, server, signature["layers"])
+    server.requests.clear()
+    return server
+
+
+@pytest.mark.parametrize("provider", ["cosign", "notation"])
+def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch, provider):
+    from test_trust_private_registry import BASIC, PASSWORD, USERNAME
+    from pycontainer import trust_notation
+
+    if provider == "cosign":
+        image = QUAY
+        policy = {"provider": "cosign", "repository": QUAY[0],
+                  "binary": _require_environment("PYCONTAINER_COSIGN_BIN"),
+                  "key": _require_environment("PYCONTAINER_COSIGN_TEST_KEY")}
+        module, name = base_trust, "_run_cosign"
+    else:
+        image = MCR
+        policy = {
+            "provider": "notation", "repository": MCR[0],
+            "binary": _require_environment("PYCONTAINER_NOTATION_BIN"),
+            "identity": (
+                "CN=Microsoft SCD Products RSA Signing,O=Microsoft Corporation,"
+                "L=Redmond,ST=Washington,C=US"
+            ),
+            "signer_fingerprint": (
+                "279fe22c1705ff7d5ab8a00f15b4321bc1120a891be5b01b6acde032fa1c8c5e"),
+            "trust_root": _require_environment("PYCONTAINER_NOTATION_ROOT"),
+            "tsa_root": _require_environment("PYCONTAINER_NOTATION_TSA"),
+        }
+        module, name = trust_notation, "_run"
+    server = _private_mirror(image, provider)
+    secret = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+    verifier_calls = []
+    real_run = getattr(module, name)
+
+    def run(args, environment):
+        for value in [*args, *environment.values()]:
+            assert PASSWORD not in value and secret not in value
+        verifier_calls.append(args)
+        return real_run(args, environment)
+
+    class LoopbackClient(RegistryClient):
+        def __init__(self, *args, **kwargs):
+            assert kwargs["strict_auth"] is True and kwargs["password"] == PASSWORD
+            super().__init__(*args, **kwargs)
+            self.base_url = server.url + "/v2"
+
+        def pull_blob(self, blob_digest, destination, expected_size):
+            if not verifier_calls:
+                assert any(prefix in str(destination)
+                           for prefix in ("pycontainer-trust-", ".notation-"))
+                return super().pull_blob(blob_digest, destination, expected_size)
+            raise _BaseBlobReached
+
+    monkeypatch.setattr(module, name, run)
+    monkeypatch.setattr(builder_module, "RegistryClient", LoopbackClient)
+    monkeypatch.setattr(builder_module, "get_registry_auth",
+                        lambda *_: RegistryAuth(username=USERNAME, password=PASSWORD))
+    monkeypatch.setenv("REGISTRY_PASSWORD", PASSWORD)
+    config = BuildConfig(
+        context_dir=str(tmp_path), output_dir=str(tmp_path / "output"),
+        base_image=f"{image[0]}@{image[1]}", base_image_trust=policy, use_cache=False,
+    )
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    try:
+        with pytest.raises(_BaseBlobReached):
+            ImageBuilder(config)._pull_base_image(layers, "linux", "amd64")
+        assert len(verifier_calls) == 1
+        assert server.requests and all(auth == BASIC for _, auth in server.requests)
+        unauthenticated = RegistryClient(image[0].split("/", 1)[0], server.repository,
+                                         strict_auth=True)
+        unauthenticated.base_url = server.url + "/v2"
+        with pytest.raises(Exception):
+            unauthenticated.pull_manifest_bytes(image[1])
+    finally:
+        server.close()

@@ -26,6 +26,7 @@ INDEX = "application/vnd.oci.image.index.v1+json"
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 CONFIG = "application/vnd.oci.image.config.v1+json"
 LAYER = "application/vnd.oci.image.layer.v1.tar"
+SIMPLESIGNING = "application/vnd.dev.cosign.simplesigning.v1+json"
 
 
 def _encoded(value):
@@ -93,6 +94,25 @@ class _Registry:
         self.events = []
         self.tag_requests = 0
         self.verified = False
+        signature_config = b'{"rootfs":{"type":"layers","diff_ids":[]}}'
+        payload = b'{"critical":{}}'
+        self.signature_blobs = {_digest(signature_config): signature_config, _digest(payload): payload}
+        self.signatures = {
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": {"mediaType": CONFIG, "digest": _digest(signature_config),
+                       "size": len(signature_config)},
+            "layers": [{"mediaType": SIMPLESIGNING, "digest": _digest(payload),
+                        "size": len(payload)}],
+        }
+
+    def pull_optional_manifest_bytes(self, reference, max_bytes):
+        self.events.append(("optional-manifest", reference))
+        if self.signatures is None or reference != f"sha256-{self.root_digest[7:]}.sig":
+            return None
+        body = _encoded(self.signatures)
+        assert len(body) <= max_bytes
+        return self.signatures, _digest(body), body
 
     def pull_manifest_bytes(self, reference, expected_digest=None, expected_size=None):
         self.events.append(("manifest", reference))
@@ -110,10 +130,14 @@ class _Registry:
 
     def pull_blob(self, digest, destination, expected_size):
         self.events.append(("blob", digest))
-        assert self.verified, "base blob was fetched before trust verification"
-        content = self.blobs[digest]
+        if digest in self.signature_blobs:
+            content = self.signature_blobs[digest]
+        else:
+            assert self.verified, "base blob was fetched before trust verification"
+            content = self.blobs[digest]
         assert len(content) == expected_size
         Path(destination).write_bytes(content)
+        return True
 
 
 def _builder(tmp_path, policy=None, base_image="registry.example/team/base:latest"):
@@ -477,6 +501,16 @@ def test_cosign_keyless_checks_claims_transparency_and_exact_identity(monkeypatc
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
 
     def run(command, environment):
+        layout = Path(command[-1])
+        index = json.loads((layout / "index.json").read_bytes())
+        blobs = layout / "blobs" / "sha256"
+        assert [entry["annotations"]["kind"] for entry in index["manifests"]] == [
+            "dev.cosignproject.cosign/image", "dev.cosignproject.cosign/sigs"]
+        assert index["manifests"][0]["digest"] == client.root_digest
+        assert (blobs / client.root_digest[7:]).read_bytes() == client.root_bytes
+        assert sorted(path.name for path in blobs.iterdir()) == sorted(
+            [client.root_digest[7:], index["manifests"][1]["digest"][7:]]
+            + [digest[7:] for digest in client.signature_blobs])
         commands.append((command, environment))
         return _encoded(_cosign_evidence(client.root_digest))
 
@@ -486,12 +520,14 @@ def test_cosign_keyless_checks_claims_transparency_and_exact_identity(monkeypatc
         client.root, client.root_bytes, client,
     )
     command, environment = commands[0]
+    assert command[1:3] == ["verify", "--local-image"]
     assert "--check-claims=true" in command
     assert "--insecure-ignore-tlog=false" in command
     assert "--insecure-ignore-sct=false" in command
     assert "--certificate-identity=builder@example.com" in command
     assert "--certificate-oidc-issuer=https://issuer.example" in command
-    assert command[-1] == f"registry.example/team/base@{client.root_digest}"
+    assert not any("registry.example" in argument for argument in command)
+    assert not any(event[0] == "blob" and event[1] in client.blobs for event in client.events)
     assert "COSIGN_REPOSITORY" not in environment
     assert "SIGSTORE_ROOT_FILE" not in environment
     assert "DOCKER_AUTH_CONFIG" not in environment
@@ -534,6 +570,79 @@ def test_cosign_rejects_missing_or_mismatched_verification_evidence(monkeypatch,
     client = _Registry()
     monkeypatch.setattr(base_trust, "_run_cosign", lambda *args: output)
     with pytest.raises(TrustVerificationError):
+        verify_base_image(
+            _policy(), "registry.example/team/base", client.root_digest,
+            client.root, client.root_bytes, client,
+        )
+
+
+@pytest.mark.parametrize("problem", [
+    "missing", "schema", "media", "no-layers", "too-many-layers", "layer-media",
+    "layer-size", "config-size", "subject", "bad-digest",
+])
+def test_cosign_signature_discovery_fails_closed_before_verifier(monkeypatch, problem):
+    client = _Registry(index=True)
+    signatures = client.signatures
+    layer = signatures["layers"][0]
+    if problem == "missing":
+        client.signatures = None
+    elif problem == "schema":
+        signatures["schemaVersion"] = 1
+    elif problem == "media":
+        signatures["mediaType"] = INDEX
+    elif problem == "no-layers":
+        signatures["layers"] = []
+    elif problem == "too-many-layers":
+        signatures["layers"] = [layer] * (base_trust.MAX_COSIGN_SIGNATURES + 1)
+    elif problem == "layer-media":
+        layer["mediaType"] = "application/vnd.dev.sigstore.bundle.v0.3+json"
+    elif problem == "layer-size":
+        layer["size"] = base_trust.MAX_COSIGN_SIGNATURE_BLOB_BYTES + 1
+    elif problem == "config-size":
+        signatures["config"]["size"] = 0
+    elif problem == "subject":
+        signatures["subject"] = {"mediaType": INDEX, "digest": client.child_digest, "size": 1}
+    else:
+        layer["digest"] = "sha256:ABC"
+    called = []
+    monkeypatch.setattr(base_trust, "_run_cosign", lambda *args: called.append(args))
+    with pytest.raises(TrustVerificationError, match="Cosign"):
+        verify_base_image(
+            _policy(), "registry.example/team/base", client.root_digest,
+            client.root, client.root_bytes, client,
+        )
+    assert called == []
+    assert not any(event[0] == "blob" and event[1] in client.blobs for event in client.events)
+
+
+def test_cosign_index_subject_is_staged_as_image_index(monkeypatch):
+    client = _Registry(index=True)
+    client.signatures["subject"] = {
+        "mediaType": INDEX, "digest": client.root_digest, "size": len(client.root_bytes)}
+    kinds = []
+
+    def run(command, environment):
+        index = json.loads((Path(command[-1]) / "index.json").read_bytes())
+        kinds.extend(entry["annotations"]["kind"] for entry in index["manifests"])
+        return _encoded(_cosign_evidence(client.root_digest))
+
+    monkeypatch.setattr(base_trust, "_run_cosign", run)
+    verify_base_image(
+        _policy(), "registry.example/team/base", client.root_digest,
+        client.root, client.root_bytes, client,
+    )
+    assert kinds == ["dev.cosignproject.cosign/imageIndex", "dev.cosignproject.cosign/sigs"]
+
+
+def test_cosign_signature_blob_integrity_error_is_trust_error(monkeypatch):
+    client = _Registry()
+
+    def pull_blob(digest, destination, expected_size):
+        raise BlobIntegrityError("signature digest mismatch")
+
+    client.pull_blob = pull_blob
+    monkeypatch.setattr(base_trust, "_run_cosign", lambda *args: pytest.fail("verifier ran"))
+    with pytest.raises(TrustVerificationError, match="digest mismatch"):
         verify_base_image(
             _policy(), "registry.example/team/base", client.root_digest,
             client.root, client.root_bytes, client,

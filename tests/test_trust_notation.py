@@ -15,7 +15,8 @@ from pycontainer import base_trust
 
 REPOSITORY = "example.com/team/image"
 IDENTITY = "CN=Exact,O=Example"
-FINGERPRINT = "a" * 64
+CERT = b"test certificate"
+FINGERPRINT = hashlib.sha256(CERT).hexdigest()
 MEDIA = "application/vnd.oci.image.index.v1+json"
 
 
@@ -27,28 +28,107 @@ def digest(value):
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def _cbor_head(major, value):
+    if value < 24:
+        return bytes([major << 5 | value])
+    for info, width in ((24, 1), (25, 2), (26, 4), (27, 8)):
+        if value < 1 << (8 * width):
+            return bytes([major << 5 | info]) + value.to_bytes(width, "big")
+    raise ValueError(value)
+
+
+def cbor(value):
+    if isinstance(value, int):
+        return _cbor_head(0, value) if value >= 0 else _cbor_head(1, -1 - value)
+    if isinstance(value, bytes):
+        return _cbor_head(2, len(value)) + value
+    if isinstance(value, str):
+        return _cbor_head(3, len(value.encode())) + value.encode()
+    if isinstance(value, list):
+        return _cbor_head(4, len(value)) + b"".join(cbor(item) for item in value)
+    return _cbor_head(5, len(value)) + b"".join(cbor(k) + cbor(v) for k, v in value.items())
+
+
+def cose(cert=CERT, unprotected=None, protected=None):
+    unprotected = {33: [cert]} if unprotected is None else unprotected
+    return b"\xd2" + cbor([cbor(protected or {1: -37}), unprotected, b"payload", b"signature"])
+
+
 class Client:
+    """Fake strict registry client exposing only digest-bound discovery methods."""
+
     def __init__(self, subject):
-        self.envelope = b"\xd2\x84approved signature envelope"
-        self.descriptor = {"digest": digest(self.envelope), "size": len(self.envelope),
-                           "mediaType": "application/cose"}
+        self.subject = subject
+        self.mode = "referrers"
+        self.referrers = None
+        self.others = {}
+        self.calls = []
+        self.set_envelope(cose())
+
+    def set_envelope(self, envelope, media="application/cose"):
+        self.envelope = envelope
+        self.descriptor = {"digest": digest(envelope), "size": len(envelope), "mediaType": media}
         self.manifest = {"schemaVersion": 2, "mediaType": notation._OCI_MANIFEST,
-                         "artifactType": notation._SIGNATURE, "subject": subject,
+                         "artifactType": notation._SIGNATURE, "subject": self.subject,
                          "layers": [self.descriptor]}
+        self.refresh()
+
+    def refresh(self):
         self.raw = encode(self.manifest)
         self.signature_digest = digest(self.raw)
-        self.calls = []
+
+    def add_signature(self, envelope, media="application/cose"):
+        descriptor = {"digest": digest(envelope), "size": len(envelope), "mediaType": media}
+        manifest = {"schemaVersion": 2, "mediaType": notation._OCI_MANIFEST,
+                    "artifactType": notation._SIGNATURE, "subject": self.subject,
+                    "layers": [descriptor]}
+        raw = encode(manifest)
+        self.others[digest(raw)] = (manifest, raw, descriptor, envelope)
+        return digest(raw)
+
+    def entry(self, signature_digest, raw):
+        return {"mediaType": notation._OCI_MANIFEST, "artifactType": notation._SIGNATURE,
+                "digest": signature_digest, "size": len(raw)}
+
+    def index(self):
+        manifests = self.referrers
+        if manifests is None:
+            manifests = [self.entry(self.signature_digest, self.raw)] + [
+                self.entry(key, value[1]) for key, value in self.others.items()]
+        return {"schemaVersion": 2, "mediaType": MEDIA, "manifests": manifests}
+
+    def pull_referrers(self, subject_digest, artifact_type, max_bytes):
+        self.calls.append(("referrers", subject_digest))
+        assert subject_digest == self.subject["digest"]
+        assert artifact_type == notation._SIGNATURE
+        if self.mode != "referrers":
+            return None
+        index = self.index()
+        return index, encode(index)
+
+    def pull_optional_manifest_bytes(self, reference, max_bytes):
+        self.calls.append(("tag", reference))
+        assert reference == "sha256-" + self.subject["digest"][7:]
+        if self.mode != "tag":
+            return None
+        index = self.index()
+        return index, digest(encode(index)), encode(index)
 
     def pull_manifest_bytes(self, reference, expected_digest=None, expected_size=None):
         self.calls.append(("manifest", reference))
-        assert reference == expected_digest == self.signature_digest
+        assert reference == expected_digest
+        if reference in self.others:
+            manifest, raw = self.others[reference][:2]
+            return manifest, reference, raw
+        assert reference == self.signature_digest
         return self.manifest, self.signature_digest, self.raw
 
     def pull_blob(self, blob_digest, destination, expected_size):
         self.calls.append(("blob", blob_digest))
-        assert blob_digest == self.descriptor["digest"]
-        assert expected_size == self.descriptor["size"]
-        destination.write_bytes(self.envelope)
+        blobs = {self.descriptor["digest"]: self.envelope}
+        blobs.update({value[2]["digest"]: value[3] for value in self.others.values()})
+        assert expected_size == len(blobs[blob_digest])
+        destination.write_bytes(blobs[blob_digest])
         return True
 
 
@@ -56,7 +136,7 @@ class Client:
 def case(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     root = tmp_path / "root.crt"
-    root.write_bytes(b"test certificate")
+    root.write_bytes(b"test root")
     manifest = {"schemaVersion": 2, "mediaType": MEDIA, "manifests": []}
     raw = encode(manifest)
     subject = {"digest": digest(raw), "size": len(raw), "mediaType": MEDIA}
@@ -64,20 +144,17 @@ def case(tmp_path, monkeypatch):
     policy = {"provider": "notation", "repository": REPOSITORY, "identity": IDENTITY,
               "signer_fingerprint": FINGERPRINT, "trust_root": str(root),
               "binary": sys.executable}
-    signature = {"digest": client.signature_digest, "mediaType": "application/cose",
-                 "signedArtifact": subject.copy(),
-                 "certificates": [{"issuedTo": IDENTITY, "SHA256Fingerprint": FINGERPRINT}]}
-    return policy, manifest, raw, client, signature
+    return policy, manifest, raw, client
 
 
 def invoke(case):
-    policy, manifest, raw, client, _ = case
+    policy, manifest, raw, client = case
     notation.verify_notation(policy, REPOSITORY, digest(raw), manifest, raw, client)
 
 
-def runner(case, monkeypatch, verify=None, signatures=None, verify_output=None):
+def runner(case, monkeypatch, verify=None, verify_output=None):
     observed = []
-    _, _, raw, client, signature = case
+    _, _, raw, client = case
 
     def run(args, env):
         observed.append(args)
@@ -86,9 +163,6 @@ def runner(case, monkeypatch, verify=None, signatures=None, verify_output=None):
         assert "NOTATION_PASSWORD" not in env
         assert env["REGISTRY_AUTH_FILE"] != os.environ.get("REGISTRY_AUTH_FILE")
         assert "DOCKER_AUTH_CONFIG" not in env
-        if args[1] == "inspect":
-            assert args[-1] == REPOSITORY + "@" + digest(raw)
-            return encode({"Signatures": signatures if signatures is not None else [signature]})
         assert args[1:5] == ["verify", "--oci-layout", "--scope", REPOSITORY]
         layout_name, sep, subject_digest = args[-1].rpartition("@")
         assert sep and subject_digest == digest(raw)
@@ -103,7 +177,7 @@ def runner(case, monkeypatch, verify=None, signatures=None, verify_output=None):
         assert len(index["manifests"]) == 2
         wrapper_digest = index["manifests"][1]["digest"]
         wrapper = json.loads((layout / "blobs" / "sha256" / wrapper_digest[7:]).read_bytes())
-        assert wrapper["subject"] == signature["signedArtifact"]
+        assert wrapper["subject"] == client.subject
         assert wrapper["config"]["mediaType"] == notation._SIGNATURE
         assert wrapper["layers"] == [client.descriptor]
         assert (layout / "blobs" / "sha256" / client.descriptor["digest"][7:]).read_bytes() == client.envelope
@@ -129,9 +203,29 @@ def test_snapshot_contains_only_digest_bound_signature_and_strict_policy(case, m
 
     observed = runner(case, monkeypatch, verify=check)
     invoke(case)
-    assert len(observed) == 2
-    assert case[3].calls == [("manifest", case[3].signature_digest),
-                             ("blob", case[3].descriptor["digest"])]
+    assert len(observed) == 1
+    client = case[3]
+    assert client.calls == [("referrers", client.subject["digest"]),
+                            ("manifest", client.signature_digest),
+                            ("blob", client.descriptor["digest"])]
+
+
+def test_referrers_tag_fallback_is_used_only_when_api_is_absent(case, monkeypatch):
+    client = case[3]
+    client.mode = "tag"
+    runner(case, monkeypatch)
+    invoke(case)
+    assert [call[0] for call in client.calls] == ["referrers", "tag", "manifest", "blob"]
+
+
+def test_missing_signature_evidence_fails_closed(case, monkeypatch):
+    client = case[3]
+    client.mode = "none"
+    observed = runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError, match="No Notation signature evidence"):
+        invoke(case)
+    assert observed == []
+    assert [call[0] for call in client.calls] == ["referrers", "tag"]
 
 
 @pytest.mark.parametrize("output", [
@@ -142,7 +236,7 @@ def test_zero_exit_without_exact_verification_message_fails(case, monkeypatch, o
     observed = runner(case, monkeypatch, verify_output=output)
     with pytest.raises(notation.NotationTrustError, match="did not confirm"):
         invoke(case)
-    assert len(observed) == 2
+    assert len(observed) == 1
 
 
 def test_verification_message_for_same_digest_wrong_layout_fails(case, monkeypatch):
@@ -181,42 +275,90 @@ def test_notation_executable_symlink_is_resolved(case, monkeypatch, tmp_path):
     assert Path(observed[0][0]) == executable
 
 
-def test_other_valid_partial_subject_signature_cannot_rescue_invalid_pinned_signature(case, monkeypatch):
-    other = dict(case[4], digest="sha256:" + "b" * 64,
-                 certificates=[{"issuedTo": "CN=Exact,O=Example,OU=Extra",
-                                "SHA256Fingerprint": "b" * 64}])
+def test_other_signer_cannot_rescue_invalid_pinned_signature(case, monkeypatch):
+    client = case[3]
+    other = client.add_signature(cose(b"other certificate"))
 
     def reject(layout, statement):
         raise notation.NotationTrustError("invalid pinned signature")
 
-    runner(case, monkeypatch, verify=reject, signatures=[case[4], other])
+    observed = runner(case, monkeypatch, verify=reject)
     with pytest.raises(notation.NotationTrustError, match="invalid pinned"):
         invoke(case)
-    assert case[3].calls[0] == ("manifest", case[3].signature_digest)
+    assert len(observed) == 1
+    assert ("manifest", other) in client.calls
 
 
-@pytest.mark.parametrize("change", ["fingerprint", "subject", "missing_cert", "missing_signed",
-                                    "wrong_size", "wrong_media", "wrong_digest", "missing_signatures"])
-def test_missing_or_mismatched_inspection_evidence_fails(case, monkeypatch, change):
-    sig = case[4]
-    if change == "fingerprint":
-        sig["certificates"][0]["SHA256Fingerprint"] = "b" * 64
-    elif change == "subject":
-        sig["certificates"][0]["issuedTo"] = IDENTITY + ",OU=Extra"
-    elif change == "missing_cert":
-        del sig["certificates"]
-    elif change == "missing_signed":
-        del sig["signedArtifact"]
-    elif change == "wrong_size":
-        sig["signedArtifact"]["size"] += 1
-    elif change == "wrong_media":
-        sig["signedArtifact"]["mediaType"] = "application/other"
-    elif change == "wrong_digest":
-        sig["signedArtifact"]["digest"] = "sha256:" + "b" * 64
-    runner(case, monkeypatch, signatures=[] if change == "missing_signatures" else [sig])
+def test_registry_thumbprint_annotations_are_not_trusted(case, monkeypatch):
+    client = case[3]
+    client.set_envelope(cose(b"other certificate"))
+    client.referrers = [dict(client.entry(client.signature_digest, client.raw), annotations={
+        "io.cncf.notary.x509chain.thumbprint#S256": json.dumps([FINGERPRINT])})]
+    observed = runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError, match="pinned signer fingerprint"):
+        invoke(case)
+    assert observed == []
+
+
+def test_two_pinned_signatures_are_ambiguous(case, monkeypatch):
+    case[3].add_signature(cose(unprotected={33: [CERT], "io.cncf.notary.signingAgent": "x"}))
+    observed = runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError, match="exactly one"):
+        invoke(case)
+    assert observed == []
+
+
+@pytest.mark.parametrize("change", [
+    "media", "schema", "not-list", "too-many-referrers", "too-many-candidates",
+    "descriptor-media", "descriptor-size", "conflict", "only-other-artifacts",
+])
+def test_invalid_or_unbounded_referrers_fail_before_fetch(case, monkeypatch, change):
+    client = case[3]
+    entry = client.entry(client.signature_digest, client.raw)
+    index = client.index()
+    if change == "media":
+        index["mediaType"] = notation._OCI_MANIFEST
+    elif change == "schema":
+        index["schemaVersion"] = 1
+    elif change == "not-list":
+        index["manifests"] = {}
+    elif change == "too-many-referrers":
+        index["manifests"] = [{"artifactType": "other"}] * (notation._MAX_REFERRERS + 1)
+    elif change == "too-many-candidates":
+        index["manifests"] = [dict(entry, digest="sha256:%064x" % n)
+                              for n in range(notation._MAX_CANDIDATES + 1)]
+    elif change == "descriptor-media":
+        index["manifests"] = [dict(entry, mediaType="application/other")]
+    elif change == "descriptor-size":
+        index["manifests"] = [dict(entry, size=notation._MAX_MANIFEST + 1)]
+    elif change == "conflict":
+        index["manifests"] = [entry, dict(entry, size=entry["size"] + 1)]
+    else:
+        index["manifests"] = [dict(entry, artifactType="application/other")]
+    client.index = lambda: index
+    observed = runner(case, monkeypatch)
     with pytest.raises(notation.NotationTrustError):
         invoke(case)
-    assert case[3].calls == []
+    assert observed == []
+    assert [call for call in client.calls if call[0] != "referrers"] == []
+
+
+def test_duplicate_referrer_descriptors_are_evaluated_once(case, monkeypatch):
+    client = case[3]
+    entry = client.entry(client.signature_digest, client.raw)
+    client.referrers = [entry, dict(entry)]
+    runner(case, monkeypatch)
+    invoke(case)
+    assert client.calls.count(("manifest", client.signature_digest)) == 1
+
+
+def test_aggregate_envelope_budget_is_enforced_before_download(case, monkeypatch):
+    client = case[3]
+    monkeypatch.setattr(notation, "_MAX_ENVELOPE_TOTAL", len(client.envelope) - 1)
+    runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError, match="exceeds size limit"):
+        invoke(case)
+    assert not [call for call in client.calls if call[0] == "blob"]
 
 
 @pytest.mark.parametrize("change", ["manifest_bytes", "subject", "extra_layer", "envelope", "type"])
@@ -233,12 +375,11 @@ def test_tampered_signature_manifest_and_envelope_fail(case, monkeypatch, change
             client.manifest["layers"] = [client.descriptor, client.descriptor]
         else:
             client.manifest["artifactType"] = "application/other"
-        client.raw = encode(client.manifest)
-        client.signature_digest = digest(client.raw)
-        case[4]["digest"] = client.signature_digest
-    runner(case, monkeypatch)
+        client.refresh()
+    observed = runner(case, monkeypatch)
     with pytest.raises(notation.NotationTrustError):
         invoke(case)
+    assert observed == []
 
 
 @pytest.mark.parametrize("field,value", [
@@ -290,7 +431,7 @@ def test_notation_subprocess_is_noninteractive_and_hides_stderr(monkeypatch):
     assert "secret" not in str(error.value)
 
 
-def test_bad_subject_bytes_fail_before_inspection(case):
+def test_bad_subject_bytes_fail_before_discovery(case):
     with pytest.raises(notation.NotationTrustError):
         notation.verify_notation(case[0], REPOSITORY, "sha256:" + "0" * 64,
                                  case[1], case[2], case[3])
@@ -299,30 +440,61 @@ def test_bad_subject_bytes_fail_before_inspection(case):
 
 def test_multi_signer_cose_is_rejected(case, monkeypatch):
     client = case[3]
-    client.envelope = b"\xd8\x62\x84" + client.envelope[2:]
-    client.descriptor["digest"] = digest(client.envelope)
-    client.descriptor["size"] = len(client.envelope)
-    client.raw = encode(client.manifest)
-    client.signature_digest = digest(client.raw)
-    case[4]["digest"] = client.signature_digest
+    client.set_envelope(b"\xd8\x62" + cbor([cbor({1: -37}), {}, b"payload", [[b"", {33: [CERT]}, b"s"]]]))
     observed = runner(case, monkeypatch)
     with pytest.raises(notation.NotationTrustError, match="single-signer"):
         invoke(case)
-    assert len(observed) == 1
+    assert observed == []
+
+
+@pytest.mark.parametrize("change", [
+    "indefinite", "trailing", "duplicate-key", "protected-x5chain", "overlap",
+    "missing-chain", "empty-chain", "non-bytes-cert", "truncated", "deep", "untagged",
+])
+def test_ambiguous_cose_envelopes_fail(case, monkeypatch, change):
+    envelope = cose()
+    if change == "indefinite":
+        envelope = b"\xd2\x9f" + envelope[2:] + b"\xff"
+    elif change == "trailing":
+        envelope += b"\x00"
+    elif change == "duplicate-key":
+        envelope = b"\xd2" + cbor([cbor({1: -37}), {}, b"payload", b"s"]).replace(
+            b"\xa0", b"\xa2" + cbor(33) + cbor([CERT]) + cbor(33) + cbor([CERT]), 1)
+    elif change == "protected-x5chain":
+        envelope = cose(protected={1: -37, 33: [b"other certificate"]})
+    elif change == "overlap":
+        envelope = cose(unprotected={1: -37, 33: [CERT]})
+    elif change == "missing-chain":
+        envelope = cose(unprotected={})
+    elif change == "empty-chain":
+        envelope = cose(unprotected={33: []})
+    elif change == "non-bytes-cert":
+        envelope = cose(unprotected={33: ["text"]})
+    elif change == "truncated":
+        envelope = envelope[:-3]
+    elif change == "deep":
+        nested = b"\x81" * (notation._MAX_CBOR_DEPTH + 2) + b"\x00"
+        envelope = b"\xd2" + cbor([cbor({1: -37}), {33: [CERT]}, b"payload", b"s"])[:-2] + nested
+    else:
+        envelope = envelope[1:]
+    case[3].set_envelope(envelope)
+    observed = runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError):
+        invoke(case)
+    assert observed == []
+
+
+def test_single_certificate_x5chain_is_accepted(case, monkeypatch):
+    case[3].set_envelope(cose(unprotected={33: CERT}))
+    runner(case, monkeypatch)
+    invoke(case)
 
 
 def _jws_case(case, envelope):
-    client = case[3]
-    client.envelope = envelope
-    client.descriptor.update(
-        digest=digest(envelope), size=len(envelope), mediaType="application/jose+json"
-    )
-    client.raw = encode(client.manifest)
-    client.signature_digest = digest(client.raw)
-    case[4].update(digest=client.signature_digest, mediaType="application/jose+json")
+    case[3].set_envelope(envelope, "application/jose+json")
 
 
-def _jws(cert=b"test certificate"):
+def _jws(cert=CERT):
     protected = encode({
         "alg": "PS256",
         "cty": "application/vnd.cncf.notary.payload.v1+json",
@@ -340,14 +512,10 @@ def _jws(cert=b"test certificate"):
 
 
 def test_flattened_jws_is_bound_to_pinned_certificate(case, monkeypatch):
-    cert = b"test certificate"
-    fingerprint = hashlib.sha256(cert).hexdigest()
-    case[0]["signer_fingerprint"] = fingerprint
-    case[4]["certificates"][0]["SHA256Fingerprint"] = fingerprint
-    _jws_case(case, encode(_jws(cert)))
+    _jws_case(case, encode(_jws(CERT)))
     observed = runner(case, monkeypatch)
     invoke(case)
-    assert len(observed) == 2
+    assert len(observed) == 1
 
 
 @pytest.mark.parametrize("change", [
@@ -358,11 +526,7 @@ def test_flattened_jws_is_bound_to_pinned_certificate(case, monkeypatch):
     "bom", "utf16", "missing-signing-time", "wrong-scheme-time", "invalid-time",
 ])
 def test_jws_ambiguous_or_unpinned_envelopes_fail(case, monkeypatch, change):
-    cert = b"test certificate"
-    fingerprint = hashlib.sha256(cert).hexdigest()
-    case[0]["signer_fingerprint"] = fingerprint
-    case[4]["certificates"][0]["SHA256Fingerprint"] = fingerprint
-    obj = _jws(cert)
+    obj = _jws(CERT)
     if change == "wrong-certificate":
         obj["header"]["x5c"] = [base64.b64encode(b"other cert").decode()]
     elif change == "general-jws":
@@ -424,7 +588,7 @@ def test_jws_ambiguous_or_unpinned_envelopes_fail(case, monkeypatch, change):
     observed = runner(case, monkeypatch)
     with pytest.raises(notation.NotationTrustError):
         invoke(case)
-    assert len(observed) == 1
+    assert observed == []
 
 
 @pytest.mark.registry_integration
@@ -436,8 +600,8 @@ def test_real_notation_verifies_local_jws_snapshot(case, monkeypatch, tmp_path):
     layout = tmp_path / "signed-layout"
     blobs = layout / "blobs" / "sha256"
     blobs.mkdir(parents=True)
-    policy, manifest, raw, client, signature = case
-    subject = signature["signedArtifact"]
+    policy, manifest, raw, client = case
+    subject = client.subject
     (blobs / digest(raw)[7:]).write_bytes(raw)
     (layout / "oci-layout").write_bytes(encode({"imageLayoutVersion": "1.0.0"}))
     (layout / "index.json").write_bytes(encode({"schemaVersion": 2, "manifests": [subject]}))
@@ -461,25 +625,12 @@ def test_real_notation_verifies_local_jws_snapshot(case, monkeypatch, tmp_path):
     identity = "CN=pycontainer-jws-test,O=Notary,L=Seattle,ST=WA,C=US"
     policy.update(binary=binary, identity=identity, signer_fingerprint=fingerprint,
                   trust_root=str(config / "localkeys" / "pycontainer-jws-test.crt"))
-    signature.update(digest=client.signature_digest, mediaType="application/jose+json",
-                     certificates=[{"issuedTo": identity, "SHA256Fingerprint": fingerprint}])
-
-    original_run = notation._run
-
-    def run(args, environment):
-        if args[1] == "inspect":
-            return encode({"Signatures": [signature]})
-        return original_run(args, environment)
-
-    monkeypatch.setattr(notation, "_run", run)
     invoke(case)
 
     policy["signer_fingerprint"] = "0" * 64
-    signature["certificates"][0]["SHA256Fingerprint"] = "0" * 64
     with pytest.raises(notation.NotationTrustError, match="fingerprint"):
         invoke(case)
     policy["signer_fingerprint"] = fingerprint
-    signature["certificates"][0]["SHA256Fingerprint"] = fingerprint
 
     subprocess.run(
         [binary, "cert", "generate-test", "untrusted-jws-test"],
@@ -530,19 +681,6 @@ def test_real_notation_trusted_timestamp_after_signer_expiry(monkeypatch, tmp_pa
         "signer_fingerprint": fingerprint, "trust_root": str(cert), "tsa_root": str(tsa),
         "binary": binary,
     }
-    signature = {
-        "digest": client.signature_digest, "mediaType": client.descriptor["mediaType"],
-        "signedArtifact": subject,
-        "certificates": [{"issuedTo": identity, "SHA256Fingerprint": fingerprint}],
-    }
-    real_run = notation._run
-
-    def run(args, environment):
-        if args[1] == "inspect":
-            return encode({"Signatures": [signature]})
-        return real_run(args, environment)
-
-    monkeypatch.setattr(notation, "_run", run)
     notation.verify_notation(policy, REPOSITORY, digest(raw), json.loads(raw), raw, client)
     policy["tsa_root"] = str(wrong_tsa)
     with pytest.raises(notation.NotationTrustError):
