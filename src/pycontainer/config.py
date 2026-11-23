@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
+
 SBOM_FORMATS = ("spdx", "cyclonedx")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 _REGISTRY_HOST = re.compile(
@@ -127,6 +129,8 @@ class BuildConfig:
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
+    release_notes_file: Optional[str] = None
+    release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
     build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -141,9 +145,11 @@ class BuildConfig:
             raise ValueError(self.redact(str(exc))) from None
 
     def _validate(self):
+        from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
         self.validate_metadata()
+        validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
         if self.scan_threshold not in SCAN_SEVERITIES:
             raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
