@@ -201,6 +201,25 @@ def test_failed_build_records_partial_phase_without_error_text(tmp_path, monkeyp
     assert secret not in (Path(config.history_dir) / "history.json").read_text()
 
 
+def test_rejected_package_index_credentials_are_not_recorded(tmp_path, monkeypatch):
+    secret = "synthetic-index-secret"
+    _offline_base(monkeypatch)
+    config = _history_config(tmp_path, include_paths=["requirements.txt"])
+    (Path(config.context_dir) / "requirements.txt").write_text(
+        f"--index-url https://synthetic-user:{secret}@example.invalid/simple\n"
+    )
+
+    with pytest.raises(ValueError, match="literal credentials") as error:
+        ImageBuilder(config).build()
+
+    assert secret not in str(error.value)
+    history = BuildHistory(config.history_dir)
+    record = history.list()[0]
+    assert record["status"] == "failed"
+    assert "application" in record["phases_ns"]
+    assert secret not in history.history_file.read_text()
+
+
 def test_constructor_failure_is_recorded(tmp_path, monkeypatch):
     import pycontainer.builder as builder_module
 

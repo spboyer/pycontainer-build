@@ -90,6 +90,20 @@ dist/image/
       └── <tag-name>              # Tag reference
 ```
 
+### Generate Deployment Artifacts
+
+After publishing an image, generate Kubernetes resources and a matching Helm
+chart, or a Compose service that references that image:
+
+```bash
+pycontainer generate kubernetes --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --service-port 80 -o deploy
+pycontainer generate compose --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --host-port 8080 -o compose.yaml
+```
+
+Generation does not run a daemon or apply resources, and refuses existing
+output. See the [deployment artifact guide](docs/deployment-artifacts.md) for
+supported fields, output safety, versions, and optional validation.
+
 ### Testing Locally
 
 **Important**: `pycontainer` creates OCI-compliant image layouts, not Docker-specific images. To test locally:
@@ -179,6 +193,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
 - ✅ **Opt-in local history** — Inspect private build outcomes and phase timings
+- ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
+  configuration for an existing image without applying it
 
 ### Coming Soon
 
@@ -410,6 +426,14 @@ pycontainer build \
   setuptools or Flit tables mentioning host markers fail, as do unreadable
   dynamic dependencies. Unmarked declarations in those unparsed sources are
   not verified. Use a requirements file when a virtualenv cannot be verified.
+  Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
+  `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
+  placeholders in the requirements file, including in URL paths. Literal
+  credentials in requirements files (URL userinfo, secret-like query values
+  and recognized URL path tokens) are rejected, and host pip settings that
+  could change target selection (for example `PIP_PLATFORM` or
+  `PIP_NO_BINARY`) are ignored; see
+  [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:

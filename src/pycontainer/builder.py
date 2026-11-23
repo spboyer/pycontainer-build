@@ -201,6 +201,8 @@ from .security import SECURITY_DIR, render_security_fragments, write_security_fr
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
+    reject_credentialed_direct_urls,
+    reject_shipped_credentials,
     staged_packages,
     stage_virtualenv,
     target_python_version,
@@ -744,7 +746,7 @@ class ImageBuilder:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if is_requirements:
-                install_requirements(
+                self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,
                     ctx,
@@ -766,6 +768,7 @@ class ImageBuilder:
                     ctx,
                     ctx / requirements_relative,
                 )
+                reject_credentialed_direct_urls(site_packages)
 
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
@@ -773,7 +776,13 @@ class ImageBuilder:
                 strict=bool(self.config.generate_sbom),
             )
             files = sorted(
-                (path for path in stage_root.rglob("*") if path.is_file()),
+                (
+                    path
+                    for directory in (site_packages, stage_root / "bin")
+                    if directory.is_dir()
+                    for path in directory.rglob("*")
+                    if path.is_file()
+                ),
                 key=lambda path: path.relative_to(stage_root).as_posix(),
             )
             self._dependency_site_packages = bool(files)
@@ -826,6 +835,15 @@ class ImageBuilder:
                 exclude_paths=self.context_excludes,
                 exclude_defaults=self.config.exclude_defaults,
             )
+        )
+        configured_requirements = ctx / self.config.requirements_file
+        reject_shipped_credentials(
+            files,
+            ctx,
+            [
+                *getattr(self, "_requirement_files", ()),
+                configured_requirements,
+            ],
         )
 
         if self.cache:
