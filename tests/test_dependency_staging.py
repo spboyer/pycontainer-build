@@ -43,10 +43,23 @@ BASE_CONFIG = {
         "Env": [
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHON_VERSION=3.11.8",
+            "PYTHON_IMPLEMENTATION=CPython",
+            "PYTHON_LIBC=glibc-2.17",
         ],
         "WorkingDir": "/",
     },
     "rootfs": {"type": "layers", "diff_ids": []},
+}
+
+UNPROVEN_BASE_CONFIG = {
+    **BASE_CONFIG,
+    "config": {
+        **BASE_CONFIG["config"],
+        "Env": [
+            item for item in BASE_CONFIG["config"]["Env"]
+            if not item.startswith("PYTHON_LIBC=")
+        ],
+    },
 }
 
 
@@ -101,6 +114,24 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
     )
 
 
+def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("pip must not run"))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": ["PYTHON_VERSION=3.11.8"]},
+    }
+
+    with pytest.raises(ValueError, match="unverified or custom base image"):
+        builder._create_deps_layer(layers, base_config=base_config)
+
+
 @pytest.mark.parametrize("signal", [
     "environment.yml", "environment.yaml", "conda-lock.yml", "conda-meta",
 ])
@@ -150,7 +181,7 @@ def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
     installed = []
 
     def install(path, destination, *args, base_image_tag_verified):
-        assert base_image_tag_verified is True
+        assert base_image_tag_verified is False
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
@@ -480,7 +511,7 @@ def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, 
     installed = []
 
     def install(path, destination, *args, base_image_tag_verified):
-        assert base_image_tag_verified is True
+        assert base_image_tag_verified is False
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
@@ -975,7 +1006,7 @@ def _dpkg_libc(version="2.36-9", architecture="amd64"):
 
 
 def _layer_libc_config(layers, *, base_image="python:3.11-slim", arch="amd64"):
-    config = {**BASE_CONFIG, "architecture": arch}
+    config = {**UNPROVEN_BASE_CONFIG, "architecture": arch}
     return target_libc_config(
         "linux", arch, base_image, config, layers, base_image_tag_verified=True
     )
@@ -1348,10 +1379,10 @@ def test_layer_libc_cannot_establish_digest_custom_or_local_provenance(
 ):
     layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
     config = target_libc_config(
-        "linux", "amd64", base_image, BASE_CONFIG, [layer],
+        "linux", "amd64", base_image, UNPROVEN_BASE_CONFIG, [layer],
         base_image_tag_verified=verified,
     )
-    assert config is BASE_CONFIG
+    assert config is UNPROVEN_BASE_CONFIG
     with pytest.raises(ValueError, match="unverified"):
         target_wheel_platform(
             "linux", "amd64", base_image, config, base_image_tag_verified=verified
@@ -1531,8 +1562,9 @@ def test_unproven_default_or_alpine_rejects_before_dependency_staging(
 
     monkeypatch.setattr("pycontainer.builder.install_requirements", unexpected_staging)
     monkeypatch.setattr("pycontainer.builder.stage_virtualenv", unexpected_staging)
+    builder._base_image_tag_verified = True
     with pytest.raises(ValueError, match="Cannot validate target") as error:
-        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+        builder._create_deps_layer(tmp_path / "layers", base_config=UNPROVEN_BASE_CONFIG)
     assert "python:3.11-slim-bookworm" in str(error.value)
 
 
@@ -1544,10 +1576,11 @@ def test_default_image_build_requires_libc_only_for_dependency_staging(
     context.mkdir()
     (context / "app.py").write_text("print('app')\n")
     (context / "requirements.txt").write_text("# no dependencies\n")
-    monkeypatch.setattr(
-        ImageBuilder, "_pull_base_image",
-        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
-    )
+    def verified_pull(self, layers_dir, os_name, arch):
+        self._base_image_tag_verified = True
+        return [], UNPROVEN_BASE_CONFIG
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", verified_pull)
     builder = ImageBuilder(
         BuildConfig(
             context_dir=str(context), output_dir=str(tmp_path / "output"),
@@ -1637,7 +1670,7 @@ def test_unverified_tag_plus_digest_rejects_before_pip(tmp_path, monkeypatch, ta
     with pytest.raises(ValueError, match="unverified"):
         install_requirements(
             requirements, tmp_path / "staged", tmp_path,
-            "linux", "amd64", "3.11", base_image, BASE_CONFIG,
+            "linux", "amd64", "3.11", base_image, _libc_config(),
         )
 
 
@@ -1955,9 +1988,10 @@ def test_codename_tag_keeps_dependency_layer_digest_for_same_wheel(
             tmp_path, monkeypatch, context=context, include_deps=True,
             base_image=base_image, workdir="/app", reproducible=True,
         )
+        builder._base_image_tag_verified = True
         layers = tmp_path / "layers" / base_image.replace(":", "_")
         layers.mkdir(parents=True)
-        config = BASE_CONFIG
+        config = UNPROVEN_BASE_CONFIG
         if base_image == "python:3.11-slim":
             config = {**BASE_CONFIG, **_libc_config("PYTHON_LIBC=glibc-2.17")}
         digests.append(builder._create_deps_layer(layers, base_config=config).digest)
@@ -2281,8 +2315,117 @@ def _target_config(arch, python_version="3.11.8"):
     return {
         **BASE_CONFIG,
         "architecture": arch,
-        "config": {"Env": [f"PYTHON_VERSION={python_version}"], "WorkingDir": "/"},
+        "config": {
+            "Env": [
+                "PYTHON_IMPLEMENTATION=CPython",
+                f"PYTHON_VERSION={python_version}",
+                "PYTHON_LIBC=glibc-2.17",
+            ],
+            "WorkingDir": "/",
+        },
     }
+
+def _multi_platform_marker_builder(tmp_path, monkeypatch, context):
+    def pull_base(self, layers_dir, os_name, arch):
+        config = {
+            **BASE_CONFIG,
+            "architecture": arch,
+            "config": {
+                **BASE_CONFIG["config"],
+                "Env": [
+                    "PYTHON_IMPLEMENTATION=CPython",
+                    f"PYTHON_VERSION=3.11.{8 if arch == 'amd64' else 9}",
+                    "PYTHON_LIBC=glibc-2.17",
+                ],
+            },
+        }
+        return [], config
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull_base)
+    return ImageBuilder(
+        BuildConfig(
+            tag="app:v1",
+            base_image="example.invalid/custom:latest",
+            context_dir=str(context),
+            output_dir=str(tmp_path / "output"),
+            platform="linux/amd64,linux/arm64",
+            include_deps=True,
+            use_cache=False,
+        )
+    )
+
+
+def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            'transitive-amd; platform_machine == "x86_64"',
+            'transitive-arm; platform_machine == "aarch64"',
+            'new-patch; python_full_version >= "3.11.9"',
+        ],
+    )
+    for name in (
+        "transitive-amd", "transitive-arm", "new-patch", "root-amd", "root-arm",
+        "injected-dep",
+    ):
+        _write_named_wheel(wheelhouse, name)
+    injected_requirements = tmp_path / "host-requirements.txt"
+    injected_requirements.write_text("injected-dep\n")
+    monkeypatch.setenv("PIP_REQUIREMENT", str(injected_requirements))
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        "marker-root\n"
+        'root-amd; platform_machine == "x86_64"\n'
+        'root-arm; platform_machine == "aarch64"\n'
+    )
+    (context / "app.py").write_text("print('hello')\n")
+    builder = _multi_platform_marker_builder(tmp_path, monkeypatch, context)
+
+    builder.build()
+
+    expected = {
+        "amd64": {"marker_root", "transitive_amd", "root_amd"},
+        "arm64": {"marker_root", "transitive_arm", "root_arm", "new_patch"},
+    }
+    for image in builder.platform_images:
+        with tarfile.open(image.layers[0].tar_path) as layer:
+            modules = {
+                name.split("/")[-2]
+                for name in layer.getnames()
+                if "/site-packages/" in name and name.endswith("/__init__.py")
+            }
+        assert modules == expected[image.platform["architecture"]]
+
+
+def test_multi_platform_unknown_marker_preserves_published_index(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "common")
+    _write_named_wheel(
+        wheelhouse, "arm-root", requires=['unknown-dep; platform_release >= "1"']
+    )
+    _write_named_wheel(wheelhouse, "unknown-dep")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        "common\n"
+        'arm-root; platform_machine == "aarch64"\n'
+    )
+    (context / "app.py").write_text("print('hello')\n")
+    out = tmp_path / "output"
+    refs = out / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (out / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    builder = _multi_platform_marker_builder(tmp_path, monkeypatch, context)
+
+    with pytest.raises(ValueError, match="refusing to stage.*platform_release"):
+        builder.build()
+
+    assert (out / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
 
 
 def _write_venv(context, distributions, extra_dirs=()):
