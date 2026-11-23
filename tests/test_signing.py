@@ -219,6 +219,90 @@ def test_signed_push_rejects_insecure_registry_before_publication(tmp_path, monk
     assert builder.pushed_refs == []
 
 
+def test_signed_push_uses_scanned_snapshot_when_source_changes(tmp_path, monkeypatch):
+    from pycontainer import scanning
+
+    builder = _builder(tmp_path, monkeypatch)
+    builder.config.scan = True
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+    original_layer = Path(builder.layers[-1].tar_path)
+    original_push_blob = registry.push_blob
+    scanned = []
+
+    def scan(root, descriptor, config, *, report):
+        scanned.append((root, descriptor["digest"]))
+        original_layer.write_bytes(b"changed after snapshot")
+
+    def push_blob(digest, path, check_exists=True):
+        assert path.is_relative_to(scanned[0][0])
+        assert _digest(path.read_bytes()) == digest
+        return original_push_blob(digest, path, check_exists)
+
+    monkeypatch.setattr(scanning, "scan_image", scan)
+    monkeypatch.setattr(registry, "push_blob", push_blob)
+    builder.push(show_progress=False)
+
+    subject = f"registry.example/team/app@{builder.manifest_digest}"
+    assert scanned[0][1] == builder.manifest_digest
+    assert ("verify", subject) in registry.events
+    assert ("manifest", "v1") in registry.events
+    assert original_layer.read_bytes() == b"changed after snapshot"
+
+
+def test_signed_push_scan_failure_leaves_tags_and_signer_untouched(tmp_path, monkeypatch):
+    from pycontainer import scanning
+
+    builder = _builder(tmp_path, monkeypatch)
+    builder.config.scan = True
+    builder.signed_ref = "stale"
+    builder.pushed_refs = ["stale"]
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+
+    def reject_scan(root, descriptor, config, *, report):
+        raise scanning.ScanError("scanner", "simulated scan failure")
+
+    monkeypatch.setattr(scanning, "scan_image", reject_scan)
+    with pytest.raises(scanning.ScanError, match="simulated scan failure"):
+        builder.push(show_progress=False)
+    assert registry.events == []
+    assert builder.signed_ref is None
+    assert builder.pushed_refs == []
+
+
+def test_signed_scan_rejects_conflicting_tag_descriptors(tmp_path, monkeypatch):
+    from pycontainer import scanning
+
+    builder = _builder(tmp_path, monkeypatch)
+    builder.config.scan = True
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+    index_path = Path(builder.config.output_dir) / "index.json"
+    index = json.loads(index_path.read_text())
+    index["manifests"][1]["size"] += 1
+    index_path.write_text(json.dumps(index))
+    monkeypatch.setattr(
+        scanning, "scan_image",
+        lambda *args, **kwargs: pytest.fail("ambiguous descriptors must not be scanned"),
+    )
+
+    with pytest.raises(scanning.ScanError, match="ambiguous"):
+        builder.push(show_progress=False)
+    assert registry.events == []
+
+
+def test_signed_multi_platform_scan_rejected_before_publication(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch, "linux/amd64,linux/arm64")
+    builder.config.scan = True
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+
+    with pytest.raises(ValueError, match="multi-platform"):
+        builder.push(show_progress=False)
+    assert registry.events == []
+
+
 def test_unsigned_push_clears_previous_signed_subject(tmp_path, monkeypatch):
     builder = _builder(tmp_path, monkeypatch)
     registry = FakeRegistry()

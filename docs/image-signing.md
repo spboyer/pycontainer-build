@@ -21,6 +21,9 @@ remain unverified.
   redirects are rejected; authorization is not forwarded across origins.
   Bearer-token exchange endpoints must use HTTPS. `--registry-ca-file` configures
   only the builder; the signer and verifier need separately configured trust.
+- When `--scan` is also enabled, push scans and signs the same private
+  single-platform image snapshot. Scanning multi-platform indexes is unsupported
+  and fails before publication.
 - A trusted `cosign` or `notation` executable on `PATH`, plus registry access
   and the provider's signing credentials. Pycontainer's registry credentials
   are not translated into signer credentials: configure the signer's Docker
