@@ -213,6 +213,46 @@ This is normal! pycontainer checks if blobs exist before uploading:
 
 This makes subsequent pushes much faster.
 
+### Registry errors, rate limits and quotas
+
+Registry failures report the operation, registry host and HTTP status.
+Distribution error codes and messages are used to classify failures, but
+transfer response bodies are omitted because they can echo image metadata:
+
+```text
+Manifest pull failed with HTTP 429 from registry-1.docker.io: (response details omitted)
+The registry rate limit was exceeded;
+it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
+100 remaining. Authenticate to the registry ...
+```
+
+- **`TOOMANYREQUESTS` / HTTP 429** (`RegistryRateLimitError`): the reset time
+  comes from `Retry-After`. Sign in (Docker Hub grants higher pull limits to
+  authenticated users), wait for the reset, or use a registry mirror. Only
+  safe reads (`GET`/`HEAD`) have at most two transient retries per request,
+  with delays capped at 5 seconds; when `Retry-After` is longer than that cap
+  the build fails immediately instead of retrying into the same limit. Uploads,
+  upload initiation and manifest `PUT`s are not retried for transient errors;
+  a request refused with a 401 bearer challenge can be replayed once after
+  authentication. Invalid or negative numeric `Retry-After` values use bounded
+  backoff. Very large intervals are reported in seconds without a UTC date
+  when the date is out of range.
+- **HTTP 413, 507, `*QUOTA*` codes or quota messages**
+  (`RegistryQuotaError`): the error names the rejected upload size. Free space
+  in the repository, raise its quota or reduce the image size.
+- **`DENIED` / `UNAUTHORIZED` / HTTP 401 or 403**: check that the credentials
+  can pull or push the repository. Some registries also report exhausted
+  quotas as `DENIED`.
+
+Run with `--verbose` to log Docker Hub style `RateLimit-Limit` and
+`RateLimit-Remaining` headers. A warning is printed once per registry client
+when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
+
+Token-exchange error bodies are treated as untrusted: at most five errors are
+shown, messages are truncated, control characters are removed, and credentials
+are replaced with `[REDACTED]`. Registry hosts and HTTP(S) URLs in error
+details omit userinfo and query strings.
+
 ## Authentication Priority
 
 pycontainer tries authentication methods in this order:

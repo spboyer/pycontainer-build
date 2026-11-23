@@ -20,7 +20,9 @@ from pycontainer.oci import (
     build_index_json,
     build_manifest_json,
 )
-from pycontainer.registry_client import RegistryClient, RegistryRequestError
+from pycontainer.registry_client import (
+    RegistryClient, RegistryQuotaError, RegistryRateLimitError, RegistryRequestError,
+)
 
 
 REF_NAME = "org.opencontainers.image.ref.name"
@@ -403,9 +405,12 @@ def test_null_base_labels_are_accepted_but_invalid_labels_are_rejected():
 @pytest.mark.parametrize(
     "operation", ["pull", "push_manifest", "push_index", "blob_head", "upload_init"]
 )
-def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, operation):
+@pytest.mark.parametrize(
+    "payload",
+    [b"metadata-secret", b'{"errors":[{"code":"DENIED","message":"metadata-secret"}]}'],
+)
+def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, operation, payload):
     client = RegistryClient("registry.example", "example")
-    payload = b"metadata-secret"
     monkeypatch.setattr(
         client, "_make_request", lambda *args, **kwargs: (400, payload, {})
     )
@@ -418,6 +423,26 @@ def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, ope
             client.initiate_blob_upload()
         else:
             getattr(client, operation)("latest", payload)
+    assert "metadata-secret" not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "detail", "error_type"),
+    [
+        (429, "TOOMANYREQUESTS", "metadata-secret", RegistryRateLimitError),
+        (400, "DENIED", "storage quota exceeded metadata-secret", RegistryQuotaError),
+    ],
+)
+def test_registry_classification_keeps_metadata_values_hidden(
+    monkeypatch, status, code, detail, error_type
+):
+    client = RegistryClient("registry.example", "example")
+    payload = json.dumps({"errors": [{"code": code, "message": detail}]}).encode()
+    monkeypatch.setattr(
+        client, "_make_request", lambda *args, **kwargs: (status, payload, {})
+    )
+    with pytest.raises(error_type) as error:
+        client.push_manifest("latest", b"{}")
     assert "metadata-secret" not in "".join(traceback.format_exception(error.value))
 
 
