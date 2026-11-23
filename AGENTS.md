@@ -15,6 +15,8 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -117,6 +119,13 @@ the release notes. Only targets listed as validated have runtime evidence.
 The tests workflow also runs the multi-platform index check on both native
 targets and uploads separate `index-runtime-evidence-*` artifacts; the release
 workflow continues to use only the single-platform release evidence.
+
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
 
 `.github/workflows/execution-backend-probe.yml` records isolated-execution host
 prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
