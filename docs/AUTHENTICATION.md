@@ -20,7 +20,7 @@ Push Request
     │   └─> Password only: Use it as a bearer token
     │
     ├─> Check Environment Variables
-    │   ├─> GITHUB_TOKEN (for ghcr.io)
+    │   ├─> GITHUB_TOKEN (only for ghcr.io)
     │   ├─> REGISTRY_TOKEN (generic bearer token)
     │   └─> REGISTRY_USERNAME + REGISTRY_PASSWORD
     │
@@ -29,7 +29,7 @@ Push Request
     │   ├─> Decode base64 auth
     │   └─> Extract username/password
     │
-    ├─> Check Azure CLI (for *.azurecr.io)
+    ├─> Check Azure CLI (only for an ACR login server)
     │   └─> Run: az acr login --expose-token
     │
     └─> Make Request
@@ -59,8 +59,29 @@ class AuthProvider(ABC):
 #### `EnvironmentAuthProvider`
 Reads credentials from environment variables:
 - `REGISTRY_USERNAME` + `REGISTRY_PASSWORD` (Basic Auth)
-- `GITHUB_TOKEN` (for ghcr.io)
+- `GITHUB_TOKEN` (only for the `ghcr.io` registry)
 - `REGISTRY_TOKEN` (generic)
+
+#### Registry host scoping
+Provider-specific credentials are selected only when the registry is a bare
+`host` authority, optionally with a numeric HTTPS port of 443 (including
+zero-padded forms such as `:0443`). Hostnames are compared case-insensitively
+and must consist of valid DNS labels; schemes, paths, user information, trailing
+dots, other ports and other malformed authorities never match.
+
+- `GITHUB_TOKEN` is used only for exactly `ghcr.io`. Hosts such as
+  `ghcr.io.example.com` or `evilghcr.io` do not receive it.
+- Azure CLI runs only for an ACR login server named `<name>.azurecr.io` or
+  `<name>-<suffix>.azurecr.io`. The registry resource name is 5-50 ASCII
+  letters or digits, and the optional suffix accommodates domain-name-label
+  protected registries. The provider passes the resource name to
+  `az acr login --name` and accepts the token only if the returned
+  `loginServer` matches the requested host.
+
+Explicit CLI credentials and `REGISTRY_USERNAME` + `REGISTRY_PASSWORD` remain
+host-agnostic, subject to provider precedence. `REGISTRY_TOKEN` is available
+for non-GHCR registries; for GHCR, the environment provider uses `GITHUB_TOKEN`
+instead, even when it is unset. Docker config credentials use registry keys.
 
 #### `DockerConfigAuthProvider`
 Reads `~/.docker/config.json`:
@@ -71,9 +92,9 @@ Reads `~/.docker/config.json`:
 - Returns decoded username/password as Basic credentials, never as a bearer token
 
 #### `AzureCLIAuthProvider`
-For Azure Container Registry (`*.azurecr.io`):
+For Azure Container Registry login servers (optionally with HTTPS port 443):
 - Runs `az acr login --expose-token`
-- Returns access token from Azure
+- Returns the exposed token only when the login server matches
 - Only activates for ACR registries
 
 #### `ChainAuthProvider`
@@ -123,7 +144,7 @@ The `push()` method:
 - Supports username/password or token
 - Token created at https://hub.docker.com/settings/security
 
-### Azure Container Registry (*.azurecr.io)
+### Azure Container Registry (`<name>.azurecr.io`)
 - Auto-detects via `az acr login`
 - Supports service principal credentials
 - Supports admin username/password

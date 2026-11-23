@@ -546,6 +546,29 @@ def test_mirror_auth_ignores_host_agnostic_environment_credentials(
     assert get_mirror_auth("ghcr.io.evil.example") == RegistryAuth()
 
 
+def test_mirror_auth_uses_provider_credentials_only_for_matching_https_hosts(monkeypatch):
+    monkeypatch.setattr(
+        auth_module.DockerConfigAuthProvider, "get_credentials", lambda *_args: None
+    )
+    azure_calls = []
+
+    def azure_credentials(_self, host):
+        azure_calls.append(host)
+        return ("azure-user", "azure-token")
+
+    monkeypatch.setattr(auth_module.AzureCLIAuthProvider, "get_credentials", azure_credentials)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+
+    assert get_mirror_auth("GHCR.IO:0443") == RegistryAuth(bearer_token="gh-token")
+    assert get_mirror_auth("myregistry.azurecr.io:443") == RegistryAuth(
+        username="azure-user", password="azure-token"
+    )
+    assert get_mirror_auth("ghcr.io:5000") == RegistryAuth()
+    assert get_mirror_auth("myregistry.azurecr.io:5000") == RegistryAuth()
+    assert get_mirror_auth("myregistry.azurecr.io.evil.example") == RegistryAuth()
+    assert azure_calls == ["myregistry.azurecr.io:443"]
+
+
 def test_mirror_configuration_is_normalized():
     config = BuildConfig(registry_mirrors={
         "Docker.IO": ["Mirror.Example", "mirror.example", "backup.example:5000"],
@@ -592,10 +615,11 @@ def _cli_config(monkeypatch, argv):
     return configs[0]
 
 
-def test_cli_and_toml_mirror_options_merge_per_upstream(tmp_path, monkeypatch):
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_and_toml_mirror_options_merge_per_upstream(tmp_path, monkeypatch, table):
     toml = tmp_path / "pycontainer.toml"
     toml.write_text(
-        "[build.registry_mirrors]\n"
+        f"[{table}.registry_mirrors]\n"
         '"index.docker.io" = ["file-mirror.example"]\n'
         '"ghcr.io" = ["ghcr-mirror.example"]\n'
     )

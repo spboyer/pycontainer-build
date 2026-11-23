@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from pycontainer import cli
+from pycontainer.auth import RegistryAuth
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
@@ -791,6 +792,28 @@ def test_cli_and_toml_accept_transport_options(tmp_path, monkeypatch, certificat
     assert loaded.registry_ca_file == ca_file
 
 
+def test_cli_transport_options_preserve_and_override_toml(
+    tmp_path, monkeypatch, certificate_authority
+):
+    _, ca_file = certificate_authority
+    toml = tmp_path / "pycontainer.toml"
+    toml.write_text(
+        "[build]\n"
+        'insecure-registries = ["registry.example:5000"]\n'
+        f"registry-ca-file = {json.dumps(ca_file)}\n"
+    )
+
+    preserved = _capture_cli_config(monkeypatch, ["build", "--config", str(toml)])
+    overridden = _capture_cli_config(
+        monkeypatch,
+        ["build", "--config", str(toml), "--insecure-registry", "localhost:5000"],
+    )
+
+    assert preserved.insecure_registries == ["registry.example:5000"]
+    assert overridden.insecure_registries == ["localhost:5000"]
+    assert preserved.registry_ca_file == overridden.registry_ca_file == ca_file
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -825,3 +848,63 @@ def test_builder_warns_once_per_insecure_host(tmp_path, caplog):
     assert secure.base_url.startswith("https://")
     warnings = [r for r in caplog.records if "insecure registry" in r.getMessage()]
     assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("transport", ["http", "custom-ca-https"])
+def test_builder_pull_and_push_honor_registry_transport(
+    tmp_path, monkeypatch, certificate_authority, transport
+):
+    server_context, ca_file = certificate_authority
+    tls_context = server_context if transport == "custom-ca-https" else None
+    monkeypatch.setattr(
+        "pycontainer.builder.get_registry_auth",
+        lambda *_args, **_kwargs: RegistryAuth(),
+    )
+
+    image_config = {"architecture": "amd64", "os": "linux"}
+    config_bytes = json.dumps(image_config).encode()
+    config_digest = f"sha256:{hashlib.sha256(config_bytes).hexdigest()}"
+    manifest_bytes = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_TYPE,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": len(config_bytes),
+        },
+        "layers": [],
+    }).encode()
+    manifest_digest = f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}"
+
+    with _serve(tls_context) as (port, state):
+        registry = f"127.0.0.1:{port}"
+        state.manifests["latest"] = manifest_bytes
+        state.blobs[config_digest] = config_bytes
+        output = tmp_path / "image"
+        builder = ImageBuilder(BuildConfig(
+            base_image=f"{registry}/team/base:latest",
+            tag=f"{registry}/team/app:v1",
+            context_dir=str(tmp_path),
+            output_dir=str(output),
+            insecure_registries=[registry] if transport == "http" else [],
+            registry_ca_file=ca_file if tls_context else None,
+        ))
+
+        layers, pulled_config = builder._pull_base_image(
+            tmp_path / "base-blobs", "linux", "amd64"
+        )
+        assert layers == []
+        assert pulled_config == image_config
+
+        blobs = output / "blobs" / "sha256"
+        blobs.mkdir(parents=True)
+        (blobs / config_digest.split(":", 1)[1]).write_bytes(config_bytes)
+        (blobs / manifest_digest.split(":", 1)[1]).write_bytes(manifest_bytes)
+        builder.config_digest = config_digest
+        builder.manifest_digest = manifest_digest
+        builder.layers = []
+        state.blobs.clear()
+
+        assert builder.push(show_progress=False) == f"{registry}/team/app:v1"
+        assert state.blobs[config_digest] == config_bytes
+        assert state.manifests["v1"] == manifest_bytes

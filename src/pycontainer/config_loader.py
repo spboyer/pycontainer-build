@@ -3,23 +3,50 @@ import types
 import tomllib
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig, canonical_registry
 
 
-def load_config_file(path: Path) -> Dict[str, Any]:
-    """Load configuration from pycontainer.toml file."""
+BUILD_TABLE = "[build]"
+TOOL_TABLE = "[tool.pycontainer]"
+PLUGIN_ONLY_HINTS = {
+    "push": "push is a Poetry plugin setting; use 'pycontainer build --push' for direct builds",
+}
+
+
+def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Return the label and contents of the single configuration table in path."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
     with open(path, 'rb') as f:
         data=tomllib.load(f)
 
-    build_config = data.get('build', {})
-    if not isinstance(build_config, dict):
-        raise ValueError("The [build] configuration must be a TOML table.")
+    found = []
+    if 'build' in data:
+        if not isinstance(data['build'], dict):
+            raise ValueError("The [build] configuration must be a TOML table.")
+        found.append((BUILD_TABLE, data['build']))
+    if 'tool' in data:
+        tool = data['tool']
+        if not isinstance(tool, dict) and 'build' not in data:
+            raise ValueError("The [tool] configuration must be a TOML table.")
+        if isinstance(tool, dict) and 'pycontainer' in tool:
+            if not isinstance(tool['pycontainer'], dict):
+                raise ValueError("The [tool.pycontainer] configuration must be a TOML table.")
+            found.append((TOOL_TABLE, tool['pycontainer']))
 
-    return build_config
+    if len(found) > 1:
+        raise ValueError(
+            f"{path} defines both [build] and [tool.pycontainer]; keep exactly one "
+            "pycontainer configuration table."
+        )
+    return found[0] if found else (BUILD_TABLE, {})
+
+
+def load_config_file(path: Path) -> Dict[str, Any]:
+    """Load the [build] or [tool.pycontainer] table from a TOML config file."""
+    return _load_config_table(path)[1]
 
 
 def _normalize_config_keys(config: Dict[str, Any], source: str) -> Dict[str, Any]:
@@ -76,14 +103,17 @@ def _format_type(expected_type: Any) -> str:
     return getattr(expected_type, "__name__", str(expected_type))
 
 
-def _validate_config(config: Dict[str, Any]) -> None:
+def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
     valid_fields = {field.name for field in fields(BuildConfig)}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))
         unknown = ", ".join(repr(key) for key in unknown_fields)
+        hints = "".join(
+            f" ({PLUGIN_ONLY_HINTS[key]}.)" for key in unknown_fields if key in PLUGIN_ONLY_HINTS
+        )
         raise ValueError(
-            f"Unknown [build] setting(s): {unknown}. Supported settings: {supported}."
+            f"Unknown {table} setting(s): {unknown}.{hints} Supported settings: {supported}."
         )
 
     type_hints = get_type_hints(BuildConfig)
@@ -91,7 +121,7 @@ def _validate_config(config: Dict[str, Any]) -> None:
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):
             raise ValueError(
-                f"Invalid value for [build].{key}: expected "
+                f"Invalid value for {table}.{key}: expected "
                 f"{_format_type(expected_type)}, got {type(value).__name__}."
             )
 
@@ -132,6 +162,7 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
 
 def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
-    config = merge_configs(load_config_file(path), cli_overrides or {})
-    _validate_config(config)
+    table, file_config = _load_config_table(path)
+    config = merge_configs(file_config, cli_overrides or {})
+    _validate_config(config, table)
     return BuildConfig(**config)
