@@ -1135,6 +1135,47 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     assert any("other" in path for path in index_b.requests)
 
 
+def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, monkeypatch, indexes):
+    wheelhouse = tmp_path / "wheels"
+    first = _named_wheel(wheelhouse, "marker-first")
+    second = _named_wheel(wheelhouse, "marker-second")
+    index_a, index_b, rogue = (indexes(first, second) for _ in range(3))
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
+    digest = lambda wheel: (f"sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",)
+    selection = LockSelection(
+        "uv",
+        Path("uv.lock"),
+        (
+            LockedPackage("marker-first", "1.0", digest(first), index_a.url),
+            LockedPackage("marker-second", "1.0", digest(second), index_b.url),
+        ),
+    )
+    requirements = []
+    for index, text in selection.requirement_sets():
+        for name in ("marker-first", "marker-second"):
+            text = text.replace(
+                f"{name}==1.0 ",
+                f"{name}==1.0; python_version == '3.9' and "
+                "platform_machine == 'aarch64' and sys_platform == 'linux' ",
+            )
+        requirements.append((index, text))
+    site_packages = tmp_path / "stage" / "site-packages"
+    site_packages.parent.mkdir()
+
+    install_locked_requirements(
+        requirements, site_packages, tmp_path, "linux", "arm64", "3.9",
+        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18"]}},
+        base_image_tag_verified=True,
+    )
+
+    assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
+    assert any("marker-first" in path for path in index_a.requests)
+    assert any("marker-second" in path for path in index_b.requests)
+    assert not [path for path in index_a.requests if "marker-second" in path]
+    assert not [path for path in index_b.requests if "marker-first" in path]
+    assert not rogue.requests
+
+
 @pytest.mark.parametrize(
     ("arch", "selected_arch", "excluded_arch"),
     [
