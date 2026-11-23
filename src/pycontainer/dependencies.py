@@ -15,7 +15,7 @@ from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
-from .venv_markers import declared_roots
+from .venv_markers import declared_roots, host_environments, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -450,7 +450,7 @@ def stage_virtualenv(
         raise ValueError("Dependencies from multiple virtualenv site-packages roots are unsupported.")
 
     root = next(iter(site_roots), ())
-    _validate_virtualenv_version(files, root, python_version)
+    version_established = _validate_virtualenv_version(files, root, python_version)
     destination.mkdir(parents=True, exist_ok=True)
     total_bytes = 0
     total_files = 0
@@ -479,6 +479,8 @@ def stage_virtualenv(
         base_config,
         context_dir,
         requirements,
+        version_established,
+        venv_layout_os(root),
     )
 
 
@@ -490,6 +492,8 @@ def _verify_target_closure(
     base_config: Optional[dict],
     context_dir: Optional[Path],
     requirements: Optional[Path],
+    version_established: bool,
+    host_os_name: Optional[str] = None,
 ) -> None:
     """Reject staged packages whose target-active requirements are not installed."""
     constraint_lines: List[str] = []
@@ -542,10 +546,10 @@ def _verify_target_closure(
     if not distributions and not any(lines for _, _, lines in roots):
         return
 
+    environment = _target_marker_environment(os_name, arch, python_version, base_config)
     request = {
-        "environment": _target_marker_environment(
-            os_name, arch, python_version, base_config
-        ),
+        "environment": environment,
+        "hosts": host_environments(environment, version_established, host_os_name),
         "distributions": distributions,
         "roots": roots,
         "constraints": constraint_lines,

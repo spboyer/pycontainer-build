@@ -157,17 +157,22 @@ closed on `platform_release`, `platform_version`, unknown variables, or
 pip's vendored `packaging`; a self-test refuses to install if that changes.
 Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
-target-active roots, transitive `Requires-Dist`, versions, extras, and
-`Requires-Python` using pip's vendored `packaging`; `venv_markers.py` collects
-project roots and checks unparsed sources. The verifier never imports staged
-packages and fails closed on unknown markers, egg distributions, invalid
-metadata, direct URLs, and patch-dependent `Requires-Python` without a full
+target-active roots, transitive `Requires-Dist`, versions, extras, constraint
+files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
+collects project roots, plausible venv hosts and checks unparsed sources. The
+verifier never imports staged packages and fails closed on unknown markers, egg
+distributions, missing or unsupported `Metadata-Version`, invalid metadata,
+direct URLs, and patch-dependent `Requires-Python` without a full
 `PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
-can contain credentials. Unrecorded extras and optional groups fail closed
-when their target-active requirements are unsatisfied. Loose modules without
-metadata remain unverified; host-only packages remain staged. Unparsed root
-sources with host markers and unreadable dynamic dependencies fail closed.
-Unmarked declarations in those unparsed sources are not verified.
+can contain credentials. An unrecorded extra or optional group is ruled out
+only if every plausible Windows/Linux/macOS CPython host (narrowed by the
+`lib/pythonX.Y` or `Lib` site-packages layout; `python_version` shared only when
+the venv minor is established) would have installed one of its missing
+requirements; otherwise unsatisfied target-active requirements fail closed.
+Loose modules without metadata remain unverified; host-only packages remain
+staged. Unparsed root sources with host markers and unreadable dynamic
+dependencies fail closed. Unmarked declarations in those unparsed sources are
+not verified.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

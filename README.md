@@ -352,19 +352,23 @@ pycontainer build \
   cannot be re-resolved, so its closure is verified for each target instead.
   Requirements-file and pyproject roots and installed `Requires-Dist` metadata
   are checked for missing packages, version mismatches, and requested extras;
-  `Requires-Python` is also checked. Every installed `.dist-info` needs valid
-  `METADATA`. Direct URLs, egg distributions, unknown markers, and
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
-  Virtualenvs do not record selected extras or groups. If an extra or group
-  may have been selected and its target requirements are not satisfied,
-  verification fails rather than guessing. Direct URL installation metadata
-  is rejected because it can contain credentials. Host-only packages remain in
-  the image, and loose modules without package metadata are copied unverified.
-  `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies, and
-  Poetry, PDM, Hatch, setuptools or Flit tables mentioning host markers fail,
-  as do unreadable dynamic dependencies. Unmarked declarations in those
-  unparsed sources are not verified. Use a requirements file when a
-  virtualenv cannot be verified.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout limits the hosts to Linux
+  and macOS, and `Lib/site-packages` to Windows. Otherwise, if its target
+  requirements are not satisfied, verification fails rather than guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery

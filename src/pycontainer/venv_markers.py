@@ -2,7 +2,7 @@
 import re
 import tomllib
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 # Marker variables whose value can differ between the venv host and the target.
 _HOST_MARKER_TEXT = re.compile(
@@ -11,7 +11,54 @@ _HOST_MARKER_TEXT = re.compile(
     r"platform_python_implementation|python_full_version)\b|['\"]platform['\"]\s*[:=]"
 )
 _UNPARSED_TOOL_TABLES = ("poetry", "pdm", "hatch", "setuptools", "flit")
+# Values a staged virtualenv shares with the target: it must be CPython of the target minor.
+_SHARED_VARIABLES = {
+    "implementation_name",
+    "platform_python_implementation",
+    "python_version",
+}
+# Plausible hosts that created the virtualenv; an unrequested extra must be provable on each.
+_VENV_HOSTS = (
+    ("win32", "Windows", "nt", ("AMD64", "ARM64", "x86")),
+    ("linux", "Linux", "posix", ("x86_64", "aarch64")),
+    ("darwin", "Darwin", "posix", ("x86_64", "arm64")),
+)
+
+_POSIX_LIB_DIR = re.compile(r"python\d+\.\d+t?")
+
 RootGroup = Tuple[str, bool, List[str]]
+
+
+def venv_layout_os(site_root: Tuple[str, ...]) -> Optional[str]:
+    """Infer the creating host's os_name from the site-packages layout, if recognizable."""
+    if (
+        len(site_root) >= 3
+        and _POSIX_LIB_DIR.fullmatch(site_root[-2])
+        and site_root[-3] in ("lib", "lib64")
+    ):
+        return "posix"
+    if len(site_root) >= 2 and site_root[-2] == "Lib":
+        return "nt"
+    return None
+
+
+def host_environments(
+    environment: dict, shared_python_version: bool, host_os_name: Optional[str]
+) -> List[dict]:
+    """Marker environments of the plausible hosts that created the virtualenv."""
+    shared = _SHARED_VARIABLES if shared_python_version else _SHARED_VARIABLES - {"python_version"}
+    return [
+        {
+            **{key: environment[key] for key in shared if key in environment},
+            "sys_platform": sys_platform,
+            "platform_system": system,
+            "os_name": os_name,
+            "platform_machine": machine,
+        }
+        for sys_platform, system, os_name, machines in _VENV_HOSTS
+        if host_os_name in (None, os_name)
+        for machine in machines
+    ]
 
 
 def _string_list(value) -> List[str]:

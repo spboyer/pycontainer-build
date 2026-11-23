@@ -72,7 +72,8 @@ def main():
             not matching.evaluate(probe)
             or opposite.evaluate(probe)
             or unknown_variables != {"platform_release"}
-            or marker_info(Marker('extra == "Foo_Bar"'))[1:] != ({"foo-bar"}, {"Foo_Bar"})
+            or marker_info(Marker('extra == "Foo_Bar"'))[1] != {"foo-bar"}
+            or len(marker_info(Marker('extra == "Foo_Bar"'))[2]) != 1
             or not Marker('extra == "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
             or Marker('extra != "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
         ):
@@ -87,9 +88,7 @@ def main():
         if message not in problems:
             problems.append(message)
 
-    def active(requirement, extra, label):
-        if requirement.parsed.marker is None:
-            return extra == ""
+    def evaluate(requirement, extra, env, label):
         if extra:
             # Older vendored packaging compares extra spellings literally, so
             # evaluate with the marker's own spelling of the canonical extra.
@@ -102,7 +101,38 @@ def main():
                     f"extra [{extra}] inconsistently"
                 )
             extra = next(iter(spellings), extra)
-        return requirement.parsed.marker.evaluate(dict(environment, extra=extra))
+        return requirement.parsed.marker.evaluate(dict(env, extra=extra))
+
+    def active(requirement, extra, label):
+        if requirement.parsed.marker is None:
+            return extra == ""
+        return evaluate(requirement, extra, environment, label)
+
+    hosts = request.get("hosts", [])
+
+    def host_state(requirement, extra, host, label):
+        if requirement.parsed.marker is None:
+            return extra == ""
+        if not requirement.info[0] <= set(host) | {"extra"}:
+            return None
+        return evaluate(requirement, extra, host, label)
+
+    def unrequested(missing, extra, label):
+        """Whether every plausible venv host would have installed one of `missing` for it."""
+        return bool(missing and hosts) and all(
+            any(
+                host_state(requirement, extra, host, label) is True
+                and (not extra or host_state(requirement, "", host, label) is False)
+                for requirement in missing
+            )
+            for host in hosts
+        )
+
+    def not_installed(requirements):
+        return [
+            requirement for requirement in requirements
+            if canonicalize_name(requirement.parsed.name) not in dists
+        ]
 
     def unsatisfied(requirement, label):
         parsed = requirement.parsed
@@ -243,6 +273,8 @@ def main():
         pending = [(key, "") for key in sorted(dists)]
         for label, required, lines in request["roots"]:
             requirements = [Parsed(text, label) for text in lines]
+            if not required and unrequested(not_installed(requirements), "", label):
+                continue
             for requirement in requirements:
                 if not active(requirement, "", label):
                     continue
@@ -284,6 +316,8 @@ def main():
                     for requirement in dist["requirements"]
                     if "extra" in requirement.info[0]
                 ]
+                if unrequested(not_installed(members), extra, label):
+                    continue
                 for requirement in members:
                     if not active(requirement, extra, label):
                         continue

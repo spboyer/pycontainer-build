@@ -911,8 +911,8 @@ def test_virtualenv_closure_fails_closed_without_target_marker_support(
         _stage_venv(tmp_path, monkeypatch, [("app-lib", "1.0", [])])
 
 
-def _write_base_venv(context, dists, pyvenv="version = 3.11.7\n"):
-    site_packages = context / ".venv" / "Lib" / "site-packages"
+def _write_base_venv(context, dists, pyvenv="version = 3.11.7\n", lib=("Lib",)):
+    site_packages = context.joinpath(".venv", *lib, "site-packages")
     site_packages.mkdir(parents=True, exist_ok=True)
     (context / ".venv" / "pyvenv.cfg").write_text(pyvenv)
     for name, headers in dists.items():
@@ -993,7 +993,7 @@ def test_virtualenv_project_dependency_markers_are_verified(tmp_path, monkeypatc
                 'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
             ],
             "",
-            "Cannot determine whether extra [speed]",
+            None,
         ),
         (
             [
@@ -1003,7 +1003,7 @@ def test_virtualenv_project_dependency_markers_are_verified(tmp_path, monkeypatc
                 'Requires-Dist: venv-broker; platform_system == "Linux" and extra == "broker"',
             ],
             "",
-            "Cannot determine whether extra [broker]",
+            None,
         ),
         (
             [
@@ -1160,7 +1160,7 @@ def test_virtualenv_installed_versions_must_satisfy_target_constraints(
         "venv-absent==2\n"
     )
     with pytest.raises(
-        ValueError, match=r"requirements constraints requires 'venv-root<1.*1.0 is installed"
+        ValueError, match=r"requirements constraints requires .venv-root<1.*1.0 is installed"
     ):
         _stage_base_venv(tmp_path, monkeypatch, context)
 
@@ -1198,7 +1198,7 @@ def test_virtualenv_root_versions_and_extras_are_enforced(tmp_path, monkeypatch)
         _stage_base_venv(tmp_path, monkeypatch, context)
 
 
-def test_virtualenv_optional_roots_fail_when_selection_is_unknown(tmp_path, monkeypatch):
+def test_virtualenv_optional_roots_fail_only_when_selection_is_unknown(tmp_path, monkeypatch):
     context = tmp_path / "context"
     _write_base_venv(context, {"venv-root": []})
     pyproject = context / "pyproject.toml"
@@ -1215,8 +1215,8 @@ def test_virtualenv_optional_roots_fail_when_selection_is_unknown(tmp_path, monk
         '[project.optional-dependencies]\n'
         'speed = ["not-installed", "venv-linux; sys_platform == \'linux\'"]\n'
     )
-    with pytest.raises(ValueError, match="Cannot determine whether .*speed.*not-installed"):
-        _stage_base_venv(tmp_path, monkeypatch, context)
+    # Every plausible host would have installed not-installed, so speed was not selected.
+    assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
 
     pyproject.write_text(
         '[project]\nname = "app"\n'
@@ -1280,3 +1280,29 @@ def test_virtualenv_rejects_malformed_metadata_headers(tmp_path, monkeypatch):
     builder = _builder(tmp_path, monkeypatch, context=tmp_path / "context", include_deps=True)
     with pytest.raises(ValueError, match="malformed headers"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+
+@pytest.mark.parametrize(
+    ("lib", "fails"), [(("lib", "python3.11"), False), (("Lib",), True)]
+)
+def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
+    tmp_path, monkeypatch, lib, fails
+):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {
+            "venv-root": [
+                "Provides-Extra: uvloop",
+                'Requires-Dist: venv-uvloop; sys_platform != "win32" and extra == "uvloop"',
+            ]
+        },
+        lib=lib,
+    )
+    (context / "requirements.txt").write_text("venv-root\n")
+
+    if fails:
+        with pytest.raises(ValueError, match=r"extra \[uvloop\] of venv-root"):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
