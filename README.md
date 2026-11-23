@@ -90,6 +90,20 @@ dist/image/
       └── <tag-name>              # Tag reference
 ```
 
+### Generate Deployment Artifacts
+
+After publishing an image, generate Kubernetes resources and a matching Helm
+chart, or a Compose service that references that image:
+
+```bash
+pycontainer generate kubernetes --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --service-port 80 -o deploy
+pycontainer generate compose --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --host-port 8080 -o compose.yaml
+```
+
+Generation does not run a daemon or apply resources, and refuses existing
+output. See the [deployment artifact guide](docs/deployment-artifacts.md) for
+supported fields, output safety, versions, and optional validation.
+
 ### Testing Locally
 
 **Important**: `pycontainer` creates OCI-compliant image layouts, not Docker-specific images. To test locally:
@@ -105,6 +119,10 @@ brew install skopeo  # macOS
 skopeo copy oci:dist/image docker-daemon:myapp:latest
 docker run -p 8000:8000 myapp:latest
 ```
+
+With several tags, select one explicitly, for example
+`skopeo copy oci:dist/image:myapp:stable docker-daemon:myapp:stable`; see
+[Multiple tags](docs/multiple-tags.md#output).
 
 #### Option 2: Use Podman (Native OCI Support)
 
@@ -149,8 +167,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -165,11 +183,18 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
+- ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
+  OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
+  read-only root; applied by your runtime, not enforced by the image
+  ([guide](docs/security-fragments.md))
 - ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
 - ✅ **Cross-platform builds** — Build linux/amd64 from ARM, linux/arm64 from x86, etc.
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
+- ✅ **Opt-in local history** — Inspect private build outcomes and phase timings
+- ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
+  configuration for an existing image without applying it
 
 ### Coming Soon
 
@@ -223,6 +248,7 @@ builder.build()  # Creates dist/image/
 Perfect for integration with:
 - **Azure Developer CLI (azd)** — Custom build strategies ([docs](docs/azd-integration.md))
 - **GitHub Actions** — Automated CI/CD workflows ([docs](docs/github-actions.md))
+- **GitLab CI, Jenkins, CircleCI** — Standalone pipeline examples ([GitLab](docs/ci/gitlab.md), [Jenkins](docs/ci/jenkins.md), [CircleCI](docs/ci/circleci.md))
 - **Poetry/Hatch** — Build plugins ([plugins](plugins/))
 - **VS Code** — Extension for container builds ([plugin](plugins/vscode-pycontainer/))
 - **AI agents** — Copilot, MCP servers, automated scaffolding
@@ -281,6 +307,27 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Skaffold and Tilt
+
+Use pycontainer as a custom builder for the Kubernetes inner loop. It builds
+without a Docker daemon and pushes to a registry the cluster pulls from:
+
+```yaml
+# skaffold.yaml (build.local.push: true is required)
+custom:
+  buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+```
+
+```python
+# Tiltfile
+custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
+             deps=['app'], skips_local_docker=True)
+```
+
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and
+multi-platform requests are rejected. Plain HTTP requires per-host opt-in.
+[See full documentation →](docs/skaffold-tilt.md)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:
@@ -288,6 +335,11 @@ Install from VS Code Marketplace or command palette:
 - "Build and Push Container Image"
 
 [See full documentation →](plugins/vscode-pycontainer/)
+
+### Other editors and task runners
+
+Project-scoped PyCharm, Vim, Emacs, GNU Make, and Go Task examples are
+available in the [integration examples](examples/editor-task-runners/).
 
 ---
 
@@ -330,7 +382,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
 - `--include-deps` — Stage importable dependencies from a venv or install a
   requirements file as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
@@ -340,9 +392,120 @@ pycontainer build \
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
   distributions, cross-compilation, and lockfile resolution are not supported.
+  Generated Linux console scripts use UTF-8 and LF line endings on every host,
+  including Windows, and retain executable mode in the dependency layer.
+  Copied application files are not normalized.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Environment markers in the requirements file and in transitive
+  `Requires-Dist` metadata are evaluated for the target (`linux`, the target
+  machine, CPython and the base image's Python version), not the build host.
+  Markers on `platform_release` or `platform_version`, and on
+  `python_full_version` when the base image does not declare a full
+  `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
+  Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
+  `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
+  placeholders in the requirements file, including in URL paths. Literal
+  credentials in requirements files (URL userinfo, secret-like query values
+  and recognized URL path tokens) are rejected, and host pip settings that
+  could change target selection (for example `PIP_PLATFORM` or
+  `PIP_NO_BINARY`) are ignored; see
+  [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to requirements and
+  virtualenv staging alike.
+- **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
+  `conda-lock.yml`, and `conda-meta/` directories in the context. With
+  `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
+  selected pip requirements file takes precedence over a venv, with a warning
+  that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
+  ordinary Conda projects still build application-only images. Host Conda
+  prefixes are never copied, even with explicit includes or
+  `--no-default-excludes`; a context inside a Conda prefix requires a source-only
+  context instead. See the [export workaround](docs/local-development.md#conda-projects).
+  Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+### Local base images
+
+`--base-image` (and `base_image` in `[build]`) can read a base image from disk
+without a registry, credentials, or a Docker daemon:
+
+```bash
+# OCI image layout (for example `skopeo copy docker://python:3.11-slim oci:base:3.11-slim`)
+pycontainer build --tag app:v1 --base-image oci:./base:3.11-slim
+pycontainer build --tag app:v1 --base-image oci:./base@sha256:<manifest-digest>
+
+# A previous pycontainer output is itself an OCI layout
+pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./dist/v2
+
+# Uncompressed `docker save` archive (legacy and Docker 25+ formats)
+pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). For a single-entry index,
+  either annotation on the index itself can also identify the entry. The
+  reference may be omitted when the layout holds one image, or a set of images
+  that all carry platform metadata. Nested image indexes use the same exact
+  OS/architecture/variant selection as registry pulls.
+- `docker-archive:<path>[:<repo-tag>]` selects a `manifest.json` entry by
+  `RepoTags`, normalized like registry references (`python:3.11-slim` matches
+  `docker.io/library/python:3.11-slim`). The tag may be omitted when the archive
+  holds one image.
+- The path ends at the first `:` after an optional Windows drive prefix, so
+  paths containing `:` are not supported. Relative paths resolve against the
+  current directory, and the source must not overlap `--output`.
+- Every blob is checked against its digest and size, and every base layer is
+  checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
+  more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+  Each OCI index, including nested indexes, is limited to 1,000 entries.
+  Layers are limited to 64 GiB (including decompressed content); Docker archive
+  member sizes are checked before any selected image blobs are staged.
+- Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
+  are not supported; extract or decompress them first.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
@@ -365,6 +528,22 @@ exclude-defaults = true
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
 
+**Local Build History**:
+
+```bash
+pycontainer build --record-history
+pycontainer history list
+pycontainer history clear
+```
+
+History is disabled by default. It records only a random run ID, UTC start
+time, outcome, and timings, never build configuration or error text. Use
+`--history-dir PATH` to select a directory outside the build context and OCI
+output; specifying a directory alone does not enable recording. For a build
+configured with `record-history = true`, `--no-record-history` disables it.
+See the [build history guide](docs/build-history.md) for retention, privacy,
+error handling, and custom-directory inspection.
+
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
 - `--label KEY=VALUE` — Set an image-config label; repeat to add labels
@@ -376,6 +555,9 @@ exclude-defaults = true
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
   `linux/arm64` or `linux/arm/v7`)
+- `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
+  as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
+- `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
@@ -388,6 +570,19 @@ the image manifest, not that layout index. Metadata is visible to image
 consumers and registries: **do not put secrets in labels or annotations**.
 See [metadata configuration and integration details](docs/metadata.md).
 
+**Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
+- `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
+  (repeatable; `[build] insecure-registries = [...]`). Each build that uses
+  one logs a warning. Credentials are sent over HTTP only to loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); any other HTTP registry must be
+  anonymous.
+- `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
+  HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
+  there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
+
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
 not affect the image manifest digest. Inventory contains Python distributions
@@ -396,8 +591,34 @@ inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
-- Invalidates on file content changes (mtime + size checks)
+- Invalidates when file contents, relative paths, permission bits, the
+  workdir or reproducibility settings change (mtime is ignored for
+  reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Saving and restoring the cache (offline export/import):** the `--cache-dir`
+directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only
+relative source paths, so it can be archived or saved by CI (for example with
+`actions/cache`) and restored to a different absolute path and checkout
+location. A restored cache produces cache hits and an identical OCI manifest,
+config and layers. Partial restores are handled as follows:
+
+- Blobs without `index.json`: a clean miss; the layer is rebuilt and indexed.
+- `index.json` with missing or corrupt blobs: those entries are discarded and
+  rebuilt.
+- Malformed `index.json`: the build fails with `CacheIndexError`; delete the
+  reported `index.json` (cached layers are rebuilt) or rerun with `--no-cache`.
+- Concurrent builds may share a restored directory; index updates are locked.
+
+Caches are portable between machines of the same OS, not across operating
+systems: Windows reports source files as mode `0o666`, Linux checkouts as
+`0o644`/`0o755`, and the mode is recorded in the layer, so a cache saved on
+Windows misses on Linux (and vice versa) by design. Windows checkouts with
+`core.autocrlf` also change file content. Key saved caches on the OS. Blobs
+left without an index entry are not counted or evicted; delete the directory to
+reclaim them. See [GitHub Actions](docs/github-actions.md#caching-application-layers).
 
 ### Python API
 
@@ -459,8 +680,50 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+#### Stop signal and volumes
+
+`stop_signal` (`--stop-signal`) and `volumes` (`--volume`, repeatable) set the
+OCI image config `StopSignal` and `Volumes` fields:
+
+```toml
+[build]
+stop_signal = "SIGINT"
+volumes = ["/data", "/var/cache/app"]
+```
+
+- When unset, the base image's `StopSignal` and `Volumes` are inherited
+  unchanged. A configured `stop_signal` replaces the base value.
+- Configured volumes are merged with the base volumes as a sorted,
+  de-duplicated set, so the config digest is deterministic. Base volumes
+  cannot be removed. `--volume` values replace (not extend) the file's list.
+- Signals must be canonical Linux names (`SIGTERM`, not `term`, `15` or
+  `sigterm`). Volume paths must be absolute, normalized Linux paths; `/`,
+  relative paths, `.`/`..` segments, backslashes, trailing slashes and control
+  characters are rejected.
+- Volumes are image metadata only: pycontainer does not create mounts, and the
+  container runtime decides how to back them. The stop signal is honored only by
+  runtimes that read it, such as `docker stop`.
+- These are config fields, not OCI labels; `labels` are unaffected.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
+
+Optional `[build.security.kubernetes]` and `[build.security.oci]` tables
+(`[tool.pycontainer.security.*]` in `pyproject.toml`) write deployment
+fragments to `<output_dir>/security/` without changing the image. They are
+not enforced by the image; see [runtime security
+fragments](docs/security-fragments.md) for the schema, supported versions and
+how to apply them.
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -556,6 +819,9 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
+- **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
@@ -621,8 +887,11 @@ This style is intentional for the experimental phase.
 ### Documentation
 
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
+- **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 

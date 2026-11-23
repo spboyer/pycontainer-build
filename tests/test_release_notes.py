@@ -154,6 +154,25 @@ def test_release_notes_label_overrides_base_and_keeps_label_precedence(tmp_path,
     assert list(labels) == sorted(labels)
 
 
+def test_release_notes_coexist_with_runtime_config(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    (context / "notes.md").write_text("notes", encoding="utf-8")
+    base_config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {"Env": [], "StopSignal": "SIGQUIT", "Volumes": {"/base": {}}},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }
+    _, image_config = _build(
+        tmp_path, monkeypatch, base_config=base_config, release_notes_file="notes.md",
+        stop_signal="SIGTERM", volumes=["/data"],
+    )
+    config = image_config["config"]
+    assert config["Labels"][DEFAULT_RELEASE_NOTES_LABEL] == "notes"
+    assert config["StopSignal"] == "SIGTERM"
+    assert config["Volumes"] == {"/base": {}, "/data": {}}
+
+
 def test_crlf_and_lf_release_notes_produce_identical_digests(tmp_path, monkeypatch):
     _context(tmp_path)
     crlf = tmp_path / "crlf.md"

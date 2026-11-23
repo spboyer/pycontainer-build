@@ -20,7 +20,9 @@ from pycontainer.oci import (
     build_index_json,
     build_manifest_json,
 )
-from pycontainer.registry_client import RegistryClient, RegistryRequestError
+from pycontainer.registry_client import (
+    RegistryClient, RegistryQuotaError, RegistryRateLimitError, RegistryRequestError,
+)
 
 
 REF_NAME = "org.opencontainers.image.ref.name"
@@ -173,6 +175,47 @@ def test_single_image_metadata_inheritance_serialization_and_digests(
     output_text = capsys.readouterr()
     for value in ("label-secret", "manifest-secret", "index-secret"):
         assert value not in output_text.out + output_text.err
+
+
+def test_configured_stop_signal_and_volumes_coexist_with_metadata(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    _mock_base_image(monkeypatch, {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Env": [],
+            "Labels": {"shared": "base", "base-only": "base"},
+            "StopSignal": "SIGQUIT",
+            "Volumes": {"/data": {}},
+        },
+        "rootfs": {"type": "layers", "diff_ids": []},
+    })
+    builder = ImageBuilder(BuildConfig(
+        tag="example:v1",
+        context_dir=str(context),
+        output_dir=str(tmp_path / "output"),
+        use_cache=False,
+        labels={"shared": "explicit"},
+        manifest_annotations={"example.manifest": "one"},
+        stop_signal="SIGTERM",
+        volumes=["/cache"],
+    ))
+    builder.build()
+
+    blobs = tmp_path / "output" / "blobs" / "sha256"
+    manifest_bytes = (blobs / builder.manifest_digest.split(":", 1)[1]).read_bytes()
+    manifest = json.loads(manifest_bytes)
+    config_bytes = (blobs / builder.config_digest.split(":", 1)[1]).read_bytes()
+    image_config = json.loads(config_bytes)["config"]
+
+    assert manifest["config"]["digest"] == _digest(config_bytes)
+    assert manifest["config"]["size"] == len(config_bytes)
+    assert manifest["annotations"] == {"example.manifest": "one"}
+    assert image_config["Labels"] == {"shared": "explicit", "base-only": "base"}
+    assert image_config["StopSignal"] == "SIGTERM"
+    assert image_config["Volumes"] == {"/cache": {}, "/data": {}}
 
 
 def test_metadata_targets_change_only_their_content_addressed_objects(tmp_path, monkeypatch):
@@ -403,9 +446,12 @@ def test_null_base_labels_are_accepted_but_invalid_labels_are_rejected():
 @pytest.mark.parametrize(
     "operation", ["pull", "push_manifest", "push_index", "blob_head", "upload_init"]
 )
-def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, operation):
+@pytest.mark.parametrize(
+    "payload",
+    [b"metadata-secret", b'{"errors":[{"code":"DENIED","message":"metadata-secret"}]}'],
+)
+def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, operation, payload):
     client = RegistryClient("registry.example", "example")
-    payload = b"metadata-secret"
     monkeypatch.setattr(
         client, "_make_request", lambda *args, **kwargs: (400, payload, {})
     )
@@ -418,6 +464,26 @@ def test_registry_manifest_errors_do_not_echo_response_metadata(monkeypatch, ope
             client.initiate_blob_upload()
         else:
             getattr(client, operation)("latest", payload)
+    assert "metadata-secret" not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "detail", "error_type"),
+    [
+        (429, "TOOMANYREQUESTS", "metadata-secret", RegistryRateLimitError),
+        (400, "DENIED", "storage quota exceeded metadata-secret", RegistryQuotaError),
+    ],
+)
+def test_registry_classification_keeps_metadata_values_hidden(
+    monkeypatch, status, code, detail, error_type
+):
+    client = RegistryClient("registry.example", "example")
+    payload = json.dumps({"errors": [{"code": code, "message": detail}]}).encode()
+    monkeypatch.setattr(
+        client, "_make_request", lambda *args, **kwargs: (status, payload, {})
+    )
+    with pytest.raises(error_type) as error:
+        client.push_manifest("latest", b"{}")
     assert "metadata-secret" not in "".join(traceback.format_exception(error.value))
 
 

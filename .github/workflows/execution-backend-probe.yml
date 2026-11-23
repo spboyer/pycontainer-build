@@ -1,0 +1,299 @@
+name: Execution backend host probe
+
+# Observational probe for the isolated execution backend design (#22, #31, #63).
+# It records host prerequisites on GitHub-hosted runners and never fails on a
+# missing prerequisite. It changes no host settings and installs nothing.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/execution-backend-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Host probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      PROBE_OS: ${{ matrix.os }}
+    steps:
+      - name: Record execution backend prerequisites
+        run: |
+          set +e
+          set +o pipefail
+          out="$RUNNER_TEMP/host-probe-$PROBE_OS.md"
+          tmp="$(mktemp -d "$RUNNER_TEMP/probe.XXXXXX")"
+
+          probe() {
+            local label="$1"; shift
+            printf '#### %s\n\n```text\n' "$label" >>"$out"
+            "$@" >>"$out" 2>&1
+            local rc=$?
+            printf '[exit %s]\n```\n\n' "$rc" >>"$out"
+          }
+
+          host_info() {
+            uname -srvm
+            . /etc/os-release && echo "$PRETTY_NAME"
+            echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+            id
+          }
+
+          apparmor_state() {
+            echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>&1)"
+            for f in /proc/sys/kernel/apparmor_restrict_unprivileged_userns \
+                     /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined \
+                     /proc/sys/kernel/unprivileged_userns_clone \
+                     /proc/sys/user/max_user_namespaces; do
+              echo "$f = $(cat "$f" 2>&1)"
+            done
+            echo "profiles:"
+            ls /etc/apparmor.d | grep -Ei '^(crun|runc|runsc|bwrap|unshare|podman|buildah|slirp4netns|pasta|passt|unprivileged_userns)$' \
+              || echo "no matching profiles"
+          }
+
+          apparmor_attachments() {
+            for p in crun runc podman buildah unprivileged_userns; do
+              echo "== /etc/apparmor.d/$p"
+              grep -nE '^[[:space:]]*(profile|userns)' "/etc/apparmor.d/$p"
+            done
+            for b in crun runc; do
+              command -v "$b" >/dev/null && echo "$b resolves to $(readlink -f "$(command -v "$b")")"
+            done
+          }
+
+          userns_single() {
+            unshare --user --map-root-user sh -c '
+              id; cat /proc/self/uid_map
+              echo "apparmor label: $(cat /proc/self/attr/apparmor/current 2>/dev/null || cat /proc/self/attr/current)"
+              grep CapEff /proc/self/status'
+          }
+
+          userns_mount() {
+            mkdir -p "$tmp/m"
+            unshare --user --map-root-user --mount sh -c 'mount -t tmpfs probe "$1" && echo tmpfs-mount-ok' sh "$tmp/m"
+          }
+
+          overlay_userxattr() {
+            mkdir -p "$tmp/ov/l/d" "$tmp/ov/u" "$tmp/ov/w" "$tmp/ov/m"
+            echo base >"$tmp/ov/l/f"
+            unshare --user --map-root-user --mount sh -c '
+              mount -t overlay overlay -o "lowerdir=$1/l,upperdir=$1/u,workdir=$1/w,userxattr" "$1/m" || exit 1
+              echo overlay-userxattr-ok
+              rm "$1/m/f" && rm -r "$1/m/d" && mkdir "$1/m/d" && echo whiteout-and-opaque-ok
+              ls -la "$1/u"
+              getfattr -d -m - "$1/u/f" "$1/u/d" 2>&1' sh "$tmp/ov"
+          }
+
+          userns_multi() {
+            unshare --user --map-auto sh -c 'echo uid_map:; cat /proc/self/uid_map; echo gid_map:; cat /proc/self/gid_map'
+          }
+
+          subids() {
+            local u; u="$(id -un)"
+            grep -E "^(${u}|$(id -u)):" /etc/subuid /etc/subgid || echo "no subuid/subgid entries for ${u}"
+            wc -l /etc/subuid /etc/subgid
+            for b in newuidmap newgidmap getsubids; do
+              p="$(command -v "$b")" && ls -l "$p" || echo "$b: not found"
+            done
+            getcap /usr/bin/newuidmap /usr/bin/newgidmap 2>&1
+          }
+
+          cgroup_self() {
+            echo "fs: $(stat -fc %T /sys/fs/cgroup)"
+            echo "root controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+            echo "self: $(cat /proc/self/cgroup)"
+            local cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -n1)"
+            ls -ld "$cg"
+            echo "own controllers: $(cat "$cg/cgroup.controllers")"
+            echo "own subtree_control: $(cat "$cg/cgroup.subtree_control")"
+            if [ -w "$cg/cgroup.procs" ]; then echo "own cgroup.procs writable"; else echo "own cgroup.procs not writable"; fi
+          }
+
+          cgroup_user_slice() {
+            local u; u="$(id -u)"
+            local p="/sys/fs/cgroup/user.slice/user-$u.slice/user@$u.service"
+            ls -ld "$p"
+            echo "user@ controllers: $(cat "$p/cgroup.controllers" 2>&1)"
+            echo "user@ active: $(systemctl is-active "user@$u.service" 2>&1)"
+            loginctl show-user "$u" -p State -p Linger
+            systemctl show "user@$u.service" -p Delegate -p DelegateControllers
+            ls /etc/systemd/system/user@.service.d/ 2>&1
+            echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
+          }
+
+          cgroup_transient_scope() {
+            timeout 20 systemd-run --user --scope --quiet -p MemoryMax=64M -p TasksMax=32 \
+              sh -c 'cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$cg"; cat "$cg/memory.max" "$cg/pids.max"'
+          }
+
+          binfmt_handlers() {
+            ls /proc/sys/fs/binfmt_misc/
+            echo "status: $(cat /proc/sys/fs/binfmt_misc/status 2>&1)"
+            for f in /proc/sys/fs/binfmt_misc/*; do
+              case "${f##*/}" in register|status) continue ;; esac
+              echo "== ${f##*/}"
+              grep -E '^(enabled|interpreter|flags)' "$f"
+            done
+            ls /usr/lib/binfmt.d /etc/binfmt.d 2>&1
+            dpkg-query -W -f='${Package} ${Version}\n' 'qemu-user*' binfmt-support 2>&1
+          }
+
+          tool_availability() {
+            for b in crun runc runsc bwrap podman buildah docker containerd skopeo umoci pasta slirp4netns unshare newuidmap jq; do
+              p="$(command -v "$b")" || { echo "$b: not found"; continue; }
+              pkg="$(dpkg -S "$(readlink -f "$p")" 2>/dev/null | cut -d: -f1 | head -n1)"
+              echo "$b: $p (${pkg:-no dpkg owner}) :: $("$b" --version 2>&1 | head -n1)"
+            done
+          }
+
+          runtime_features() {
+            for b in runc crun; do
+              command -v "$b" >/dev/null || { echo "$b: not found"; continue; }
+              echo "== $b"
+              sha256sum "$(readlink -f "$(command -v "$b")")"
+              "$b" features >"$tmp/$b-features.json" 2>&1
+              echo "features exit $?"
+              jq -c '{ociVersionMin, ociVersionMax, namespaces: .linux.namespaces, seccomp: .linux.seccomp.enabled, cgroup: .linux.cgroup, mountExtensions: .linux.mountExtensions}' \
+                "$tmp/$b-features.json" 2>&1 || head -c 2000 "$tmp/$b-features.json"
+            done
+          }
+
+          # Throwaway rootless bundles over a read-only bind of host /usr. Runtime state
+          # lives under $RUNNER_TEMP and every container is force-deleted.
+          make_bundle() {
+            local runtime="$1" bundle="$2" filter="$3"; shift 3
+            mkdir -p "$bundle/rootfs/usr" "$bundle/rootfs/proc" "$bundle/rootfs/dev" "$bundle/rootfs/sys" "$bundle/rootfs/tmp"
+            ln -sfn usr/bin "$bundle/rootfs/bin"
+            ln -sfn usr/lib "$bundle/rootfs/lib"
+            [ -e /usr/lib64 ] && ln -sfn usr/lib64 "$bundle/rootfs/lib64"
+            (cd "$bundle" && "$runtime" spec --rootless) || return 1
+            jq "$@" '.process.terminal = false
+                | .mounts += [{"destination": "/usr", "type": "bind", "source": "/usr", "options": ["rbind", "ro"]}]
+                | '"$filter" "$bundle/config.json" >"$bundle/config.tmp" && mv "$bundle/config.tmp" "$bundle/config.json"
+          }
+
+          rootless_noop() {
+            command -v jq >/dev/null || { echo "jq not found; skipped"; return 0; }
+            for b in runc crun; do
+              command -v "$b" >/dev/null || { echo "$b: not found"; continue; }
+              make_bundle "$b" "$tmp/noop-$b" \
+                '.process.args = ["/usr/bin/sh", "-c", "id; cat /proc/self/uid_map; grep CapEff /proc/self/status"]' \
+                || { echo "$b spec failed"; continue; }
+              echo "== $b run"
+              timeout 30 "$b" --root "$tmp/state-$b" run --bundle "$tmp/noop-$b" "probe-$b" </dev/null
+              echo "$b run exit $?"
+              "$b" --root "$tmp/state-$b" delete --force "probe-$b" >/dev/null 2>&1
+            done
+          }
+
+          # The overlay mount happens inside crun's user namespace, which is how a
+          # backend step would build its private rootfs. overlayfs creates its work
+          # directory with mode 0000, so the mounter also needs CAP_DAC_OVERRIDE.
+          crun_overlay_whiteout() {
+            command -v crun >/dev/null && command -v jq >/dev/null || { echo "crun or jq not found; skipped"; return 0; }
+            local ov="$tmp/ov-crun"
+            mkdir -p "$ov/l/d" "$ov/u" "$ov/w" "$ov/m"
+            echo base >"$ov/l/f"
+            echo keep >"$ov/l/d/x"
+            local script='grep CapEff /proc/self/status
+          python3 -c "import ctypes, os, sys; libc = ctypes.CDLL(None, use_errno=True); a = [s.encode() for s in sys.argv[1:]]; r = libc.mount(a[0], a[1], a[2], 0, a[3]); print(r, os.strerror(ctypes.get_errno()))" overlay /ov/m overlay lowerdir=/ov/l,upperdir=/ov/u,workdir=/ov/w,userxattr
+          umount /ov/m 2>/dev/null
+          mount -t tmpfs t /tmp && mkdir -p /tmp/l/d /tmp/u /tmp/w /tmp/m && echo base >/tmp/l/f && echo keep >/tmp/l/d/x && echo tmpfs-ok
+          for base in /ov /tmp; do
+            echo "== upper on $base"
+            mount -t overlay overlay -o lowerdir=$base/l,upperdir=$base/u,workdir=$base/w,userxattr $base/m || continue
+            echo overlay-userxattr-ok
+            rm $base/m/f && rm -r $base/m/d && mkdir $base/m/d && echo whiteout-and-opaque-ok
+            umount $base/m
+            ls -la $base/u
+            python3 -c "import os, sys; [print(p, {n: os.getxattr(p, n, follow_symlinks=False) for n in os.listxattr(p, follow_symlinks=False)}) for p in sys.argv[1:]]" $base/u/f $base/u/d
+          done'
+            make_bundle crun "$tmp/ovb" \
+              '.process.args = ["/usr/bin/sh", "-c", $script]
+               | .process.capabilities.bounding += $caps
+               | .process.capabilities.effective += $caps
+               | .process.capabilities.permitted += $caps
+               | .mounts += [{"destination": "/ov", "type": "bind", "source": $ov, "options": ["rbind", "rw"]}]' \
+              --arg script "$script" --arg ov "$ov" \
+              --argjson caps '["CAP_SYS_ADMIN", "CAP_DAC_OVERRIDE"]' || { echo "spec failed"; return 1; }
+            timeout 30 crun --root "$tmp/state-ov" run --bundle "$tmp/ovb" probe-ov </dev/null
+            echo "crun run exit $?"
+            crun --root "$tmp/state-ov" delete --force probe-ov >/dev/null 2>&1
+            echo "host view of upper dir:"
+            ls -la "$ov/u"
+            echo "filesystem of upper dir: $(stat -fc %T "$ov/u")"
+            echo "kernel log:"
+            journalctl -k --since "-3 min" --no-pager 2>&1 | grep -iE 'overlay|apparmor' | tail -n 20
+          }
+
+          crun_cgroup_limits() {
+            command -v crun >/dev/null && command -v jq >/dev/null || { echo "crun or jq not found; skipped"; return 0; }
+            make_bundle crun "$tmp/nobus" '.process.args = ["/usr/bin/true"] | .linux.resources = {"pids": {"limit": 32}}' \
+              || { echo "spec failed"; return 1; }
+            env -u DBUS_SESSION_BUS_ADDRESS timeout 30 crun --cgroup-manager=systemd --root "$tmp/state-nobus" run --bundle "$tmp/nobus" probe-nobus </dev/null
+            echo "systemd cgroup manager without DBUS_SESSION_BUS_ADDRESS: exit $?"
+            crun --root "$tmp/state-nobus" delete --force probe-nobus >/dev/null 2>&1
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            local st="$tmp/state-cg"
+            make_bundle crun "$tmp/cg" \
+              '.process.args = ["/usr/bin/sleep", "60"] | .linux.resources = {"memory": {"limit": 67108864}, "pids": {"limit": 32}}' \
+              || { echo "spec failed"; return 1; }
+            crun --cgroup-manager=systemd --root "$st" run --detach --bundle "$tmp/cg" probe-cg </dev/null >/dev/null
+            echo "detached run exit $?"
+            local pid; pid="$(crun --root "$st" state probe-cg | jq -r .pid)"
+            local cgp="/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")"
+            echo "cgroup: $cgp"
+            echo "memory.max=$(cat "$cgp/memory.max") pids.max=$(cat "$cgp/pids.max")"
+            crun --root "$st" kill probe-cg KILL
+            sleep 2
+            crun --root "$st" delete --force probe-cg
+            echo "after kill+delete: process $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone), cgroup $([ -d "$cgp" ] && echo present || echo removed)"
+            echo "containers left: $(crun --root "$st" list -q | wc -l)"
+
+            make_bundle crun "$tmp/oom" \
+              '.process.args = ["/usr/bin/python3", "-c", "bytearray(256 * 1024 * 1024)"] | .linux.resources = {"memory": {"limit": 67108864, "swap": 67108864}}' \
+              || { echo "spec failed"; return 1; }
+            timeout 60 crun --cgroup-manager=systemd --root "$tmp/state-oom" run --bundle "$tmp/oom" probe-oom </dev/null
+            echo "256 MiB allocation under a 64 MiB limit: exit $? (137 means killed by the limit)"
+            echo "kernel OOM log: $(journalctl -k --since "-2 min" --no-pager 2>&1 | grep -iE 'oom-kill|Memory cgroup out of memory' | tail -n 2)"
+            crun --root "$tmp/state-oom" delete --force probe-oom >/dev/null 2>&1
+          }
+
+          printf '## Execution backend host probe: %s\n\nObservational only: no host settings changed, nothing installed.\n\n' "$PROBE_OS" >"$out"
+          probe "Host" host_info
+          probe "AppArmor user namespace restriction" apparmor_state
+          probe "AppArmor profile attachments" apparmor_attachments
+          probe "Unconfined unshare: single-id map" userns_single
+          probe "Unconfined unshare: tmpfs mount" userns_mount
+          probe "Unconfined unshare: overlay with userxattr" overlay_userxattr
+          probe "Unconfined unshare: multi-id map via newuidmap (--map-auto)" userns_multi
+          probe "subuid/subgid and id-map helpers" subids
+          probe "cgroup v2 (own cgroup)" cgroup_self
+          probe "cgroup v2 (user slice delegation)" cgroup_user_slice
+          probe "systemd --user transient scope with limits" cgroup_transient_scope
+          probe "binfmt_misc handlers" binfmt_handlers
+          probe "Runtime and helper availability" tool_availability
+          probe "OCI runtime features" runtime_features
+          probe "Rootless no-op container" rootless_noop
+          probe "crun: overlay whiteout and opaque directory in the container user namespace" crun_overlay_whiteout
+          probe "crun: systemd cgroup limits, kill and delete" crun_cgroup_limits
+
+          chmod -R u+rwX "$tmp" 2>/dev/null
+          rm -rf "$tmp" 2>/dev/null
+          cat "$out" >>"$GITHUB_STEP_SUMMARY"
+          cat "$out"
+          exit 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: execution-backend-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/host-probe-${{ matrix.os }}.md
+          retention-days: 30
