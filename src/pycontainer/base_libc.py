@@ -65,6 +65,17 @@ class _BoundedTarInfo(tarfile.TarInfo):
         self._check_extended_header()
         return super()._proc_gnulong(archive)
 
+    def _apply_pax_info(self, pax_headers, encoding, errors):
+        # Validate before tarfile normalizes or uses a supplemental size.
+        size = pax_headers.get("size")
+        if size is not None:
+            if not size.isascii() or not size.isdecimal():
+                raise ValueError("Base libc inspection found an invalid tar member size.")
+            normalized = size.lstrip("0") or "0"
+            if len(normalized) > len(str(MAX_LAYER_BYTES)) or int(normalized) > MAX_LAYER_BYTES:
+                raise ValueError("Base libc inspection found an invalid tar member size.")
+        return super()._apply_pax_info(pax_headers, encoding, errors)
+
 
 def _path(name):
     path = PurePosixPath(name)
@@ -105,13 +116,7 @@ def _layer_records(layer, deadline):
                 _check_deadline(deadline)
                 if index > MAX_LAYER_MEMBERS:
                     raise ValueError("Base libc inspection exceeds the layer member limit.")
-                pax_size = member.pax_headers.get("size")
-                if member.size < 0 or (
-                    pax_size is not None and (
-                        not pax_size.isascii() or not pax_size.isdecimal()
-                        or (pax_size.lstrip("0") or "0") != str(member.size)
-                    )
-                ):
+                if member.size < 0:
                     raise ValueError("Base libc inspection found an invalid tar member size.")
                 if member.size > MAX_LAYER_BYTES:
                     raise ValueError("Base libc inspection exceeds the decoded layer size limit.")
