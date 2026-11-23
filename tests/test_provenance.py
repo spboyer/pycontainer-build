@@ -144,6 +144,28 @@ def test_installer_without_wheel_evidence_is_incomplete(tmp_path, monkeypatch):
         }]
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_wheel_evidence_uses_verified_base_tag_for_target_selection(tmp_path, monkeypatch, verified):
+    context = _context(tmp_path)
+
+    def pull_base(self, layers_dir, os_name, arch):
+        layers, config = _observed_base(self, layers_dir, os_name, arch)
+        self._base_image_tag_verified = verified
+        config["config"] = {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"]}
+        return layers, config
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull_base)
+    builder = ImageBuilder(_config(tmp_path, context, include_deps=True))
+    if not verified:
+        with pytest.raises(ValueError, match="unverified"):
+            builder.build()
+        return
+
+    builder.build()
+    dependencies = builder.provenance_statement["predicate"]["buildDefinition"]["resolvedDependencies"]
+    assert any(item["annotations"]["kind"] == "installed-wheel" for item in dependencies)
+
+
 def test_evidence_mode_rejects_tampered_installs_and_non_wheel_downloads(tmp_path):
     context = _context(tmp_path)
     evidence = tmp_path / "evidence"

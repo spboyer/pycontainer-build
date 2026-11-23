@@ -161,7 +161,19 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
+`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
+registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
+glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
+Local image names/annotations are not provenance either. The shared
+`target_wheel_platform` helper defaults to requiring explicit metadata;
+`base_image_tag_verified=True` permits tag inference only for tag-only registry
+pulls. Local sources must leave it false. Unsupported metadata and metadata
+conflicting with a verified tag-only pull fail before pip runs.
+`target_python_version` uses the same default-false keyword; digest and
+unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
+`PYTHON_VERSION`. Both helpers validate before requirements or venv staging.
+Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
 Comma-separated `platform` values build an OCI image index for exactly
 `linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own

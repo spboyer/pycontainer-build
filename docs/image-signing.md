@@ -8,7 +8,10 @@ been exercised. Against `ttl.sh`, synthetic-base manifest and index builds
 passed Cosign key-mode signing and verification with v2.6.1 and v3.1.4 in
 stacked #219. Notation v1.3.2 named-key signing and verification also passed for
 both subjects with a self-signed test key and isolated strict trust policy.
-Cosign keyless, Notation plugin mode and other registries remain unverified.
+Cosign v2.6.1 and v3.1.4 keyless signing and verification also passed for both
+subjects in a gated GitHub Actions job using its workflow OIDC identity.
+Notation plugin mode, other keyless identity providers and other registries
+remain unverified.
 
 ## Prerequisites and use
 
@@ -157,10 +160,9 @@ default transparency settings; a wrong key failed. Notation named-key
 signatures were independently verified with the strict test policy. A separate
 real-base multi-platform run in #219 failed during Cosign v3.1.4 signing before
 tag publication. Later direct signing of the same index and a fresh full index
-run succeeded; the original failure's cause remains unknown. Keyless Cosign
-verification has not been exercised against real providers or registries. A
-valid signature authenticates an artifact only under the verifier's policy; it
-does not establish that an image is free of vulnerabilities or safe to run.
+run succeeded; the original failure's cause remains unknown. A valid signature
+authenticates an artifact only under the verifier's policy; it does not
+establish that an image is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
@@ -245,5 +247,19 @@ writes only digests and Rekor log indexes to the job summary.
 This repository is public, and so is the public-good Sigstore transparency log.
 Each keyless signature permanently publishes the signing certificate, including
 the repository, workflow path and ref, commit SHA, trigger, run URL, runner
-environment and repository visibility, and the signed image digest. Use the
-job only with synthetic images and disposable `ttl.sh` repositories.
+environment and repository visibility, plus a hash of the signed payload. The
+v2.6.1 entries observed below are `hashedrekord` records; they store the
+payload hash and certificate, not the image reference. Use the job only with
+synthetic images and disposable `ttl.sh` repositories.
+
+Observed evidence: dispatch run
+[45088903327](https://github.com/spboyer/pycontainer-build/actions/runs/45088903327)
+at commit `a2b6d25`, after a passing preflight run, executed four tests with
+zero skips for each Cosign version. Keyless signing and pre-tag verification
+passed for a manifest and an index; wrong identity, issuer and workflow SHA
+failed with a recognized mismatch before any requested tag existed. Both
+versions accepted the GitHub claim flags. The v2.6.1 Rekor indexes were
+`4049339949` (manifest) and `4049349966` (index); their certificate SAN is
+`https://github.com/spboyer/pycontainer-build/.github/workflows/tests.yml@refs/heads/spboyer-issue-13-image-signing`.
+Cosign v3.1.4 output did not include a log index in a form the test parses, so
+its transparency-log entry remains unrecorded here. Only `ttl.sh` was used.
