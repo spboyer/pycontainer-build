@@ -97,6 +97,11 @@ starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
 part of the default test suite or CI.
 
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
+
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
