@@ -107,6 +107,53 @@ def test_bases_tags_default_and_independent_layouts(tmp_path, monkeypatch):
     assert not (root / "index.json").exists()
 
 
+def test_matrix_base_mirror_fallback_uses_endpoint_credentials(tmp_path, monkeypatch):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, registry_mirrors={"docker.io": ["mirror.example"]},
+    )
+    base_client = builder_module.RegistryClient
+    connections = []
+    requests = []
+
+    def client(registry, repository, **kwargs):
+        connections.append((registry, kwargs["auth_token"]))
+        delegate = base_client(registry, repository, **kwargs)
+
+        class Client:
+            def pull_manifest(self, reference, **expected):
+                requests.append((registry, reference))
+                if registry == "mirror.example" and reference == "3.11-slim":
+                    raise RegistryHTTPError(404, "manifest not found")
+                return delegate.pull_manifest(reference, **expected)
+
+            def pull_blob(self, digest, path, size):
+                return delegate.pull_blob(digest, path, size)
+
+        return Client()
+
+    def upstream_auth(host, *, include_generic_environment):
+        assert host == "docker.io"
+        assert not include_generic_environment
+        return RegistryAuth(bearer_token="upstream-token")
+
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    monkeypatch.setattr(builder_module, "get_registry_auth", upstream_auth)
+    monkeypatch.setattr(
+        builder_module, "get_mirror_auth",
+        lambda host: RegistryAuth(bearer_token=f"{host}-token"),
+    )
+    build.build()
+
+    assert ("mirror.example", "3.11-slim") in requests
+    assert ("docker.io", "3.11-slim") in requests
+    assert ("mirror.example", "3.12-slim") in requests
+    assert ("docker.io", "3.12-slim") not in requests
+    assert set(connections) == {
+        ("mirror.example", "mirror.example-token"),
+        ("docker.io", "upstream-token"),
+    }
+
+
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_matrix_preserves_image_metadata_for_every_version(tmp_path, monkeypatch, platform):
     labels = {"example.label": "configured"}
