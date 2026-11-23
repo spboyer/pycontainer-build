@@ -143,6 +143,37 @@ def test_imported_empty_entrypoint_and_cmd_clear_base_values(tmp_path, monkeypat
     assert "Cmd" not in image
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "cmd", "expected_entrypoint", "expected_cmd"),
+    [(None, ["python", "app.py"], ["docker-entrypoint.sh"], ["python", "app.py"]),
+     ([], [], None, None)],
+    ids=["inherit-entrypoint", "clear-entrypoint-and-cmd"],
+)
+def test_command_semantics_with_metadata(
+    tmp_path, monkeypatch, entrypoint, cmd, expected_entrypoint, expected_cmd
+):
+    base = copy.deepcopy(ENTRYPOINT_BASE)
+    base["config"]["Labels"] = {"shared": "base", "base-only": "base"}
+    context = _context(tmp_path, framework=True)
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "out"), use_cache=False,
+        entrypoint=entrypoint, cmd=cmd, labels={"shared": "explicit"},
+        manifest_annotations={"example.manifest": "value"},
+        index_annotations={"example.index": "value"},
+    )
+    image = _built_config(tmp_path, monkeypatch, base, config)["config"]
+    assert image.get("Entrypoint") == expected_entrypoint
+    assert image.get("Cmd") == expected_cmd
+    assert image["Labels"]["shared"] == "explicit"
+    assert image["Labels"]["base-only"] == "base"
+    assert base["config"]["Labels"]["shared"] == "base"
+    output = tmp_path / "out"
+    index = json.loads((output / "index.json").read_bytes())
+    manifest = json.loads(_read_blob(output / "blobs" / "sha256", index["manifests"][0]["digest"]))
+    assert index["annotations"]["example.index"] == "value"
+    assert manifest["annotations"]["example.manifest"] == "value"
+
+
 @pytest.mark.parametrize("cmd", [[], ["argument"]], ids=["clear-cmd", "set-cmd"])
 def test_distroless_explicit_shell_entrypoint_with_cmd_is_kept(cmd):
     base = copy.deepcopy(ENTRYPOINT_BASE)
@@ -157,9 +188,13 @@ def test_distroless_explicit_shell_entrypoint_with_cmd_is_kept(cmd):
 
 
 def test_without_base_unset_entrypoint_is_omitted():
-    image = build_config_json("amd64", "linux", {}, "/app", None, [], cmd=["python", "app.py"])
+    image = build_config_json(
+        "amd64", "linux", {}, "/app", None, [],
+        labels={"z": "last", "a": "first"}, cmd=["python", "app.py"],
+    )
     assert "Entrypoint" not in image["config"]
     assert image["config"]["Cmd"] == ["python", "app.py"]
+    assert list(image["config"]["Labels"].items()) == [("a", "first"), ("z", "last")]
 
 
 def test_dry_run_plan_reports_inherited_entrypoint(tmp_path, capsys):
