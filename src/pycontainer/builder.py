@@ -191,8 +191,9 @@ from .local_image import (
     parse_local_image_reference,
     verify_layer_diff_ids,
 )
-from .cache import LayerCache
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -206,17 +207,19 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 
-def write_app_files(tar, files, workdir: str, reproducible: bool, opener=None) -> None:
+def write_app_files(tar, files, workdir: str, reproducible: bool, opener=None) -> List[Tuple[Path, Path]]:
     """Write application files to ``tar`` exactly as the application layer stores them.
 
     ``opener`` replaces ``open(path, "rb")`` so callers can observe the content as it is written.
+    Returns the written files in member order, for ``emitted_hardlinks``.
     """
     opener = opener or (lambda path, _info: open(path, "rb"))
-    ordered = sorted(files, key=lambda item: item[1].as_posix()) if reproducible else files
-    for abs_path, rel in ordered:
-        info = tar.gettarinfo(abs_path, arcname=f"{workdir.lstrip('/')}/{rel.as_posix()}")
+    written = []
+    for abs_path, rel in ordered_app_files(files, reproducible):
+        info = tar.gettarinfo(abs_path, arcname=app_layer_arcname(workdir, rel))
         if info is None:
             continue
+        written.append((abs_path, rel))
         if reproducible:
             info.mtime = 0
             info.uid = 0
@@ -228,6 +231,7 @@ def write_app_files(tar, files, workdir: str, reproducible: bool, opener=None) -
                 tar.addfile(info, source)
         else:
             tar.addfile(info)
+    return written
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
@@ -293,6 +297,9 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
@@ -393,6 +400,9 @@ class ImageBuilder:
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
@@ -624,6 +634,8 @@ class ImageBuilder:
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
@@ -801,7 +813,8 @@ class ImageBuilder:
         tmp=_create_temporary_file(layers_dir,"app-layer")
         try:
             with tarfile.open(tmp,'w') as tar:
-                write_app_files(tar, files, self.config.workdir, self.config.reproducible)
+                written=write_app_files(tar, files, self.config.workdir, self.config.reproducible)
+                hardlinks=emitted_hardlinks(written, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -813,6 +826,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(
