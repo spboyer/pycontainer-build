@@ -114,6 +114,19 @@ Docker, runs it and compares the exact output. The requested `--platform` must
 match the Docker daemon. An optional `--evidence` record is tagged
 `shell-command` and does not satisfy the separate full-startup release gate.
 
+For `CMD`-only imports, use the separate verifier on a disposable Docker host
+with Skopeo:
+
+```bash
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --cmd-only --evidence cmd-only-evidence.json
+```
+
+It builds a base with a known entrypoint, imports shell- and exec-form
+`CMD` Dockerfiles with no `ENTRYPOINT`, and checks the exact output of each
+container. The same-repository PR runtime workflow runs this check on the
+exact PR head on Linux/amd64 and uploads a separate `cmd-only-runtime-evidence`
+artifact. It does not substitute for the full-startup release evidence.
+
 ## Parsing
 
 Parser directives (`# syntax=`, `# escape=`), comments, line continuations
