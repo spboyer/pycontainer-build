@@ -373,6 +373,39 @@ def test_local_custom_map_selects_each_platform_without_tag_provenance(tmp_path,
     assert all(len(child.platform_images) == 2 for child in build.children.values())
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_matrix_layouts_are_reusable_as_digest_pinned_local_bases(tmp_path, monkeypatch, platform):
+    source, _, _ = matrix(tmp_path, monkeypatch, platform=platform)
+    source.build()
+    default = source.children[source.default]
+    descriptors = json.loads((Path(default.config.output_dir) / "index.json").read_text())["manifests"]
+    assert sum(entry["digest"] == default.manifest_digest for entry in descriptors) > 1
+
+    bases = {
+        version: f"oci:{child.config.output_dir}@{child.manifest_digest}"
+        for version, child in source.children.items()
+    }
+    context = tmp_path / "consumer"
+    context.mkdir()
+    (context / "app.py").write_text("print('consumer')\n")
+    consumer = PythonMatrixBuilder(replace(
+        source.config, context_dir=str(context), output_dir=str(tmp_path / "consumer-output"),
+        base_image="custom:base", python_matrix=bases,
+    ))
+    consumer.build()
+    for version, child in consumer.children.items():
+        expected = {
+            image.platform["architecture"]: [layer.digest for layer in image.layers]
+            for image in source.children[version].platform_images
+        }
+        assert {image.platform["architecture"] for image in child.platform_images} == set(expected)
+        assert child._base_image_tag_verified is False
+        for image in child.platform_images:
+            assert [layer.digest for layer in image.layers[:-image.app_layer_count]] == (
+                expected[image.platform["architecture"]]
+            )
+
+
 @pytest.mark.parametrize("during_build", [True, False])
 def test_local_base_change_prevents_matrix_publication(tmp_path, monkeypatch, during_build):
     build, paths = local_matrix(tmp_path, monkeypatch)
