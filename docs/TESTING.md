@@ -65,17 +65,33 @@ context retained by the client. The product-path push
 timings include client construction; the probe push timings reuse a client
 constructed outside the timed region.
 
-For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
+For a real OCI import and startup check on Linux/WSL, install Skopeo,
 start a Docker daemon, and allow the builder to pull the selected registry base
 image. The script imports the generated OCI layout into Docker and starts a container:
 
 ```shell
-PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json
 ```
 
-This check is not part of default pytest or CI. It uses a unique temporary image
+This check is not part of default pytest. It uses a unique temporary image
 tag and removes that tag after execution; registry pulls and image startup are
-real runtime evidence, unlike the synthetic benchmark above.
+real runtime evidence, unlike the synthetic benchmark above. The target
+platform must match the Docker daemon, so emulated runs fail instead of
+producing evidence.
+
+The `Runtime image check` workflow runs it natively for `linux/amd64` and
+`linux/arm64` on same-repository pull requests, pushes to main and release
+tags. Its gate runs `scripts/verify_runtime_evidence.py`, which passes only
+when every required target has exactly one passing full import/startup record
+for the current commit, workflow run and attempt, and every startup job
+succeeded. Missing (runner unavailable, skipped or cancelled), failed,
+incomplete, emulated, dependency-layer-only, stale or duplicate evidence, or a
+failed evidence download, fails the gate and is listed under "Not validated"
+in the summary. Re-run all jobs rather than only failed jobs so every target
+produces evidence in the same attempt. A release cannot be created unless the
+gate passes and the release job re-verifies evidence for its own attempt. The
+release notes include the validated targets.
+Licensing and PyPI publication remain separate owner decisions (#79).
 
 ## Overview
 
