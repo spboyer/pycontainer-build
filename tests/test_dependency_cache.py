@@ -35,6 +35,9 @@ SECRET = "hunter2-secret"
 
 @pytest.fixture(autouse=True)
 def _no_ambient_pip(monkeypatch):
+    for name in [name for name in os.environ if name.upper().startswith("PIP_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
     monkeypatch.setattr(dependency_cache, "ambient_pip_settings", lambda: [])
 
 
@@ -410,10 +413,11 @@ def test_unverified_base_cannot_reuse_a_trusted_dependency_layer(
 def test_index_credentials_are_dropped_but_never_alias_query_routing():
     plain = _lock_key("https://pkgs.example.invalid/simple")
 
-    assert _lock_key("https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple/") == plain
+    assert _lock_key("https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple") == plain
     assert _lock_key(f"https://user:{SECRET}@pkgs.example.invalid/simple") == plain
     assert _lock_key("https://pkgs.example.invalid/other/simple") != plain
     for url in (
+        "https://pkgs.example.invalid/simple?",
         "https://pkgs.example.invalid/simple?feed=tenant-a",
         "https://pkgs.example.invalid/simple?feed=tenant-b",
         "https://pkgs.example.invalid/simple?token=${INDEX_TOKEN}",
@@ -427,6 +431,39 @@ def test_index_credentials_are_dropped_but_never_alias_query_routing():
         _lock_key("https://pkgs.example.invalid/simple", "fixture-dep==1.0")
 
 
+def test_find_links_url_path_trailing_slashes_do_not_alias(tmp_path):
+    context = _project(tmp_path)
+    requirements = context / "requirements.txt"
+    content = requirements.read_text().replace(
+        "./wheelhouse", "https://pkgs.example.invalid/wheels"
+    )
+    requirements.write_text(content)
+    without_slash = _key(context)
+    requirements.write_text(content.replace("/wheels", "/wheels/"))
+
+    assert _key(context) != without_slash
+
+
+def test_utf16_file_used_as_requirement_and_constraint_is_checked_in_both_roles(tmp_path):
+    context = _project(tmp_path)
+    (context / "requirements.txt").write_text(
+        "-r shared.txt\n-c shared.txt\n", encoding="utf-16"
+    )
+    shared = context / "shared.txt"
+    shared.write_text("fixture-dep==1.0\n", encoding="utf-16")
+    with pytest.raises(DependencyCacheMiss, match="not fully pinned"):
+        _key(context)
+
+    shared.write_text(
+        "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-16"
+    )
+    original = _key(context)
+    shared.write_text(
+        "fixture-dep==1.0 --hash=sha256:" + "b" * 64 + "\n", encoding="utf-16"
+    )
+    assert _key(context) != original
+
+
 @pytest.mark.parametrize(
     "requirements, reason",
     [
@@ -436,6 +473,11 @@ def test_index_credentials_are_dropped_but_never_alias_query_routing():
         ("--no-deps\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n", "--no-deps"),
         (
             "--index-url https://pkgs.example.invalid/simple?feed=a\n"
+            "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
+            "query string",
+        ),
+        (
+            "--find-links https://pkgs.example.invalid/wheels?feed=a\n"
             "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
             "query string",
         ),
@@ -707,7 +749,7 @@ def test_parse_pip_config_keys_sanitized_settings_and_rejects_unprovable_ones():
         "freeze.all='true'\n"
     )
     assert rows == [
-        [":env:", "index-url", "https://pkgs.example.invalid/simple"],
+        [":env:", "index-url", "https://pkgs.example.invalid/simple/"],
         ["install", "only-binary", ":all:"],
     ]
     for line, reason in [

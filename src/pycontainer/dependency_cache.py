@@ -181,10 +181,10 @@ def sanitize_url(value: str) -> str:
         raise DependencyCacheMiss(
             "an index or find-links URL uses an environment placeholder in its host or path"
         )
-    if parts.query:
+    if "?" in value.split("#", 1)[0]:
         # A query can route to another tenant or feed, so it is not a safe credential to drop.
         raise DependencyCacheMiss("an index or find-links URL has a query string")
-    return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/"), "", ""))
+    return urlunsplit((parts.scheme.lower(), host.lower(), parts.path, "", ""))
 
 
 def _key_token(token: str) -> str:

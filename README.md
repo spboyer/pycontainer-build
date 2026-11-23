@@ -550,14 +550,16 @@ The cache automatically:
 **Dependency layer reuse.** A whole staged dependency layer is reused only when
 its complete target closure is provably hash-pinned: a lockfile selection, or
 requirements (including nested `-r`/`-c` files) where every requirement is
-`==`-pinned with `--hash`. A hit runs no pip and makes no index requests, and
-yields the same layer digest, DiffID and SBOM inventory as a fresh build.
+`==`-pinned with `--hash`. A hit runs no pip install and makes no index requests,
+and yields the same layer digest, DiffID and SBOM inventory as a fresh build.
 The key covers requirement/constraint/find-links content, target platform,
 pip target/ABI/libc tags, the installer's target marker environment, Python
 version and implementation, workdir, pip version, the installer backend and
-sanitized index identity. Plain requirements also key allowlisted ambient pip
-settings; locked installs are `--isolated`. Credentials and userinfo placeholders are
-never stored. Anything that cannot be proven is an explicit miss printed as
+sanitized index and find-links identities, including their exact paths. Plain
+requirements also key allowlisted ambient pip settings, read locally with
+`pip config list` even on a hit; locked installs are `--isolated`. Credentials
+and userinfo placeholders are never stored. Anything that cannot be proven is
+an explicit miss printed as
 `Dependency layer cache miss: <reason>.`, including unpinned or unhashed
 requirements, `-e`, `--no-deps`, direct-URL constraints, `file:` find-links,
 virtualenv staging, `--no-reproducible`, unknown ambient pip settings, and any

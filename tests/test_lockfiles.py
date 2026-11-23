@@ -2,6 +2,7 @@ import hashlib
 import http.server
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -1165,10 +1166,12 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     site_packages = tmp_path / "stage" / "site-packages"
     site_packages.parent.mkdir()
     commands = []
+    environments = []
     popen = subprocess.Popen
 
     def record_pip(command, *args, **kwargs):
         commands.append(command)
+        environments.append(kwargs["env"])
         return popen(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", record_pip)
@@ -1182,6 +1185,15 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
     assert len(commands) == 2
     assert all(command[1:3] == ["-c", bootstrap] for command in commands)
+    assert all(
+        {"--isolated", "--no-deps", "--require-hashes"} <= set(command)
+        for command in commands
+    )
+    assert all(
+        {key.upper(): value for key, value in env.items() if key.upper().startswith("PIP_")}
+        == {"PIP_CONFIG_FILE": os.devnull}
+        for env in environments
+    )
     assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
     assert any("marker-first" in path for path in index_a.requests)
     assert any("marker-second" in path for path in index_b.requests)

@@ -56,7 +56,8 @@ the installer's exact target marker environment, allowlisted ambient pip
 settings for plain requirements, and `INSTALLER_BACKEND`. A backend change that
 alters marker evaluation must bump `INSTALLER_BACKEND` and key its marker
 environment. The inventory entry is stored after the layer and must name its
-digest; a hit runs no pip and makes no network requests.
+digest; a hit runs no pip install and makes no network requests. Plain
+requirements still read the local pip configuration before lookup.
 
 ## Setup and verified checks
 
