@@ -252,13 +252,16 @@ class ImageBuilder:
 
     def build(self):
         self._conda_warning_emitted = False
-        if self.config.include_deps:
-            self._check_conda_dependencies()
         if conda_prefix(self.config.context_dir, ".") is not None:
             raise ValueError(
-                "The build context is a host Conda environment; use a source-only "
-                "build context to avoid copying host environment files."
+                "The build context is inside a host Conda environment; use a "
+                "source-only build context to avoid copying host environment files. "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` and select that "
+                "file with --requirements and --include-deps."
             )
+        if self.config.include_deps:
+            self._check_conda_dependencies()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -585,17 +588,26 @@ class ImageBuilder:
         relative = relative_context_path(self.config.requirements_file)
         signals = detect_conda_inputs(
             ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
+            selected_paths=self.context_include_paths,
         )
         requirements = ctx / relative
-        if relative.name in CONDA_FILES and requirements.is_file():
+        requirements_exist = requirements.is_file()
+        conda_requirements = requirements_exist and (
+            relative.name in CONDA_FILES
+            or requirements.resolve().name in CONDA_FILES
+        )
+        requirements_prefix = (
+            conda_prefix(ctx, relative) if requirements_exist else None
+        )
+        if conda_requirements or requirements_prefix is not None:
             if relative not in signals:
                 signals.append(relative)
         if not signals:
             return False
         if (
-            relative.name in CONDA_FILES
-            or not requirements.is_file()
-            or conda_prefix(ctx, relative) is not None
+            conda_requirements
+            or not requirements_exist
+            or requirements_prefix is not None
         ):
             raise ValueError(
                 f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "

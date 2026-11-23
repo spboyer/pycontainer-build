@@ -350,8 +350,8 @@ pycontainer build \
   that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
   ordinary Conda projects still build application-only images. Host Conda
   prefixes are never copied, even with explicit includes or
-  `--no-default-excludes`; a context that is itself a Conda prefix requires a
-  source-only context instead. See the [export workaround](docs/local-development.md#conda-projects).
+  `--no-default-excludes`; a context inside a Conda prefix requires a source-only
+  context instead. See the [export workaround](docs/local-development.md#conda-projects).
   Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
 
 **Context Selection**:

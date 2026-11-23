@@ -14,6 +14,7 @@ import pytest
 
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.fs_utils import iter_files
 from pycontainer.project import detect_conda_inputs
 from pycontainer.dependencies import (
     MAX_REQUIREMENTS_BYTES,
@@ -318,6 +319,257 @@ def _symlink_or_skip(link, target, *, directory=False):
         link.symlink_to(target, target_is_directory=directory)
     except OSError as error:
         pytest.skip(f"Symlinks unavailable: {error}")
+
+
+@pytest.mark.parametrize("include_deps", [False, True])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_context_inside_conda_prefix_is_rejected_before_pull(
+    tmp_path, monkeypatch, include_deps, dry_run,
+):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    context = prefix / "Lib" / "site-packages"
+    context.mkdir(parents=True)
+    (context / "host.pyd").write_bytes(b"host binary")
+    (context / "requirements.txt").write_text("")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context,
+        include_deps=include_deps, dry_run=dry_run,
+        include_paths=["host.pyd"], exclude_defaults=False,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    with pytest.raises(ValueError, match="source-only build context"):
+        builder.build()
+    assert list(iter_files(context, ["."], exclude_defaults=False)) == []
+    assert not Path(builder.config.output_dir).exists()
+
+
+def test_context_link_into_conda_prefix_is_rejected_before_pull(tmp_path, monkeypatch):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    site = prefix / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "host.pyd").write_bytes(b"host binary")
+    context = tmp_path / "context"
+    _symlink_or_skip(context, site, directory=True)
+    builder = _builder(tmp_path / "run", monkeypatch, context=context, dry_run=True)
+
+    with pytest.raises(ValueError, match="source-only build context"):
+        builder.build()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_linked_conda_virtualenv_is_detected_before_pull(tmp_path, monkeypatch, dry_run):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _symlink_or_skip(context / ".venv", prefix, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context,
+        include_deps=True, dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    assert detect_conda_inputs(context) == [Path(".venv/conda-meta")]
+    assert detect_conda_inputs(context, exclude_paths=[".venv/conda-meta"]) == []
+    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
+        builder.build()
+
+
+def test_linked_conda_virtualenv_warns_and_installs_export(tmp_path, monkeypatch, caplog):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "host.pyd").write_bytes(b"host binary")
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    requirements = context / "requirements.txt"
+    _write_wheel(context / "wheelhouse")
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    _symlink_or_skip(context / ".venv", prefix, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        include_paths=[".", ".venv"], exclude_defaults=False,
+    )
+    monkeypatch.setattr(
+        "pycontainer.builder.stage_virtualenv", lambda *args: pytest.fail("host staging"),
+    )
+    builder.build()
+
+    assert len([record for record in caplog.records if "Conda inputs ignored" in record.message]) == 1
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+    with tarfile.open(builder.layers[1].tar_path) as archive:
+        assert not any("host.pyd" in name for name in archive.getnames())
+
+
+@pytest.mark.parametrize("selected", ["src", "src/nested/environment.yml"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_selected_linked_source_conda_descriptor_is_detected(
+    tmp_path, monkeypatch, selected, dry_run,
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    source = tmp_path / "linked-source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "environment.yml").write_text("invalid YAML")
+    _symlink_or_skip(context / "src", source, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        include_paths=[selected], dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
+        builder.build()
+
+
+def test_selected_linked_source_detection_respects_excludes(tmp_path, monkeypatch, caplog):
+    context = tmp_path / "context"
+    context.mkdir()
+    source = tmp_path / "linked-source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "environment.yml").write_text("invalid YAML")
+    _symlink_or_skip(context / "src", source, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        include_paths=["src"], exclude_paths=["src/nested"], dry_run=True,
+    )
+
+    assert builder.build() == builder.config.tag
+    assert not [record for record in caplog.records if "Conda" in record.message]
+
+
+def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, caplog):
+    context = tmp_path / "context"
+    context.mkdir()
+    source = tmp_path / "linked-source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "environment.yml").write_text("invalid YAML")
+    (source / "app.py").write_text("print('app')\n")
+    _symlink_or_skip(context / "src", source, directory=True)
+    venv = context / ".venv" / "Lib" / "site-packages"
+    venv.mkdir(parents=True)
+    (venv / "venv_dep.py").write_text("value = 1\n")
+    requirements = context / "requirements.txt"
+    requirements.write_text("")
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        include_paths=["src"],
+    )
+    installed = []
+
+    def install(path, destination, *args):
+        installed.append(path)
+        destination.mkdir(parents=True)
+        (destination / "pip_dep.py").write_text("value = 1\n")
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", install)
+    monkeypatch.setattr(
+        "pycontainer.builder.stage_virtualenv", lambda *args: pytest.fail("venv staging"),
+    )
+    builder.build()
+
+    assert installed == [requirements]
+    assert len([record for record in caplog.records if "Conda inputs ignored" in record.message]) == 1
+
+
+@pytest.mark.parametrize("selected", ["src", "src/host.pyd"])
+def test_selected_link_into_conda_prefix_is_reported_before_pull(
+    tmp_path, monkeypatch, selected,
+):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    site = prefix / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "host.pyd").write_bytes(b"host binary")
+    context = tmp_path / "context"
+    context.mkdir()
+    _symlink_or_skip(context / "src", site, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        include_paths=[selected], dry_run=True,
+    )
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
+        builder.build()
+
+
+def test_selected_excluded_conda_prefix_does_not_trigger_detection(tmp_path):
+    prefix = tmp_path / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    site = prefix / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "host.pyd").write_bytes(b"host binary")
+
+    assert detect_conda_inputs(
+        tmp_path, exclude_paths=[".venv/conda-meta"],
+        selected_paths=[".venv/Lib/site-packages/host.pyd"],
+    ) == []
+
+
+def test_selected_link_into_excluded_conda_prefix_is_not_copied(tmp_path):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    site = prefix / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "host.pyd").write_bytes(b"host binary")
+    context = tmp_path / "context"
+    context.mkdir()
+    _symlink_or_skip(context / "src", site, directory=True)
+
+    assert detect_conda_inputs(
+        context, exclude_paths=["**/conda-meta"],
+        selected_paths=["src/host.pyd"],
+    ) == []
+    assert list(iter_files(context, ["src/host.pyd"], exclude_defaults=False)) == []
+
+
+@pytest.mark.parametrize("exclude_paths", [[], ["**/conda-meta"]])
+def test_selected_requirements_inside_linked_conda_prefix_is_rejected_before_pull(
+    tmp_path, monkeypatch, exclude_paths,
+):
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    exports = prefix / "exports"
+    exports.mkdir()
+    (exports / "requirements.txt").write_text("")
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _symlink_or_skip(context / "linked", exports, directory=True)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=context, include_deps=True,
+        requirements_file="linked/requirements.txt", exclude_paths=exclude_paths,
+        dry_run=True,
+    )
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+
+@pytest.mark.parametrize("signal", [
+    "environment.yml", "environment.yaml", "conda-lock.yml",
+])
+@pytest.mark.parametrize("exclude_target", [False, True])
+def test_requirements_alias_to_conda_descriptor_is_rejected(
+    tmp_path, monkeypatch, signal, exclude_target,
+):
+    descriptor = tmp_path / signal
+    descriptor.write_text("numpy\n")
+    _symlink_or_skip(tmp_path / "requirements.txt", descriptor)
+    builder = _builder(
+        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+        exclude_paths=[signal] if exclude_target else [], dry_run=True,
+    )
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
 
 
 @pytest.mark.parametrize("include", [

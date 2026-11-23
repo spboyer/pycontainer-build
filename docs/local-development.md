@@ -112,10 +112,12 @@ pycontainer build \
 Conda staging is unsupported. Detection checks names only: `environment.yml`,
 `environment.yaml`, `conda-lock.yml`, and `conda-meta/` directories anywhere in
 the selected build context. It does not parse YAML, run Conda, or inspect the
-active host environment. Application include paths do not limit dependency
-detection; excluded tests, fixtures, generated output/cache directories, and
-explicitly excluded descendants do not trigger it. Conventional virtualenv
-directories are checked because they may actually contain Conda environments.
+active host environment. Ordinary directories are checked independently of
+application include paths; excluded tests, fixtures, generated output/cache
+directories, and explicitly excluded descendants do not trigger it.
+Conventional virtualenv directories and linked Conda prefixes are checked.
+Directory links are otherwise traversed only when selected as application
+include roots, matching application file selection.
 
 With `--include-deps`, detected Conda inputs without a supported selected pip
 requirements file raise an explicit error before pulling the base image, also
@@ -123,7 +125,10 @@ in dry-run. When both are present, the selected pip requirements file wins over
 virtualenv discovery and a warning explains that Conda inputs are ignored.
 `--requirements` remains relative to the context and can select an exported
 file excluded from the application layer. Selecting a Conda YAML file as pip
-requirements is rejected, not passed to pip.
+requirements, including via a file link, is rejected rather than passed to pip.
+Selected source paths inside a host Conda prefix are omitted; with
+`--include-deps` they also produce a Conda diagnostic unless the marker is
+excluded. Selected requirements inside a host prefix are rejected.
 
 Export the pip-compatible portion from your Conda environment, then build from
 your application source directory:
@@ -144,9 +149,9 @@ builds application-only, without dependency warnings or installation. Nested
 host Conda prefixes (directories containing `conda-meta/`) are always omitted
 from application and virtualenv dependency selection, including explicit
 includes and `--no-default-excludes`. A context that is itself a host Conda
-prefix is rejected: choose a source-only context instead of the environment
-directory. This protects against copying host binaries, not a guarantee that
-an application-only image has all dependencies needed to run.
+prefix or is inside one is rejected: choose a source-only context instead of
+the environment directory. This protects against copying host binaries, not a
+guarantee that an application-only image has all dependencies needed to run.
 
 ### Preview Before Building
 

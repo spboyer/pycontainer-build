@@ -104,18 +104,31 @@ def _raise_walk_error(error):
     raise error
 
 
+def _conda_prefix_in_context(base, relative):
+    """Check context-relative ancestors and resolved link targets."""
+    for parent in (relative, *relative.parents):
+        candidate = base / parent
+        if (candidate / "conda-meta").is_dir():
+            return candidate.absolute()
+    absolute = (base / relative).absolute()
+    resolved = absolute.resolve()
+    if resolved != absolute:
+        for parent in (resolved, *resolved.parents):
+            if (parent / "conda-meta").is_dir():
+                return parent
+    return None
+
+
 def conda_prefix(base, relative):
     """Find a Conda prefix containing a context path without reading metadata."""
     base = Path(base)
     relative = relative_context_path(relative)
-    for parent in (relative, *relative.parents):
-        if (base / parent / "conda-meta").is_dir():
+    prefix = _conda_prefix_in_context(base, relative)
+    if prefix is not None:
+        return prefix
+    for parent in base.absolute().parents:
+        if (parent / "conda-meta").is_dir():
             return parent
-    resolved = (base / relative).resolve()
-    if resolved != base.absolute() / relative:
-        for parent in (resolved, *resolved.parents):
-            if (parent / "conda-meta").is_dir():
-                return parent
     return None
 
 
@@ -167,7 +180,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
-                    and conda_prefix(base, root_relative / directory) is None
+                    and _conda_prefix_in_context(base, root_relative / directory) is None
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename
@@ -177,7 +190,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                         child.is_file()
                         and (
                             not child.is_symlink()
-                            or conda_prefix(base, child_relative) is None
+                            or _conda_prefix_in_context(base, child_relative) is None
                         )
                         and relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)

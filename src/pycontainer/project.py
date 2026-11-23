@@ -14,31 +14,71 @@ from .fs_utils import (
 CONDA_FILES = ("environment.yml", "environment.yaml", "conda-lock.yml")
 
 
-def detect_conda_inputs(context_dir, *, exclude_paths=(), exclude_defaults=True):
+def detect_conda_inputs(
+    context_dir, *, exclude_paths=(), exclude_defaults=True, selected_paths=(),
+):
     """Detect supported Conda signal names, without parsing environment files."""
     ctx = Path(context_dir)
     excludes = [
         path for path in DEFAULT_CONTEXT_EXCLUDES if path not in VIRTUALENV_EXCLUDES
     ] if exclude_defaults else []
     excludes.extend(exclude_paths)
-    signals = []
-    for root, directories, filenames in os.walk(ctx, onerror=_raise_walk_error):
-        root_path = Path(root)
-        relative = root_path.relative_to(ctx)
-        metadata = relative / "conda-meta"
-        if "conda-meta" in directories:
-            if not path_is_excluded(metadata, excludes):
-                signals.append(metadata)
-            directories[:] = []
-        else:
-            directories[:] = sorted(
-                directory for directory in directories
-                if not path_is_excluded(relative / directory, excludes)
-            )
-        for name in CONDA_FILES:
-            path = relative / name
-            if name in filenames and not path_is_excluded(path, excludes):
-                signals.append(path)
+    signals = set()
+    roots = [ctx]
+    absolute_context = ctx.absolute()
+    resolved_context = ctx.resolve()
+    for selected in selected_paths:
+        relative = relative_context_path(selected)
+        if path_is_excluded(relative, excludes):
+            continue
+        path = ctx / relative
+        is_file = path.is_file()
+        is_dir = path.is_dir()
+        if not (is_file or is_dir):
+            continue
+        prefix = conda_prefix(ctx, relative)
+        if prefix is not None:
+            try:
+                marker = (prefix / "conda-meta").relative_to(absolute_context)
+            except ValueError:
+                if any(
+                    path_is_excluded(parent / "conda-meta", excludes)
+                    for parent in (relative, *relative.parents)
+                ):
+                    continue
+                marker = relative
+            if not path_is_excluded(marker, excludes):
+                signals.add(marker)
+            continue
+        if is_file and relative.name in CONDA_FILES:
+            signals.add(relative)
+        elif is_dir and path.resolve() != resolved_context / relative:
+            roots.append(path)
+    for scan_root in roots:
+        for root, directories, filenames in os.walk(scan_root, onerror=_raise_walk_error):
+            root_path = Path(root)
+            relative = root_path.relative_to(ctx)
+            metadata = relative / "conda-meta"
+            if "conda-meta" in directories:
+                if not path_is_excluded(metadata, excludes):
+                    signals.add(metadata)
+                directories[:] = []
+            else:
+                directories[:] = sorted(
+                    directory for directory in directories
+                    if not path_is_excluded(relative / directory, excludes)
+                )
+                for directory in directories:
+                    metadata = relative / directory / "conda-meta"
+                    if (
+                        not path_is_excluded(metadata, excludes)
+                        and (root_path / directory / "conda-meta").is_dir()
+                    ):
+                        signals.add(metadata)
+            for name in CONDA_FILES:
+                path = relative / name
+                if name in filenames and not path_is_excluded(path, excludes):
+                    signals.add(path)
     return sorted(signals, key=lambda path: path.as_posix())
 
 def detect_python_version(context_dir):
