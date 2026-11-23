@@ -1,0 +1,7 @@
+.PHONY: pycontainer-build pycontainer-dry-run
+
+pycontainer-build:
+	python -m pycontainer.cli build --context . --config pycontainer.toml
+
+pycontainer-dry-run:
+	python -m pycontainer.cli build --context . --config pycontainer.toml --dry-run

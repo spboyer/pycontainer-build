@@ -1,4 +1,6 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
+from contextlib import nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -42,6 +44,7 @@ IMAGE_CONFIG_MEDIA_TYPES = {
     "application/vnd.oci.image.config.v1+json",
     "application/vnd.docker.container.image.v1+json",
 }
+_LOCKFILE_STAGING_PREFIX = ".pycontainer-lockfile-"
 
 
 def _write_content_addressed_bytes(
@@ -178,7 +181,11 @@ def _select_index_descriptor(
         f"variant. Available platforms: {available_text}."
     )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
-from .project import detect_entrypoint, default_include_paths, find_dependencies
+from .project import (
+    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    default_include_paths, find_dependencies,
+)
+from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
 from .registry_client import (
     RegistryClient,
@@ -186,26 +193,64 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
-from .cache import LayerCache
+from .local_image import (
+    check_local_image_bounds,
+    open_local_image_source,
+    parse_local_image_reference,
+    verify_layer_diff_ids,
+)
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
+from .tags import local_reference_names
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
+    reject_credentialed_direct_urls,
+    reject_shipped_credentials,
     staged_packages,
     stage_virtualenv,
     strip_type_stubs,
     target_python_full_version,
     target_python_version,
+    target_libc_config,
+    target_wheel_platform,
     validate_target_platform,
 )
-from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
+from .lockfiles import (
+    detect_lockfile, load_lockfile, preflight_lockfile, target_environment,
+    verify_locked_installation,
+)
 
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
 logger=logging.getLogger(__name__)
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): 
+    def __init__(self, config: BuildConfig):
+        self._history = (
+            BuildHistory(config.history_dir)
+            if config.record_history and not config.dry_run
+            else None
+        )
+        self._history_timer = (
+            ContextVar("pycontainer_build_history", default=None)
+            if self._history else None
+        )
+        if self._history:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            timing = BuildTiming()
+            try:
+                with timing.phase("initialization"):
+                    self._initialize(config)
+            except BaseException:
+                self._record_failed_history(timing, config)
+                raise
+        else:
+            self._initialize(config)
+
+    def _initialize(self, config: BuildConfig):
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -213,12 +258,15 @@ class ImageBuilder:
             if config.cache_dir
             else default_cache_dir
         )
-        self.context_excludes=context_exclude_paths(
-            context_dir,
-            output_dir=config.output_dir,
-            cache_dir=cache_dir,
-            exclude_paths=config.exclude_paths,
-            exclude_defaults=config.exclude_defaults,
+        self.context_excludes=(
+            *context_exclude_paths(
+                context_dir,
+                output_dir=config.output_dir,
+                cache_dir=cache_dir,
+                exclude_paths=config.exclude_paths,
+                exclude_defaults=config.exclude_defaults,
+            ),
+            f"{_LOCKFILE_STAGING_PREFIX}*",
         )
         self.context_include_paths=(
             config.include_paths
@@ -252,28 +300,83 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _record_failed_history(self, timing, config):
+        try:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            self._history.append(timing.record("failed"))
+        except BaseException as error:
+            # Recording must never replace the original build failure.
+            logger.error("Build history could not be saved or confirmed: %s", error)
+
+    def _time_history_phase(self, name):
+        timing = self._history_timer.get() if self._history_timer else None
+        return timing.phase(name) if timing else nullcontext()
+
     def build(self):
+        self._conda_warning_emitted = False
+        if conda_prefix(self.config.context_dir, ".") is not None:
+            raise ValueError(
+                "The build context is inside a host Conda environment; use a "
+                "source-only build context to avoid copying host environment files. "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` and select that "
+                "file with --requirements and --include-deps."
+            )
+        if self.config.include_deps:
+            self._check_conda_dependencies()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
             return self.config.tag
 
-        with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+        timing = BuildTiming() if self._history else None
+        token = self._history_timer.set(timing) if timing else None
+        try:
+            try:
+                if self._history:
+                    self._history.validate_location(
+                        self.config.context_dir, self.config.output_dir
+                    )
+                with output_directory_lock(self.config.output_dir):
+                    result = self._build_image()
+            except BaseException:
+                if timing:
+                    self._record_failed_history(timing, self.config)
+                raise
+
+            if timing:
+                self._history.validate_location(
+                    self.config.context_dir, self.config.output_dir
+                )
+                self._history.append(timing.record("success"))
+            return result
+        finally:
+            if timing:
+                self._history_timer.reset(token)
 
     def _build_image(self):
+        self._dependency_source_cache = None
+        self._lock_selection_cache = {}
+        self._requirement_files = []
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
-        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
+        with self._time_history_phase("base_image"):
+            base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         locked_names = ()
         if self.config.include_deps and self._uses_lockfile():
             locked_names = tuple(
                 package.name
-                for package in self._lock_selection(base_config, os_name, arch).packages
+                for package in self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified=self._base_image_tag_verified(),
+                ).packages
             )
         report_system_packages(self.config, base_layers, locked_names)
         variant = (
@@ -285,12 +388,21 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
+            with self._time_history_phase("dependencies"):
+                staging_config = target_libc_config(
+                    os_name, arch, self.config.base_image, base_config, base_layers,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                    ),
+                )
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=staging_config, os_name=os_name, arch=arch
+                )
             if deps_layer: app_layers.append(deps_layer)
         
-        app_layer=self._create_app_layer(layers_dir, include)
+        with self._time_history_phase("application"):
+            app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(app_layer)
         
         all_layers=base_layers+app_layers
@@ -321,7 +433,8 @@ class ImageBuilder:
 
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
-                                layer_diff_ids=[layer.digest for layer in app_layers])
+                                layer_diff_ids=[layer.digest for layer in app_layers],
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -339,13 +452,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -363,41 +478,85 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(
-                Path(self.config.context_dir),
-                sbom_path,
-                format=(
-                    self.config.generate_sbom
-                    if isinstance(self.config.generate_sbom, str)
-                    else "spdx"
-                ),
-                package_inventory=getattr(self, "_staged_packages", []),
-            )
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
-    def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
-        """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
+    def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
+        """Create a registry client honoring insecure-host and CA settings."""
+        insecure=registry.lower() in self.config.insecure_registries
         client=RegistryClient(
             registry,
             repo,
             auth_token=auth.bearer_token,
             username=auth.username,
             password=auth.password,
+            insecure=insecure,
+            ca_file=self.config.registry_ca_file,
         )
-        
+        warned=self.__dict__.setdefault('_warned_insecure_registries', set())
+        if insecure and registry.lower() not in warned:
+            warned.add(registry.lower())
+            logger.warning(
+                f"WARNING: using plain HTTP for insecure registry {registry}; "
+                "traffic is unencrypted and unauthenticated by TLS."
+            )
+        return client
+
+    def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Pull or load the base image, return (base_layers, base_config)."""
+        self._base_image_name=self.config.base_image
+        requested_variant = parse_platform_variant(self.config.platform)
+        local=parse_local_image_reference(self.config.base_image)
+        if local is None:
+            registry, repo, reference=parse_image_reference(self.config.base_image)
+            auth=get_registry_auth(registry)
+            client=self._registry_client(registry, repo, auth)
+            return self._read_base_image(client, reference, layers_dir, os_name, arch)
+
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
+        )
+        print(f"Loading local base image {self.config.base_image} for {target}...")
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+        ) as source:
+            base_layers, base_config = self._read_base_image(
+                source, None, layers_dir, os_name, arch
+            )
+            verify_layer_diff_ids(base_layers, base_config)
+            self._base_image_name=source.source_name
+        return base_layers, base_config
+
+    def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Resolve and validate a base image through a registry or local source."""
+        local = reference is None
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        if not local:
+            print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
-            expected_digest=reference if reference.startswith("sha256:") else None,
+            expected_digest=(
+                reference if reference and reference.startswith("sha256:") else None
+            ),
         )
 
         selected_variant = None
@@ -451,6 +610,8 @@ class ImageBuilder:
             )
             for index, descriptor in enumerate(layer_descriptors, 1)
         ]
+        if local:
+            check_local_image_bounds(config_size, [size for _, size, _ in validated_layers])
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
@@ -501,13 +662,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -528,13 +689,7 @@ class ImageBuilder:
             username=username,
             password=password,
         )
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
-        )
+        client=self._registry_client(registry, repo, auth)
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         
@@ -575,6 +730,10 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        if self.config.stop_signal:
+            print(f"  Stop Signal: {self.config.stop_signal}")
+        if self.config.volumes:
+            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.include_deps:
             try:
@@ -592,6 +751,8 @@ class ImageBuilder:
                 print("  Strip Type Stubs: True")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _uses_lockfile(self) -> bool:
@@ -600,6 +761,13 @@ class ImageBuilder:
         if self.config.requirements_file or not self.config.use_lockfile:
             return False
         return detect_lockfile(Path(self.config.context_dir)) is not None
+
+    def _base_image_tag_verified(self) -> bool:
+        # Local annotations and digest references do not establish registry identity.
+        return (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
 
     def _dependency_source(self):
         """Choose the dependency source: lock, requirements file, or virtualenv."""
@@ -622,6 +790,7 @@ class ImageBuilder:
                     DEFAULT_REQUIREMENTS_FILE,
                     exclude_paths=self.dependency_excludes,
                     exclude_defaults=False,
+                    prefer_requirements=self._check_conda_dependencies(),
                 )
                 if not deps_paths:
                     raise FileNotFoundError(
@@ -632,23 +801,80 @@ class ImageBuilder:
                     source = ("requirements", Path(DEFAULT_REQUIREMENTS_FILE))
                 else:
                     source = ("venv", deps_paths)
-        self._dependency_source_cache = source
+        if source[0] != "venv":
+            self._dependency_source_cache = source
         return source
 
-    def _lock_selection(self, base_config, os_name, arch):
-        cached = getattr(self, "_lock_selection_cache", None)
-        if cached is not None:
-            return cached
+    def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
         _, relative = self._dependency_source()
         environment = target_environment(
             os_name,
             arch,
-            target_python_version(self.config.base_image, base_config),
+            target_python_version(
+                getattr(self, "_base_image_name", self.config.base_image), base_config,
+                base_image_tag_verified=base_image_tag_verified,
+            ),
             target_python_full_version(base_config),
         )
-        selection = load_lockfile(Path(self.config.context_dir), relative, environment)
-        self._lock_selection_cache = selection
-        return selection
+        key = (os_name, arch, environment["python_version"], environment["python_full_version"])
+        cache = getattr(self, "_lock_selection_cache", None)
+        if cache is None:
+            cache = self._lock_selection_cache = {}
+        if key not in cache:
+            cache[key] = load_lockfile(Path(self.config.context_dir), relative, environment)
+        return cache[key]
+
+    def _check_conda_dependencies(self):
+        ctx = Path(self.config.context_dir)
+        selected_lock = self.config.lockfile
+        if not selected_lock and not self.config.requirements_file and self.config.use_lockfile:
+            selected_lock = detect_lockfile(ctx)
+        relative = relative_context_path(
+            selected_lock or self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE
+        )
+        signals = detect_conda_inputs(
+            ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
+            selected_paths=self.context_include_paths,
+        )
+        selected = ctx / relative
+        selected_exists = selected.is_file()
+        conda_requirements = selected_exists and (
+            relative.name in CONDA_FILES
+            or selected.resolve().name in CONDA_FILES
+        )
+        selected_prefix = (
+            conda_prefix(ctx, relative) if selected_exists else None
+        )
+        if conda_requirements or selected_prefix is not None:
+            if relative not in signals:
+                signals.append(relative)
+        if not signals:
+            return False
+        if (
+            conda_requirements
+            or not selected_exists
+            or selected_prefix is not None
+        ):
+            raise ValueError(
+                f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` in your Conda "
+                "environment, then select that file with --requirements and "
+                "--include-deps. Conda-only packages must be provided by the base "
+                "image; host Conda environments are never copied."
+            )
+        if not selected.resolve().is_relative_to(ctx.resolve()):
+            raise ValueError("Dependency file must stay inside the build context.")
+        if not getattr(self, "_conda_warning_emitted", False):
+            logger.warning(
+                "Conda inputs ignored (%s); installing only %s from %s. "
+                "Conda-only packages are not staged.",
+                ", ".join(path.as_posix() for path in signals),
+                "locked dependencies" if selected_lock else "pip requirements",
+                relative.as_posix(),
+            )
+            self._conda_warning_emitted = True
+        return True
 
     def _create_deps_layer(
         self,
@@ -660,6 +886,7 @@ class ImageBuilder:
     ) -> Optional[OCILayer]:
         """Create a target-compatible dependency layer from a lock, requirements, or venv."""
         ctx=Path(self.config.context_dir)
+        self._check_conda_dependencies()
         source_kind, source_value = self._dependency_source()
         if source_kind == "venv":
             deps_paths = source_value
@@ -682,20 +909,34 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        version = target_python_version(self.config.base_image, base_config)
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        base_image_tag_verified = self._base_image_tag_verified()
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if source_kind == "lock":
-                selection = self._lock_selection(base_config, os_name, arch)
+                selection = self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified=base_image_tag_verified,
+                )
                 print(
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
                 )
-                locked_requirements = stage_root / "locked-requirements.txt"
-                locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
-                try:
+                with tempfile.TemporaryDirectory(
+                    prefix=_LOCKFILE_STAGING_PREFIX, dir=ctx.resolve()
+                ) as requirements_dir:
+                    locked_requirements = Path(requirements_dir) / "locked-requirements.txt"
+                    locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
                     install_requirements(
                         locked_requirements,
                         site_packages,
@@ -703,27 +944,43 @@ class ImageBuilder:
                         os_name,
                         arch,
                         version,
-                        self.config.base_image,
+                        base_image_name,
                         base_config,
                         locked=True,
+                        base_image_tag_verified=base_image_tag_verified,
                     )
-                finally:
-                    locked_requirements.unlink(missing_ok=True)
+                verify_locked_installation(
+                    selection,
+                    ctx,
+                    site_packages,
+                    target_environment(
+                        os_name, arch, version, target_python_full_version(base_config)
+                    ),
+                )
             elif source_kind == "requirements":
-                install_requirements(
+                self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,
                     ctx,
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / DEFAULT_REQUIREMENTS_FILE,
                 )
+                reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
                 removed = strip_type_stubs(site_packages)
@@ -735,7 +992,13 @@ class ImageBuilder:
                 strict=bool(self.config.generate_sbom),
             )
             files = sorted(
-                (path for path in stage_root.rglob("*") if path.is_file()),
+                (
+                    path
+                    for directory in (site_packages, stage_root / "bin")
+                    if directory.is_dir()
+                    for path in directory.rglob("*")
+                    if path.is_file()
+                ),
                 key=lambda path: path.relative_to(stage_root).as_posix(),
             )
             self._dependency_site_packages = bool(files)
@@ -789,6 +1052,15 @@ class ImageBuilder:
                 exclude_defaults=self.config.exclude_defaults,
             )
         )
+        configured_requirements = ctx / (self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE)
+        reject_shipped_credentials(
+            files,
+            ctx,
+            [
+                *getattr(self, "_requirement_files", ()),
+                configured_requirements,
+            ],
+        )
 
         if self.cache:
             cached=self.cache.get_layer(
@@ -821,11 +1093,11 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -840,6 +1112,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -851,6 +1124,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(

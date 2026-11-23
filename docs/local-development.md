@@ -2,6 +2,13 @@
 
 Complete guide for using pycontainer-build locally during development, including installation, building images, testing, and troubleshooting.
 
+Dependency staging uses a mapped release, explicit base image `PYTHON_LIBC`,
+or effective package metadata from verified official tag-only base layers.
+Codename-less automatic/default Python images remain supported when that
+evidence is valid. Missing or unsupported evidence fails before pip; then use
+`--base-image python:3.11-slim-bookworm` (or a mapped release for your Python
+version) or provide supported base metadata. No libc floor is guessed.
+
 ---
 
 ## 📦 Installation
@@ -75,37 +82,85 @@ By default, images are created at:
 ### With Base Image & Dependencies
 
 ```bash
-# Build with auto-detected Python base image
+# Select a mapped release for dependency staging
 pycontainer build \
   --tag myapp:latest \
+  --base-image python:3.11-slim-bookworm \
   --include-deps
 
 # Or explicitly specify a base image
 pycontainer build \
   --tag myapp:latest \
-  --base-image python:3.12-slim \
+  --base-image python:3.12-slim-bookworm \
   --include-deps
 
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build \
   --tag myapp:amd64 \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --platform linux/amd64 \
   --include-deps
 
 # Build for ARM64 (e.g., for AWS Graviton instances)
 pycontainer build \
   --tag myapp:arm64 \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --platform linux/arm64 \
   --include-deps
 
 # This will:
-# 1. Pull python:3.11-slim layers from registry
+# 1. Pull python:3.11-slim-bookworm layers from registry
 # 2. Package your app files
 # 3. Include pip-installed dependencies
 # 4. Combine everything into a complete image
 ```
+
+### Conda Projects
+
+Conda staging is unsupported. Detection checks names only: `environment.yml`,
+`environment.yaml`, `conda-lock.yml`, and `conda-meta/` directories anywhere in
+the selected build context. It does not parse YAML, run Conda, or inspect the
+active host environment. Ordinary directories are checked independently of
+application include paths; excluded tests, fixtures, generated output/cache
+directories, and explicitly excluded descendants do not trigger it.
+Conventional virtualenv directories and linked Conda prefixes are checked.
+Directory links are otherwise traversed only when selected as application
+include roots, matching application file selection.
+
+With `--include-deps`, detected Conda inputs without a supported selected lock
+or pip requirements file raise an explicit error before pulling the base image,
+also in dry-run. An explicitly selected or auto-detected supported lock takes
+precedence over a virtualenv; otherwise a pip requirements file takes
+precedence. A warning explains that Conda inputs are ignored.
+`--requirements` remains relative to the context and can select an exported
+file excluded from the application layer. Selecting a Conda YAML file as pip
+requirements, including via a file link, is rejected rather than passed to pip.
+Selected source paths inside a host Conda prefix are omitted; with
+`--include-deps` they also produce a Conda diagnostic unless the marker is
+excluded. Selected lockfiles and requirements inside a host prefix are rejected.
+
+Export the pip-compatible portion from your Conda environment, then build from
+your application source directory:
+
+```bash
+python -m pip freeze > requirements.txt
+python -m pycontainer.cli build --tag myapp:latest --include-deps --requirements requirements.txt
+```
+
+Review the export: remove host-local paths and ensure requirements resolve to
+target-compatible wheels. `pip freeze` is not a conversion of Conda-only
+packages or native/system libraries; provide those in a compatible base image.
+No YAML resolution or full Conda staging is implemented; that work is tracked
+in [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+Without `--include-deps`, a source project containing Conda descriptors still
+builds application-only, without dependency warnings or installation. Nested
+host Conda prefixes (directories containing `conda-meta/`) are always omitted
+from application and virtualenv dependency selection, including explicit
+includes and `--no-default-excludes`. A context that is itself a host Conda
+prefix or is inside one is rejected: choose a source-only context instead of
+the environment directory. This protects against copying host binaries, not a
+guarantee that an application-only image has all dependencies needed to run.
 
 ### Preview Before Building
 
@@ -143,7 +198,7 @@ sudo apt-get install skopeo
 sudo dnf install skopeo
 
 # 1. Build the image with pycontainer
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # 2. Copy the OCI layout to Docker daemon
 skopeo copy oci:dist/image docker-daemon:myapp:latest
@@ -173,7 +228,7 @@ sudo apt-get install podman
 sudo dnf install podman
 
 # 1. Build with pycontainer
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # 2. Run directly from the OCI layout
 podman run --rm -p 8000:8000 oci:dist/image:myapp
@@ -189,7 +244,7 @@ If you only have Docker and can't install skopeo:
 
 ```bash
 # 1. Build the image with pycontainer
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # 2. Create a tar archive and import (less efficient)
 tar -C dist/image -czf - . | docker import - myapp:latest
@@ -205,7 +260,7 @@ docker run -p 8000:8000 myapp:latest
 
 ```bash
 # Build with pycontainer
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # Import into Podman
 podman load -i <(tar -C dist/image -cf - .)
@@ -227,7 +282,7 @@ podman run -d -p 5000:5000 --name registry docker.io/library/registry:2
 # Build and push to local registry
 pycontainer build \
   --tag localhost:5000/myapp:latest \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --include-deps \
   --push
 
@@ -296,7 +351,7 @@ cd examples/fastapi-app
 pycontainer build --tag test:latest --verbose --dry-run
 
 # 3. Build a real image
-pycontainer build --tag test:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag test:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # 4. Test the image
 docker load -i <(tar -C dist/image -cf - .)
@@ -313,7 +368,7 @@ The `examples/` directory contains ready-to-use test projects:
 ```bash
 # FastAPI example
 cd examples/fastapi-app
-pycontainer build --tag fastapi-test:latest --include-deps --verbose
+pycontainer build --tag fastapi-test:latest --base-image python:3.11-slim-bookworm --include-deps --verbose
 
 # Test the output structure
 tree dist/image
@@ -406,16 +461,16 @@ pycontainer build --tag flask-test:latest --dry-run --verbose
 
 ```bash
 # First build (cold cache)
-time pycontainer build --tag myapp:v1 --base-image python:3.11-slim --include-deps
+time pycontainer build --tag myapp:v1 --base-image python:3.11-slim-bookworm --include-deps
 
 # Second build (warm cache - should be faster)
-time pycontainer build --tag myapp:v2 --base-image python:3.11-slim --include-deps
+time pycontainer build --tag myapp:v2 --base-image python:3.11-slim-bookworm --include-deps
 
 # Check cached blobs
 ls -lh ~/.pycontainer/cache/blobs/sha256/
 
 # Force rebuild without cache
-pycontainer build --tag myapp:v3 --base-image python:3.11-slim --include-deps --no-cache
+pycontainer build --tag myapp:v3 --base-image python:3.11-slim-bookworm --include-deps --no-cache
 ```
 
 ### Use Case 6: Cross-Platform Builds
@@ -425,7 +480,7 @@ pycontainer build --tag myapp:v3 --base-image python:3.11-slim --include-deps --
 pycontainer build \
   --tag myapp:amd64 \
   --platform linux/amd64 \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --include-deps \
   --verbose
 
@@ -439,7 +494,7 @@ jq '.architecture, .os' dist/image/blobs/sha256/$CONFIG_DIGEST
 pycontainer build \
   --tag myapp:arm64 \
   --platform linux/arm64 \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --include-deps
 
 # Build for both platforms and push
@@ -497,7 +552,7 @@ tree /tmp/layer
 
 ```bash
 # Build with pycontainer
-pycontainer build --tag myapp:pycontainer --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:pycontainer --base-image python:3.11-slim-bookworm --include-deps
 
 # Build equivalent with Docker
 cat > Dockerfile << EOF
@@ -570,6 +625,21 @@ az acr login --name myregistry
 pycontainer build --tag myapp:latest --base-image python:3.11-slim
 ```
 
+For offline or air-gapped builds, load the base image from disk instead of a
+registry; no credentials or daemon are used:
+
+```bash
+skopeo copy docker://python:3.11-slim oci:./base:3.11-slim   # or: docker save python:3.11-slim -o python.tar
+pycontainer build --tag myapp:latest --base-image oci:./base:3.11-slim
+pycontainer build --tag myapp:latest --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+For `--include-deps`, the local image config must explicitly declare
+`PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
+`PYTHON_LIBC`, even when its tag claims an official Python image.
+See [Local base images](../README.md#local-base-images) for selection rules,
+verification, and limitations.
+
 #### Issue: "Dependencies not found in image"
 
 **Solution**: Ensure `--include-deps` and dependencies are installed:
@@ -579,7 +649,7 @@ pycontainer build --tag myapp:latest --base-image python:3.11-slim
 pip install -r requirements.txt
 
 # Then build with --include-deps
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 ```
 
 #### Issue: "Permission denied writing to dist/"
@@ -648,10 +718,10 @@ except Exception as e:
 
 ```bash
 # 1. Use cache (enabled by default)
-pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 
 # 2. Use smaller base images
-pycontainer build --tag myapp:latest --base-image python:3.11-alpine --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-alpine3.20 --include-deps
 
 # 3. Include only necessary files
 pycontainer build \
@@ -672,7 +742,7 @@ pycontainer build --tag myapp:latest --base-image python:3.11-alpine
 
 # Don't include unnecessary dependencies
 pip install --no-dev -r requirements.txt
-pycontainer build --tag myapp:latest --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-slim-bookworm --include-deps
 ```
 
 ---
@@ -738,7 +808,7 @@ Try these ready-made examples:
 cd examples/fastapi-app
 
 # Quick build
-pycontainer build --tag fastapi-demo:latest --include-deps --verbose
+pycontainer build --tag fastapi-demo:latest --base-image python:3.11-slim-bookworm --include-deps --verbose
 
 # Test locally
 docker load -i <(tar -C dist/image -cf - .)
