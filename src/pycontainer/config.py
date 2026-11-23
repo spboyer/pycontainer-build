@@ -62,11 +62,17 @@ class BuildConfig:
     _git_tag_snapshot: Optional[Tuple[str, str, str, bool]] = field(
         init=False, default=None, repr=False, compare=False
     )
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

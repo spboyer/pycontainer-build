@@ -371,6 +371,20 @@ def test_config_file_supports_the_sha_fallback(git_repo, tmp_path):
     assert config_from_file(config_path).tag == f"app:sha-{commit[:12]}"
 
 
+def test_git_tag_and_security_config_can_be_used_together(release_repo, tmp_path):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        f"[tool.pycontainer]\ncontext_dir = {json.dumps(str(release_repo))}\n"
+        "tag = 'app:placeholder'\ntag_from_git = true\n"
+        "[tool.pycontainer.security.kubernetes]\n"
+        "read-only-root-filesystem = true\n",
+        encoding="utf-8",
+    )
+    config = config_from_file(config_path)
+    assert config.tag == "app:v0.1.0"
+    assert config.security["kubernetes"]["read_only_root_filesystem"] is True
+
+
 @pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
 @pytest.mark.parametrize("key", ["allow_dirty", "allow-dirty"])
 def test_config_file_cannot_silently_allow_dirty_worktrees(release_repo, tmp_path, table, key):
