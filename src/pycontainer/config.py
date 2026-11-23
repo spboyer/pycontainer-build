@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 from urllib.parse import unquote, urlsplit
 
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
+
 SBOM_FORMATS = ("spdx", "cyclonedx")
 SIGNING_PROVIDERS = ("cosign", "notation")
 NOTATION_SIGNATURE_FORMATS = ("jws", "cose")
@@ -147,6 +149,8 @@ class BuildConfig:
     sign_verify_key: Optional[str] = None
     sign_certificate_identity: Optional[str] = None
     sign_certificate_oidc_issuer: Optional[str] = None
+    manifest_annotations: Optional[Dict[str, str]] = None
+    index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
     scan_executable: str = "grype"
     scan_threshold: str = "high"
@@ -163,10 +167,15 @@ class BuildConfig:
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
+    release_notes_file: Optional[str] = None
+    release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
 
     def __post_init__(self):
+        from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
+        self.validate_metadata()
+        validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
         self.validate_signing()
         if self.scan_threshold not in SCAN_SEVERITIES:
@@ -318,6 +327,16 @@ class BuildConfig:
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
+
+    def validate_metadata(self) -> None:
+        from .metadata import validate_metadata
+
+        for name in ("labels", "manifest_annotations", "index_annotations"):
+            validate_metadata(
+                getattr(self, name),
+                name,
+                protect_reference=name != "labels",
+            )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

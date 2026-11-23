@@ -851,7 +851,7 @@ def _patch_urlopen(monkeypatch, handler):
     return requests, delays
 
 
-def test_denied_manifest_push_reports_registry_operation_code_and_message(
+def test_denied_manifest_push_reports_operation_and_permission_hint(
     monkeypatch,
 ):
     client = RegistryClient("registry.example", "team/app")
@@ -872,7 +872,8 @@ def test_denied_manifest_push_reports_registry_operation_code_and_message(
     message = str(error.value)
     assert not isinstance(error.value, (RegistryRateLimitError, RegistryQuotaError))
     assert "Manifest push failed with HTTP 403 from registry.example" in message
-    assert "DENIED: requested access to the resource is denied" in message
+    assert "(response details omitted)" in message
+    assert "requested access to the resource is denied" not in message
     assert "push permission" in message
     assert len(requests) == 1
     assert delays == []
@@ -903,7 +904,8 @@ def test_rate_limit_with_long_retry_after_fails_fast_with_reset_time(monkeypatch
     message = str(error.value)
     assert error.value.retry_after_seconds == 3600
     assert "registry-1.docker.io" in message
-    assert "TOOMANYREQUESTS: You have reached your pull rate limit." in message
+    assert "(response details omitted)" in message
+    assert "You have reached your pull rate limit." not in message
     assert "resets in about 3600 seconds" in message
     assert "0 of 100 remaining" in message
     assert "Authenticate" in message
@@ -1112,7 +1114,7 @@ def test_error_bodies_are_truncated_sanitized_and_redacted(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     message = str(error.value)
     assert len(message) < 1000
@@ -1145,7 +1147,7 @@ def test_error_body_redacts_complete_credential_fields(monkeypatch, detail):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "marker-first" not in str(error.value)
     assert "marker-second" not in str(error.value)
@@ -1172,7 +1174,7 @@ def test_error_body_redacts_overlapping_credentials_and_username(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "sensitive-user" not in str(error.value)
     assert "distinct-suffix" not in str(error.value)
@@ -1194,7 +1196,7 @@ def test_error_body_redacts_credentials_and_query_in_urls(monkeypatch, structure
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "storage.example/layer" in str(error.value)
     for secret in ("marker-user", "marker-password", "marker-signature", "marker-token"):
@@ -1212,7 +1214,7 @@ def test_error_body_redacts_malformed_url(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "[REDACTED URL]" in str(error.value)
     for secret in ("marker-user", "marker-password", "marker-signature"):
@@ -1231,9 +1233,9 @@ def test_malformed_and_oversized_error_json_is_summarized(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as malformed:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
     with pytest.raises(RegistryRequestError) as oversized:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert '{"errors": [{"code": "DENIED"' in str(malformed.value)
     message = str(oversized.value)
@@ -1253,7 +1255,7 @@ def test_deeply_nested_error_body_is_summarized(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "HTTP 400" in str(error.value)
     assert "..." in str(error.value)
@@ -1284,7 +1286,7 @@ def test_omitted_distribution_error_still_controls_classification(
         client.push_manifest("latest", b"{}")
 
     assert hint in str(error.value).lower()
-    assert "1 more error(s) omitted" in str(error.value)
+    assert "(response details omitted)" in str(error.value)
 
 
 @pytest.mark.parametrize("structured", [True, False])
@@ -1802,7 +1804,7 @@ def test_url_encoded_credentials_are_redacted(monkeypatch, operation):
         if operation == "network":
             client._make_request("PUT", url, data=b"")
         else:
-            client.push_manifest("latest", b"{}")
+            client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert token not in str(error.value)
     assert encoded_token not in str(error.value)
