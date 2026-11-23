@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
 from .config import BuildConfig
-from .config_loader import _validate_config, load_validated_file_config, merge_configs
+from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
 from .dependencies import validate_target_platform
 from .fs_utils import relative_context_path
 from .project import detect_python_version
@@ -133,9 +133,9 @@ def resolve_build_config(
     """
     table, file_config = None, {}
     if config_path is not None:
-        table, file_config = load_validated_file_config(config_path)
+        table, file_config = load_explicit_file_config(config_path)
     merged = merge_configs(file_config, overrides)
-    _validate_config(merged)
+    _validate_config(merged, table or BUILD_TABLE)
     origin = lambda field: _origin(field, overrides, table, file_config)
     try:
         cfg = BuildConfig(**merged)

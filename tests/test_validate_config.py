@@ -108,6 +108,22 @@ def test_cli_overrides_take_precedence_and_are_attributed(offline, monkeypatch, 
     assert _run(monkeypatch, ["validate", "config", "-c", path, "--platform", "linux/amd64"]) == 0
 
 
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_overrides_invalid_file_types_before_validation(offline, monkeypatch, capsys, table):
+    path = _write(offline / "config.toml", f'[{table}]\nplatform = 123\ninclude-deps = "invalid"\n')
+
+    assert _run(monkeypatch, ["validate", "config", path]) == 2
+    assert f"Invalid value for [{table}].platform" in capsys.readouterr().err
+    assert _run(
+        monkeypatch, ["validate", "config", path, "--platform", "linux/arm64", "--include-deps"]
+    ) == 0
+
+
+def test_validate_build_table_with_unrelated_scalar_tool(offline, monkeypatch):
+    path = _write(offline / "config.toml", 'tool = "standalone"\n[build]\n')
+    assert _run(monkeypatch, ["validate", "config", path]) == 0
+
+
 @pytest.mark.parametrize(
     ("content", "extra", "origin"),
     [
