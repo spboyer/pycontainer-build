@@ -12,7 +12,7 @@ import tarfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,9 @@ _TRACKED = {
 }
 
 
-def inspect_base_layers(layers: Iterable) -> Tuple[Optional[str], Set[str]]:
+def inspect_base_layers(
+    layers: Iterable, *, redact: Optional[Callable[[str], str]] = None
+) -> Tuple[Optional[str], Set[str]]:
     """Return (distro family, installed package names) for a base image."""
     files: Dict[str, str] = {}
     status_d: Dict[str, str] = {}
@@ -152,7 +154,8 @@ def inspect_base_layers(layers: Iterable) -> Tuple[Optional[str], Set[str]]:
                     elif name.startswith("var/lib/dpkg/status.d/") and not name.endswith(".md5sums"):
                         status_d[name] = tar.extractfile(member).read().decode("utf-8", "replace")
         except (tarfile.TarError, OSError) as exc:
-            logger.debug("Could not inspect base layer %s: %s", layer.tar_path, exc)
+            message = f"Could not inspect base layer {layer.tar_path}: {exc}"
+            logger.debug("%s", redact(message) if redact is not None else message)
 
     family = None
     for key in ("etc/os-release", "usr/lib/os-release"):
@@ -173,14 +176,17 @@ def inspect_base_layers(layers: Iterable) -> Tuple[Optional[str], Set[str]]:
     return family, installed
 
 
-def report_system_packages(config, base_layers) -> SystemPackageReport:
+def report_system_packages(
+    config, base_layers, *, redact: Optional[Callable[[str], str]] = None
+) -> SystemPackageReport:
     """Compare required system packages with the base image and log findings."""
+    redact_message = redact if redact is not None else str
     report = SystemPackageReport()
     explicit = validate_system_packages(config.system_packages)
     if not explicit and not config.detect_system_packages:
         return report
 
-    family, installed = inspect_base_layers(base_layers)
+    family, installed = inspect_base_layers(base_layers, redact=redact)
     report.family = family
 
     required = list(explicit)
@@ -199,27 +205,26 @@ def report_system_packages(config, base_layers) -> SystemPackageReport:
 
     if family is None:
         report.unverified = list(required)
-        logger.warning(
+        logger.warning("%s", redact_message(
             "Could not determine the base image package manager, so system "
             "packages cannot be verified: %s. pycontainer-build does not "
-            "install system packages; use a base image that provides them.",
-            ", ".join(required),
-        )
+            "install system packages; use a base image that provides them."
+            % ", ".join(required)
+        ))
         return report
 
     for package in required:
         (report.satisfied if package in installed else report.missing).append(package)
     for package in report.missing:
         reason = report.reasons.get(package, "declared in system_packages")
-        logger.warning(
+        logger.warning("%s", redact_message(
             "System package %r (%s) is not installed in base image (%s). "
             "pycontainer-build cannot run %s; choose a base image that "
-            "includes it.",
-            package,
-            reason,
-            family,
-            "apt-get install" if family == DEBIAN else "apk add",
-        )
+            "includes it."
+            % (package, reason, family, "apt-get install" if family == DEBIAN else "apk add")
+        ))
     if report.satisfied:
-        logger.info("System packages present in base image: %s", ", ".join(report.satisfied))
+        logger.info(
+            "%s", redact_message("System packages present in base image: %s" % ", ".join(report.satisfied))
+        )
     return report

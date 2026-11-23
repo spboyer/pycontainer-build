@@ -4,15 +4,21 @@ import logging
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pycontainer import cli
+from pycontainer import auth as auth_module
+from pycontainer import builder as builder_module
+from pycontainer.auth import RegistryAuth
 from pycontainer.build_args import resolve_arguments
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
+from pycontainer.registry_client import RegistryClient
+from pycontainer.system_packages import report_system_packages
 
 
 def test_direct_config_without_arguments_preserves_runtime_dollars():
@@ -23,6 +29,11 @@ def test_direct_config_without_arguments_preserves_runtime_dollars():
 def test_explicit_empty_arguments_reject_undeclared_references():
     with pytest.raises(ValueError, match="Undeclared build argument reference"):
         BuildConfig(build_args={}, cmd=["echo ${PORT}"])
+
+
+def test_explicit_empty_arguments_expand_escaped_dollars():
+    config = BuildConfig(build_args={}, cmd=["echo $$PORT"])
+    assert config.cmd == ["echo $PORT"]
 
 
 def test_cli_without_config_rejects_undeclared_reference(monkeypatch, capsys):
@@ -47,6 +58,19 @@ def test_defaults_required_values_and_cli_precedence(tmp_path, table):
     )
     assert config.tag == "override:v3=extra"
     assert config.build_args == {"VERSION": "v3=extra", "OPTION": ""}
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_override_replaces_invalid_file_value_before_build_arg_interpolation(tmp_path, table):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'[{table}]\ntag = 42\n'
+        f'[{table}.build-args]\nVERSION = "default"\n'
+    )
+    config = config_from_file(
+        path, {"tag": "override:${VERSION}"}, ["VERSION=explicit"]
+    )
+    assert config.tag == "override:explicit"
 
 
 @pytest.mark.parametrize(
@@ -187,6 +211,101 @@ def test_dry_run_redacts_values_in_non_expandable_fields(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "libpq5" not in output
     assert "8000" not in output
+
+
+@pytest.mark.parametrize("operation", ["pull", "push"])
+def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, caplog, operation):
+    value = "private-registry"
+    config = BuildConfig(
+        base_image="${REGISTRY}.example/team/base:v1",
+        tag="${REGISTRY}.example/team/app:v1",
+        build_args={"REGISTRY": value},
+        context_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+        use_cache=False,
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
+
+    def observe_and_stop(client, *args, **kwargs):
+        client._observe_rate_limit(
+            {"ratelimit-limit": "100", "ratelimit-remaining": "0"}, client.base_url
+        )
+        raise RuntimeError("stopped after rate-limit response")
+
+    monkeypatch.setattr(RegistryClient, "pull_manifest", observe_and_stop)
+    monkeypatch.setattr(RegistryClient, "push_blob", observe_and_stop)
+    builder.manifest_digest = "sha256:" + "a" * 64
+    builder.config_digest = "sha256:" + "b" * 64
+    builder.layers = []
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError, match="stopped"):
+        if operation == "pull":
+            builder._pull_base_image(tmp_path / "layers", "linux", "amd64")
+        else:
+            builder.push(show_progress=False)
+
+    assert "rate limit" in caplog.text
+    assert value not in caplog.text
+
+
+def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
+    value = "privatehost"
+    config = BuildConfig(
+        base_image="${REGISTRY}.azurecr.io/team/base:v1",
+        build_args={"REGISTRY": value},
+        context_dir=str(tmp_path),
+        use_cache=False,
+    )
+    for provider in (auth_module.EnvironmentAuthProvider, auth_module.DockerConfigAuthProvider):
+        monkeypatch.setattr(provider, "get_token", lambda self, registry: None)
+        monkeypatch.setattr(provider, "get_credentials", lambda self, registry: None)
+    monkeypatch.setattr(
+        auth_module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1)
+    )
+    monkeypatch.setattr(
+        RegistryClient, "pull_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
+    )
+
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="stopped"):
+        ImageBuilder(config)._pull_base_image(tmp_path / "layers", "linux", "amd64")
+
+    assert "Azure CLI authentication failed" in caplog.text
+    assert value not in caplog.text
+
+
+def test_direct_build_redacts_system_package_logs(tmp_path, monkeypatch, caplog):
+    value = "libpq5"
+    (tmp_path / "app.py").write_text("print('hello')")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"],
+        output_dir=str(tmp_path / "out"), use_cache=False,
+        build_args={"PACKAGE": value}, system_packages=[value],
+        detect_system_packages=False,
+    )
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(config).build()
+
+    assert "system packages cannot be verified" in caplog.text
+    assert value not in caplog.text
+
+
+def test_unreadable_base_layer_diagnostic_redacts_build_arguments(tmp_path, caplog):
+    value = "private-path"
+    config = BuildConfig(
+        build_args={"DIRECTORY": value}, system_packages=["libpq5"],
+        detect_system_packages=False,
+    )
+    layer = SimpleNamespace(tar_path=tmp_path / value / "missing.tar")
+
+    with caplog.at_level(logging.DEBUG):
+        report_system_packages(config, [layer], redact=config.redact)
+
+    assert "Could not inspect base layer" in caplog.text
+    assert value not in caplog.text
 
 
 def test_build_cache_identity_and_no_implicit_runtime_leakage(tmp_path, monkeypatch):

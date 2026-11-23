@@ -23,6 +23,14 @@ _CACHE_KEY_VERSION = 2
 class CacheIndexError(RuntimeError):
     """Raised when the persisted cache index cannot be trusted."""
 
+    def __init__(self, message: str, index_file: Optional[Path] = None):
+        if index_file is not None:
+            message = (
+                f"{message}. Delete {index_file} to discard the cached entries "
+                "(their layers are rebuilt on the next build), or rerun with --no-cache."
+            )
+        super().__init__(message)
+
 
 class CacheIntegrityError(RuntimeError):
     """Raised when a layer does not match its content-addressed digest."""
@@ -158,20 +166,27 @@ class LayerCache:
         try:
             data = json.loads(self.index_file.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise CacheIndexError(f"Malformed cache index {self.index_file}: {error}") from error
+            raise CacheIndexError(
+                f"Malformed cache index {self.index_file}: {error}", self.index_file
+            ) from error
         if not isinstance(data, dict):
-            raise CacheIndexError(f"Malformed cache index {self.index_file}: expected an object")
+            raise CacheIndexError(
+                f"Malformed cache index {self.index_file}: expected an object", self.index_file
+            )
 
         entries = {}
         for key, value in data.items():
             if not isinstance(key, str) or not isinstance(value, dict):
-                raise CacheIndexError(f"Malformed cache index entry in {self.index_file}")
+                raise CacheIndexError(
+                    f"Malformed cache index entry in {self.index_file}", self.index_file
+                )
             try:
                 entry = CacheEntry(**value)
                 self._digest_hex(entry.digest)
             except (TypeError, ValueError) as error:
                 raise CacheIndexError(
-                    f"Malformed cache index entry {key!r} in {self.index_file}: {error}"
+                    f"Malformed cache index entry {key!r} in {self.index_file}: {error}",
+                    self.index_file,
                 ) from error
             if (
                 isinstance(entry.size, bool)
@@ -182,10 +197,12 @@ class LayerCache:
                 or not isinstance(entry.source_files, list)
                 or any(not isinstance(path, str) for path in entry.source_files)
             ):
-                raise CacheIndexError(f"Malformed cache index entry {key!r} in {self.index_file}")
+                raise CacheIndexError(
+                    f"Malformed cache index entry {key!r} in {self.index_file}", self.index_file
+                )
             entries[key] = entry
 
-        self._unique_blob_sizes(entries)
+        self._unique_blob_sizes(entries, self.index_file)
         return entries
 
     def _save_index(self, entries: Dict[str, CacheEntry]):
@@ -205,13 +222,16 @@ class LayerCache:
             temp_path.unlink(missing_ok=True)
 
     @staticmethod
-    def _unique_blob_sizes(entries: Dict[str, CacheEntry]) -> Dict[str, int]:
+    def _unique_blob_sizes(
+        entries: Dict[str, CacheEntry], index_file: Optional[Path] = None
+    ) -> Dict[str, int]:
         sizes = {}
         for entry in entries.values():
             previous_size = sizes.setdefault(entry.digest, entry.size)
             if previous_size != entry.size:
                 raise CacheIndexError(
-                    f"Cache index has conflicting sizes for shared blob {entry.digest}"
+                    f"Cache index has conflicting sizes for shared blob {entry.digest}",
+                    index_file,
                 )
         return sizes
 
