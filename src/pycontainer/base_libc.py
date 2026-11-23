@@ -52,6 +52,8 @@ class _BoundedReader:
 
 class _BoundedTarInfo(tarfile.TarInfo):
     def _check_extended_header(self):
+        if self.size < 0:
+            raise ValueError("Base libc inspection found an invalid tar member size.")
         if self.size > MAX_METADATA_BYTES:
             raise ValueError("Base libc extended tar metadata exceeds its size limit.")
 
@@ -103,8 +105,16 @@ def _layer_records(layer, deadline):
                 _check_deadline(deadline)
                 if index > MAX_LAYER_MEMBERS:
                     raise ValueError("Base libc inspection exceeds the layer member limit.")
-                if member.size < 0:
+                pax_size = member.pax_headers.get("size")
+                if member.size < 0 or (
+                    pax_size is not None and (
+                        not pax_size.isascii() or not pax_size.isdecimal()
+                        or (pax_size.lstrip("0") or "0") != str(member.size)
+                    )
+                ):
                     raise ValueError("Base libc inspection found an invalid tar member size.")
+                if member.size > MAX_LAYER_BYTES:
+                    raise ValueError("Base libc inspection exceeds the decoded layer size limit.")
                 if member.sparse is not None:
                     raise ValueError("Base libc inspection does not support sparse layer entries.")
                 name = _path(member.name)

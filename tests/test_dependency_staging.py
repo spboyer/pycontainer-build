@@ -479,7 +479,9 @@ def test_layer_libc_applies_zero_device_whiteouts_before_additions(tmp_path, rep
             _layer_libc_config([lower, upper])
 
 
-def test_layer_libc_rejects_invalid_device_whiteouts_and_negative_sizes(tmp_path):
+@pytest.mark.parametrize("pax_size", ["-1", "not-a-size", "9" * 5000],
+                         ids=["negative", "non-numeric", "overflow"])
+def test_layer_libc_rejects_invalid_device_whiteouts_and_pax_sizes(tmp_path, pax_size):
     whiteout = tarfile.TarInfo("var/lib/dpkg/.wh.status")
     whiteout.type = tarfile.CHRTYPE
     whiteout.devmajor = 1
@@ -487,7 +489,7 @@ def test_layer_libc_rejects_invalid_device_whiteouts_and_negative_sizes(tmp_path
     with pytest.raises(ValueError, match="invalid whiteout"):
         _layer_libc_config([layer])
     invalid = tarfile.TarInfo("unrelated")
-    invalid.pax_headers = {"size": "-1"}
+    invalid.pax_headers = {"size": pax_size}
     layer = _base_metadata_layer(tmp_path, [(invalid.name, invalid)])
     with pytest.raises(ValueError, match="invalid tar member size"):
         _layer_libc_config([layer])
