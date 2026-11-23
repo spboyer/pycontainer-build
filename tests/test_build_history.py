@@ -220,6 +220,25 @@ def test_rejected_package_index_credentials_are_not_recorded(tmp_path, monkeypat
     assert secret not in history.history_file.read_text()
 
 
+@pytest.mark.parametrize("signal", ["environment.yml", "conda-meta"])
+def test_conda_preflight_failure_is_recorded(tmp_path, monkeypatch, signal):
+    config = _history_config(tmp_path, include_deps=True)
+    path = Path(config.context_dir) / signal
+    if signal == "conda-meta":
+        path.mkdir()
+    else:
+        path.write_text("name: example\n")
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+    record = BuildHistory(config.history_dir).list()[0]
+    assert record["status"] == "failed"
+    assert record["phases_ns"] == {}
+
+
 @pytest.mark.parametrize("exclude_credentials", [False, True])
 def test_framework_history_respects_selected_file_credential_scan(
     tmp_path, monkeypatch, exclude_credentials
