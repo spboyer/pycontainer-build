@@ -5,8 +5,9 @@ A dependency-free HTTP service built by pycontainer-build as a
 and pushed straight to a registry, with no Docker daemon involved.
 
 Requirements: Skaffold v2, `kubectl` with a cluster context, pycontainer-build
-installed in the active Python environment, and an HTTPS registry the cluster
-can pull from (see [credentials](../../docs/skaffold-tilt.md#credentials)).
+installed in the active Python environment, and a registry the cluster can
+pull from (see [registry transport](../../docs/skaffold-tilt.md#what-is-supported)
+and [credentials](../../docs/skaffold-tilt.md#credentials)).
 
 ```bash
 cd examples/skaffold

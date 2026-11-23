@@ -173,7 +173,10 @@ concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
 redirected storage hosts. Registry blob downloads verify descriptor digest and
 size before publication; only safe reads use bounded retries and explicit
-request timeouts.
+request timeouts. Registry HTTP(S) requests go through the client's openers:
+keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
+explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
+credentials over HTTP to non-loopback hosts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
