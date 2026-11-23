@@ -49,6 +49,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
         b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
         b.add_argument("--password",help="Registry password/token (or use env vars)")
+    b.add_argument("--insecure-registry",dest="insecure_registries",action="append",metavar="HOST[:PORT]",help="Use plain HTTP for this exact registry host[:port] (repeatable; unsafe outside trusted networks)")
+    b.add_argument("--registry-ca-file",metavar="PATH",help="Trust an additional PEM CA bundle for registry HTTPS (verification stays enabled)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
@@ -140,6 +142,8 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'insecure_registries': args.insecure_registries,
+        'registry_ca_file': args.registry_ca_file,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
