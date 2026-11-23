@@ -2,7 +2,9 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -572,10 +574,39 @@ def test_cosign_tool_failures_are_explicit(tmp_path, monkeypatch, failure):
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 def test_cosign_output_is_bounded_while_process_runs(monkeypatch, stream):
     monkeypatch.setattr(base_trust, "MAX_VERIFIER_OUTPUT_BYTES", 1024)
-    monkeypatch.setattr(base_trust, "VERIFIER_TIMEOUT_SECONDS", 2)
-    script = f"import sys, time; sys.{stream}.write('x' * 200000); sys.{stream}.flush(); time.sleep(10)"
+    # Leave room for slow child startup; an unbounded reader would still hit this timeout.
+    monkeypatch.setattr(base_trust, "VERIFIER_TIMEOUT_SECONDS", 30)
+    script = f"import sys, time; sys.{stream}.write('x' * 200000); sys.{stream}.flush(); time.sleep(120)"
+    started = time.monotonic()
     with pytest.raises(TrustVerificationError, match="output exceeded"):
         base_trust._run_cosign([sys.executable, "-c", script], os.environ.copy())
+    assert time.monotonic() - started < 30
+
+
+def test_output_limit_takes_precedence_over_racing_timeout(monkeypatch):
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.stdout = io.BytesIO(b"x" * 2048)
+            self.stderr = io.BytesIO()
+            self.returncode = None
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                deadline = time.monotonic() + 5
+                while not self.stdout.closed and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                raise subprocess.TimeoutExpired("cosign", timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(base_trust.subprocess, "Popen", Process)
+    with pytest.raises(TrustVerificationError, match="output exceeded"):
+        base_trust.run_bounded_verifier(["cosign"], {}, 1, 1024, "Cosign")
 
 
 @pytest.mark.parametrize("size", [1024, 1025])

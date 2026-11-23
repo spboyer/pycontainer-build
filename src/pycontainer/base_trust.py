@@ -195,19 +195,23 @@ def run_bounded_verifier(command, environment, timeout, output_limit, label) -> 
     ]
     for thread in threads:
         thread.start()
+    timed_out = False
     try:
         process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as error:
+    except subprocess.TimeoutExpired:
+        timed_out = True
         process.kill()
         process.wait()
-        raise TrustVerificationError(f"{label} verification timed out.") from error
     finally:
         for thread in threads:
             thread.join(timeout=2)
-    if any(thread.is_alive() for thread in threads):
-        raise TrustVerificationError(f"{label} output streams did not close.")
+    # The output limit is the more precise diagnosis when it races the deadline.
     if exceeded.is_set():
         raise TrustVerificationError(f"{label} output exceeded its size limit.")
+    if timed_out:
+        raise TrustVerificationError(f"{label} verification timed out.")
+    if any(thread.is_alive() for thread in threads):
+        raise TrustVerificationError(f"{label} output streams did not close.")
     if stream_failed.is_set():
         raise TrustVerificationError(f"Cannot read {label} verification output.")
     if process.returncode:
