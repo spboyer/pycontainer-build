@@ -1,7 +1,8 @@
 """Hermetic Python-version matrix and non-atomic publication regressions."""
 import json
 import tarfile
-from dataclasses import replace
+import subprocess
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import pytest
@@ -240,6 +241,44 @@ def test_matrix_scan_is_rejected_before_builder_or_push(tmp_path, monkeypatch, c
         cli.main()
     assert error.value.code == 2
     assert "scanning is not supported for Python version matrices" in capsys.readouterr().err
+
+
+def test_matrix_git_derived_tags_are_rejected_at_configuration(tmp_path):
+    # #212 adds BuildConfig.tag_from_git, whose __post_init__ rewrites tag and
+    # would erase each child's -pyX.Y suffix; reject before any build exists.
+    if "tag_from_git" in {f.name for f in fields(BuildConfig)}:
+        GitTagConfig = BuildConfig
+    else:
+        @dataclass
+        class GitTagConfig(BuildConfig):
+            tag_from_git: bool = False
+
+    for args in (["init", "-q"], ["-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                                  "commit", "-q", "--allow-empty", "-m", "x"], ["tag", "v1.2.3"]):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True)
+    options = dict(context_dir=str(tmp_path), python_versions=["3.11", "3.12"])
+    GitTagConfig(**options)
+    with pytest.raises(ValueError, match="tag_from_git"):
+        GitTagConfig(tag_from_git=True, **options)
+
+
+def test_matrix_git_derived_tags_prevent_build_and_publication(tmp_path, monkeypatch):
+    build, _, pulls = matrix(tmp_path, monkeypatch)
+    build.config.tag_from_git = True
+    with pytest.raises(ValueError, match="tag_from_git"):
+        build.build()
+    assert pulls == []
+    with pytest.raises(ValueError, match="tag_from_git"):
+        PythonMatrixBuilder(build.config)
+
+    build.config.tag_from_git = False
+    build.build()
+    build.config.tag_from_git = True
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(ValueError, match="tag_from_git"):
+        build.push()
+    assert push.calls == [] and build.operations == []
 
 
 def test_enabling_scan_after_matrix_build_prevents_publication(tmp_path, monkeypatch):

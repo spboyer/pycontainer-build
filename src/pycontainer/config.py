@@ -18,6 +18,10 @@ MATRIX_SCAN_ERROR = (
     "Vulnerability scanning is not supported for Python version matrices; "
     "build and scan each Python version separately."
 )
+MATRIX_GIT_TAG_ERROR = (
+    "Git-derived tags (tag_from_git) are not supported for Python version matrices; "
+    "set an explicit tag or build each Python version separately."
+)
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
@@ -214,6 +218,8 @@ class BuildConfig:
         if self.python_versions or self.python_matrix or self.default_python_version:
             if self.scan:
                 raise ValueError(MATRIX_SCAN_ERROR)
+            if getattr(self, "tag_from_git", False):
+                raise ValueError(MATRIX_GIT_TAG_ERROR)
             from .python_matrix import matrix_targets
 
             matrix_targets(self)

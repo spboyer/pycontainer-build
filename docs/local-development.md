@@ -432,6 +432,10 @@ retained at the destination, as in non-matrix pushes, without regenerating
 semver aliases from the override. Local layout tags remain unchanged. Invalid
 generated tags or version/alias collisions fail before any remote publication.
 
+Python matrices reject vulnerability scanning and Git-derived tags
+(`tag_from_git`) at configuration and again before build or publication;
+set an explicit tag or build each Python version separately.
+
 Hermetic tests do not establish real per-version/per-architecture startup;
 the existing cross-target dependency-marker limitation (#142) still applies.
 
