@@ -63,6 +63,102 @@ def create_dependency_wheel(wheelhouse):
             wheel.writestr(name, content)
 
 
+def record_image(evidence, builder):
+    evidence["image"] = {
+        "manifest_digest": builder.manifest_digest,
+        "config_digest": builder.config_digest,
+        "layer_digests": [layer.digest for layer in builder.layers],
+    }
+
+
+def run_layout(docker, skopeo, layout, image_ref, timeout, platform, evidence):
+    """Import an OCI layout into Docker, run it once, and return stdout."""
+    try:
+        subprocess.run(
+            [skopeo, "copy", f"oci:{layout}:runtime-check", f"docker-daemon:{image_ref}"],
+            check=True,
+            timeout=timeout,
+        )
+        image_platform = command_output(
+            [docker, "image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", image_ref]
+        )
+        evidence["image_platform"] = image_platform
+        if image_platform != os_arch(platform):
+            raise RuntimeError(
+                f"imported image platform {image_platform} does not match target {platform}"
+            )
+        stdout = subprocess.run(
+            [docker, "run", "--pull=never", "--rm", image_ref],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        ).stdout
+        evidence["container_stdout"] = stdout[:STDOUT_LIMIT]
+        return stdout
+    finally:
+        cleanup = subprocess.run(
+            [docker, "image", "rm", "--force", image_ref],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if cleanup.returncode:
+            print(
+                f"warning: unable to remove temporary image {image_ref}: {cleanup.stderr.strip()}",
+                file=sys.stderr,
+            )
+
+
+SHELL_COMMAND_DOCKERFILE = (
+    "FROM {base}\n"
+    "ENV MARKER=ok\n"
+    "ENTRYPOINT printf '%s\\n' \"pycontainer-shell-command-$MARKER\" 'quoted  $NOT_EXPANDED'\n"
+)
+SHELL_COMMAND_EXPECTED = "pycontainer-shell-command-ok\nquoted  $NOT_EXPANDED\n"
+
+
+def shell_command_check(args, docker, skopeo, image_ref, evidence):
+    """Import a quoted shell-form ENTRYPOINT, build it, and run it in the target base image."""
+    from pycontainer.dockerfile_import import import_dockerfile, parse_shell_option
+
+    shell = parse_shell_option(args.shell) if args.shell is not None else None
+    result = import_dockerfile(SHELL_COMMAND_DOCKERFILE.format(base=args.base_image), shell=shell)
+    for warning in result.warnings:
+        print(f"import warning: {warning}", file=sys.stderr)
+    print(f"Imported entrypoint: {result.config['entrypoint']}")
+    with tempfile.TemporaryDirectory(prefix="pycontainer-shell-check-") as temp_dir:
+        temp_path = Path(temp_dir)
+        context = temp_path / "context"
+        context.mkdir()
+        (context / "app.py").write_text("")
+        layout = temp_path / "oci-layout"
+        builder = ImageBuilder(
+            BuildConfig(
+                tag="runtime-check",
+                base_image=args.base_image,
+                context_dir=str(context),
+                output_dir=str(layout),
+                entrypoint=result.config["entrypoint"],
+                env=result.config.get("env", {}),
+                platform=args.platform,
+                use_cache=False,
+            )
+        )
+        builder.build()
+        record_image(evidence, builder)
+        stdout = run_layout(
+            docker, skopeo, layout, image_ref, args.timeout, args.platform, evidence
+        )
+    if stdout != SHELL_COMMAND_EXPECTED:
+        raise RuntimeError(
+            f"shell-form command output mismatch: expected {SHELL_COMMAND_EXPECTED!r}, got {stdout!r}"
+        )
+    print(stdout, end="")
+    print("Shell-form command runtime check passed.")
+
+
 def command_output(command, timeout=30):
     return subprocess.run(
         command, check=True, capture_output=True, text=True, timeout=timeout
@@ -108,11 +204,29 @@ def main(argv=None):
         action="store_true",
         help="Run the staged dependency layer in the target base image without Skopeo",
     )
+    parser.add_argument(
+        "--shell-command",
+        action="store_true",
+        help="Import a quoted shell-form ENTRYPOINT, build it and run it in the target base image",
+    )
+    parser.add_argument(
+        "--shell",
+        help='JSON shell array for --shell-command conversion (default: ["/bin/sh", "-c"])',
+    )
     args = parser.parse_args(argv)
     if args.timeout < 1:
         parser.error("--timeout must be positive")
+    if args.shell is not None and not args.shell_command:
+        parser.error("--shell requires --shell-command")
+    if args.shell_command and args.dependency_layer_only:
+        parser.error("--shell-command cannot be combined with --dependency-layer-only")
 
-    mode = "dependency-layer-only" if args.dependency_layer_only else "oci-import-startup"
+    if args.shell_command:
+        mode = "shell-command"
+    elif args.dependency_layer_only:
+        mode = "dependency-layer-only"
+    else:
+        mode = "oci-import-startup"
     evidence = {
         "schema": EVIDENCE_SCHEMA,
         "status": "failed",
@@ -172,6 +286,9 @@ def run_check(args, evidence):
         evidence["skopeo_version"] = command_output([skopeo, "--version"])
 
     image_ref = f"pycontainer-runtime-check:{uuid.uuid4().hex[:12]}"
+    if args.shell_command:
+        shell_command_check(args, docker, skopeo, image_ref, evidence)
+        return
     with tempfile.TemporaryDirectory(prefix="pycontainer-runtime-check-") as temp_dir:
         temp_path = Path(temp_dir)
         context = temp_path / "context"
@@ -196,11 +313,7 @@ def run_check(args, evidence):
 
         builder = ImageBuilder(config)
         builder.build()
-        evidence["image"] = {
-            "manifest_digest": builder.manifest_digest,
-            "config_digest": builder.config_digest,
-            "layer_digests": [layer.digest for layer in builder.layers],
-        }
+        record_image(evidence, builder)
         sbom = (layout / "sbom.json").read_text()
         if '"name": "runtime-fixture"' not in sbom:
             raise RuntimeError("SBOM does not describe the staged runtime dependency")
@@ -251,46 +364,13 @@ def run_check(args, evidence):
                 print("Target dependency import check passed.")
             return
 
-        try:
-            subprocess.run(
-                [skopeo, "copy", f"oci:{layout}:runtime-check", f"docker-daemon:{image_ref}"],
-                check=True,
-                timeout=args.timeout,
-            )
-            image_platform = command_output(
-                [docker, "image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", image_ref]
-            )
-            evidence["image_platform"] = image_platform
-            if image_platform != os_arch(args.platform):
-                raise RuntimeError(
-                    f"imported image platform {image_platform} does not match target "
-                    f"{args.platform}"
-                )
-            result = subprocess.run(
-                [docker, "run", "--pull=never", "--rm", image_ref],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=args.timeout,
-            )
-            evidence["container_stdout"] = result.stdout[:STDOUT_LIMIT]
-            if RUNTIME_MARKER not in result.stdout:
-                raise RuntimeError("container did not import and run its staged dependency")
-            print(result.stdout, end="")
-            print("OCI import and container startup check passed.")
-        finally:
-            cleanup = subprocess.run(
-                [docker, "image", "rm", "--force", image_ref],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            if cleanup.returncode:
-                print(
-                    f"warning: unable to remove temporary image {image_ref}: {cleanup.stderr.strip()}",
-                    file=sys.stderr,
-                )
+        stdout = run_layout(
+            docker, skopeo, layout, image_ref, args.timeout, args.platform, evidence
+        )
+        if RUNTIME_MARKER not in stdout:
+            raise RuntimeError("container did not import and run its staged dependency")
+        print(stdout, end="")
+        print("OCI import and container startup check passed.")
 
 
 if __name__ == "__main__":
