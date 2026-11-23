@@ -212,9 +212,13 @@ codename tokens (`docs/libc-codename-mappings.md` pins each row to immutable
 snapshot/commit sources; update it with the code table). Codename-less or unmapped
 official tag-only pulls instead use effective `libc6`/`musl` package metadata
 from digest-checked ordered layers. `base_libc.py` applies whiteouts and fails
-closed on links, absent/ambiguous records, unsupported versions or architecture
-mismatches; limits are 8 MiB metadata, 2 GiB decoded bytes and 100,000 members
-per layer, and 300 seconds overall. It never extracts base files.
+closed on active database links, unknown foreign links, absent/ambiguous
+records, unsupported versions or architecture mismatches. It recognizes the
+foreign root aliases `lib -> usr/lib` and `var -> usr/var` without following
+links and checks their redirected databases for conflicts. Historical links
+may cause conservative rejection. Limits are 8 MiB metadata, 2 GiB decoded
+bytes and 100,000 members per layer, and 300 seconds overall. It never extracts
+base files.
 Core defaults, auto-detection and the Aspire unversioned-tag invocation remain
 supported with this evidence. Missing evidence requires a mapped release or
 explicit base config `PYTHON_LIBC`. Inference uses a staging-only config copy.

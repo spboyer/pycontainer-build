@@ -79,7 +79,7 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
 def _path(name):
     path = PurePosixPath(name)
-    if path.is_absolute() or ".." in path.parts or "\\" in name:
+    if path.is_absolute() or ".." in path.parts or "\\" in name or "\0" in name:
         raise ValueError("Base libc inspection found an unsafe layer path.")
     return path.as_posix()
 
@@ -87,6 +87,12 @@ def _path(name):
 def _layer_records(layer, deadline, expected):
     updates = {}
     deleted = set()
+    foreign = next(database for database in _DATABASES if database != expected)
+    foreign_root = foreign.split("/", 1)[0]
+    redirected = f"usr/{foreign}"
+    database_paths = _DATABASES | {redirected}
+    foreign_link = False
+    unsafe_redirect = False
     with ExitStack() as stack:
         source = stack.enter_context(open(layer.tar_path, "rb"))
         digest = hashlib.sha256()
@@ -132,15 +138,31 @@ def _layer_records(layer, deadline, expected):
                         raise ValueError("Base libc inspection found an invalid whiteout.")
                     opaque = path.name == ".wh..wh..opq"
                     removed = path.parent if opaque else path.with_name(path.name[4:])
-                    for database in _DATABASES:
+                    for database in database_paths:
                         candidate = PurePosixPath(database)
                         if removed == candidate or removed in candidate.parents:
                             deleted.add(database)
                     continue
-                # Only the target database's ancestors matter: usr-merged Debian
-                # layers link lib -> usr/lib, an ancestor of the APK database.
                 if path in PurePosixPath(expected).parents and not member.isdir():
                     raise ValueError("Base libc metadata has a non-directory or linked ancestor.")
+                if path in PurePosixPath(foreign).parents and not member.isdir():
+                    if (
+                        name == foreign_root
+                        and member.issym()
+                        and not member.size
+                        and member.linkname == f"usr/{foreign_root}"
+                    ):
+                        foreign_link = True
+                    else:
+                        raise ValueError(
+                            "Base libc metadata has a non-directory or linked ancestor."
+                        )
+                if path in PurePosixPath(redirected).parents and not member.isdir():
+                    unsafe_redirect = True
+                if name == redirected:
+                    # The foreign database only needs to be tracked as present.
+                    updates[name] = b""
+                    continue
                 if name not in _DATABASES:
                     continue
                 if not member.isfile() or name in updates:
@@ -154,13 +176,16 @@ def _layer_records(layer, deadline, expected):
                 if len(data) != member.size:
                     raise ValueError("Base libc metadata is truncated.")
                 updates[name] = data.decode("utf-8")
+                if name == foreign:
+                    # A tar entry under the foreign root may have followed its link.
+                    updates[redirected] = b""
             end = archive.offset
         # Drain under the same bounds to validate gzip trailers and tar end blocks.
         while reader.read(_CHUNK_BYTES):
             pass
         if reader.size < end + _TAR_END_BYTES or reader.tail != b"\0" * _TAR_END_BYTES:
             raise ValueError("Base libc layer has missing tar end blocks.")
-    return deleted, updates
+    return deleted, updates, foreign_link, unsafe_redirect
 
 
 def _package_version(text, family, architecture):
@@ -210,13 +235,22 @@ def infer_libc_from_layers(layers, family, architecture, machine):
     """Read effective package metadata; the caller establishes source provenance."""
     deadline = time.monotonic() + INSPECTION_TIMEOUT_SECONDS
     expected = "var/lib/dpkg/status" if family == "glibc" else "lib/apk/db/installed"
+    foreign = next(database for database in _DATABASES if database != expected)
+    redirected = f"usr/{foreign}"
     files = {}
+    foreign_link = False
+    unsafe_redirect = False
     for layer in layers:
-        deleted, updates = _layer_records(layer, deadline, expected)
+        deleted, updates, layer_link, layer_unsafe = _layer_records(layer, deadline, expected)
+        # Retaining historical links makes uncertain overlay transitions fail closed.
+        foreign_link |= layer_link
+        unsafe_redirect |= layer_unsafe
         for name in deleted:
             files.pop(name, None)
         files.update(updates)
-    if set(files) != {expected}:
+    if foreign_link and unsafe_redirect:
+        raise ValueError("Base libc metadata has a non-directory or linked ancestor.")
+    if set(files) - {redirected} != {expected} or (foreign_link and redirected in files):
         raise ValueError(
             "Cannot validate target libc from absent or ambiguous base metadata. "
             "Pin a mapped codename tag or provide supported base PYTHON_LIBC."

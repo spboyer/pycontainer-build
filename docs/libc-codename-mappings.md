@@ -125,6 +125,12 @@ values from `git ls-remote https://git.alpinelinux.org/aports`.
   trailers, tar end blocks, regular-file/ancestor types, package status,
   unique fields and native package architecture are checked. Invalid,
   missing, linked, ambiguous or unsupported evidence fails closed.
+  To support usr-merged images, a foreign database root link of exactly
+  `lib -> usr/lib` or `var -> usr/var` is recognized without following links;
+  the redirected database is checked for conflicting evidence with the same
+  whiteout rules. Other foreign links and links above the redirected path fail
+  closed. Historical links are retained conservatively, so later removal can
+  still cause rejection.
   Limits are 8 MiB per database/extended header, 2 GiB decoded bytes and
   100,000 members per layer, and 300 seconds including verification.
   Base files are never extracted. The reporting scanner in

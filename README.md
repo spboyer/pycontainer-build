@@ -401,7 +401,10 @@ pycontainer build \
   For verified official tag-only pulls, the builder instead reads the effective
   `libc6`/`musl` package record from digest-checked base layers. It applies
   whiteouts and rejects missing, linked, ambiguous, unsupported or wrong-architecture
-  records. Inspection is bounded (8 MiB metadata, 2 GiB decoded bytes and 100,000
+  records. A foreign-database root link such as Debian's `lib -> usr/lib` is
+  allowed only when its redirected database has no conflicting evidence;
+  other foreign links and links on the active database path fail closed.
+  Inspection is bounded (8 MiB metadata, 2 GiB decoded bytes and 100,000
   members per layer, 300 seconds overall) and never extracts base files.
   Thus the CLI's automatic selection, `BuildConfig`'s `python:3.11-slim`
   default, and Aspire's `python:3.12-slim --include-deps` invocation remain

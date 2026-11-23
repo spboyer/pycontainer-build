@@ -593,6 +593,151 @@ def test_layer_libc_ignores_only_links_above_the_other_database(
         _layer_libc_config([layer], base_image=base_image)
 
 
+_FOREIGN_DATABASE_LINK_CASES = [
+    pytest.param(
+        "python:3.11-slim", "var/lib/dpkg/status", _dpkg_libc(), "lib",
+        "usr/lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n",
+        "glibc-2.36", id="glibc",
+    ),
+    pytest.param(
+        "python:3.11-alpine", "lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n",
+        "var", "usr/var/lib/dpkg/status", _dpkg_libc(), "musl-1.2", id="musl",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize("placement", ["same-layer", "link-first", "link-last"])
+def test_layer_libc_rejects_mixed_databases_hidden_by_foreign_link(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, placement
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    if placement == "same-layer":
+        layers = [_base_metadata_layer(tmp_path, [(root, link), (database, record), (alias, foreign)])]
+    elif placement == "link-first":
+        layers = [
+            _base_metadata_layer(tmp_path, [(root, link), (database, record)]),
+            _base_metadata_layer(tmp_path, [(alias, foreign)]),
+        ]
+    else:
+        layers = [
+            _base_metadata_layer(tmp_path, [(database, record), (alias, foreign)]),
+            _base_metadata_layer(tmp_path, [(root, link)]),
+        ]
+    with pytest.raises(ValueError, match="ambiguous"):
+        _layer_libc_config(layers, base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize("whiteout", ["file", "parent", "opaque"])
+@pytest.mark.parametrize("replace", [False, True])
+def test_layer_libc_applies_whiteouts_to_linked_foreign_database(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, whiteout, replace
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    lower = _base_metadata_layer(tmp_path, [(root, link), (database, record), (alias, foreign)])
+    parent, _, name = alias.rpartition("/")
+    if whiteout == "parent":
+        grandparent, _, directory = parent.rpartition("/")
+        marker = f"{grandparent}/.wh.{directory}"
+    elif whiteout == "opaque":
+        marker = f"{parent}/.wh..wh..opq"
+    else:
+        marker = f"{parent}/.wh.{name}"
+    entries = [(marker, b"")]
+    if replace:
+        entries.insert(0, (alias, foreign))
+    upper = _base_metadata_layer(tmp_path, entries)
+    if replace:
+        with pytest.raises(ValueError, match="ambiguous"):
+            _layer_libc_config([lower, upper], base_image=base_image)
+    else:
+        config = _layer_libc_config([lower, upper], base_image=base_image)
+        assert f"PYTHON_LIBC={expected}" in config["config"]["Env"]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+def test_layer_libc_does_not_forget_foreign_database_through_root_replacement(
+    tmp_path, base_image, database, record, root, alias, foreign, expected
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    canonical = alias.removeprefix("usr/")
+    lower = _base_metadata_layer(
+        tmp_path, [(root, link), (database, record), (canonical, foreign)]
+    )
+    upper = _base_metadata_layer(tmp_path, [(f".wh.{root}", b""), (root, link)])
+    with pytest.raises(ValueError, match="ambiguous"):
+        _layer_libc_config([lower, upper], base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize(
+    "link_location",
+    ["unexpected-root", "escaping-root", "absolute-root", "hardlink-root", "nonempty-root",
+     "canonical-target", "nested-target"],
+)
+def test_layer_libc_rejects_unverifiable_foreign_links(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, link_location
+):
+    root_link = tarfile.TarInfo(root)
+    root_link.type = tarfile.LNKTYPE if link_location == "hardlink-root" else tarfile.SYMTYPE
+    root_link.linkname = {
+        "unexpected-root": "elsewhere",
+        "escaping-root": f"../usr/{root}",
+        "absolute-root": f"/usr/{root}",
+        "hardlink-root": f"usr/{root}",
+        "nonempty-root": f"usr/{root}",
+        "canonical-target": f"usr/{root}",
+        "nested-target": f"usr/{root}",
+    }[link_location]
+    if link_location == "nonempty-root":
+        root_link.size = 1
+    entries = [(root, root_link), (database, record)]
+    if link_location in {"canonical-target", "nested-target"}:
+        nested_path = alias.rsplit("/", 2)[0]
+        if link_location == "canonical-target":
+            nested_path = nested_path.removeprefix("usr/")
+        nested = tarfile.TarInfo(nested_path)
+        nested.type = tarfile.SYMTYPE
+        nested.linkname = "elsewhere"
+        entries.append((nested_path, nested))
+    with pytest.raises(ValueError, match="linked ancestor"):
+        _layer_libc_config([_base_metadata_layer(tmp_path, entries)], base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../usr/lib/apk/db/installed", "/usr/lib/apk/db/installed",
+     "usr\\lib\\apk\\db\\installed", "usr/lib/apk/db/installed\0ignored"],
+)
+def test_layer_libc_rejects_unsafe_foreign_database_paths(tmp_path, name):
+    entry = tarfile.TarInfo("placeholder")
+    entry.pax_headers = {"path": name}
+    layer = _base_metadata_layer(
+        tmp_path, [("var/lib/dpkg/status", _dpkg_libc()), (entry.name, entry)]
+    )
+    with pytest.raises(ValueError, match="unsafe layer path"):
+        _layer_libc_config([layer])
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [
