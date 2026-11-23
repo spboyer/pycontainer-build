@@ -131,6 +131,71 @@ class _GeneratedList(_TrackedList):
         return self.generated and not self.specified and tuple(self) == self.snapshot
 
 
+class _GeneratedLabels(dict):
+    def __init__(self, values=(), *, generated=False):
+        super().__init__(values)
+        self.generated = generated
+        self.snapshot = self.get("framework")
+        self.specified = False
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(deepcopy(dict(self), memo), generated=self.generated)
+        memo[id(self)] = copied
+        copied.snapshot = self.snapshot
+        copied.specified = self.specified
+        return copied
+
+    @property
+    def untouched(self):
+        return (
+            self.generated and not self.specified
+            and self.get("framework") == self.snapshot
+        )
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if key == "framework":
+            self.specified = True
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        if key == "framework":
+            self.specified = True
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        super().update(values)
+        if "framework" in values:
+            self.specified = True
+
+    def clear(self):
+        if "framework" in self:
+            self.specified = True
+        super().clear()
+
+    def pop(self, key, *default):
+        present = key in self
+        result = super().pop(key, *default)
+        if key == "framework" and present:
+            self.specified = True
+        return result
+
+    def popitem(self):
+        key, value = super().popitem()
+        if key == "framework":
+            self.specified = True
+        return key, value
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
 _FRAMEWORK_FIELDS = {
     "entrypoint": "_framework_generated_entrypoint",
     "cmd": "_framework_generated_cmd",
@@ -153,12 +218,23 @@ def _is_generated_field(config, name):
     )
 
 
+def _is_generated_label(config):
+    labels = config.labels
+    previous = getattr(config, "_framework_generated_labels", None)
+    return (
+        isinstance(labels, _GeneratedLabels) and labels.untouched
+        and (previous is None or labels is previous)
+    )
+
+
 class _FrameworkState:
     """Track generated fields across dataclass copies and serialization."""
 
-    def __init__(self, values, generated):
+    def __init__(self, values, generated, labels, generated_label):
         self.values = values
         self.generated = generated
+        self.labels = labels
+        self.generated_label = generated_label
 
     def __deepcopy__(self, memo):
         return {
@@ -168,6 +244,7 @@ class _FrameworkState:
                 for name, value in self.values.items()
                 if self.generated[name]
             },
+            "generated_label": self.labels["framework"] if self.generated_label else None,
         }
 
 
@@ -202,6 +279,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    manifest_annotations: Optional[Dict[str, str]] = None
+    index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
     scan_executable: str = "grype"
     scan_threshold: str = "high"
@@ -241,7 +320,7 @@ class BuildConfig:
                 field_name: _is_generated_field(self, field_name)
                 for field_name in _FRAMEWORK_FIELDS
             }
-            return _FrameworkState(values, generated)
+            return _FrameworkState(values, generated, self.labels, _is_generated_label(self))
         return object.__getattribute__(self, name)
 
     def __post_init__(self):
@@ -283,6 +362,28 @@ class BuildConfig:
                     object.__setattr__(self, name, list(value))
             self._framework_default_env = {}
 
+        if isinstance(generated_state, _FrameworkState):
+            if (
+                isinstance(self.labels, _GeneratedLabels)
+                and self.labels is generated_state.labels
+                and generated_state.generated_label
+            ):
+                object.__setattr__(self, "_framework_generated_labels", self.labels)
+            elif isinstance(self.labels, _GeneratedLabels):
+                self.labels = dict(self.labels)
+        elif isinstance(generated_state, dict):
+            label = generated_state.get("generated_label")
+            if (
+                isinstance(label, str) and isinstance(self.labels, dict)
+                and self.labels.get("framework") == label
+            ):
+                self.labels = _GeneratedLabels(self.labels, generated=True)
+                object.__setattr__(self, "_framework_generated_labels", self.labels)
+            elif isinstance(self.labels, _GeneratedLabels):
+                self.labels = dict(self.labels)
+        elif isinstance(self.labels, _GeneratedLabels):
+            self.labels = dict(self.labels)
+
         ports = self.exposed_ports
         if configured is None:
             configured = _ports_configured(ports)
@@ -299,6 +400,7 @@ class BuildConfig:
         if isinstance(ports, _DefaultPorts):
             ports.specified = configured
 
+        self.validate_metadata()
         self.system_packages = validate_system_packages(self.system_packages)
         if self.scan_threshold not in SCAN_SEVERITIES:
             raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
@@ -341,6 +443,16 @@ class BuildConfig:
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
         object.__setattr__(self, "_framework_initialized", True)
+
+    def validate_metadata(self) -> None:
+        from .metadata import validate_metadata
+
+        for name in ("labels", "manifest_annotations", "index_annotations"):
+            validate_metadata(
+                getattr(self, name),
+                name,
+                protect_reference=name != "labels",
+            )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

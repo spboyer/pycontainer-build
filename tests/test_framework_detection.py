@@ -650,6 +650,78 @@ def test_serialized_generated_defaults_can_be_redetected(tmp_path):
     apply_framework_defaults(restored, tmp_path)
     assert restored.entrypoint[0] == "uvicorn"
     assert restored.exposed_ports == [8000]
+    assert restored.labels["framework"] == "fastapi"
+
+
+@pytest.mark.parametrize("label", ["celery", "custom", ""])
+@pytest.mark.parametrize("copy_mode", ["same", "replace", "deepcopy", "serialized"])
+def test_explicit_framework_label_survives_redetection(tmp_path, label, copy_mode):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    worker = write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    config = apply_framework_defaults(BuildConfig(labels={"framework": label}), tmp_path)
+    if copy_mode == "replace":
+        config = replace(config)
+    elif copy_mode == "deepcopy":
+        config = deepcopy(config)
+    elif copy_mode == "serialized":
+        config = BuildConfig(**json.loads(json.dumps(asdict(config))))
+
+    worker.unlink()
+    api = write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == label
+    api.unlink()
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == label
+
+
+@pytest.mark.parametrize("operation", ["set", "update", "union", "replace"])
+@pytest.mark.parametrize("copy_mode", ["same", "serialized"])
+def test_explicit_framework_label_matching_generated_value_is_preserved(
+    tmp_path, operation, copy_mode
+):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    config = apply_framework_defaults(BuildConfig(), tmp_path)
+    if operation == "set":
+        config.labels["framework"] = "celery"
+    elif operation == "update":
+        config.labels.update({"framework": "celery"})
+    elif operation == "union":
+        config.labels |= {"framework": "celery"}
+    else:
+        config.labels = dict(config.labels)
+    if copy_mode == "serialized":
+        config = BuildConfig(**json.loads(json.dumps(asdict(config))))
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "celery"
+
+
+@pytest.mark.parametrize("copy_config", [replace, deepcopy, lambda config: BuildConfig(
+    **json.loads(json.dumps(asdict(config)))
+)])
+def test_generated_label_is_removed_after_detection_disappears(tmp_path, copy_config):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    worker = write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    config = apply_framework_defaults(BuildConfig(labels={"owner": "example"}), tmp_path)
+    config.labels["other"] = "value"
+    config = copy_config(config)
+    worker.unlink()
+
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels == {"owner": "example", "other": "value"}
+
+
+def test_explicit_matching_framework_label_is_not_removed(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    worker = write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    config = apply_framework_defaults(BuildConfig(labels={"framework": "celery"}), tmp_path)
+    worker.unlink()
+
+    apply_framework_defaults(config, tmp_path)
+    assert config.labels["framework"] == "celery"
 
 
 def test_explicit_replacement_of_generated_ports_remains_an_override(tmp_path):

@@ -7,7 +7,10 @@ import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
-from .config import _DefaultPorts, _GeneratedList, _is_generated_field
+from .config import (
+    _DefaultPorts, _GeneratedLabels, _GeneratedList, _is_generated_field,
+    _is_generated_label,
+)
 from .fs_utils import DEFAULT_CONTEXT_EXCLUDES, iter_files, path_is_excluded
 from .project import declared_dependency_names, default_include_paths
 
@@ -879,6 +882,7 @@ def apply_framework_defaults(
     generated_entrypoint = _is_generated_field(config, "entrypoint")
     generated_ports = _is_generated_field(config, "exposed_ports")
     generated_cmd = _is_generated_field(config, "cmd")
+    generated_label = _is_generated_label(config)
     configured_entrypoint = None if generated_entrypoint else config.entrypoint
     configured_cmd = None if generated_cmd else config.cmd
     if generated_entrypoint and configured_cmd is not None:
@@ -914,10 +918,10 @@ def apply_framework_defaults(
             config.cmd = None
         if generated_ports:
             object.__setattr__(config, "exposed_ports", _DefaultPorts())
-        previous_detection = getattr(config, "_framework_detection", None)
-        if previous_detection and config.labels and config.labels.get("framework") == previous_detection.name.lower():
+        if generated_label:
             config.labels = dict(config.labels)
             del config.labels["framework"]
+            config._framework_generated_labels = None
         config._framework_default_env = {}
         config._framework_detection = None
         return config
@@ -976,7 +980,12 @@ def apply_framework_defaults(
     config._framework_ports_generated = generated_ports
     
     config.labels = dict(config.labels or {})
-    config.labels["framework"]=framework.lower()
+    if generated_label or "framework" not in config.labels:
+        config.labels["framework"] = framework.lower()
+        config.labels = _GeneratedLabels(config.labels, generated=True)
+        config._framework_generated_labels = config.labels
+    else:
+        config._framework_generated_labels = None
     logger.info("Detected framework: %s", framework.lower())
     
     return config
