@@ -1592,6 +1592,75 @@ def test_locked_build_requires_a_matching_wheel_hash_for_each_target(tmp_path, m
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
 
 
+def _host_pip_setting(monkeypatch, tmp_path, source, key, value, *, bypass):
+    from pycontainer import dependencies
+
+    config = tmp_path / "pip.ini"
+    if source == "environment":
+        monkeypatch.setenv(f"PIP_{key.upper()}", value)
+        config.write_text("")
+    else:
+        config.write_text(f"[install]\n{key} = {value}\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    if bypass:
+        # Negative control: allowlisting the key must let it reach pip.
+        monkeypatch.setattr(
+            dependencies,
+            "_PIP_ENVIRONMENT_ALLOWED",
+            dependencies._PIP_ENVIRONMENT_ALLOWED | {f"PIP_{key.upper()}"},
+        )
+        monkeypatch.setattr(
+            dependencies, "_PIP_CONFIG_ALLOWED", [*dependencies._PIP_CONFIG_ALLOWED, key]
+        )
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_requirement_injection(tmp_path, monkeypatch, source, bypass):
+    context = tmp_path / "context"
+    wheel = _offline_wheelhouse(monkeypatch, context)
+    _write_uv_project(context, wheel)
+    extra_wheels = tmp_path / "extra-wheels"
+    _write_named_wheel(extra_wheels, "injected-dep")
+    injected = extra_wheels / "injected_dep-1.0-py3-none-any.whl"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(
+        f"--find-links {extra_wheels.as_uri()}\n"
+        f"injected-dep==1.0 --hash=sha256:{hashlib.sha256(injected.read_bytes()).hexdigest()}\n"
+    )
+    _host_pip_setting(monkeypatch, tmp_path, source, "requirement", str(extra), bypass=bypass)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    if bypass:
+        with pytest.raises(LockfileError, match="Unexpected or duplicate staged package injected-dep"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+        return
+    layer = builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+    names = _layer_names(layer)
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("injected_dep" in name for name in names)
+
+
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_target_platform_override(tmp_path, monkeypatch, source):
+    # Allowlisting platform trips _pip_target's self-test; test_private_index proves raw pip honors it.
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    wheel = _write_wheel(wheelhouse, tag="py3-none-win_amd64")
+    _write_uv_project(context, wheel)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    _host_pip_setting(monkeypatch, tmp_path, source, "platform", "win_amd64", bypass=False)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+
+
 def _source(tmp_path, context, **options):
     builder = ImageBuilder(
         BuildConfig(context_dir=str(context), output_dir=str(tmp_path / "out"), use_cache=False, **options)
