@@ -262,6 +262,44 @@ def test_oci_layout_selects_each_tag_for_shared_manifest(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
 
 
+@pytest.mark.parametrize("with_platform", [False, True])
+def test_oci_layout_digest_selects_manifest_shared_by_tags(tmp_path, offline, with_platform):
+    layout = Layout(tmp_path / "base")
+    descriptor, platform, layer = layout.image(b"shared")
+    for tag in ("app:v1", "app:latest"):
+        layout.add(descriptor, ref=tag, platform=platform if with_platform else None)
+
+    builder, manifest, _ = build(tmp_path, f"oci:{layout.root}@{descriptor['digest']}")
+    assert manifest["layers"][0] == layer
+    assert builder._base_image_name not in ("app:v1", "app:latest")
+
+
+def test_oci_layout_ref_selects_manifest_shared_by_aliases(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"shared")
+    layout.descriptors.append(
+        {**descriptor, "annotations": {"org.opencontainers.image.ref.name": "app:v1"}}
+    )
+    layout.descriptors.append(
+        {**descriptor, "annotations": {"io.containerd.image.name": "app:v1"}}
+    )
+    layout.write_index()
+
+    builder, manifest, _ = build(tmp_path, f"oci:{layout.root}:app:v1")
+    assert manifest["layers"][0] == layer
+    assert builder._base_image_name == "app:v1"
+
+
+def test_oci_layout_rejects_conflicting_duplicate_digest_descriptors(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, _ = layout.image(b"shared")
+    layout.add(descriptor, ref="one")
+    layout.add({**descriptor, "size": descriptor["size"] + 1}, ref="two")
+
+    with pytest.raises(LocalImageError, match="conflicting descriptors"):
+        build(tmp_path, f"oci:{layout.root}@{descriptor['digest']}")
+
+
 def test_oci_layout_selects_by_containerd_image_name_alias(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     tagged, _, tagged_layer = layout.image(b"tagged")
