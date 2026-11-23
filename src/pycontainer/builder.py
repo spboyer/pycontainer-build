@@ -195,6 +195,7 @@ from .dependencies import (
     stage_virtualenv,
     target_python_full_version,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
@@ -272,7 +273,10 @@ class ImageBuilder:
         if self.config.include_deps and self._uses_lockfile():
             locked_names = tuple(
                 package.name
-                for package in self._lock_selection(base_config, os_name, arch).packages
+                for package in self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified="@" not in self.config.base_image,
+                ).packages
             )
         report_system_packages(self.config, base_layers, locked_names)
         variant = (
@@ -632,7 +636,7 @@ class ImageBuilder:
         self._dependency_source_cache = source
         return source
 
-    def _lock_selection(self, base_config, os_name, arch):
+    def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
         cached = getattr(self, "_lock_selection_cache", None)
         if cached is not None:
             return cached
@@ -640,7 +644,10 @@ class ImageBuilder:
         environment = target_environment(
             os_name,
             arch,
-            target_python_version(self.config.base_image, base_config),
+            target_python_version(
+                self.config.base_image, base_config,
+                base_image_tag_verified=base_image_tag_verified,
+            ),
             target_python_full_version(base_config),
         )
         selection = load_lockfile(Path(self.config.context_dir), relative, environment)
@@ -679,13 +686,24 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        version = target_python_version(self.config.base_image, base_config)
+        base_image_tag_verified = "@" not in self.config.base_image
+        version = target_python_version(
+            self.config.base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, self.config.base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if source_kind == "lock":
-                selection = self._lock_selection(base_config, os_name, arch)
+                selection = self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified=base_image_tag_verified,
+                )
                 print(
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
@@ -703,6 +721,7 @@ class ImageBuilder:
                         self.config.base_image,
                         base_config,
                         locked=True,
+                        base_image_tag_verified=base_image_tag_verified,
                     )
                 finally:
                     locked_requirements.unlink(missing_ok=True)
@@ -716,6 +735,7 @@ class ImageBuilder:
                     version,
                     self.config.base_image,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(

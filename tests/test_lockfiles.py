@@ -20,7 +20,7 @@ from pycontainer.lockfiles import (
     preflight_lockfile,
     target_environment,
 )
-from test_dependency_staging import _builder, _write_wheel
+from test_dependency_staging import BASE_CONFIG, _builder, _write_wheel
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
 FORMATS = {
@@ -714,6 +714,79 @@ def _offline_wheelhouse(monkeypatch, context):
 def _layer_names(layer):
     with tarfile.open(layer.tar_path) as archive:
         return archive.getnames()
+
+
+@pytest.mark.parametrize(
+    ("base_image", "environment", "wheel_tag"),
+    [
+        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
+            "cp311-cp311-musllinux_1_2_x86_64",
+        ),
+    ],
+)
+def test_locked_build_uses_verified_base_abi_and_libc(
+    tmp_path, monkeypatch, base_image, environment, wheel_tag
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(context / "wheelhouse", tag=wheel_tag)
+    _write_uv_project(context, wheel)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+
+    builder.build()
+
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
+
+
+@pytest.mark.parametrize(
+    ("base_image", "environment", "message"),
+    [
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython"],
+            "unverified",
+        ),
+        ("python@sha256:" + "a" * 64, ["PYTHON_LIBC=musl-1.2"], "Python ABI"),
+        ("python:3.11-slim", ["PYTHON_LIBC=musl-1.2"], "conflicts"),
+    ],
+)
+def test_locked_build_rejects_unverified_base_before_pip(
+    tmp_path, monkeypatch, base_image, environment, message
+):
+    context = _write_uv_project(tmp_path / "context")
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran before validating the base image"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        builder.build()
 
 
 def test_locked_build_installs_hashed_target_selection_reproducibly(tmp_path, monkeypatch):
