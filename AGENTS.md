@@ -77,7 +77,12 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 - `tests/test_signing_integration.py::test_real_provider_signs_and_independently_verifies` (eight provider/platform combinations)
+- `tests/test_signing_integration.py::test_real_provider_wrong_trust_fails_before_tags` (four Cosign mode/platform combinations)
 
+The opt-in `keyless-signing` dispatch job in `.github/workflows/tests.yml` runs
+the Cosign keyless subset with the workflow's GitHub OIDC identity; it is gated
+to a manual owner dispatch of the reviewed branch and expected SHA. See
+`docs/image-signing.md`.
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
 in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`

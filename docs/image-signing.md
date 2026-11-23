@@ -175,7 +175,7 @@ mode-specific variables for the tests you want to run:
 
 | Mode | Required variables |
 |---|---|
-| Cosign key | `PYCONTAINER_COSIGN_TEST_KEY`, `PYCONTAINER_COSIGN_TEST_PUBLIC_KEY` |
+| Cosign key | `PYCONTAINER_COSIGN_TEST_KEY`, `PYCONTAINER_COSIGN_TEST_PUBLIC_KEY`, `PYCONTAINER_COSIGN_TEST_WRONG_PUBLIC_KEY` |
 | Cosign OIDC | `PYCONTAINER_COSIGN_TEST_IDENTITY`, `PYCONTAINER_COSIGN_TEST_ISSUER`, plus an ambient OIDC identity |
 | Notation named key | `PYCONTAINER_NOTATION_TEST_KEY` and a configured strict verifier trust policy without overrides |
 | Notation plugin | `PYCONTAINER_NOTATION_TEST_PLUGIN`, `PYCONTAINER_NOTATION_TEST_KEY_ID` and a configured strict verifier trust policy without overrides |
@@ -194,5 +194,52 @@ uv run --locked --group test python -m pytest tests/test_signing_integration.py 
 Each configured mode signs and independently verifies both a single-platform
 manifest and a multi-platform index with unique content. Notation tests reject
 skip, audit, permissive or overridden trust policies. Unconfigured modes skip.
-This check is not part of the default suite or CI and should be run with an
-external timeout.
+This check is not part of the default suite or automatic CI and should be run
+with an external timeout.
+
+For both Cosign modes, `test_real_provider_wrong_trust_fails_before_tags`
+configures the build with untrusted verification material (the wrong public
+key, or the expected identity with an `.invalid` suffix). It requires that the
+requested tags are absent before the push, that the push fails during
+pre-tag signature verification, that the tags are still absent afterwards, and
+that the signature itself verifies with the correct trust.
+
+When `PYCONTAINER_COSIGN_TEST_ISSUER` is
+`https://token.actions.githubusercontent.com`, the keyless tests also require
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_SHA`,
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_REPOSITORY`,
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_REF` and
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER`. Independent verification then checks those
+certificate claims, and requires a wrong identity, wrong issuer and wrong
+workflow SHA to fail. Optional `PYCONTAINER_SIGNING_EVIDENCE_FILE` receives one
+line per verified keyless subject with its digest and Rekor log indexes.
+
+### Gated GitHub Actions keyless check
+
+`.github/workflows/tests.yml` contains an opt-in keyless job that uses the
+workflow's own GitHub OIDC identity; it needs no stored credentials or
+interactive login. It runs only on a manual `workflow_dispatch` in
+`spboyer/pycontainer-build`, from the reviewed signing branch, by the
+repository owner. Its `expected-sha` input must be the full commit SHA of the
+dispatched ref, and must equal both `github.sha` and `github.workflow_sha`.
+
+```bash
+# Prove the gate and inputs without requesting an OIDC token.
+gh workflow run tests.yml --ref <branch> -f keyless-signing=preflight -f expected-sha=<sha>
+# Sign and verify synthetic images in ttl.sh with Cosign v2 and v3.
+gh workflow run tests.yml --ref <branch> -f keyless-signing=run -f expected-sha=<sha>
+```
+
+Only the signing job receives `id-token: write`. It checks out the expected SHA
+without persisted credentials, uses commit-pinned actions, installs Cosign
+v2.6.1 and v3.1.4 from release downloads checked against fixed SHA-256 values,
+and isolates `HOME`, `DOCKER_CONFIG`, `TUF_ROOT` and XDG directories after
+clearing ambient registry, signer, proxy and token variables. It asserts exactly
+four executed tests per Cosign version with no failures, errors or skips, and
+writes only digests and Rekor log indexes to the job summary.
+
+This repository is public, and so is the public-good Sigstore transparency log.
+Each keyless signature permanently publishes the signing certificate, including
+the repository, workflow path and ref, commit SHA, trigger, run URL, runner
+environment and repository visibility, and the signed image digest. Use the
+job only with synthetic images and disposable `ttl.sh` repositories.

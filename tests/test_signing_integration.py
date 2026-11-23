@@ -6,13 +6,23 @@ import uuid
 
 import pytest
 
+from pycontainer.auth import get_registry_auth
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.registry_client import parse_image_reference
-from pycontainer.signing import _find_executable
+from pycontainer.registry_client import MANIFEST_ACCEPT, RegistryClient, parse_image_reference
+from pycontainer.signing import SigningError, _find_executable
 
 
 pytestmark = pytest.mark.registry_integration
+
+GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com"
+GITHUB_CLAIM_VARIABLES = (
+    ("sha", "PYCONTAINER_COSIGN_TEST_WORKFLOW_SHA"),
+    ("repository", "PYCONTAINER_COSIGN_TEST_WORKFLOW_REPOSITORY"),
+    ("ref", "PYCONTAINER_COSIGN_TEST_WORKFLOW_REF"),
+    ("trigger", "PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER"),
+)
+VERIFIER_TIMEOUT_SECONDS = 300
 
 
 def _required(name):
@@ -120,11 +130,7 @@ def _strict_notation_policy(executable):
     return policy
 
 
-@pytest.mark.parametrize("mode", ["cosign-key", "cosign-keyless", "notation-key", "notation-plugin"])
-@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
-def test_real_provider_signs_and_independently_verifies(
-    tmp_path, monkeypatch, mode, platform
-):
+def _test_repository():
     repository = _required("PYCONTAINER_SIGNING_TEST_REPOSITORY")
     if (
         "@" in repository
@@ -137,21 +143,142 @@ def test_real_provider_signs_and_independently_verifies(
         registry, repo, _ = parse_image_reference(repository)
     except ValueError:
         pytest.fail("The signing test repository is not a valid image repository.")
-    settings, verifier = _provider_settings(mode)
-    executable = _find_executable(verifier[0])
-    if not executable:
-        pytest.fail(f"{verifier[0]} must be installed to run this test.")
-    if os.name == "nt" and os.path.splitext(executable)[1].lower() not in {".exe", ".com"}:
-        pytest.fail(f"{verifier[0]} must be a native Windows executable.")
-    verifier[0] = executable
-    notation_policy = _strict_notation_policy(executable) if mode.startswith("notation-") else None
+    return registry, repo
 
+
+def _verifier_executable(name):
+    executable = _find_executable(name)
+    if not executable:
+        pytest.fail(f"{name} must be installed to run this test.")
+    if os.name == "nt" and os.path.splitext(executable)[1].lower() not in {".exe", ".com"}:
+        pytest.fail(f"{name} must be a native Windows executable.")
+    return executable
+
+
+def _run_verifier(args, subject, capture=False):
+    try:
+        return subprocess.run(
+            [*args, "--", subject], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, text=True, errors="replace",
+            timeout=VERIFIER_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.fail("The independent signature verifier failed to run or timed out.")
+
+
+def _github_claim_args():
+    """Return exact GitHub workflow claim constraints for GitHub Actions identities."""
+    if os.getenv("PYCONTAINER_COSIGN_TEST_ISSUER") != GITHUB_ACTIONS_ISSUER:
+        return []
+    args = []
+    for claim, variable in GITHUB_CLAIM_VARIABLES:
+        value = os.getenv(variable)
+        if not value:
+            pytest.fail(f"Set {variable} to check the GitHub Actions certificate claims.")
+        args.append(f"--certificate-github-workflow-{claim}={value}")
+    return args
+
+
+def _rekor_log_indexes(output):
+    found = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "logIndex" and (
+                    type(item) is int or (isinstance(item, str) and item.isdigit())
+                ):
+                    found.add(int(item))
+                else:
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for document in [output, *output.splitlines()]:
+        try:
+            visit(json.loads(document))
+        except ValueError:
+            continue
+    return sorted(found)
+
+
+def _record_evidence(mode, platform, subject, log_indexes):
+    path = os.getenv("PYCONTAINER_SIGNING_EVIDENCE_FILE")
+    if not path:
+        return
+    kind = "index" if "," in platform else "manifest"
+    indexes = ",".join(str(index) for index in log_indexes) or "not-reported"
+    with open(path, "a", encoding="utf-8") as evidence:
+        evidence.write(
+            f"{mode} {kind} {subject.rsplit('@', 1)[1]} rekor-log-index={indexes}\n"
+        )
+
+
+def _check_keyless_trust_boundaries(executable, subject):
+    """Require exact keyless trust to pass and each wrong trust input to fail."""
+    identity = _required("PYCONTAINER_COSIGN_TEST_IDENTITY")
+    issuer = _required("PYCONTAINER_COSIGN_TEST_ISSUER")
+    claims = _github_claim_args()
+    exact = [
+        executable, "verify",
+        f"--certificate-identity={identity}", f"--certificate-oidc-issuer={issuer}",
+    ]
+    accepted = _run_verifier([*exact, *claims], subject, capture=True)
+    assert accepted.returncode == 0, (
+        "Independent verification rejected the exact identity, issuer and workflow claims."
+    )
+    wrong_trust = {
+        "wrong identity": [
+            executable, "verify", f"--certificate-identity={identity}.invalid",
+            f"--certificate-oidc-issuer={issuer}",
+        ],
+        "wrong issuer": [
+            executable, "verify", f"--certificate-identity={identity}",
+            f"--certificate-oidc-issuer={issuer.rstrip('/')}/invalid",
+        ],
+    }
+    if claims:
+        wrong_trust["wrong workflow commit"] = [
+            *exact, "--certificate-github-workflow-sha=" + "0" * 40,
+        ]
+    for name, args in wrong_trust.items():
+        assert _run_verifier(args, subject).returncode != 0, (
+            f"Independent verification accepted a {name}."
+        )
+    assert _run_verifier(exact, subject).returncode == 0, (
+        "Exact trust was rejected after the negative checks, so they are inconclusive."
+    )
+    return _rekor_log_indexes(accepted.stdout)
+
+
+def _published_tags(registry, repo, tags):
+    auth = get_registry_auth(registry)
+    client = RegistryClient(
+        registry, repo, auth_token=auth.bearer_token,
+        username=auth.username, password=auth.password,
+    )
+    present = []
+    for tag in tags:
+        status, _, _ = client._make_request(
+            "HEAD", f"{client.base_url}/{client.repository}/manifests/{tag}",
+            headers={"Accept": MANIFEST_ACCEPT},
+        )
+        if status == 200:
+            present.append(tag)
+        elif status != 404:
+            pytest.fail(f"Tag lookup returned HTTP {status}; tag absence is unknown.")
+    return present
+
+
+def _signing_config(tmp_path, registry, repo, platform, settings, suffix=""):
     context = tmp_path / "context"
     context.mkdir()
     unique = _write_unique_fixture(context)
-    config = BuildConfig(
-        tag=f"{registry}/{repo}:signing-{unique}",
-        tags=[f"signing-{unique}-second"],
+    return BuildConfig(
+        tag=f"{registry}/{repo}:signing-{unique}{suffix}",
+        tags=[f"signing-{unique}{suffix}-second"],
         context_dir=str(context),
         output_dir=str(tmp_path / "out"),
         include_paths=["fixture.txt"],
@@ -160,28 +287,78 @@ def test_real_provider_signs_and_independently_verifies(
         sign=True,
         **settings,
     )
+
+
+def _use_synthetic_base(monkeypatch):
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
         lambda self, layers_dir, os_name, arch: ([], None),
     )
+
+
+@pytest.mark.parametrize("mode", ["cosign-key", "cosign-keyless", "notation-key", "notation-plugin"])
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_real_provider_signs_and_independently_verifies(
+    tmp_path, monkeypatch, mode, platform
+):
+    registry, repo = _test_repository()
+    settings, verifier = _provider_settings(mode)
+    executable = _verifier_executable(verifier[0])
+    verifier[0] = executable
+    notation_policy = _strict_notation_policy(executable) if mode.startswith("notation-") else None
+
+    config = _signing_config(tmp_path, registry, repo, platform, settings)
+    _use_synthetic_base(monkeypatch)
     builder = ImageBuilder(config)
     builder.build()
     builder.push(show_progress=False)
     subject = f"{registry}/{repo}@{builder.index_digest or builder.manifest_digest}"
 
-    try:
-        result = subprocess.run(
-            [*verifier, "--", subject], stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=300, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pytest.fail("The independent signature verifier failed or timed out.")
+    result = _run_verifier(verifier, subject)
     assert result.returncode == 0, (
         "Independent signature verification failed; check registry credentials "
         "and the verifier's identity or trust policy."
     )
+    if mode == "cosign-keyless":
+        log_indexes = _check_keyless_trust_boundaries(executable, subject)
+        _record_evidence(mode, platform, subject, log_indexes)
     if notation_policy is not None:
         assert _strict_notation_policy(executable) == notation_policy, (
             "The Notation trust policy changed during signing and verification."
         )
+
+
+@pytest.mark.parametrize("mode", ["cosign-key", "cosign-keyless"])
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_real_provider_wrong_trust_fails_before_tags(
+    tmp_path, monkeypatch, mode, platform
+):
+    registry, repo = _test_repository()
+    settings, verifier = _provider_settings(mode)
+    verifier[0] = _verifier_executable(verifier[0])
+    if mode == "cosign-key":
+        wrong = {"sign_verify_key": _required("PYCONTAINER_COSIGN_TEST_WRONG_PUBLIC_KEY")}
+    else:
+        wrong = {
+            "sign_certificate_identity": settings["sign_certificate_identity"] + ".invalid",
+        }
+    config = _signing_config(
+        tmp_path, registry, repo, platform, {**settings, **wrong}, "-wrong-trust",
+    )
+    tags = [parse_image_reference(tag)[2] for tag in config.all_tags()]
+    assert _published_tags(registry, repo, tags) == [], "A requested tag already exists."
+
+    _use_synthetic_base(monkeypatch)
+    builder = ImageBuilder(config)
+    builder.build()
+    with pytest.raises(SigningError, match="^Verifying the signature of "):
+        builder.push(show_progress=False)
+
+    assert _published_tags(registry, repo, tags) == [], (
+        "A requested tag moved after build-time verification rejected the signature."
+    )
+    subject = f"{registry}/{repo}@{builder.index_digest or builder.manifest_digest}"
+    assert _run_verifier(verifier, subject).returncode == 0, (
+        "The correct trust inputs rejected the signature, so the product failure "
+        "is not attributable to the wrong trust input."
+    )
