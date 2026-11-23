@@ -186,9 +186,18 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
-from .cache import LayerCache
+from .local_image import (
+    check_local_image_bounds,
+    open_local_image_source,
+    parse_local_image_reference,
+    verify_layer_diff_ids,
+)
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .tags import local_reference_names
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
+    _LOCKFILE_STAGING_PREFIX,
     create_console_entrypoints,
     install_locked_requirements,
     install_requirements,
@@ -199,7 +208,10 @@ from .dependencies import (
     target_wheel_platform,
     validate_target_platform,
 )
-from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
+from .lockfiles import (
+    detect_lockfile, load_lockfile, preflight_lockfile, target_environment,
+    verify_locked_installation,
+)
 
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
@@ -214,12 +226,15 @@ class ImageBuilder:
             if config.cache_dir
             else default_cache_dir
         )
-        self.context_excludes=context_exclude_paths(
-            context_dir,
-            output_dir=config.output_dir,
-            cache_dir=cache_dir,
-            exclude_paths=config.exclude_paths,
-            exclude_defaults=config.exclude_defaults,
+        self.context_excludes=(
+            *context_exclude_paths(
+                context_dir,
+                output_dir=config.output_dir,
+                cache_dir=cache_dir,
+                exclude_paths=config.exclude_paths,
+                exclude_defaults=config.exclude_defaults,
+            ),
+            f"{_LOCKFILE_STAGING_PREFIX}*",
         )
         self.context_include_paths=(
             config.include_paths
@@ -263,12 +278,17 @@ class ImageBuilder:
             return self._build_image()
 
     def _build_image(self):
+        self._dependency_source_cache = None
+        self._lock_selection_cache = {}
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         locked_names = ()
         if self.config.include_deps and self._uses_lockfile():
@@ -276,7 +296,7 @@ class ImageBuilder:
                 package.name
                 for package in self._lock_selection(
                     base_config, os_name, arch,
-                    base_image_tag_verified="@" not in self.config.base_image,
+                    base_image_tag_verified=self._base_image_tag_verified(),
                 ).packages
             )
         report_system_packages(self.config, base_layers, locked_names)
@@ -343,13 +363,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -378,30 +400,58 @@ class ImageBuilder:
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
-        """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
+        """Pull or load the base image, return (base_layers, base_config)."""
+        self._base_image_name=self.config.base_image
+        requested_variant = parse_platform_variant(self.config.platform)
+        local=parse_local_image_reference(self.config.base_image)
+        if local is None:
+            registry, repo, reference=parse_image_reference(self.config.base_image)
+            auth=get_registry_auth(registry)
+            client=RegistryClient(
+                registry,
+                repo,
+                auth_token=auth.bearer_token,
+                username=auth.username,
+                password=auth.password,
+            )
+            return self._read_base_image(client, reference, layers_dir, os_name, arch)
+
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
         )
-        
+        print(f"Loading local base image {self.config.base_image} for {target}...")
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+        ) as source:
+            base_layers, base_config = self._read_base_image(
+                source, None, layers_dir, os_name, arch
+            )
+            verify_layer_diff_ids(base_layers, base_config)
+            self._base_image_name=source.source_name
+        return base_layers, base_config
+
+    def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Resolve and validate a base image through a registry or local source."""
+        local = reference is None
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        if not local:
+            print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
-            expected_digest=reference if reference.startswith("sha256:") else None,
+            expected_digest=(
+                reference if reference and reference.startswith("sha256:") else None
+            ),
         )
 
         selected_variant = None
@@ -455,6 +505,8 @@ class ImageBuilder:
             )
             for index, descriptor in enumerate(layer_descriptors, 1)
         ]
+        if local:
+            check_local_image_bounds(config_size, [size for _, size, _ in validated_layers])
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
@@ -505,13 +557,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -594,6 +646,8 @@ class ImageBuilder:
                     print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _uses_lockfile(self) -> bool:
@@ -602,6 +656,13 @@ class ImageBuilder:
         if self.config.requirements_file or not self.config.use_lockfile:
             return False
         return detect_lockfile(Path(self.config.context_dir)) is not None
+
+    def _base_image_tag_verified(self) -> bool:
+        # Local annotations and digest references do not establish registry identity.
+        return (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
 
     def _dependency_source(self):
         """Choose the dependency source: lock, requirements file, or virtualenv."""
@@ -634,26 +695,28 @@ class ImageBuilder:
                     source = ("requirements", Path(DEFAULT_REQUIREMENTS_FILE))
                 else:
                     source = ("venv", deps_paths)
-        self._dependency_source_cache = source
+        if source[0] != "venv":
+            self._dependency_source_cache = source
         return source
 
     def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
-        cached = getattr(self, "_lock_selection_cache", None)
-        if cached is not None:
-            return cached
         _, relative = self._dependency_source()
         environment = target_environment(
             os_name,
             arch,
             target_python_version(
-                self.config.base_image, base_config,
+                getattr(self, "_base_image_name", self.config.base_image), base_config,
                 base_image_tag_verified=base_image_tag_verified,
             ),
             target_python_full_version(base_config),
         )
-        selection = load_lockfile(Path(self.config.context_dir), relative, environment)
-        self._lock_selection_cache = selection
-        return selection
+        key = (os_name, arch, environment["python_version"], environment["python_full_version"])
+        cache = getattr(self, "_lock_selection_cache", None)
+        if cache is None:
+            cache = self._lock_selection_cache = {}
+        if key not in cache:
+            cache[key] = load_lockfile(Path(self.config.context_dir), relative, environment)
+        return cache[key]
 
     def _create_deps_layer(
         self,
@@ -687,13 +750,14 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        base_image_tag_verified = "@" not in self.config.base_image
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        base_image_tag_verified = self._base_image_tag_verified()
         version = target_python_version(
-            self.config.base_image, base_config,
+            base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
         )
         target_wheel_platform(
-            os_name, arch, self.config.base_image, base_config,
+            os_name, arch, base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
         )
         layers_dir=Path(layers_dir)
@@ -716,9 +780,17 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
                     base_image_tag_verified=base_image_tag_verified,
+                )
+                verify_locked_installation(
+                    selection,
+                    ctx,
+                    site_packages,
+                    target_environment(
+                        os_name, arch, version, target_python_full_version(base_config)
+                    ),
                 )
             elif source_kind == "requirements":
                 install_requirements(
@@ -728,7 +800,7 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
                     base_image_tag_verified=base_image_tag_verified,
                 )
@@ -836,11 +908,11 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -855,6 +927,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -866,6 +939,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(
