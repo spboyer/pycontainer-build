@@ -49,6 +49,13 @@ def _errors(code, message):
     return json.dumps({"errors": [{"code": code, "message": message}]}).encode()
 
 
+def _patch_transport(monkeypatch, handler):
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.OpenerDirector.open",
+        lambda _opener, request, timeout=None: handler(request, timeout),
+    )
+
+
 class FakeRegistry:
     """In-memory Registry v2 subset: manifests, tags/list pagination, DELETE."""
 
@@ -167,7 +174,7 @@ class FakeRegistry:
 @pytest.fixture
 def registry(monkeypatch):
     fake = FakeRegistry()
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fake)
+    _patch_transport(monkeypatch, fake)
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _delay: None)
     return fake
 
@@ -258,7 +265,7 @@ def test_denied_deletion_reports_code_and_delete_permission(monkeypatch, registr
 
     assert _run(monkeypatch, "delete", f"{HOST}/{REPO}:v1.0.0", "--yes") == 1
     err = capsys.readouterr().err
-    assert "DENIED: requested access is denied" in err
+    assert "DENIED" in err
     assert "delete permission" in err
     assert PASSWORD not in err
     assert len(registry.methods("DELETE")) == 1
@@ -301,7 +308,7 @@ def test_authorization_is_not_copied_to_redirects(monkeypatch):
         seen.append(request)
         return _Response(b"{}")
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", capture)
+    _patch_transport(monkeypatch, capture)
     client._make_request("GET", f"{client.base_url}/{REPO}/tags/list")
 
     request = seen[0]
@@ -321,7 +328,7 @@ def test_token_exchange_credentials_are_not_copied_to_redirects(monkeypatch, reg
             token_requests.append(request)
         return original(request, timeout)
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", capture)
+    _patch_transport(monkeypatch, capture)
     assert _run(monkeypatch, "delete", f"{HOST}/{REPO}:v1.0.0", "--dry-run") == 0
     assert token_requests
     for request in token_requests:
@@ -374,7 +381,7 @@ def test_cleanup_commands_scope_provider_credentials(
     monkeypatch, command, host, expected_auth, uses_azure_cli
 ):
     registry = FakeRegistry(host=host)
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", registry)
+    _patch_transport(monkeypatch, registry)
     monkeypatch.setattr(
         "pycontainer.auth.DockerConfigAuthProvider._load_config", lambda self: None
     )
@@ -524,7 +531,8 @@ def test_listing_rate_limit_keeps_diagnostics(monkeypatch, registry, capsys):
 
     assert _run(monkeypatch, "prune", f"{HOST}/{REPO}", "--keep", "1") == 1
     err = capsys.readouterr().err
-    assert "TOOMANYREQUESTS" in err and "resets in about 120 seconds" in err
+    assert "HTTP 429" in err and "resets in about 120 seconds" in err
+    assert "response details omitted" in err
 
 
 def test_unresolvable_tag_aborts_before_any_delete(monkeypatch, registry, capsys):

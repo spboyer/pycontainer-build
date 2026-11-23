@@ -14,7 +14,10 @@ from pycontainer.config import BuildConfig
 BASE_CONFIG = {
     "architecture": "amd64",
     "os": "linux",
-    "config": {"Env": [], "WorkingDir": "/"},
+    "config": {
+        "Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8", "PYTHON_LIBC=glibc-2.17"],
+        "WorkingDir": "/",
+    },
     "rootfs": {"type": "layers", "diff_ids": []},
 }
 
@@ -27,6 +30,9 @@ def _create_builder(tmp_path, monkeypatch, *, use_cache, output_dir=None):
     site_packages = context / ".venv" / "lib" / "python3.11" / "site-packages"
     (site_packages / "example-1.0.dist-info").mkdir(parents=True, exist_ok=True)
     (site_packages / "example.py").write_text("value = 1\n")
+    (site_packages / "example-1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: example\nVersion: 1.0\n\n"
+    )
     (site_packages / "example-1.0.dist-info" / "WHEEL").write_text(
         "Root-Is-Purelib: true\nTag: py3-none-any\n"
     )
@@ -42,6 +48,7 @@ def _create_builder(tmp_path, monkeypatch, *, use_cache, output_dir=None):
             output_dir=str(output_dir or tmp_path / "output"),
             include_paths=["app.py", "requirements.txt"],
             include_deps=True,
+            base_image="python:3.11-slim-bookworm",
             use_cache=use_cache,
             cache_dir=str(tmp_path / "cache") if use_cache else None,
         )
@@ -106,7 +113,7 @@ def test_failed_layer_write_cleans_only_its_staging_file(
         if layer_kind == "app":
             builder._create_app_layer(layers_dir, ["app.py"])
         else:
-            builder._create_deps_layer(layers_dir)
+            builder._create_deps_layer(layers_dir, base_config=BASE_CONFIG)
 
     assert sentinel.read_text() == "owned by another build"
     assert list(layers_dir.glob(f".{layer_kind}-layer-*.tmp")) == [sentinel]

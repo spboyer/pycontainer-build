@@ -120,7 +120,7 @@ def test_build_appends_layer_diffids_without_mutating_base_config(tmp_path, monk
     base_config = {
         "architecture": "amd64",
         "os": "linux",
-        "config": {"Env": [], "WorkingDir": "/"},
+        "config": {"Env": ["PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
         "rootfs": {"type": "layers", "diff_ids": [base_diff_id]},
     }
     original_base_config = json.loads(json.dumps(base_config))
@@ -202,6 +202,7 @@ def test_dependency_layer_creation():
             context_dir=str(ctx),
             output_dir=str(output),
             include_deps=True,
+            base_image="python:3.11-slim-bookworm",
             use_cache=False
         )
         builder = ImageBuilder(cfg)
