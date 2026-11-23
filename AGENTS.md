@@ -274,17 +274,20 @@ Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
 target-active roots, transitive `Requires-Dist`, versions, extras, constraint
 files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
-collects project roots, plausible venv hosts and checks unparsed sources. The
+collects project roots, established venv host facts and checks unparsed sources. The
 verifier never imports staged packages and fails closed on unknown markers, egg
 distributions, missing or unsupported `Metadata-Version`, invalid metadata,
 direct URLs, and patch-dependent `Requires-Python` without a full
 `PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
 can contain credentials. An unrecorded extra or optional group is ruled out
-only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
-`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
-`Lib` layout; `python_version` shared only when
-the venv minor is established) would have installed one of its missing
-requirements; otherwise unsatisfied target-active requirements fail closed.
+only if one of its missing requirements is provably active on the creator host
+using three-valued (Kleene) marker evaluation over established facts only:
+CPython, `os_name` from the layout (`posix` for `lib/pythonX.Y` with a POSIX
+`pyvenv.cfg` `home`, `nt` for `Lib`, which also implies the Windows
+`sys_platform`/`platform_system` values), and `python_version` when the venv
+minor is established. Every other host marker (for example `platform_machine`,
+or a non-Windows `sys_platform`) is unknown, never sampled from a finite host
+list (#142); otherwise unsatisfied target-active requirements fail closed.
 Extra markers compare canonical names on any vendored `packaging` version;
 `in`/`not in` keep PEP 508 substring semantics (not list membership), never
 name candidate extras or rule one out, and fail closed without
