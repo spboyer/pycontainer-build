@@ -368,7 +368,8 @@ class ImageBuilder:
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull base image from registry, return (base_layers, base_config)."""
         registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
+        # Generic REGISTRY_* variables target the destination, not the base registry.
+        auth=get_registry_auth(registry, include_generic_environment=False)
         client=RegistryClient(
             registry,
             repo,

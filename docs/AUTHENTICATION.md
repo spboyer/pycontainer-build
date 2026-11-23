@@ -62,6 +62,11 @@ Reads credentials from environment variables:
 - `GITHUB_TOKEN` (for ghcr.io)
 - `REGISTRY_TOKEN` (generic)
 
+The generic `REGISTRY_*` variables are not scoped to a registry. Pass
+`include_generic_environment=False` to `EnvironmentAuthProvider`,
+`get_default_auth_provider` or `get_registry_auth` to ignore them while keeping
+`GITHUB_TOKEN` for ghcr.io; base-image pulls do this.
+
 #### `DockerConfigAuthProvider`
 Reads `~/.docker/config.json`:
 - Parses `auths` section
@@ -172,6 +177,27 @@ without either `--password` or `REGISTRY_PASSWORD` is an error.
 export REGISTRY_USERNAME="myuser"
 export REGISTRY_PASSWORD="mypass"
 pycontainer build --tag registry.example.com/app:v1 --push
+```
+
+### Private Base Images
+Base-image pulls use only registry-scoped credentials. Generic
+`REGISTRY_TOKEN`, `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` values, and the
+`--username`/`--password` flags, are reserved for the destination push and are
+never sent to the base registry or its token endpoint. Authenticate a private
+base independently of the destination with an inline `auths` entry for the base
+registry host in `~/.docker/config.json` (credential helpers and `credsStore`
+are not read). The host-scoped `GITHUB_TOKEN` (ghcr.io) and Azure CLI
+(`*.azurecr.io`) providers remain enabled for base pulls, with the same behavior
+as for pushes.
+
+```bash
+# ~/.docker/config.json contains an inline auths entry for base.example.com
+export REGISTRY_USERNAME="push-user"
+export REGISTRY_PASSWORD="push-password"
+pycontainer build \
+  --base-image base.example.com/team/python:3.11 \
+  --tag registry.example.com/app:v1 \
+  --push
 ```
 
 ## Security Considerations

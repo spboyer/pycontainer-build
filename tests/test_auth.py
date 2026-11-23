@@ -90,7 +90,7 @@ def test_docker_config_password_is_not_a_bearer_token(tmp_path, monkeypatch):
         }
     }))
     provider=DockerConfigAuthProvider(config_path)
-    monkeypatch.setattr(auth_module, "get_default_auth_provider", lambda: provider)
+    monkeypatch.setattr(auth_module, "get_default_auth_provider", lambda **kwargs: provider)
 
     auth=get_registry_auth("registry.example")
 
@@ -107,7 +107,7 @@ def test_environment_username_password_resolve_as_basic_auth(monkeypatch):
     monkeypatch.setattr(
         auth_module,
         "get_default_auth_provider",
-        lambda: EnvironmentAuthProvider(),
+        lambda **kwargs: EnvironmentAuthProvider(**kwargs),
     )
 
     auth=get_registry_auth("registry.example")
