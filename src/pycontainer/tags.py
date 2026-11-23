@@ -6,6 +6,8 @@ from .registry_client import parse_image_reference
 
 _SEMVER = re.compile(r"(?P<prefix>v?)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
 _TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_OCI_COMPONENT = r"[A-Za-z0-9]+(?:(?:[-._:@+]|--)[A-Za-z0-9]+)*"
+_OCI_REF_NAME = re.compile(rf"{_OCI_COMPONENT}(?:/{_OCI_COMPONENT})*")
 
 
 def semver_expansion(tag: str) -> List[str]:
@@ -72,3 +74,28 @@ def resolve_tags(
 
     ordered = list(dict.fromkeys(names))
     return [f"{base}:{name}" for name in ordered]
+
+
+def local_reference_names(primary: str, all_tags: List[str]) -> List[str]:
+    """Return OCI layout ``ref.name`` values for a build's resolved tags.
+
+    Names use the primary's repository spelling. If a name is not a valid OCI
+    annotation reference, encode its UTF-8 bytes as hex after ``pycontainer-``.
+    """
+    last_segment = primary.rsplit("/", 1)[-1]
+    repository = primary.rsplit(":", 1)[0] if ":" in last_segment else primary
+    names = list(dict.fromkeys([primary] + [
+        f"{repository}:{parse_image_reference(ref)[2]}" for ref in all_tags[1:]
+    ]))
+    used = {name for name in names if _OCI_REF_NAME.fullmatch(name)}
+    result = []
+    for name in names:
+        if _OCI_REF_NAME.fullmatch(name):
+            result.append(name)
+            continue
+        encoded = "pycontainer-" + name.encode("utf-8").hex()
+        while encoded in used:
+            encoded += "0"
+        used.add(encoded)
+        result.append(encoded)
+    return result
