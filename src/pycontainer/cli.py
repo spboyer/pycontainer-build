@@ -68,7 +68,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     if platform:
-        b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list (linux/amd64,linux/arm64) to build an OCI image index")
+        b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list of linux/amd64, linux/arm64 and linux/arm/v7 to build an OCI image index")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
     b.add_argument(
         "--sbom",

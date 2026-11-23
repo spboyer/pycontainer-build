@@ -415,7 +415,9 @@ pycontainer build \
 - `--include-deps` — Stage importable dependencies from a venv or install a
   requirements file as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
-  supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
+  supported targets are `linux/amd64`, `linux/arm64` and `linux/arm/v7` with
+  CPython (`linux/arm/v7` uses `armv7l` wheel tags; `linux/arm` without the
+  `v7` variant is rejected). A venv
   must match the target Python minor version and contain only pure-Python
   packages. Dependencies are placed under `<workdir>/.python`, added to
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
@@ -624,8 +626,8 @@ error handling, and custom-directory inspection.
   label; `--release-notes-label KEY` selects another key
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
-  `linux/arm64` or `linux/arm/v7`), or `linux/amd64,linux/arm64` to build an
-  OCI image index
+  `linux/arm64` or `linux/arm/v7`), or a comma-separated subset of
+  `linux/amd64,linux/arm64,linux/arm/v7` to build an OCI image index
 - `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
   as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
 - `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
@@ -914,9 +916,15 @@ metadata fail before base layers are downloaded. Base-image references may
 include a registry port or an immutable `@sha256:...` digest. Platform
 selection writes target metadata; it does not cross-compile dependencies.
 
-Multi-platform image indexes (`--platform linux/amd64,linux/arm64` or TOML
-`platform = "linux/amd64,linux/arm64"`) are limited to those two targets;
-`linux/arm/v7` is tracked in [#119](https://github.com/spboyer/pycontainer-build/issues/119) and other targets are rejected. Each
+Multi-platform image indexes (`--platform linux/amd64,linux/arm64,linux/arm/v7`
+or TOML `platform = "linux/amd64,linux/arm64"`) accept only `linux/amd64`,
+`linux/arm64` and `linux/arm/v7`; other targets, including `linux/arm` without
+a variant, are rejected. `linux/arm/v7` selects the exact `arm`/`v7` base
+manifest (never v5 or v6) and records `variant: v7` in the image config and
+index descriptor. Its dependencies install only as `armv7l` wheels
+(`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
+other targets). Many packages do not publish `armv7l` wheels; such builds fail
+explicitly, and source builds or host binaries are never used as a fallback. Each
 platform is built in isolation: it selects its own base manifest (registry
 builds re-select from the first resolved base-index digest), stages its own
 wheel-only dependency layer, and shares the byte-identical application layer

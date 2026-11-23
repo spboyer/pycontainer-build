@@ -312,7 +312,7 @@ def test_docker_manifest_list_selects_exact_variant(tmp_path, monkeypatch):
 
     monkeypatch.setattr(builder_module, "RegistryClient", FakeRegistryClient)
     monkeypatch.setattr(
-        builder_module, "get_registry_auth", lambda registry: RegistryAuth()
+        builder_module, "get_registry_auth", lambda registry, **kwargs: RegistryAuth()
     )
     builder = ImageBuilder(
         BuildConfig(
@@ -362,7 +362,7 @@ def test_missing_index_platform_fails_before_blob_download(tmp_path, monkeypatch
 
     monkeypatch.setattr(builder_module, "RegistryClient", FakeRegistryClient)
     monkeypatch.setattr(
-        builder_module, "get_registry_auth", lambda registry: RegistryAuth()
+        builder_module, "get_registry_auth", lambda registry, **kwargs: RegistryAuth()
     )
     builder = ImageBuilder(
         BuildConfig(
@@ -416,7 +416,7 @@ def test_base_config_platform_mismatch_fails_before_layer_download(
 
     monkeypatch.setattr(builder_module, "RegistryClient", FakeRegistryClient)
     monkeypatch.setattr(
-        builder_module, "get_registry_auth", lambda registry: RegistryAuth()
+        builder_module, "get_registry_auth", lambda registry, **kwargs: RegistryAuth()
     )
     builder = ImageBuilder(
         BuildConfig(
@@ -462,7 +462,7 @@ def test_digest_pinned_base_image_is_pulled_by_digest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(builder_module, "RegistryClient", FakeRegistryClient)
     monkeypatch.setattr(
-        builder_module, "get_registry_auth", lambda registry: RegistryAuth()
+        builder_module, "get_registry_auth", lambda registry, **kwargs: RegistryAuth()
     )
     builder = ImageBuilder(
         BuildConfig(
