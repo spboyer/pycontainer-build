@@ -110,7 +110,9 @@ PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --shell-command
 ```
 
 It imports a quoted shell-form `ENTRYPOINT`, builds the image, imports it into
-Docker, runs it and compares the exact output.
+Docker, runs it and compares the exact output. The requested `--platform` must
+match the Docker daemon. An optional `--evidence` record is tagged
+`shell-command` and does not satisfy the separate full-startup release gate.
 
 ## Parsing
 
