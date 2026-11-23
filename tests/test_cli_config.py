@@ -84,7 +84,7 @@ def test_cli_preserves_required_base_image_trust(tmp_path, monkeypatch):
     }
 
 
-def test_cli_accepts_base_image_trust_with_security_history_and_scan(tmp_path, monkeypatch):
+def test_cli_accepts_base_image_trust_with_other_build_options(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         '[build]\nbase_image = "registry.example/team/base:v1"\n'
@@ -94,6 +94,8 @@ def test_cli_accepts_base_image_trust_with_security_history_and_scan(tmp_path, m
         'repository = "registry.example/team/base"\n'
         'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
         '[build.security.kubernetes]\nread-only-root-filesystem = true\n'
+        '[build.manifest_annotations]\nsource = "manifest"\n'
+        '[build.index_annotations]\nsource = "index"\n'
     )
 
     config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
@@ -103,6 +105,8 @@ def test_cli_accepts_base_image_trust_with_security_history_and_scan(tmp_path, m
     assert config.history_dir == "history"
     assert config.scan is True
     assert config.scan_threshold == "critical"
+    assert config.manifest_annotations == {"source": "manifest"}
+    assert config.index_annotations == {"source": "index"}
     assert render_security_fragments(config.security, str(tmp_path)) == {
         KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
     }
