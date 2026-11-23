@@ -587,7 +587,10 @@ def test_cache_registry_credentials_are_scoped_to_the_actual_host(
     def fake_azure(command, **kwargs):
         azure_requests.append(command)
         return subprocess.CompletedProcess(
-            command, 0, stdout='{"accessToken":"synthetic-azure-token"}'
+            command, 0, stdout=json.dumps({
+                "accessToken": "synthetic-azure-token",
+                "loginServer": "trusted.azurecr.io",
+            })
         )
 
     monkeypatch.setattr(auth_module.subprocess, "run", fake_azure)
