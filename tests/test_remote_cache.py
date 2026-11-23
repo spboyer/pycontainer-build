@@ -867,6 +867,52 @@ def test_cache_credentials_stay_on_cache_host_and_off_storage(tmp_path, registry
     assert all(auth == CACHE_AUTH for *_, auth in cache_requests)
 
 
+@pytest.mark.xfail(strict=True, reason="HTTPS token-realm validation pending #202")
+@pytest.mark.parametrize("option", ["cache_from", "cache_to"])
+@pytest.mark.parametrize("credential", ["basic", "bearer"])
+def test_cache_rejects_http_token_realm_without_sending_credentials(
+    tmp_path, registry, monkeypatch, caplog, option, credential
+):
+    auth = (
+        RegistryAuth(username="cache-user", password="cache-pass")
+        if credential == "basic"
+        else RegistryAuth(bearer_token="synthetic-cache-token")
+    )
+    monkeypatch.setattr(remote_cache, "get_registry_auth", lambda host, **_: auth)
+    requests = []
+
+    def challenged_open(request, timeout=None):
+        requests.append((request.full_url, request.get_header("Authorization")))
+        if urllib.parse.urlsplit(request.full_url).scheme == "http":
+            return _Response(200, b'{"token":"synthetic-realm-token"}')
+        raise _http_error(
+            request.full_url,
+            401,
+            {"WWW-Authenticate": 'Bearer realm="http://token.example/token",service="cache.example"'},
+        )
+
+    monkeypatch.setattr("pycontainer.registry_client._open_url", challenged_open)
+    builder = _builder(tmp_path, "credentials", **{option: CACHE_SPEC})
+    if option == "cache_to":
+        with pytest.raises(RemoteCacheError, match="Failed to export"):
+            _app_layer(builder, tmp_path, "credentials")
+    else:
+        with caplog.at_level(logging.WARNING, logger="pycontainer.remote_cache"):
+            layer = _app_layer(builder, tmp_path, "credentials")
+        assert Path(layer.tar_path).is_file()
+        assert "could not import" in caplog.text
+
+    assert requests[0][1] == (
+        CACHE_AUTH if credential == "basic" else "Bearer synthetic-cache-token"
+    )
+    insecure = [
+        bool(header) for url, header in requests if urllib.parse.urlsplit(url).scheme == "http"
+    ]
+    assert not insecure, f"HTTP token realm contacted; Authorization present: {insecure}"
+    assert "cache-pass" not in caplog.text
+    assert "synthetic-cache-token" not in caplog.text
+
+
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 @pytest.mark.parametrize(
     ("host", "authorization", "azure_calls", "login_server"),
