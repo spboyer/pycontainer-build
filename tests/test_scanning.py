@@ -288,14 +288,24 @@ def test_scanning_and_push_accept_multiple_tags_for_same_manifest(tmp_path, monk
     assert pushed == ["latest", "stable"]
 
 
-def test_scanning_rejects_conflicting_same_digest_descriptors_before_auth(tmp_path, monkeypatch, scanner):
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("size", 0),
+        ("mediaType", "application/vnd.oci.image.index.v1+json"),
+        ("platform", {"os": "linux", "architecture": "arm64"}),
+    ],
+)
+def test_scanning_rejects_conflicting_same_digest_descriptors_before_auth(
+    tmp_path, monkeypatch, scanner, field, value
+):
     from pycontainer.scanning import ScanError
 
     builder = make_builder(tmp_path, monkeypatch, scanner, tags=["stable"])
     builder.build()
     path = tmp_path / "output" / "index.json"
     index = json.loads(path.read_text())
-    index["manifests"][1]["size"] += 1
+    index["manifests"][1][field] = value
     path.write_text(json.dumps(index))
     monkeypatch.setattr(
         "pycontainer.builder.get_registry_auth",
