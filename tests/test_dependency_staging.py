@@ -1988,9 +1988,10 @@ def test_codename_tag_keeps_dependency_layer_digest_for_same_wheel(
             tmp_path, monkeypatch, context=context, include_deps=True,
             base_image=base_image, workdir="/app", reproducible=True,
         )
+        builder._base_image_tag_verified = True
         layers = tmp_path / "layers" / base_image.replace(":", "_")
         layers.mkdir(parents=True)
-        config = BASE_CONFIG
+        config = UNPROVEN_BASE_CONFIG
         if base_image == "python:3.11-slim":
             config = {**BASE_CONFIG, **_libc_config("PYTHON_LIBC=glibc-2.17")}
         digests.append(builder._create_deps_layer(layers, base_config=config).digest)

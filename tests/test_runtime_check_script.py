@@ -73,6 +73,42 @@ def test_shell_command_check_rejects_empty_shell(script, monkeypatch):
         script.shell_command_check(args, "docker", "skopeo", "img:tag", {})
 
 
+def test_cmd_only_check_builds_two_imports_without_entrypoint_override(script, monkeypatch):
+    built = _patch(script, monkeypatch, "")
+    outputs = iter([
+        "inherited-entrypoint\nshell=expanded\n",
+        "inherited-entrypoint\nexec=$MARKER  literal\n",
+    ])
+    monkeypatch.setattr(script, "run_layout", lambda *args: next(outputs))
+    args = SimpleNamespace(base_image="python:3.11-slim", timeout=5, platform="linux/amd64")
+    evidence = {}
+    script.cmd_only_check(args, "docker", "skopeo", "img:tag", evidence)
+
+    base, shell, exec_form = built
+    assert base.entrypoint[:2] == ["/bin/sh", "-c"]
+    assert shell.base_image == exec_form.base_image == f"oci:{base.output_dir}:runtime-check"
+    assert shell.entrypoint is exec_form.entrypoint is None
+    assert shell.cmd == ["/bin/sh", "-c", 'printf \'shell=%s\\n\' "$MARKER"']
+    assert exec_form.cmd == ["printf", "exec=%s\\n", "$MARKER  literal"]
+    assert set(evidence["cases"]) == {"shell", "exec"}
+
+
+@pytest.mark.parametrize("bad_case", ["shell", "exec"])
+def test_cmd_only_check_requires_inherited_entrypoint_output(script, monkeypatch, bad_case):
+    _patch(script, monkeypatch, "")
+    outputs = [
+        "inherited-entrypoint\nshell=expanded\n",
+        "inherited-entrypoint\nexec=$MARKER  literal\n",
+    ]
+    index = ["shell", "exec"].index(bad_case)
+    outputs[index] = outputs[index].split("\n", 1)[1]
+    remaining = iter(outputs)
+    monkeypatch.setattr(script, "run_layout", lambda *args: next(remaining))
+    args = SimpleNamespace(base_image="python:3.11-slim", timeout=5, platform="linux/amd64")
+    with pytest.raises(RuntimeError, match=f"CMD-only {bad_case}-form output mismatch"):
+        script.cmd_only_check(args, "docker", "skopeo", "img:tag", {})
+
+
 def test_run_layout_records_platform_and_output(script, monkeypatch):
     calls = []
 
@@ -152,7 +188,8 @@ def test_index_layout_selects_platform_and_verifies_config_before_start(
     assert calls[-1] == ["docker", "image", "rm", "--force", "img:tag"]
 
 
-def test_shell_and_index_modes_cannot_be_combined(script):
+@pytest.mark.parametrize("other_mode", ["--shell-command", "--cmd-only", "--dependency-layer-only"])
+def test_index_mode_cannot_be_combined_with_other_modes(script, other_mode):
     with pytest.raises(SystemExit) as exc:
-        script.main(["--shell-command", "--multi-platform-index"])
+        script.main([other_mode, "--multi-platform-index"])
     assert exc.value.code == 2
