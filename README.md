@@ -155,7 +155,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 `--scan` uses an external **Grype 0.119.0** executable against the complete
 selected OCI image, not the Python-only SBOM. It defaults to failing on
 high/critical findings and unknown severity, and blocks registry publication
-before authentication or uploads. Core runtime dependencies remain empty.
+before authentication or uploads. Multi-platform indexes cannot be scanned;
+build and scan each platform separately. Core runtime dependencies remain empty.
 
 ```bash
 pycontainer build --scan --scan-report-format sarif --scan-report scan.sarif
@@ -633,9 +634,13 @@ error handling, and custom-directory inspection.
 - `--label KEY=VALUE` — Set an image-config label; repeat to add labels
 - `--manifest-annotation KEY=VALUE` — Set an image-manifest annotation; repeat to add annotations
 - `--index-annotation KEY=VALUE` — Set a local layout-index annotation; repeat to add annotations
+- `--release-notes FILE` — Embed a UTF-8 release notes file (at most 8 KiB after
+  line endings become LF) in the `io.github.spboyer.pycontainer.release-notes`
+  label; `--release-notes-label KEY` selects another key
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
-  `linux/arm64` or `linux/arm/v7`)
+  `linux/arm64` or `linux/arm/v7`), or `linux/amd64,linux/arm64` to build an
+  OCI image index
 - `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
   as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
 - `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
@@ -738,6 +743,7 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
 maintainer = "team@example.com"
@@ -909,6 +915,37 @@ otherwise specify it explicitly. Missing targets and inconsistent image
 metadata fail before base layers are downloaded. Base-image references may
 include a registry port or an immutable `@sha256:...` digest. Platform
 selection writes target metadata; it does not cross-compile dependencies.
+
+Multi-platform image indexes (`--platform linux/amd64,linux/arm64` or TOML
+`platform = "linux/amd64,linux/arm64"`) are limited to those two targets;
+`linux/arm/v7` is tracked in [#119](https://github.com/spboyer/pycontainer-build/issues/119) and other targets are rejected. Each
+platform is built in isolation: it selects its own base manifest (registry
+builds re-select from the first resolved base-index digest), stages its own
+wheel-only dependency layer, and shares the byte-identical application layer
+(its cache key needs no platform input; dependency layers are never cached).
+Virtualenv closure is verified separately against each target base. Detected
+virtualenvs take precedence; exclude them (for example, `--exclude .venv`) to
+select a requirements file instead.
+The output `index.json` and tag refs point at the image index only after
+every platform manifest, config, platform field and DiffID has been verified;
+a failed platform leaves earlier tags untouched. A local `oci:` base must
+keep the same layout `index.json` for every platform and until publication;
+a change fails the build instead of mixing base versions. Push uploads blobs, then
+platform manifests and the index by digest, and moves tags last. Registry v2
+has no atomic multi-tag update: tags are pushed one at a time, so if a later
+tag fails, earlier tags in the same push may already point at the new index.
+On a tag push error, the exception lists confirmed pushes, the failed or
+unknown-outcome reference, and references not attempted, even with
+`--no-progress`. `builder.pushed_refs` contains only confirmed successes from
+the current index push; no rollback is attempted.
+SBOM generation is not yet supported for index builds. A local single-platform
+`docker-archive:` base cannot satisfy an index build. Requirements and
+transitive dependency markers are evaluated separately for each target, and
+unknown target marker values fail the build. Hermetic layout and protocol
+checks do not prove that images start. The optional
+`scripts/check_runtime_image.py --multi-platform-index` check builds an index,
+imports its native target with Skopeo, and starts it; see
+[runtime testing](docs/TESTING.md).
 
 ---
 
