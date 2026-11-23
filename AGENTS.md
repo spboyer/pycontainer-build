@@ -32,7 +32,9 @@ currently has no `__main__.py`.
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings.
+content, normalized relative paths, workdir, and reproducibility settings, plus
+the context-relative hardlink targets `tarfile` emits (never inode numbers or
+absolute paths); key version 3 invalidated earlier keys that lacked them.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -96,6 +98,11 @@ It pulls the selected base image, imports the generated layout into Docker, and
 starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
 part of the default test suite or CI.
+
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
