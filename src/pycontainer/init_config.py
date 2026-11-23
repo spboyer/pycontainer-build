@@ -82,7 +82,7 @@ def default_tag(context_dir: str) -> str:
 def default_base_image(context_dir: str) -> str:
     try:
         return f"python:{detect_python_version(context_dir)}-slim"
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, AttributeError, TypeError, ValueError) as exc:
         raise InitError(f"cannot detect the Python version from {context_dir}: {exc}") from None
 
 

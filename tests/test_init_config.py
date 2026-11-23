@@ -285,6 +285,25 @@ def _wizard(answers, tty=True):
 FASTAPI_ANSWERS = ["fastapi", "", "ghcr.io/me/api:v1", "", "", "", "", "", "", "y"]
 
 
+@pytest.mark.parametrize("mode", ["template", "wizard"])
+def test_init_reports_invalid_project_metadata(offline, monkeypatch, capsys, mode):
+    pyproject = offline / "pyproject.toml"
+    original = 'project = "invalid"\n'
+    pyproject.write_text(original)
+
+    if mode == "template":
+        code = _run(monkeypatch, ["init", "--template", "generic"])
+        err = capsys.readouterr().err
+    else:
+        code, _, _, err = _wizard(["generic", "", ""])
+
+    assert code == 2
+    assert "cannot detect the Python version" in err
+    assert "Traceback" not in err
+    assert _files(offline) == ["pyproject.toml"]
+    assert pyproject.read_text() == original
+
+
 def test_wizard_requires_tty(offline):
     code, term, out, err = _wizard(FASTAPI_ANSWERS, tty=False)
     assert code == 2 and term.prompts == [] and "interactive terminal" in err
