@@ -451,7 +451,7 @@ exclude-defaults = true
 ```
 
 **Caching Options**:
-- `--no-cache` — Disable layer caching, force full rebuild
+- `--no-cache` — Disable local caching and remote imports; exports remain enabled
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
 - `--cache-from type=registry,ref=REGISTRY/REPO` — Import the application
   layer from a registry cache repository (disabled by `--no-cache`)
@@ -488,12 +488,16 @@ Import is best-effort: a missing record is a quiet miss, and an invalid record,
 integrity failure, auth or network error logs a warning and rebuilds the layer
 locally. Export errors fail the build. Manifests and configs are size-bounded,
 layers are limited to 4 GiB and verified by digest and size, credentials come
-from the cache registry's own provider, and `Authorization` is never forwarded
-to a different origin or to redirected blob storage. Every blob redirect must
-use HTTPS and contain no URL credentials. Export verifies blob presence even
-when the tag is current, then uploads any missing blobs before publishing a
-new tag; identical concurrent writers produce identical
-records, while differing writers are last-writer-wins. An interrupted export
+from the cache registry's own provider, and control-plane redirects strip
+`Authorization` across origins. Redirected blob storage receives no registry
+credentials. A registry can direct credential exchange to its advertised token
+service, so trust both the cache registry and its token service. Every blob
+redirect must use HTTPS and contain no URL credentials. When remote caching is enabled,
+generated and cached tars are checked against the original source identity and
+sources are rechecked; mismatched cached layers are rebuilt. Export verifies
+blob presence even when the tag is current, then uploads any missing blobs
+before publishing a new tag. Identical concurrent writers produce identical
+records; differing tag publications are last-write-wins. An interrupted export
 leaves untagged blobs that readers never see. Some registries may reject the
 custom artifact and config media types.
 

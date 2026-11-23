@@ -51,8 +51,10 @@ cross-OS restore outcomes.
 app layer through `RegistryClient`, using versioned keys over the local file
 identity, layer format and builder Python version. Push access to the cache
 repository defines the trusted writers; digests prove integrity, not
-provenance. Import failures warn and rebuild; export publishes blobs before
-the tag and fails explicitly. Control-plane redirects drop `Authorization`
+provenance. Import failures warn and rebuild; remote caching validates the tar
+against its source identity and rechecks sources. Mismatched cached layers are
+rebuilt; export publishes blobs before the tag and fails explicitly.
+Control-plane redirects drop `Authorization`
 across origins, and blob redirects must be HTTPS and carry no credentials.
 Cache auth excludes unscoped `REGISTRY_TOKEN` and `REGISTRY_USERNAME`/
 `REGISTRY_PASSWORD` environment credentials, including for same-host caches;

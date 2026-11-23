@@ -19,7 +19,17 @@ from .fs_utils import file_lock
 
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
+_MAX_TAR_READ_BYTES = 1024 * 1024
 _CACHE_KEY_VERSION = 3
+
+
+class _BoundedTarReader(io.BufferedReader):
+    def read(self, size=-1):
+        if size < 0 or size > _MAX_TAR_READ_BYTES:
+            raise ValueError(
+                f"Application layer tar read exceeds {_MAX_TAR_READ_BYTES} bytes"
+            )
+        return super().read(size)
 
 
 def app_layer_arcname(workdir: str, relative_path: Path) -> str:
@@ -191,6 +201,12 @@ class LayerCache:
                 record["gid"] = getattr(metadata, "st_gid", 0)
             file_records.append(record)
 
+        return self._identity_from_records(file_records, workdir, reproducible)
+
+    @staticmethod
+    def _identity_from_records(
+        file_records: List[Dict], workdir: str, reproducible: bool
+    ) -> str:
         identity = {
             "version": _CACHE_KEY_VERSION,
             "workdir": workdir,
@@ -212,6 +228,104 @@ class LayerCache:
     ) -> str:
         """Return the versioned source identity used as the local cache key."""
         return self._compute_files_digest(files, workdir, reproducible, hardlinks)
+
+    def app_layer_identity(
+        self, files: List[Tuple[Path, Path]], layer_path: Path, workdir: str = "/app"
+    ) -> str:
+        """Return the source identity represented by a reproducible application tar."""
+        records = []
+        seen = {}
+        with _BoundedTarReader(Path(layer_path).open("rb", buffering=0)) as source:
+            with tarfile.open(fileobj=source, mode="r:") as archive:
+                for abs_path, rel_path in ordered_app_files(files, True):
+                    member = archive.next()
+                    arcname = os.path.splitdrive(app_layer_arcname(workdir, rel_path))[1]
+                    arcname = arcname.replace(os.sep, "/").lstrip("/")
+                    if member is None or member.name != arcname or member.name in seen:
+                        raise ValueError("Application layer has unexpected members")
+                    if (
+                        member.uid != 0
+                        or member.gid != 0
+                        or member.mtime != 0
+                        or member.uname != "root"
+                        or member.gname != "root"
+                        or member.sparse
+                        or set(member.pax_headers) - {"path", "linkpath"}
+                    ):
+                        raise ValueError("Application layer has unexpected metadata")
+
+                    metadata = Path(abs_path).lstat()
+                    record = {
+                        "path": self._relative_path(rel_path),
+                        "mode": stat.S_IMODE(member.mode),
+                        "hardlink": None,
+                    }
+                    if member.isfile():
+                        if (
+                            not stat.S_ISREG(metadata.st_mode)
+                            or member.size != metadata.st_size
+                        ):
+                            raise ValueError("Application layer file size or type differs")
+                        content = archive.extractfile(member)
+                        if content is None:
+                            raise ValueError("Application layer file has no content")
+                        hasher = hashlib.sha256()
+                        with content:
+                            while True:
+                                chunk = content.read(
+                                    min(_HASH_CHUNK_SIZE, _MAX_TAR_READ_BYTES)
+                                )
+                                if not chunk:
+                                    break
+                                hasher.update(chunk)
+                        record.update(
+                            kind="file",
+                            size=member.size,
+                            content=f"sha256:{hasher.hexdigest()}",
+                        )
+                    elif member.islnk():
+                        target = seen.get(member.linkname)
+                        if (
+                            target is None
+                            or target["kind"] != "file"
+                            or not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_size != target["size"]
+                        ):
+                            raise ValueError("Application layer has an invalid hardlink")
+                        record.update(
+                            kind="file",
+                            size=target["size"],
+                            content=target["content"],
+                            hardlink=target["path"],
+                        )
+                    elif member.issym():
+                        if not stat.S_ISLNK(metadata.st_mode):
+                            raise ValueError("Application layer symlink type differs")
+                        # The v3 key uses lstat size, while tar stores symlinks with size zero.
+                        record.update(
+                            kind="symlink",
+                            size=metadata.st_size,
+                            content=hashlib.sha256(os.fsencode(member.linkname)).hexdigest(),
+                        )
+                    else:
+                        raise ValueError("Application layer has an unsupported member type")
+                    records.append(record)
+                    seen[member.name] = record
+                trailer_start = archive.offset
+                if archive.next() is not None:
+                    raise ValueError("Application layer has unexpected members")
+            source.seek(trailer_start)
+            trailer_size = 0
+            while True:
+                chunk = source.read(min(_HASH_CHUNK_SIZE, _MAX_TAR_READ_BYTES))
+                if not chunk:
+                    break
+                trailer_size += len(chunk)
+                if chunk.count(b"\0") != len(chunk):
+                    raise ValueError("Application layer has an invalid tar trailer")
+            if trailer_size < 2 * tarfile.BLOCKSIZE or trailer_size % tarfile.BLOCKSIZE:
+                raise ValueError("Application layer has an invalid tar trailer")
+        return self._identity_from_records(records, workdir, True)
 
     @contextmanager
     def _index_lock(self):

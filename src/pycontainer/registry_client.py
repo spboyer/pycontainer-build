@@ -863,7 +863,7 @@ class RegistryClient:
             )
         try:
             manifest = json.loads(body)
-        except json.JSONDecodeError as error:
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             preview = _sanitize_text(
                 body[:500].decode("utf-8", errors="replace"),
                 self._secrets(),

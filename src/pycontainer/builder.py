@@ -768,6 +768,7 @@ class ImageBuilder:
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
+        include_paths=tuple(include_paths)
         files=list(
             iter_files(
                 ctx,
@@ -789,9 +790,11 @@ class ImageBuilder:
         if layer is None and self.remote_cache_from:
             layer=self._app_layer_from_remote_cache(layers_dir, files, identity)
         if layer is None:
-            layer=self._write_app_layer(layers_dir, files, identity)
+            layer=self._write_app_layer(layers_dir, files, identity, include_paths)
+        if self.remote_cache_from or self.remote_cache_to:
+            self._verify_app_identity(files, identity, include_paths)
         if self.remote_cache_to:
-            self._export_app_layer(layer, files, identity)
+            self._export_app_layer(layer, identity)
         return layer
 
     def _app_layer_from_local_cache(self, layers_dir, files, identity):
@@ -816,6 +819,11 @@ class ImageBuilder:
                 raise LayerIntegrityError(
                     f"Cached layer hashes to {actual_digest}, not {digest}."
                 )
+            if (
+                (self.remote_cache_from or self.remote_cache_to)
+                and not self._cached_app_layer_matches(tmp, files, identity)
+            ):
+                return None
             _publish_content_addressed(tmp, final, digest, size)
             return OCILayer(
                 "application/vnd.oci.image.layer.v1.tar",
@@ -831,6 +839,8 @@ class ImageBuilder:
         if not fetched:
             return None
         digest, path, size=fetched
+        if not self._cached_app_layer_matches(path, files, identity):
+            return None
         if self.cache:
             self.cache.store_layer(
                 files,
@@ -842,25 +852,66 @@ class ImageBuilder:
             )
         return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
 
-    def _verify_app_identity(self, files, identity, *, hardlinks=None):
+    def _verify_app_identity(self, files, identity, include_paths, *, hardlinks=None):
+        current_files=list(
+            iter_files(
+                Path(self.config.context_dir),
+                include_paths,
+                exclude_paths=self.context_excludes,
+                exclude_defaults=self.config.exclude_defaults,
+            )
+        )
+        expected_names=sorted(Path(relative).as_posix() for _, relative in files)
+        current_names=sorted(Path(relative).as_posix() for _, relative in current_files)
+        if current_names!=expected_names:
+            raise RemoteCacheError(
+                "Application sources changed during the build; refusing to use "
+                "a layer that may not match its cache key."
+            )
         current=LayerCache().files_identity(
-            files, self.config.workdir, self.config.reproducible, hardlinks=hardlinks
+            current_files,
+            self.config.workdir,
+            self.config.reproducible,
+            hardlinks=hardlinks,
         )
         if current!=identity:
             raise RemoteCacheError(
-                "Application sources changed during the build; refusing to export "
-                "a remote cache record that may not match its key."
+                "Application sources changed during the build; refusing to use "
+                "a layer that may not match its cache key."
             )
 
-    def _export_app_layer(self, layer, files, identity):
-        self._verify_app_identity(files, identity)
+    def _verify_app_layer_identity(self, path, files, identity):
+        try:
+            actual=LayerCache().app_layer_identity(files, path, self.config.workdir)
+        except (
+            tarfile.TarError, OSError, ValueError, EOFError, OverflowError, RecursionError
+        ) as error:
+            raise RemoteCacheError(
+                f"Could not verify the application layer against its input identity: {error}"
+            ) from error
+        if actual!=identity:
+            raise RemoteCacheError(
+                "Application sources changed during the build or the application "
+                "layer does not match them; refusing to use an inconsistent layer."
+            )
+
+    def _cached_app_layer_matches(self, path, files, identity):
+        try:
+            self._verify_app_layer_identity(path, files, identity)
+        except RemoteCacheError as error:
+            logger.warning("Ignoring cached application layer: %s", error)
+            return False
+        return True
+
+    def _export_app_layer(self, layer, identity):
         self.remote_cache_to.store(
             app_layer_cache_key(identity), layer.digest, Path(layer.tar_path), layer.size
         )
 
-    def _write_app_layer(self, layers_dir, files, identity=None):
+    def _write_app_layer(self, layers_dir, files, identity, include_paths):
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=ordered_app_files(files, self.config.reproducible)
+        uses_remote_cache=self.remote_cache_from or self.remote_cache_to
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
@@ -880,8 +931,11 @@ class ImageBuilder:
                     else:
                         tar.add(abs_path,arcname=arc)
                 hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
-            if self.remote_cache_to:
-                self._verify_app_identity(files, identity, hardlinks=hardlinks)
+            if uses_remote_cache:
+                self._verify_app_identity(
+                    files, identity, include_paths, hardlinks=hardlinks
+                )
+                self._verify_app_layer_identity(tmp, files, identity)
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -893,7 +947,8 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
-                    hardlinks=hardlinks,
+                    identity=identity if uses_remote_cache else None,
+                    hardlinks=None if uses_remote_cache else hardlinks,
                 )
 
             return OCILayer(

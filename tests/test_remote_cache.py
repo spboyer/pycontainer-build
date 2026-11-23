@@ -19,6 +19,7 @@ import pytest
 from pycontainer import remote_cache
 from pycontainer import auth as auth_module
 from pycontainer import builder as builder_module
+from pycontainer import cache as cache_module
 from pycontainer.auth import (
     AzureCLIAuthProvider,
     ChainAuthProvider,
@@ -363,6 +364,250 @@ def test_remote_export_rejects_transient_hardlink_topology_change(
     assert not registry.manifest_puts()
 
 
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_remote_export_rejects_transient_content_change(
+    tmp_path, registry, monkeypatch, use_cache
+):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC, use_cache=use_cache)
+    source = Path(writer.config.context_dir) / "app.py"
+    content = source.read_bytes()
+    changed = bytes([content[0] ^ 1]) + content[1:]
+    write_layer = ImageBuilder._write_app_layer
+    collect_hardlinks = builder_module.emitted_hardlinks
+
+    def restore_after_emission(ordered_files, members):
+        hardlinks = collect_hardlinks(ordered_files, members)
+        source.write_bytes(content)
+        return hardlinks
+
+    def write_with_transient_content(self, *args, **kwargs):
+        source.write_bytes(changed)
+        try:
+            return write_layer(self, *args, **kwargs)
+        finally:
+            source.write_bytes(content)
+
+    monkeypatch.setattr(builder_module, "emitted_hardlinks", restore_after_emission)
+    monkeypatch.setattr(ImageBuilder, "_write_app_layer", write_with_transient_content)
+    with pytest.raises(RemoteCacheError, match="changed during the build"):
+        _app_layer(writer, tmp_path, "writer")
+
+    assert not registry.manifest_puts()
+    if writer.cache:
+        assert writer.cache.get_layer(
+            [(source, Path("app.py"))], workdir="/app", reproducible=True
+        ) is None
+
+
+@pytest.mark.parametrize(
+    ("cache_source", "export"),
+    [("local", True), ("remote", True), ("local", False), ("remote", False)],
+)
+def test_remote_cache_rebuilds_mismatched_cached_layer(
+    tmp_path, registry, caplog, cache_source, export
+):
+    other = _builder(tmp_path, "other", use_cache=False)
+    source = Path(other.config.context_dir) / "app.py"
+    content = source.read_bytes()
+    source.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+    mismatched = _app_layer(other, tmp_path, "other")
+    source.write_bytes(content)
+
+    writer = _builder(
+        tmp_path,
+        "writer",
+        cache_from=CACHE_SPEC if cache_source == "remote" or not export else None,
+        cache_to=CACHE_SPEC if export else None,
+    )
+    files = [(source, Path("app.py"))]
+    if cache_source == "local":
+        writer.cache.store_layer(
+            files, mismatched.digest, Path(mismatched.tar_path),
+            workdir="/app", reproducible=True,
+        )
+    else:
+        RegistryLayerCache(parse_cache_spec(CACHE_SPEC)).store(
+            _key_for(writer), mismatched.digest, Path(mismatched.tar_path), mismatched.size
+        )
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
+        rebuilt = _app_layer(writer, tmp_path, "writer")
+
+    with tarfile.open(rebuilt.tar_path) as archive:
+        assert archive.extractfile("app/app.py").read() == content
+    assert rebuilt.digest != mismatched.digest
+    assert "cached application layer" in caplog.text
+    assert writer.cache.get_layer(files, workdir="/app", reproducible=True)[0] == rebuilt.digest
+    if export:
+        record = json.loads(registry.manifests[cache_tag(_key_for(writer))])
+        assert record["layers"][0]["digest"] == rebuilt.digest
+
+
+@pytest.mark.parametrize("direction", ["from", "to"])
+def test_remote_cache_rejects_new_source_during_emission(
+    tmp_path, registry, monkeypatch, direction
+):
+    options = {f"cache_{direction}": CACHE_SPEC}
+    writer = _builder(tmp_path, "writer", **options)
+    writer.context_include_paths = ["."]
+    context = Path(writer.config.context_dir)
+    collect_hardlinks = builder_module.emitted_hardlinks
+
+    def add_source_after_emission(ordered_files, members):
+        hardlinks = collect_hardlinks(ordered_files, members)
+        (context / "new.py").write_text("new")
+        return hardlinks
+
+    monkeypatch.setattr(builder_module, "emitted_hardlinks", add_source_after_emission)
+    with pytest.raises(RemoteCacheError, match="changed during the build"):
+        _app_layer(writer, tmp_path, "writer")
+
+    assert not registry.manifest_puts()
+    assert writer.cache.get_layer(
+        [(context / "app.py", Path("app.py"))], workdir="/app", reproducible=True
+    ) is None
+
+
+@pytest.mark.parametrize("workdir", ["/", "/app/", "/srv/app"])
+def test_remote_export_accepts_workdir_paths(tmp_path, registry, workdir):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC, workdir=workdir)
+    cold = _app_layer(writer, tmp_path, "writer")
+    warm = _app_layer(writer, tmp_path, "warm")
+
+    assert warm.digest == cold.digest
+    with tarfile.open(cold.tar_path) as archive:
+        assert archive.getnames() == [f"{workdir.lstrip('/')}/app.py".lstrip("/")]
+
+
+def test_remote_export_accepts_symlinks(tmp_path, registry):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    link = Path(writer.config.context_dir) / "link.py"
+    try:
+        link.symlink_to("app.py")
+    except OSError as error:
+        pytest.skip(f"Symlinks are unavailable: {error}")
+    writer.context_include_paths.append("link.py")
+
+    cold = _app_layer(writer, tmp_path, "writer")
+    warm = _app_layer(writer, tmp_path, "warm")
+
+    assert warm.digest == cold.digest
+    with tarfile.open(cold.tar_path) as archive:
+        assert archive.getmember("app/link.py").linkname == "app.py"
+
+
+def test_remote_export_accepts_extended_tar_paths(tmp_path, registry):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    name = "x" * 105 + "\u00e9.py"
+    (Path(writer.config.context_dir) / name).write_bytes(b"content")
+    writer.context_include_paths.append(name)
+
+    cold = _app_layer(writer, tmp_path, "writer")
+    warm = _app_layer(writer, tmp_path, "warm")
+
+    assert warm.digest == cold.digest
+    with tarfile.open(cold.tar_path) as archive:
+        assert archive.extractfile(f"app/{name}").read() == b"content"
+
+
+def test_remote_export_rejects_transient_symlink_change(tmp_path, registry, monkeypatch):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    context = Path(writer.config.context_dir)
+    (context / "other.py").write_text("different")
+    link = context / "link.py"
+    try:
+        link.symlink_to("app.py")
+    except OSError as error:
+        pytest.skip(f"Symlinks are unavailable: {error}")
+    writer.context_include_paths.append("link.py")
+    write_layer = ImageBuilder._write_app_layer
+    collect_hardlinks = builder_module.emitted_hardlinks
+
+    def restore_after_emission(ordered_files, members):
+        hardlinks = collect_hardlinks(ordered_files, members)
+        link.unlink()
+        link.symlink_to("app.py")
+        return hardlinks
+
+    def write_with_transient_link(self, *args, **kwargs):
+        link.unlink()
+        link.symlink_to("other.py")
+        try:
+            return write_layer(self, *args, **kwargs)
+        finally:
+            link.unlink()
+            link.symlink_to("app.py")
+
+    monkeypatch.setattr(builder_module, "emitted_hardlinks", restore_after_emission)
+    monkeypatch.setattr(ImageBuilder, "_write_app_layer", write_with_transient_link)
+    with pytest.raises(RemoteCacheError, match="changed during the build"):
+        _app_layer(writer, tmp_path, "writer")
+
+    assert not registry.manifest_puts()
+
+
+@pytest.mark.parametrize(
+    ("header", "value", "message"),
+    [
+        ("comment", "x" * (16 * 1024 + 1), "exceeds"),
+        ("SCHILY.xattr.security.capability", "unexpected", "unexpected metadata"),
+    ],
+    ids=["oversized", "unsupported"],
+)
+def test_remote_export_rebuilds_layer_with_invalid_tar_metadata(
+    tmp_path, registry, monkeypatch, caplog, header, value, message
+):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    source = Path(writer.config.context_dir) / "app.py"
+    content = source.read_bytes()
+    path = tmp_path / "large-header.tar"
+    info = tarfile.TarInfo("app/app.py")
+    info.size = len(content)
+    info.mode = source.stat().st_mode & 0o7777
+    info.uid = info.gid = info.mtime = 0
+    info.uname = info.gname = "root"
+    info.pax_headers = {header: value}
+    with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
+        archive.addfile(info, io.BytesIO(content))
+    digest = _digest(path.read_bytes())
+    writer.cache.store_layer(
+        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True
+    )
+    monkeypatch.setattr(cache_module, "_MAX_TAR_READ_BYTES", 16 * 1024)
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
+        rebuilt = _app_layer(writer, tmp_path, "writer")
+
+    assert rebuilt.digest != digest
+    assert message in caplog.text
+
+
+def test_remote_cache_rebuilds_layer_with_trailing_tar_data(tmp_path, registry, caplog):
+    writer = _builder(tmp_path, "writer", cache_from=CACHE_SPEC)
+    source = Path(writer.config.context_dir) / "app.py"
+    content = source.read_bytes()
+    path = tmp_path / "trailing.tar"
+    info = tarfile.TarInfo("app/app.py")
+    info.size = len(content)
+    info.mode = source.stat().st_mode & 0o7777
+    info.uid = info.gid = info.mtime = 0
+    info.uname = info.gname = "root"
+    with tarfile.open(path, "w") as archive:
+        archive.addfile(info, io.BytesIO(content))
+    with path.open("ab") as archive:
+        archive.write(b"unexpected trailing data")
+    digest = _digest(path.read_bytes())
+    writer.cache.store_layer(
+        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
+        rebuilt = _app_layer(writer, tmp_path, "writer")
+
+    assert rebuilt.digest != digest
+    assert "trailer" in caplog.text
+
+
 def test_hardlinked_layer_round_trips_through_remote_cache(tmp_path, registry, monkeypatch):
     writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
     writer.context_include_paths.append("copy.py")
@@ -447,6 +692,18 @@ def test_export_restores_missing_blob_for_current_record(tmp_path, registry, mis
     assert digest in registry.blobs
     assert len(registry.manifest_puts()) == manifest_puts
     assert RegistryLayerCache(writer.remote_cache_to.ref).fetch(key, tmp_path / "reader")
+
+
+def test_export_replaces_manifest_with_invalid_utf8(tmp_path, registry):
+    writer, layer = _export(tmp_path, registry)
+    key = _key_for(writer)
+    tag = cache_tag(key)
+    registry.manifests[tag] = b"\xff"
+
+    assert writer.remote_cache_to.store(
+        key, layer.digest, Path(layer.tar_path), layer.size
+    ) is True
+    assert json.loads(registry.manifests[tag])["layers"][0]["digest"] == layer.digest
 
 
 @pytest.mark.parametrize("failure", [("PUT", "manifests/"), ("POST", "blobs/uploads/")])

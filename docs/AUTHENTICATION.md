@@ -54,7 +54,9 @@ provider remain available. For other private cache registries, configure an
 exact registry entry in `~/.docker/config.json`. Without usable cache
 credentials, an unauthorized import warns and rebuilds locally; an
 unauthorized export fails explicitly. Normal image authentication continues
-to accept generic environment credentials.
+to accept generic environment credentials. A registry's authentication
+challenge can direct credential exchange to a token service on another origin;
+trust both the cache registry and its advertised token service.
 
 ## Components
 
