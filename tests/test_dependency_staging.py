@@ -1363,6 +1363,153 @@ def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
         _stage_base_venv(tmp_path, monkeypatch, context)
 
 
+_REPRODUCER_MARKER = 'extra != "" and extra in "other,Speed_Ups"'
+_LEGACY_PACKAGING = (
+    "import pip._vendor.packaging.markers as _markers\n"
+    "_markers._normalize = lambda *values, key: values\n"
+)
+
+
+def _write_extra_venv(context, marker, requested="speed-ups", installed=False):
+    dists = {"marker-root": [
+        "Provides-Extra: Speed_Ups",
+        f"Requires-Dist: missing-child; {marker}",
+    ]}
+    if installed:
+        dists["missing-child"] = []
+    _write_base_venv(context, dists)
+    (context / "requirements.txt").write_text(f"marker-root[{requested}]\n")
+
+
+def _simulate_legacy_packaging(tmp_path, monkeypatch):
+    # Simulate packaging 21.3, which compares extra strings literally.
+    script = tmp_path / "_venv_closure.py"
+    script.write_text(
+        _LEGACY_PACKAGING + dependencies._VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8")
+    )
+    monkeypatch.setattr(dependencies, "_VENV_CLOSURE_SCRIPT", script)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("arch", ["amd64", "arm64"])
+def test_virtualenv_normalizes_extra_list_operands(
+    tmp_path, monkeypatch, arch, legacy
+):
+    if legacy:
+        _simulate_legacy_packaging(tmp_path, monkeypatch)
+    context = tmp_path / "context"
+    _write_extra_venv(context, _REPRODUCER_MARKER)
+    with pytest.raises(
+        ValueError, match=r"marker-root 1.0 \[speed-ups\] requires .*missing-child.*not installed"
+    ):
+        _stage_base_venv(tmp_path, monkeypatch, context, arch)
+
+    shutil.rmtree(context)
+    _write_extra_venv(context, _REPRODUCER_MARKER, installed=True)
+    assert _stage_base_venv(tmp_path, monkeypatch, context, arch) is not None
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    ("marker", "requested", "missing"),
+    [
+        ('extra == "Speed_Ups"', "speed-ups", True),
+        ('"Speed_Ups" == extra', "speed-ups", True),
+        ('extra != "" and extra != "Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra in "Other, Fast"', "speed-ups", False),
+        ('extra != "" and extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra not in "other,fast"', "speed-ups", True),
+        # PEP 508 `in` is a Python substring test: "" is in every string.
+        ('extra in "other,fast"', "speed-ups", True),
+        ('extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra in "Speed_Ups"', "ups", True),
+        ('"Speed" in extra', "speed-ups", True),
+        ('"other" in extra', "speed-ups", False),
+        ('"Fast" not in extra', "speed-ups", True),
+        ('extra in "other,Speed_Ups" and sys_platform == "linux"', "speed-ups", True),
+        ('extra in "other,Speed_Ups" and sys_platform == "win32"', "speed-ups", False),
+        ('sys_platform == "win32" or "Speed_Ups" == extra', "speed-ups", True),
+    ],
+)
+def test_virtualenv_extra_operators_are_verified(
+    tmp_path, monkeypatch, marker, requested, missing, legacy
+):
+    if legacy:
+        _simulate_legacy_packaging(tmp_path, monkeypatch)
+    context = tmp_path / "context"
+    _write_extra_venv(context, marker, requested=requested)
+    if requested != "speed-ups":
+        metadata = context / ".venv" / "Lib" / "site-packages" / "marker_root-1.0.dist-info" / "METADATA"
+        metadata.write_text(metadata.read_text().replace("Speed_Ups\n", f"{requested}\n", 1))
+    if missing:
+        with pytest.raises(ValueError, match="missing-child.*not installed"):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+
+@pytest.mark.parametrize(
+    "marker", ['extra >= "speed"', 'extra === "speed"', 'extra ~= "1.0"']
+)
+def test_virtualenv_unsupported_extra_comparisons_fail_closed(
+    tmp_path, monkeypatch, marker
+):
+    context = tmp_path / "context"
+    _write_extra_venv(context, marker, installed=True)
+    with pytest.raises(ValueError, match="only extra ==, !=, in and not in comparisons"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    ("marker", "message"),
+    [
+        # Substring matches differ between pip versions, so they cannot prove
+        # that an unselected extra was never requested.
+        ('extra != "" and extra in "fast,turbo"', r"Cannot determine whether extra \[fast\]"),
+        ('extra in "other,Speed_Ups"', "missing-child.*not installed"),
+    ],
+)
+def test_virtualenv_substring_extras_cannot_prove_unrequested(
+    tmp_path, monkeypatch, marker, message
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        "Provides-Extra: Fast",
+        f"Requires-Dist: missing-child; {marker}",
+    ]})
+    (context / "requirements.txt").write_text("marker-root\n")
+    with pytest.raises(ValueError, match=message):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_version_like_extra_evaluation_errors_fail_closed(
+    tmp_path, monkeypatch
+):
+    # packaging 22+ can raise InvalidVersion comparing "1-0-0" with "==1-0".
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        "Provides-Extra: 1.0.0",
+        'Requires-Dist: missing-child; extra == "1.0"',
+    ]})
+    (context / "requirements.txt").write_text("marker-root[1.0.0]\n")
+    try:
+        _stage_base_venv(tmp_path, monkeypatch, context)
+    except ValueError as exc:
+        assert re.search("missing-child.*not installed", str(exc))
+
+
+def test_virtualenv_substring_extras_without_provides_extra_fail_closed(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        'Requires-Dist: missing-child; extra != "" and extra in "fast"',
+    ]})
+    (context / "requirements.txt").write_text("marker-root\n")
+    with pytest.raises(ValueError, match="Cannot determine which extras of marker-root"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
 def test_virtualenv_installed_versions_must_satisfy_target_constraints(
     tmp_path, monkeypatch
 ):

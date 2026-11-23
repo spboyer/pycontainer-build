@@ -238,6 +238,10 @@ only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
 `Lib` layout; `python_version` shared only when
 the venv minor is established) would have installed one of its missing
 requirements; otherwise unsatisfied target-active requirements fail closed.
+Extra markers compare canonical names on any vendored `packaging` version;
+`in`/`not in` keep PEP 508 substring semantics (not list membership), never
+name candidate extras or rule one out, and fail closed without
+`Provides-Extra`. Other `extra` operators and evaluation errors fail closed.
 Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
