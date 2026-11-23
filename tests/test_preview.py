@@ -3,8 +3,11 @@ import base64
 import contextlib
 import http.server
 import json
+import logging
 import os
+import shutil
 import socket
+import stat
 import sys
 import tarfile
 import tempfile
@@ -133,9 +136,10 @@ def test_workdir_change_reports_moved_files(built, tmp_path):
                                               "before": "/app", "after": "/srv"}
 
 
-def test_non_reproducible_build_is_unknown_not_unchanged(tmp_path):
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_non_reproducible_build_is_unknown_not_unchanged(tmp_path, use_cache):
     context(tmp_path / "ctx")
-    cfg = config(tmp_path, reproducible=False)
+    cfg = config(tmp_path, reproducible=False, use_cache=use_cache)
     baseline = build(cfg)
     result = preview_image(cfg, baseline)
     assert result["provenance"]["level"] == "positional"
@@ -478,27 +482,96 @@ def test_oversized_docker_credentials_fail_explicitly(tmp_path, monkeypatch):
         provider.get_credentials("registry.example")
 
 
-def test_cache_hardlink_topology_makes_application_unknown(tmp_path):
+def built_final_diff_id(output_dir: Path) -> str:
+    root = Path(output_dir)
+
+    def blob(descriptor):
+        return (root / "blobs" / "sha256" / descriptor["digest"].split(":", 1)[1]).read_bytes()
+
+    manifest = json.loads((root / "index.json").read_bytes())
+    while "manifests" in manifest:
+        manifest = json.loads(blob(manifest["manifests"][0]))
+    layer = manifest["layers"][-1]
+    contents = blob(layer)
+    config = json.loads(blob(manifest["config"]))
+    diff_id = config["rootfs"]["diff_ids"][-1]
+    assert layer["mediaType"] == "application/vnd.oci.image.layer.v1.tar"
+    assert layer["size"] == len(contents)
+    assert layer["digest"] == diff_id == sha(contents)
+    return diff_id
+
+
+@pytest.mark.parametrize(
+    "start_linked", [False, True], ids=["independent-to-hardlink", "hardlink-to-independent"]
+)
+def test_cache_enabled_exact_matches_built_layer_across_hardlink_topology(
+    tmp_path, caplog, start_linked
+):
     ctx = context(tmp_path / "ctx", {"src/a.py": "SAME = 1\n", "src/b.py": "SAME = 1\n"})
-    cfg = config(tmp_path, use_cache=True)
-    baseline = build(cfg)
+    first, second = ctx / "src" / "a.py", ctx / "src" / "b.py"
+    stamp = 1_700_000_000_000_000_000
+
+    def set_topology(linked):
+        second.unlink()
+        if linked:
+            try:
+                os.link(first, second)
+            except (AttributeError, NotImplementedError, OSError) as error:
+                pytest.skip(f"Hardlinks are unavailable here: {error}")
+        else:
+            shutil.copy2(first, second)
+        for path in (first, second):
+            os.utime(path, ns=(stamp, stamp))
+        if not first.stat().st_ino or not second.stat().st_ino:
+            pytest.skip("Filesystem does not expose inodes needed by tarfile")
+        assert os.path.samefile(first, second) is linked
+
+    def snapshot():
+        return [(path.read_bytes(), stat.S_IMODE(path.stat().st_mode), path.stat().st_mtime_ns)
+                for path in (first, second)]
+
+    set_topology(start_linked)
+    original = snapshot()
+    assert original[0] == original[1]
+
+    def cfg(run):
+        return config(tmp_path, use_cache=True, output_dir=str(tmp_path / f"out-{run}"))
+
+    baseline = build(cfg("baseline"))
+    baseline_diff_id = built_final_diff_id(tmp_path / "out-baseline")
+
+    set_topology(not start_linked)
+    assert snapshot() == original
     cache_before = tree(tmp_path / "cache")
-    exact = preview_image(config(tmp_path, use_cache=False), baseline)
-    assert exact["provenance"]["level"] == "exact" and exact["components"]["application"]["status"] == "identical"
-    cached = preview_image(cfg, baseline)
-    assert cached["components"]["application"] == {"status": "unknown", "reason": preview.CACHE_TOPOLOGY_REASON}
-    assert cached["files"] is None and cached["plan"]["appLayerDiffId"] is None
-    (ctx / "src" / "b.py").unlink()
-    try:
-        os.link(ctx / "src" / "a.py", ctx / "src" / "b.py")
-    except OSError:
-        pytest.skip("hardlinks are not supported here")
-    linked = preview_image(cfg, baseline)
-    assert linked["components"]["application"]["status"] == "unknown" and linked["files"] is None
-    fresh = preview_image(config(tmp_path, use_cache=False), baseline)
-    assert fresh["components"]["application"]["status"] == "changed"
-    assert changes(fresh)["/app/src/b.py"]["reasons"][0] == "type"
+    flipped = preview_image(cfg("flipped"), baseline)
     assert tree(tmp_path / "cache") == cache_before
+    build(cfg("flipped"))
+    assert flipped["plan"]["useCache"] is True
+    assert flipped["provenance"]["level"] == "positional"
+    assert flipped["components"]["application"]["status"] == "changed"
+    assert changes(flipped)["/app/src/b.py"]["reasons"][0] == "type"
+    assert (
+        flipped["plan"]["appLayerDiffId"]
+        == built_final_diff_id(tmp_path / "out-flipped")
+        != baseline_diff_id
+    )
+
+    set_topology(start_linked)
+    assert snapshot() == original
+    cache_before = tree(tmp_path / "cache")
+    restored = preview_image(cfg("restored"), baseline)
+    assert tree(tmp_path / "cache") == cache_before
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.cache"):
+        build(cfg("restored"))
+    assert any("Layer cache hit:" in record.getMessage() for record in caplog.records)
+    assert restored["provenance"]["level"] == "exact"
+    assert restored["components"]["application"]["status"] == "identical"
+    assert restored["files"] == []
+    assert (
+        restored["plan"]["appLayerDiffId"]
+        == built_final_diff_id(tmp_path / "out-restored")
+        == baseline_diff_id
+    )
 
 
 def test_cli_preview_no_cache_flag(built, monkeypatch, capsys):

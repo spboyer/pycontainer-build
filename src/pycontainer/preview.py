@@ -70,14 +70,9 @@ LIMITS = (
     "when --include-deps is planned.",
     "Only the baseline config and final layer are read. Files are compared by type, content digest, size, mode, "
     "owner and link target; modification times are not compared.",
+    "Non-reproducible builds can embed modification times or reuse cached layers, so exact application "
+    "identity cannot be established.",
     "Environment values are never printed.",
-    "With the layer cache enabled, a build may reuse a cached application layer whose hardlink layout differs "
-    "from a fresh one (#229); when planned files could be hardlinked, the application result is unknown. "
-    "Use --no-cache to preview a cache-free build.",
-)
-CACHE_TOPOLOGY_REASON = (
-    "The layer cache key ignores hardlink layout (#229) and planned files share content, so a cached build may "
-    "emit a different application layer than this fresh plan. Use --no-cache to preview a cache-free build."
 )
 
 
@@ -247,12 +242,6 @@ def _app_shape(records, workdir) -> Optional[Dict[str, Entry]]:
     return entries or None
 
 
-def _hardlink_candidates(entries: Dict[str, Entry]) -> bool:
-    """True when planned files could be hardlinked to each other: a hardlink exists or contents repeat."""
-    digests = [entry.digest for entry in entries.values() if entry.kind == "file"]
-    return any(entry.kind == "hardlink" for entry in entries.values()) or len(digests) != len(set(digests))
-
-
 def _reasons(before: Entry, after: Entry) -> List[str]:
     reasons = []
     if before.kind != after.kind:
@@ -366,7 +355,6 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
     files = list(iter_files(Path(plan.context_dir), builder.context_include_paths,
                             exclude_paths=builder.context_excludes, exclude_defaults=plan.exclude_defaults))
     planned_diff_id, planned_entries = plan_app_layer(files, plan.workdir, plan.reproducible)
-    cache_ambiguous = cfg.use_cache and _hardlink_candidates(planned_entries)
 
     with tempfile.TemporaryDirectory(prefix="pycontainer-preview-") as temporary, \
             contextlib.redirect_stdout(sys.stderr):
@@ -412,9 +400,7 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
     else:
         provenance = NO_PROVENANCE
 
-    if cache_ambiguous:
-        changes = None
-    elif provenance == EXACT:
+    if provenance == EXACT:
         changes = []
     elif provenance == NO_PROVENANCE:
         changes = None
@@ -424,9 +410,7 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
             for change in changes:
                 change["inferred"] = True
 
-    if cache_ambiguous:
-        app = {"status": UNKNOWN, "reason": CACHE_TOPOLOGY_REASON}
-    elif provenance == EXACT:
+    if provenance == EXACT:
         app = {"status": IDENTICAL, "reason": PROVENANCE_NOTES[EXACT]}
     elif provenance == POSITIONAL and changes:
         app = {"status": CHANGED, "reason": f"{len(changes)} application paths differ."}
@@ -460,7 +444,7 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
             "baseImage": plan.base_image, "platform": plan.platform, "workdir": plan.workdir,
             "reproducible": plan.reproducible, "includeDeps": plan.include_deps,
             "useCache": cfg.use_cache,
-            "appLayerDiffId": planned_diff_id if plan.reproducible and not cache_ambiguous else None,
+            "appLayerDiffId": planned_diff_id if plan.reproducible else None,
             "files": len(planned_entries),
         },
         "provenance": {"level": provenance, "reason": PROVENANCE_NOTES[provenance]},

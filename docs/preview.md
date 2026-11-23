@@ -86,11 +86,10 @@ only the status reveals that a value changed.
 - Non-reproducible builds (`--no-reproducible`) embed modification times and
   can reuse a cached layer, so provenance is never `exact` and the application
   component is `unknown` unless file changes are found.
-- The layer cache key ignores hardlink topology (#229), so a cache-enabled
-  `build` can reuse a layer whose hardlinks differ from a fresh layer. When
-  caching is enabled and planned files are hardlinked or share content, the
-  application component and file list are `unknown`; preview with
-  `--no-cache` (and build with `--no-cache`) to compare a cache-free layer.
+- The plan is a fresh application layer. The layer cache key includes the
+  hardlinks a fresh layer emits, so a cache-enabled `build` reuses a cached
+  layer only when its hardlink topology matches. `--no-cache` previews a
+  cache-free build.
 - Modification times are not compared.
 - The exit code is `0` for a report and `1` for any error; errors never
   produce a partial report.
