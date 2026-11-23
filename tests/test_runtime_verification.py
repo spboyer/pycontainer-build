@@ -435,6 +435,12 @@ def test_pull_request_ci_runs_the_real_runtime_check():
     assert "check-index: true" in job
 
 
+def test_windows_squash_build_uses_utf8_output():
+    job = job_block("runtime-check.yml", "windows-squash-build")
+
+    assert "PYTHONIOENCODING: utf-8" in job
+
+
 def test_index_runtime_evidence_is_separate_from_release_evidence():
     startup = job_block("runtime-check.yml", "startup")
     gate = job_block("runtime-check.yml", "gate")

@@ -157,6 +157,7 @@ jobs:
       - name: Build both layouts with an isolated home
         env:
           PYTHONPATH: src
+          PYTHONIOENCODING: utf-8
           HOME: '${{ runner.temp }}\squash-home'
           USERPROFILE: '${{ runner.temp }}\squash-home'
         shell: pwsh
