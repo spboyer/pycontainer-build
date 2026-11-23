@@ -4,10 +4,12 @@ import hashlib
 import io
 import json
 import logging
+import ssl
 import threading
 import traceback
 import urllib.error
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -405,6 +407,121 @@ def test_pull_blob_streams_and_atomically_publishes_verified_content(
     assert all(0 < size <= TRANSFER_CHUNK_SIZE for size in response.read_sizes)
     assert not list(destination.parent.glob(".*.tmp"))
     assert not client.pull_blob(digest, destination, len(content))
+
+
+def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[len(requests)]
+            requests.append(request)
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
+        return openers[-1][0]
+
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+
+    for content in contents:
+        digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        assert client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+
+    assert len(requests) == 2
+    assert len(openers) == 1
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert isinstance(client._ssl_context, ssl.SSLContext)
+    assert client._ssl_context.verify_mode == ssl.CERT_REQUIRED
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    context = client._ssl_context
+    assert client._get_blob_opener() is openers[0][0]
+    assert client._ssl_context is context
+
+
+def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
+    def unexpected_opener(*_handlers):
+        pytest.fail("Push-only clients must not initialize the blob TLS opener")
+
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", unexpected_opener
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.ssl.create_default_context", unexpected_opener
+    )
+
+    def make_request(method, *_args, **_kwargs):
+        if method == "POST":
+            return 202, b"", {"Location": "/v2/team/app/blobs/uploads/test"}
+        return 201, b"", {}
+
+    monkeypatch.setattr(
+        client, "_make_request", make_request
+    )
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"push-only")
+    digest = f"sha256:{hashlib.sha256(blob.read_bytes()).hexdigest()}"
+    assert client.push_blob(digest, blob, check_exists=False)
+    assert client.push_manifest("latest", b"{}")
+
+
+def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
+    import threading
+
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    both_building = threading.Barrier(2, timeout=0.5)
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[int(request.full_url.endswith(digests[1]))]
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
+        try:
+            both_building.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return openers[-1][0]
+
+    digests = [f"sha256:{hashlib.sha256(c).hexdigest()}" for c in contents]
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+    results = []
+
+    def pull(index):
+        digest, content = digests[index], contents[index]
+        results.append(
+            client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+        )
+
+    threads = [threading.Thread(target=pull, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == [True, True]
+    assert len(openers) == 1
+    assert isinstance(client._ssl_context, ssl.SSLContext)
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    assert client._get_blob_opener() is openers[0][0]
 
 
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(

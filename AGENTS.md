@@ -164,8 +164,10 @@ There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
 and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
-multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
-does not measure external registry throughput. Do not describe suggested tools
+multiple blob sizes with per-sample peak RSS and Python allocation metrics, and
+`registry-network-*` cases that time the real sequential pull/build/push against
+a loopback registry with injected latency and bandwidth (see `docs/TESTING.md`);
+it does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
 
 ## Change discipline
@@ -194,7 +196,10 @@ size before publication; only safe reads use bounded retries and explicit
 request timeouts. Registry HTTP(S) requests go through the client's openers:
 keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
 explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
-credentials over HTTP to non-loopback hosts.
+credentials over HTTP to non-loopback hosts. Base-image mirrors
+(`registry_mirrors.py`) apply only to pulls; each mirror uses only its own
+host-scoped credentials, integrity and rate-limit failures never fall back,
+and pushes bypass mirrors.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.

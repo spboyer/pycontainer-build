@@ -133,6 +133,8 @@ token-exchange and blob-download credentials are not forwarded on redirects.
 Base metadata, token-service, and blob redirect chains in required mode must
 use HTTPS, even when a host is listed in `insecure_registries`. For a private
 CA, configure `registry_ca_file`; this does not disable certificate validation.
+Required trust cannot be combined with registry mirrors for the base registry.
+Remove that mirror configuration to verify and pull directly from the registry.
 
 ## Private registries
 

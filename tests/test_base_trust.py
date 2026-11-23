@@ -305,6 +305,51 @@ def test_repository_mismatch_fails_before_network(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("base_image", "policy", "mirrors"),
+    [
+        ("registry.example/team/base:latest", _policy(),
+         {"registry.example": ["mirror.example"]}),
+        ("python:3.11-slim", _policy(repository="docker.io/library/python"),
+         {"index.docker.io": ["mirror.example"]}),
+    ],
+)
+def test_required_trust_rejects_base_registry_mirrors_before_auth_or_network(
+    tmp_path, monkeypatch, base_image, policy, mirrors
+):
+    def unexpected_access(*args, **kwargs):
+        pytest.fail("trust and mirror conflict must fail before authentication or network")
+
+    monkeypatch.setattr(builder_module, "get_registry_auth", unexpected_access)
+    monkeypatch.setattr(builder_module, "get_mirror_auth", unexpected_access)
+    monkeypatch.setattr(builder_module, "RegistryClient", unexpected_access)
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(tmp_path), base_image=base_image, base_image_trust=policy,
+        registry_mirrors=mirrors, use_cache=False,
+    ))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    with pytest.raises(TrustVerificationError, match="cannot be combined with registry mirrors"):
+        builder._pull_base_image(layers, "linux", "amd64")
+
+
+def test_required_trust_allows_mirrors_for_other_registries(tmp_path, monkeypatch):
+    client = _Registry()
+    monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
+    monkeypatch.setattr(builder_module, "verify_base_image",
+                        lambda *args: setattr(client, "verified", True))
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(tmp_path), base_image="registry.example/team/base:latest",
+        base_image_trust=_policy(), registry_mirrors={"other.example": ["mirror.example"]},
+        use_cache=False,
+    ))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder._pull_base_image(layers, "linux", "amd64")
+    assert client.verified
+
+
+@pytest.mark.parametrize(
     "policy",
     [
         {},
