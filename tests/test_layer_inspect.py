@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from pycontainer import local_image
+from pycontainer import layer_inspect, local_image
 from pycontainer.layer_inspect import inspect_image, render_text, run_inspect
 from pycontainer.local_image import OCI_GZIP_LAYER, OCI_TAR_LAYER
 
@@ -49,6 +49,24 @@ def tar(*entries) -> bytes:
     return buffer.getvalue()
 
 
+def pax_chain(count: int) -> bytes:
+    payload = b"5 x=\n"
+    layer = bytearray()
+    for index in range(count):
+        header = tarfile.TarInfo(f"PaxHeaders/{index}")
+        header.type = tarfile.XHDTYPE
+        header.size = len(payload)
+        layer.extend(header.tobuf(format=tarfile.USTAR_FORMAT))
+        layer.extend(payload)
+        layer.extend(b"\0" * (tarfile.BLOCKSIZE - len(payload)))
+    member = tarfile.TarInfo("file")
+    member.size = 1
+    layer.extend(member.tobuf(format=tarfile.USTAR_FORMAT))
+    layer.extend(b"x" + b"\0" * (tarfile.BLOCKSIZE - 1))
+    layer.extend(b"\0" * (2 * tarfile.BLOCKSIZE))
+    return bytes(layer)
+
+
 class Image:
     """Write an OCI layout whose index points at one or more images."""
 
@@ -62,8 +80,8 @@ class Image:
         (self.root / "blobs" / "sha256" / sha(data).split(":")[1]).write_bytes(data)
         return {"mediaType": media_type, "digest": sha(data), "size": len(data)}
 
-    def image(self, layers, *, arch="amd64", compress=True, history=None, diff_ids=None,
-              media_type=None, ref=None, platform=True):
+    def image(self, layers, *, arch="amd64", variant=None, platform_variant=None, compress=True,
+              history=None, diff_ids=None, media_type=None, ref=None, platform=True):
         blobs = []
         for layer in layers:
             data = gzip.compress(layer, mtime=0) if compress else layer
@@ -73,6 +91,8 @@ class Image:
             "config": {"Cmd": ["python3"]},
             "rootfs": {"type": "layers", "diff_ids": diff_ids or [sha(layer) for layer in layers]},
         }
+        if variant is not None:
+            config["variant"] = variant
         if history is not None:
             config["history"] = history
         manifest = {
@@ -84,6 +104,8 @@ class Image:
             descriptor["annotations"] = {"org.opencontainers.image.ref.name": ref}
         if platform:
             descriptor["platform"] = {"os": "linux", "architecture": arch}
+            if platform_variant is not None:
+                descriptor["platform"]["variant"] = platform_variant
         self.descriptors.append(descriptor)
         (self.root / "index.json").write_text(
             json.dumps({"schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": self.descriptors})
@@ -203,7 +225,27 @@ def test_hardlink_symlink_and_device_entries(tmp_path):
     assert files["bin/py"]["linkTarget"] == "python3"
     assert files["dev/null"]["linkTarget"] == "1:3"
     assert result["filesystem"]["symlinks"] == 1
-    assert result["filesystem"]["other"] == 3
+    assert result["filesystem"]["files"] == 2
+    assert result["filesystem"]["bytes"] == 3
+    assert result["filesystem"]["other"] == 2
+
+
+def test_hardlink_retains_content_after_original_path_is_removed(tmp_path):
+    base = tar(("target", b"x" * 64), ("alias", {"type": tarfile.LNKTYPE, "linkname": "target"}))
+    result = inspect_image(layout(tmp_path, base, tar((".wh.target", b""))), files=True)
+
+    assert result["filesystem"]["files"] == 1
+    assert result["filesystem"]["bytes"] == 64
+    assert result["layers"][1]["shadowedBytes"] == 0
+
+
+def test_rejects_hardlink_to_symlink(tmp_path):
+    layer = tar(
+        ("link", {"type": tarfile.SYMTYPE, "linkname": "/etc"}),
+        ("alias", {"type": tarfile.LNKTYPE, "linkname": "link"}),
+    )
+
+    assert "does not target a regular file" in error_of(layout(tmp_path, layer))
 
 
 def test_observations_flag_duplicates_and_bloat_without_claiming_savings(tmp_path):
@@ -241,6 +283,30 @@ def test_diff_compares_filesystem_states(tmp_path):
     assert {c["path"] for c in whole["changes"]} == {"a", "c", "d", "keep"}
     last = inspect_image(image, diff=(2, 3))["diff"]["changes"]
     assert [(c["change"], c["path"]) for c in last] == [("added", "d")]
+
+
+def test_diff_reports_mtime_and_extended_attribute_changes(tmp_path):
+    def metadata_layer(mtime, selinux):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo("file")
+            member.size = 1
+            member.mtime = mtime
+            member.pax_headers = {"SCHILY.xattr.security.selinux": selinux}
+            archive.addfile(member, io.BytesIO(b"x"))
+        return buffer.getvalue()
+
+    before = metadata_layer(1, "label-a")
+    after = metadata_layer(2, "label-b")
+    result = inspect_image(layout(tmp_path, before, after), diff=(1, 2))
+
+    assert result["layers"][1]["modified"] == 1
+    change = result["diff"]["changes"][0]
+    assert change["path"] == "file"
+    assert change["before"]["mtime"] == 1
+    assert change["after"]["mtime"] == 2
+    assert change["before"]["xattrs"]["SCHILY.xattr.security.selinux"] == "label-a"
+    assert change["after"]["xattrs"]["SCHILY.xattr.security.selinux"] == "label-b"
 
 
 def test_history_maps_created_by_to_non_empty_layers(tmp_path):
@@ -288,6 +354,22 @@ def test_multi_platform_index_requires_explicit_platform(tmp_path):
     assert "no exact manifest for linux/s390x" in error_of(f"oci:{tmp_path / 'img'}", platform="linux/s390x")
 
 
+def test_index_rejects_malformed_single_manifest_platform(tmp_path):
+    image = Image(tmp_path / "img")
+    image.image([tar(("arch", b"one"))])
+    descriptor = image.descriptors[0]
+    nested = {
+        "schemaVersion": 2, "mediaType": INDEX_TYPE,
+        "manifests": [{**descriptor, "platform": "linux/amd64"}],
+    }
+    nested_descriptor = image.blob(json.dumps(nested).encode(), INDEX_TYPE)
+    (image.root / "index.json").write_text(json.dumps({
+        "schemaVersion": 2, "manifests": [nested_descriptor],
+    }))
+
+    assert "invalid platform metadata" in error_of(f"oci:{image.root}")
+
+
 def test_nested_index_over_entry_limit_fails_without_report(tmp_path, monkeypatch):
     image = Image(tmp_path / "img")
     image.image([tar(("a", b"1"))])
@@ -307,6 +389,13 @@ def test_platform_must_match_single_image(tmp_path):
     image = layout(tmp_path, tar(("a", b"1")), platform=False)
     assert "does not match" in error_of(image, platform="linux/arm64")
     assert inspect_image(image, platform="linux/amd64")["platform"] == "linux/amd64"
+
+
+def test_index_variant_must_match_config_variant(tmp_path):
+    image = Image(tmp_path / "img")
+    image.image([tar(("v", b"1"))], arch="arm", variant="v6", platform_variant="v7")
+
+    assert "variant" in error_of(f"oci:{image.root}", platform="linux/arm/v7")
 
 
 def test_reference_selection_and_non_local_reference(tmp_path):
@@ -360,7 +449,9 @@ def test_docker_archive_inspection_reports_platform_and_keeps_json_clean(tmp_pat
     result = json.loads(output)
     assert result["platform"] == "linux/amd64"
     assert [layer["deleted"] for layer in result["layers"]] == [0, 1]
-    assert "Loading" not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Loading" not in captured.out
+    assert "Loading" not in captured.err
     assert "does not match" in error_of(image, platform="linux/arm64")
     assert inspect_image(image, platform="linux/amd64")["filesystem"]["files"] == 1
 
@@ -382,6 +473,42 @@ def test_oversized_docker_layer_rejected_before_staging(tmp_path, monkeypatch):
     assert output.startswith("error: ")
     assert "exceeds" in output
     assert "Docker archive layer 1" not in staged
+
+
+def test_implicit_directories_count_toward_filesystem_node_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(layer_inspect, "MAX_IMAGE_NODES", 3)
+    image = layout(tmp_path, tar(("a/b/c/file", b"x")))
+
+    assert "filesystem nodes" in error_of(image)
+
+
+def test_retained_filesystem_paths_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(layer_inspect, "MAX_IMAGE_PATH_BYTES", 3)
+    image = layout(tmp_path, tar(("abc/file", b"x")))
+
+    assert "retained filesystem paths" in error_of(image)
+
+
+def test_layer_member_path_storage_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(layer_inspect, "MAX_LAYER_PATH_BYTES", 3)
+    image = layout(tmp_path, tar(("ab", b"x"), ("cd", b"y")))
+
+    assert "member paths" in error_of(image)
+
+
+def test_rejects_nonempty_or_nonregular_whiteouts(tmp_path):
+    nonempty = tar((".wh.target", b"x"))
+    nonregular = tar((".wh.target", {"type": tarfile.SYMTYPE, "linkname": "target"}))
+
+    assert "invalid whiteout" in error_of(layout(tmp_path / "nonempty", nonempty))
+    assert "invalid whiteout" in error_of(layout(tmp_path / "nonregular", nonregular))
+
+
+def test_rejects_whiteouts_beneath_symlinks(tmp_path):
+    base = tar(("lib", {"type": tarfile.SYMTYPE, "linkname": "/etc"}))
+    top = tar(("lib/.wh.passwd", b""))
+
+    assert "whiteout beneath symlink" in error_of(layout(tmp_path, base, top))
 
 
 # --- safe archive handling and explicit errors ---------------------------
@@ -449,6 +576,23 @@ def test_rejects_corrupt_and_mislabeled_layers(tmp_path):
 def test_rejects_data_after_tar_end(tmp_path):
     layer = tar(("a", b"1")) + b"junk" + b"\0" * 508
     assert "after the end" in error_of(layout(tmp_path, layer))
+
+
+def test_rejects_nonzero_tar_data_buffered_after_end(tmp_path):
+    layer = bytearray(tar(("a", b"1")))
+    layer[2048] = 1
+
+    assert "after the end" in error_of(layout(tmp_path, bytes(layer)))
+
+
+def test_bounds_chained_extended_tar_headers(tmp_path):
+    assert "extended headers" in error_of(layout(tmp_path, pax_chain(101)))
+
+
+def test_rejects_truncated_tar_end_marker(tmp_path):
+    layer = tar(("a", b"1"))[:1536]
+
+    assert "truncated" in error_of(layout(tmp_path, layer))
 
 
 def test_rejects_zstd_without_runtime_support(tmp_path):

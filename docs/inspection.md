@@ -62,7 +62,7 @@ what a fix would actually save.
 | Kind | What it means |
 |------|---------------|
 | `shadowed-files` | File content in a lower layer that a later layer deletes or replaces; it is invisible in the final filesystem but still stored and transferred |
-| `duplicate-content` | Identical regular files at more than one visible path (bytes beyond the first copy) |
+| `duplicate-content` | Identical content in distinct file inodes at more than one visible path (bytes beyond the first copy) |
 | `python-bytecode` | `__pycache__` directories and `*.pyc`/`*.pyo` files |
 | `pip-cache` | Files under a `.cache/pip/` directory |
 | `apt-cache` | `var/lib/apt/lists/` and `var/cache/apt/` |
@@ -75,9 +75,11 @@ Layers are applied in order with OCI semantics. A `.wh.<name>` whiteout deletes
 `<name>` and an `.wh..wh..opq` opaque marker hides a directory's existing
 contents; both affect lower layers only, never entries added by the same layer.
 Replacing a directory with a file or symlink deletes the directory's subtree,
-and each removed path counts as deleted. Hardlinks must point at a
-non-directory path that already exists when the link is read; they share their
-target's storage, so they count as "other" entries with no bytes of their own.
+and each removed path counts as deleted. Hardlinks must point at an existing
+regular-file or hardlink path; forward links, symlinks, and special-file targets
+are rejected. A hardlink shares its target's inode, so removing one name keeps
+the content while another link remains, and filesystem byte totals count the
+shared inode once.
 
 Inspection fails instead of returning a partial or misleading report when a
 layer:
@@ -98,8 +100,11 @@ characters in paths, so file names cannot rewrite the terminal.
 
 Layers are streamed: the tar is decompressed, hashed, and read member by member
 without extracting files or buffering a layer in memory. The in-memory model
-keeps one record per path, bounded by 100,000 members per layer and 1,000,000
-members per image; each layer is also limited to 64 GiB uncompressed. The shared
+keeps one record per path. Limits include 100,000 members per layer, 1,000,000
+members and filesystem nodes per image, 16 MiB of member paths per layer, and
+64 MiB each for retained filesystem paths, diff paths, and reported file paths.
+Extended tar headers are limited to 100 consecutive headers and 16 MiB total
+per layer. Each layer is also limited to 64 GiB uncompressed. The shared
 local-image reader verifies each blob into a temporary directory before it is
 read: OCI layout layers are copied and removed one at a time, while `docker
 save` layers are all staged up front, so inspecting an archive needs free
