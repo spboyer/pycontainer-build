@@ -692,7 +692,7 @@ def _measure_worker(spec):
                     {
                         "architecture": "amd64",
                         "os": "linux",
-                        "config": {"Env": [], "WorkingDir": "/"},
+                        "config": {"Env": ["PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
                     },
                 )
                 builder.build()

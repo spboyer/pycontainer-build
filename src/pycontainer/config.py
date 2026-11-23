@@ -1,9 +1,12 @@
+import posixpath
 import re
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
@@ -29,6 +32,49 @@ def validate_insecure_registries(registries: List[str]) -> List[str]:
         if entry.lower() not in normalized:
             normalized.append(entry.lower())
     return normalized
+
+# Linux signal names in the OCI "SIGNAME" format, matching Docker's Linux table.
+STOP_SIGNALS = frozenset(
+    [
+        "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE",
+        "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGKILL", "SIGPIPE",
+        "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV", "SIGSTKFLT",
+        "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN",
+        "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2", "SIGVTALRM", "SIGWINCH",
+        "SIGXCPU", "SIGXFSZ", "SIGRTMIN", "SIGRTMAX",
+    ]
+    + [f"SIGRTMIN+{n}" for n in range(1, 16)]
+    + [f"SIGRTMAX-{n}" for n in range(1, 15)]
+)
+
+
+def validate_stop_signal(value: str) -> str:
+    """Return value if it is a supported OCI SIGNAME, else raise ValueError."""
+    if not isinstance(value, str) or value not in STOP_SIGNALS:
+        raise ValueError(
+            f"stop_signal must be a Linux signal name such as SIGTERM, SIGINT or "
+            f"SIGRTMIN+3; got {value!r}."
+        )
+    return value
+
+
+def validate_volume(path: str) -> str:
+    """Return path if it is a normalized absolute container path, else raise ValueError."""
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or path == "/"
+        or path.startswith("//")
+        or "\\" in path
+        or any(unicodedata.category(ch).startswith("C") for ch in path)
+        or posixpath.normpath(path) != path
+    ):
+        raise ValueError(
+            "volumes entries must be normalized absolute container paths other "
+            f"than '/', without '.', '..', empty segments, backslashes or control "
+            f"characters; got {path!r}."
+        )
+    return path
 
 
 @dataclass
@@ -62,14 +108,37 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    scan: bool = False
+    scan_executable: str = "grype"
+    scan_threshold: str = "high"
+    scan_unknown: str = "fail"
+    scan_report_format: str = "json"
+    scan_report: Optional[str] = None
+    scan_offline: bool = False
+    scan_db_dir: Optional[str] = None
+    scan_db_max_age_hours: int = 120
+    record_history: bool = False
+    history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
     security: Optional[dict] = None
+    stop_signal: Optional[str] = None
+    volumes: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.scan_threshold not in SCAN_SEVERITIES:
+            raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
+        if self.scan_unknown not in ("fail", "ignore"):
+            raise ValueError("scan_unknown must be fail or ignore")
+        if self.scan_report_format not in ("json", "sarif"):
+            raise ValueError("scan_report_format must be json or sarif")
+        if type(self.scan_db_max_age_hours) is not int or self.scan_db_max_age_hours <= 0:
+            raise ValueError("scan_db_max_age_hours must be a positive integer")
+        if not isinstance(self.scan_executable, str) or not self.scan_executable.strip():
+            raise ValueError("scan_executable must be a nonempty executable path or name")
         self.insecure_registries = validate_insecure_registries(
             self.insecure_registries
         )
@@ -83,6 +152,11 @@ class BuildConfig:
             from .security import validate_security
 
             self.security = validate_security(self.security, self.platform)
+        if self.stop_signal is not None:
+            validate_stop_signal(self.stop_signal)
+        if not isinstance(self.volumes, list):
+            raise ValueError("volumes must be a list of absolute container paths.")
+        self.volumes = list(dict.fromkeys(validate_volume(p) for p in self.volumes))
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
