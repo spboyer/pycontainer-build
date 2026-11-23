@@ -206,6 +206,19 @@ def test_unsigned_push_does_not_invoke_signer_or_signed_readback(
     assert not any(event[0] in {"sign", "read", "head"} for event in registry.events)
 
 
+def test_signed_push_rejects_insecure_registry_before_publication(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch)
+    builder.config.insecure_registries = ["mirror.example"]
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+
+    with pytest.raises(ValueError, match="Signed.*HTTPS"):
+        builder.push(registry_url="mirror.example/other/app:v2", show_progress=False)
+
+    assert registry.events == []
+    assert builder.pushed_refs == []
+
+
 def test_unsigned_push_clears_previous_signed_subject(tmp_path, monkeypatch):
     builder = _builder(tmp_path, monkeypatch)
     registry = FakeRegistry()

@@ -17,8 +17,10 @@ remain unverified.
 
 - `--push` and an HTTPS registry that accepts and serves manifests by digest.
   Signing a local-only layout and signing during `--dry-run` are not supported.
-  Registry redirects require HTTPS; authorization is not forwarded across
-  origins. Bearer-token exchange endpoints must also use HTTPS.
+  Signed pushes reject targets listed with `--insecure-registry`. HTTPS-to-HTTP
+  redirects are rejected; authorization is not forwarded across origins.
+  Bearer-token exchange endpoints must use HTTPS. `--registry-ca-file` configures
+  only the builder; the signer and verifier need separately configured trust.
 - A trusted `cosign` or `notation` executable on `PATH`, plus registry access
   and the provider's signing credentials. Pycontainer's registry credentials
   are not translated into signer credentials: configure the signer's Docker

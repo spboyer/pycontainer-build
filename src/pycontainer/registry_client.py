@@ -2,11 +2,14 @@
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +35,7 @@ MAX_RETRY_DELAY_SECONDS = 5
 RETRY_BACKOFF_SECONDS = 0.25
 TRANSFER_CHUNK_SIZE = 1024 * 1024
 MAX_ERROR_BODY_BYTES = 4096
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 MANIFEST_ACCEPT = (
@@ -44,6 +48,7 @@ MAX_REPORTED_ERRORS = 5
 MAX_ERROR_TEXT_CHARS = 200
 LOW_RATE_LIMIT_REMAINING = 10
 QUOTA_STATUSES = {413, 507}
+SENSITIVE_HEADERS = ("Authorization", "Proxy-Authorization", "Cookie")
 
 logger = logging.getLogger(__name__)
 
@@ -87,48 +92,172 @@ class RegistryQuotaError(RegistryRequestError):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Prevent forwarding registry authorization across redirects."""
 
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
-def _is_safe_https_url(url: str) -> bool:
+def is_loopback_host(host: Optional[str]) -> bool:
+    """Return whether a URL hostname is a literal loopback name or address."""
+    if not host:
+        return False
+    host = host.strip("[]").lower()
+    if host == "localhost":
+        return True
     try:
-        parsed = urllib.parse.urlsplit(url)
-        return bool(
-            parsed.scheme.lower() == "https"
-            and parsed.hostname
-            and not parsed.username
-            and not parsed.password
-        )
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or bool(mapped and mapped.is_loopback)
 
 
-class SafeRegistryRedirect(urllib.request.HTTPRedirectHandler):
-    """Keep registry credentials off cross-origin or insecure redirects."""
+def _origin(url: str) -> Tuple[str, str, Optional[int]]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, (parsed.hostname or "").lower(), port
+
+
+def _validate_url(url: str, insecure: bool = False) -> urllib.parse.SplitResult:
+    """Validate before urllib can normalize away unsafe URL components."""
+    try:
+        if _CONTROL_CHARACTERS.search(url) or any(char.isspace() for char in url):
+            raise ValueError("URL contains whitespace or control characters")
+        if re.search(r"%(?![0-9A-Fa-f]{2})", url):
+            raise ValueError("Invalid percent escape")
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        if (
+            not parsed.hostname
+            or not parsed.netloc
+            or parsed.netloc.endswith(":")
+            or port == 0
+            or "\\" in parsed.netloc
+            or "%" in parsed.hostname
+            or (
+                parsed.netloc.startswith("[")
+                and not re.fullmatch(r"\[[^\]]+\](?::\d+)?", parsed.netloc)
+            )
+        ):
+            raise ValueError("Invalid URL authority")
+    except ValueError as error:
+        raise RegistryRequestError(
+            f"Refusing malformed registry URL: {_safe_url(url)}."
+        ) from error
+    if parsed.username is not None or parsed.password is not None:
+        raise RegistryRequestError(
+            f"Refusing embedded credentials in registry URL: {_safe_url(url)}."
+        )
+    if "#" in url:
+        raise RegistryRequestError(
+            f"Refusing fragment in registry URL: {_safe_url(url)}."
+        )
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise RegistryRequestError(
+            f"Refusing registry URL with unsupported scheme: {_safe_url(url)}."
+        )
+    if parsed.scheme.lower() == "http" and not insecure:
+        raise RegistryRequestError(
+            f"Refusing plain HTTP registry URL without explicit opt-in: {_safe_url(url)}."
+        )
+    return parsed
+
+
+def _check_transport(
+    source_url: str, target_url: str, insecure: bool = False
+) -> None:
+    """Validate both endpoints and always reject HTTPS-to-HTTP downgrades."""
+    source = _validate_url(source_url, insecure)
+    target = _validate_url(target_url, True)
+    if source.scheme.lower() == "https" and target.scheme.lower() == "http":
+        raise RegistryRequestError(
+            f"Refusing HTTPS-to-HTTP downgrade from {_safe_url(source_url)} "
+            f"to {_safe_url(target_url)}."
+        )
+    _validate_url(target_url, insecure)
+
+
+def _join_url(source_url: str, location: str, insecure: bool = False) -> str:
+    try:
+        if _CONTROL_CHARACTERS.search(location) or any(
+            char.isspace() for char in location
+        ):
+            raise ValueError("Location contains whitespace or control characters")
+        raw = urllib.parse.urlsplit(location)
+        if raw.scheme:
+            _validate_url(location, True)
+        elif location.startswith("//"):
+            _validate_url(f"{urllib.parse.urlsplit(source_url).scheme}:{location}", True)
+        target = urllib.parse.urljoin(source_url, location)
+    except ValueError as error:
+        raise RegistryRequestError(
+            f"Refusing malformed registry Location: {_safe_url(location)}."
+        ) from error
+    _check_transport(source_url, target, insecure)
+    return target
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects without downgrades or cross-origin authorization."""
+
+    def __init__(self, insecure: bool = False):
+        self.insecure = insecure
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        location = headers.get("Location") or headers.get("URI")
+        if location is not None:
+            _join_url(req.full_url, location, self.insecure)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _is_safe_https_url(newurl):
-            raise RegistryRequestError("Registry redirects must use HTTPS without embedded credentials.")
-        source = urllib.parse.urlsplit(req.full_url)
-        target = urllib.parse.urlsplit(newurl)
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirected and (
-            source.scheme.lower(), source.netloc.lower()
-        ) != (target.scheme.lower(), target.netloc.lower()):
-            for name in ("Authorization", "Proxy-Authorization", "Cookie"):
-                redirected.remove_header(name)
-        return redirected
+        _check_transport(req.full_url, newurl, self.insecure)
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is not None and _origin(req.full_url) != _origin(newurl):
+            for key, _value in new_request.header_items():
+                if any(key.lower() == header.lower() for header in SENSITIVE_HEADERS):
+                    new_request.remove_header(key)
+        return new_request
 
 
-def _open_registry_request(request, timeout):
-    return urllib.request.build_opener(SafeRegistryRedirect()).open(
-        request, timeout=timeout
-    )
+def create_registry_ssl_context(ca_file: Optional[str] = None) -> ssl.SSLContext:
+    """Return a verifying TLS context, optionally trusting an extra CA bundle."""
+    context = ssl.create_default_context()
+    if ca_file is None:
+        return context
+    path = Path(ca_file)
+    if not path.is_file():
+        raise ValueError(f"Registry CA file not found or not a regular file: {ca_file}")
+    try:
+        context.load_verify_locations(cafile=str(path))
+    except (OSError, ssl.SSLError) as error:
+        raise ValueError(
+            f"Registry CA file could not be loaded: {ca_file} ({error})"
+        ) from error
+    return context
+
+
+_INVALID_URL = "<invalid registry URL>"
 
 
 def _safe_url(url: str) -> str:
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        if _CONTROL_CHARACTERS.search(url) or any(char.isspace() for char in url):
+            return _INVALID_URL
+        parsed = urllib.parse.urlsplit(url)
+        parsed.port
+    except ValueError:
+        return _INVALID_URL
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return _INVALID_URL
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")
     )
@@ -214,10 +343,8 @@ def _format_size(size: int) -> str:
 
 
 def _redact_text_url(match: re.Match) -> str:
-    try:
-        return _safe_url(match.group())
-    except ValueError:
-        return "[REDACTED URL]"
+    safe = _safe_url(match.group())
+    return "[REDACTED URL]" if safe == _INVALID_URL else safe
 
 
 def _truncate_text(text: str, limit: int) -> str:
@@ -409,10 +536,12 @@ class RegistryClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        insecure: bool = False,
+        ca_file: Optional[str] = None,
     ):
         if timeout <= 0:
             raise ValueError("Registry request timeout must be greater than zero.")
-        self.registry = registry.rstrip("/")
+        self.registry = registry
         if self.registry == "docker.io":
             self.registry = "registry-1.docker.io"
         self.repository = repository
@@ -420,9 +549,48 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.base_url = f"https://{self.registry}/v2"
+        self.insecure = insecure
+        scheme = "http" if insecure else "https"
+        self.base_url = f"{scheme}://{self.registry}/v2"
+        parsed_base = _validate_url(self.base_url, insecure)
+        if parsed_base.netloc != self.registry:
+            raise RegistryRequestError(
+                f"Refusing malformed registry authority: {_safe_url(self.base_url)}."
+            )
         self._bearer_token = None
+        self._token_lock = threading.Lock()
         self._rate_limit_warned = False
+        if (
+            insecure
+            and (auth_token or username or password)
+            and not self._is_loopback_registry()
+        ):
+            raise RegistryAuthenticationError(
+                f"Refusing to send credentials over plain HTTP to non-loopback "
+                f"registry {self.registry}. Use HTTPS (optionally with "
+                "--registry-ca-file) or remove the credentials."
+            )
+        self._ssl_context = create_registry_ssl_context(ca_file)
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=self._ssl_context), SafeRedirect(insecure)
+        )
+        self._blob_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=self._ssl_context),
+            NoRedirect(),
+        )
+
+    def _is_loopback_registry(self) -> bool:
+        return is_loopback_host(urllib.parse.urlsplit(self.base_url).hostname)
+
+    def _refuse_plain_http_credentials(self, url: str) -> None:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() == "http" and not is_loopback_host(parsed.hostname):
+            raise RegistryAuthenticationError(
+                f"Refusing to send registry credentials over plain HTTP to "
+                f"non-loopback host {parsed.hostname}."
+            )
 
     def _secrets(self) -> List[str]:
         values = [self._bearer_token, self.auth_token, self.password]
@@ -498,44 +666,22 @@ class RegistryClient:
         return params if params else None
 
     def _is_registry_url(self, url: str) -> bool:
-        actual = urllib.parse.urlsplit(url)
-        registry = urllib.parse.urlsplit(self.base_url)
-        return (
-            actual.scheme.lower() == registry.scheme.lower()
-            and actual.netloc.lower() == registry.netloc.lower()
-        )
+        return _origin(url) == _origin(self.base_url)
 
     def _authorization_headers(self, url: str) -> Dict[str, str]:
         if not self._is_registry_url(url):
             return {}
         token = self._bearer_token or self.auth_token
         if token:
+            self._refuse_plain_http_credentials(url)
             return {"Authorization": f"Bearer {token}"}
         if self.username and self.password:
+            self._refuse_plain_http_credentials(url)
             credentials = base64.b64encode(
                 f"{self.username}:{self.password}".encode()
             ).decode()
             return {"Authorization": f"Basic {credentials}"}
         return {}
-
-    def _is_unauthenticated_loopback_request(self, url: str) -> bool:
-        # A caller-configured loopback registry must never receive credentials.
-        try:
-            target = urllib.parse.urlsplit(url)
-            base = urllib.parse.urlsplit(self.base_url)
-            return bool(
-                target.scheme == base.scheme == "http"
-                and target.hostname == base.hostname == "127.0.0.1"
-                and target.netloc == base.netloc
-                and not target.username
-                and not target.password
-                and all(
-                    value is None
-                    for value in (self.auth_token, self.username, self.password, self._bearer_token)
-                )
-            )
-        except ValueError:
-            return False
 
     def _get_bearer_token(self, auth_params: Dict[str, str]) -> str:
         """Exchange registry credentials for a bearer token."""
@@ -544,12 +690,20 @@ class RegistryClient:
             raise RegistryAuthenticationError(
                 "Registry authentication challenge did not include a token realm."
             )
-
-        if not _is_safe_https_url(realm):
+        if self.insecure and not self._is_loopback_registry():
             raise RegistryAuthenticationError(
-                "Registry bearer-token realm must use HTTPS without embedded credentials."
+                f"Registry {self.registry} requested token authentication, but "
+                "tokens are never sent over plain HTTP to non-loopback hosts."
             )
-        parsed = urllib.parse.urlsplit(realm)
+
+        try:
+            _check_transport(self.base_url, realm, self.insecure)
+        except RegistryRequestError as error:
+            raise RegistryAuthenticationError(
+                f"Refusing registry token realm {_safe_url(realm)}: "
+                f"HTTPS registries require an HTTPS token realm. {error}"
+            ) from None
+        parsed = _validate_url(realm, self.insecure)
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
             value = auth_params.get(key)
@@ -568,12 +722,16 @@ class RegistryClient:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         elif self.password:
             headers["Authorization"] = f"Bearer {self.password}"
+        if headers:
+            self._refuse_plain_http_credentials(url)
 
         request = urllib.request.Request(url, headers=headers)
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
-                with _open_registry_request(request, timeout=self.timeout) as response:
+                with self._opener.open(
+                    request, timeout=self.timeout
+                ) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
             except RegistryRequestError:
@@ -638,6 +796,23 @@ class RegistryClient:
             )
         return token
 
+    def _retry_bearer_challenge(self, request, error, sent_token) -> bool:
+        if error.code != 401 or not self._is_registry_url(request.full_url):
+            return False
+        params = self._parse_www_authenticate(error.headers.get("Www-Authenticate"))
+        if not params:
+            return False
+        with self._token_lock:
+            if not self._bearer_token:
+                error.close()
+                try:
+                    self._bearer_token = self._get_bearer_token(params)
+                except RegistryRequestError as token_error:
+                    # Do not expose the original 401 reason in a traceback.
+                    raise token_error from None
+                return True
+            return sent_token != self._bearer_token
+
     def _make_request(
         self,
         method: str,
@@ -645,17 +820,10 @@ class RegistryClient:
         data: Optional[Union[bytes, BinaryIO]] = None,
         headers: Optional[Dict[str, str]] = None,
         retry_auth: bool = True,
+        max_response_bytes: Optional[int] = None,
     ) -> Tuple[int, bytes, Dict]:
-        if not _is_safe_https_url(url):
-            sensitive_headers = any(
-                name.lower() in {"authorization", "proxy-authorization", "cookie"}
-                for name in (headers or {})
-            )
-            if sensitive_headers or not self._is_unauthenticated_loopback_request(url):
-                raise RegistryRequestError(
-                    "Registry requests must use HTTPS without embedded credentials."
-                )
         method = method.upper()
+        _check_transport(self.base_url, url, self.insecure)
         retry_safe = method in {"GET", "HEAD"}
         body_position = None
         if data is not None and hasattr(data, "tell"):
@@ -665,49 +833,49 @@ class RegistryClient:
             if body_position is not None:
                 data.seek(body_position)
             request_headers = dict(headers or {})
-            request_headers.update(self._authorization_headers(url))
+            with self._token_lock:
+                sent_token = self._bearer_token
+                request_headers.update(self._authorization_headers(url))
+            if any(
+                key.lower() == header.lower()
+                for key in request_headers
+                for header in SENSITIVE_HEADERS
+            ):
+                self._refuse_plain_http_credentials(url)
             request = urllib.request.Request(
                 url, data=data, headers=request_headers, method=method
             )
+            retry_challenge = False
             try:
-                with _open_registry_request(request, timeout=self.timeout) as response:
+                with self._opener.open(
+                    request, timeout=self.timeout
+                ) as response:
                     response_headers = dict(response.headers)
                     self._observe_rate_limit(response_headers, url)
-                    return response.status, response.read(), response_headers
+                    if max_response_bytes is None:
+                        return response.status, response.read(), response_headers
+                    body = response.read(max_response_bytes + 1)
+                    if len(body) > max_response_bytes:
+                        raise RegistryRequestError(
+                            f"{method} response from {self._safe_request_url(url)} exceeds "
+                            f"{max_response_bytes} bytes."
+                        )
+                    return response.status, body, response_headers
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 self._observe_rate_limit(response_headers, url)
-                if (
-                    error.code == 401
-                    and retry_auth
-                    and self._is_registry_url(url)
-                    and not self._bearer_token
-                ):
-                    challenge = error.headers.get("Www-Authenticate")
-                    auth_params = self._parse_www_authenticate(challenge)
-                    if auth_params:
-                        try:
-                            self._bearer_token = self._get_bearer_token(auth_params)
-                        except RegistryRequestError as token_error:
-                            # Do not expose the original 401 reason in a traceback.
-                            raise token_error from None
-                        if body_position is not None:
-                            data.seek(body_position)
-                        return self._make_request(
-                            method,
-                            url,
-                            data,
-                            headers,
-                            retry_auth=False,
-                        )
-                if retry_safe and _should_retry(error.code, error.headers, attempt):
+                if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
+                    error.close()
+                    retry_challenge = True
+                elif retry_safe and _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
                     continue
-                try:
-                    body = error.read(MAX_ERROR_BODY_BYTES)
-                except OSError:
-                    body = b""
-                return error.code, body, response_headers
+                else:
+                    try:
+                        body = error.read(MAX_ERROR_BODY_BYTES)
+                    except OSError:
+                        body = b""
+                    return error.code, body, response_headers
             except (
                 urllib.error.URLError,
                 TimeoutError,
@@ -721,6 +889,18 @@ class RegistryClient:
                     f"{method} request to {self._safe_request_url(url)} failed after "
                     f"{attempt + 1} attempt(s): {type(error).__name__}."
                 ) from None
+
+            if retry_challenge:
+                if body_position is not None:
+                    data.seek(body_position)
+                return self._make_request(
+                    method,
+                    url,
+                    data,
+                    headers,
+                    retry_auth=False,
+                    max_response_bytes=max_response_bytes,
+                )
 
         raise RegistryRequestError(
             f"{method} request to {self._safe_request_url(url)} failed."
@@ -749,7 +929,7 @@ class RegistryClient:
             raise RegistryRequestError(
                 "Registry did not return a Location for the blob upload."
             )
-        return urllib.parse.urljoin(url, location)
+        return _join_url(url, location, self.insecure)
 
     def upload_blob_monolithic(self, digest: str, blob_path: Path) -> bool:
         """Upload a content-addressed file without loading it into memory."""
@@ -844,7 +1024,14 @@ class RegistryClient:
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {"Accept": MANIFEST_ACCEPT}
         status, body, response_headers = self._make_request(
-            "GET", url, headers=headers
+            "GET",
+            url,
+            headers=headers,
+            max_response_bytes=(
+                MAX_MANIFEST_BYTES
+                if expected_size is None
+                else min(expected_size, MAX_MANIFEST_BYTES)
+            ),
         )
         if status != 200:
             raise self._error("Manifest pull", url, status, body, response_headers)
@@ -915,35 +1102,36 @@ class RegistryClient:
                 "Registry manifest HEAD descriptor does not match the built digest, size, or media type."
             )
 
-    def _open_blob_response(self, url: str):
-        if not _is_safe_https_url(url) and not self._is_unauthenticated_loopback_request(url):
-            raise RegistryRequestError(
-                "Registry blob requests must use HTTPS without embedded credentials."
+    def _open_blob_response(self, url: str, retry_auth: bool = True):
+        _check_transport(self.base_url, url, self.insecure)
+        with self._token_lock:
+            sent_token = self._bearer_token
+            request = urllib.request.Request(
+                url, headers=self._authorization_headers(url)
             )
-        request = urllib.request.Request(
-            url, headers=self._authorization_headers(url)
-        )
-        opener = urllib.request.build_opener(NoRedirect())
+        retry_challenge = False
+        location = None
         try:
-            response = opener.open(request, timeout=self.timeout)
+            response = self._blob_opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             self._observe_rate_limit(error.headers, url)
-            if error.code not in REDIRECT_STATUSES:
+            if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
+                error.close()
+                retry_challenge = True
+            elif error.code not in REDIRECT_STATUSES:
                 raise
-            location = error.headers.get("Location")
-            error.close()
-            if not location:
-                raise RegistryRequestError(
-                    "Registry blob redirect did not include a Location."
-                ) from None
-            target = urllib.parse.urljoin(url, location)
-            if not _is_safe_https_url(target):
-                raise RegistryRequestError(
-                    "Registry blob redirects must use HTTPS without embedded credentials."
-                )
-            return _open_registry_request(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            else:
+                location = error.headers.get("Location")
+                error.close()
+                if not location:
+                    raise RegistryRequestError(
+                        "Registry blob redirect did not include a Location."
+                    ) from None
+
+        if retry_challenge:
+            return self._open_blob_response(url, retry_auth=False)
+        if location:
+            return self._open_blob_redirect(url, location)
 
         self._observe_rate_limit(response.headers, url)
         if response.status in REDIRECT_STATUSES:
@@ -953,11 +1141,14 @@ class RegistryClient:
                 raise RegistryRequestError(
                     "Registry blob redirect did not include a Location."
                 )
-            target = urllib.parse.urljoin(url, location)
-            return urllib.request.urlopen(
-                urllib.request.Request(target), timeout=self.timeout
-            )
+            return self._open_blob_redirect(url, location)
         return response
+
+    def _open_blob_redirect(self, url: str, location: str):
+        target = _join_url(url, location, self.insecure)
+        return self._opener.open(
+            urllib.request.Request(target), timeout=self.timeout
+        )
 
     def _download_blob_once(
         self,
