@@ -205,6 +205,8 @@ from .local_image import (
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .tags import local_reference_names
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -218,7 +220,6 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
-VIRTUALENV_TARGET_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/180"
 
 
 @dataclass
@@ -395,7 +396,15 @@ class ImageBuilder:
             return self.config.tag
 
         with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+            security_fragments=render_security_fragments(
+                self.config.security, self.config.context_dir
+            )
+            result=self._build_image()
+            for fragment_path in write_security_fragments(
+                Path(self.config.output_dir), security_fragments
+            ):
+                logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
+            return result
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -420,13 +429,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             image.manifest_digest,
             image.manifest_size,
-            self.config.tag,
+            ref_names[0],
             image.platform["architecture"],
             image.platform["os"],
             variant=image.platform.get("variant"),
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -475,7 +486,8 @@ class ImageBuilder:
             output/'oci-layout',
             json.dumps(build_oci_layout(),separators=(',',':')).encode(),
         )
-        layout_index=build_layout_index_json(index_digest, index_size, self.config.all_tags())
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
+        layout_index=build_layout_index_json(index_digest, index_size, ref_names)
         _atomic_write_bytes(
             output/'index.json',
             json.dumps(layout_index,separators=(',',':')).encode(),
@@ -921,6 +933,8 @@ class ImageBuilder:
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
@@ -950,15 +964,6 @@ class ImageBuilder:
             raise FileNotFoundError(
                 "Dependency staging was requested, but no supported virtualenv "
                 f"site-packages or {self.config.requirements_file!r} was found."
-            )
-        if not is_requirements and len(self.config.target_platforms()) > 1:
-            raise ValueError(
-                "Multi-platform builds cannot stage dependencies from a copied "
-                "virtualenv: its packages were resolved for the host, so "
-                "target-specific dependencies may be missing. Exclude any "
-                "virtualenvs (for example, --exclude .venv) and provide "
-                f"{self.config.requirements_file!r} for wheel resolution. "
-                f"See {VIRTUALENV_TARGET_FOLLOW_UP}."
             )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)

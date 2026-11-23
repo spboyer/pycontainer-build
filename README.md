@@ -106,6 +106,10 @@ skopeo copy oci:dist/image docker-daemon:myapp:latest
 docker run -p 8000:8000 myapp:latest
 ```
 
+With several tags, select one explicitly, for example
+`skopeo copy oci:dist/image:myapp:stable docker-daemon:myapp:stable`; see
+[Multiple tags](docs/multiple-tags.md#output).
+
 #### Option 2: Use Podman (Native OCI Support)
 
 ```bash
@@ -165,6 +169,10 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
+- ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
+  OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
+  read-only root; applied by your runtime, not enforced by the image
+  ([guide](docs/security-fragments.md))
 - ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
 - ✅ **Cross-platform builds** — Build linux/amd64 from ARM, linux/arm64 from x86, etc.
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
@@ -281,6 +289,27 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Skaffold and Tilt
+
+Use pycontainer as a custom builder for the Kubernetes inner loop. It builds
+without a Docker daemon and pushes to a registry the cluster pulls from:
+
+```yaml
+# skaffold.yaml (build.local.push: true is required)
+custom:
+  buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+```
+
+```python
+# Tiltfile
+custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
+             deps=['app'], skips_local_docker=True)
+```
+
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
+registries and multi-platform requests are rejected.
+[See full documentation →](docs/skaffold-tilt.md)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:
@@ -342,6 +371,9 @@ pycontainer build \
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
   distributions, cross-compilation, and lockfile resolution are not supported.
+  Generated Linux console scripts use UTF-8 and LF line endings on every host,
+  including Windows, and retain executable mode in the dependency layer.
+  Copied application files are not normalized.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
@@ -350,25 +382,29 @@ pycontainer build \
   machine, CPython and the base image's Python version), not the build host.
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
-  `PYTHON_VERSION`, cannot be known in advance and fail the build. In
-  single-platform builds, a virtualenv cannot be re-resolved, so it is verified
-  instead: root requirements (the
-  requirements file and pyproject `[project]` dependencies, optional
-  dependencies and dependency groups) and every installed `Requires-Dist` are
-  re-evaluated for each target, and the build fails if a requirement the
-  target needs is missing, uses an unknown marker value, or belongs to an extra
-  or group whose request cannot be ruled out. An extra or group counts as not
-  requested only when it is missing a requirement that any Windows, Linux or
-  macOS CPython host of the venv's Python version would have installed; a
-  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
-  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
-  layout), and `Lib/site-packages` to Windows. Only
-  package presence is checked, not versions; extra host-only packages are
-  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
-  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
-  also fail the build, as do dynamic dependencies that cannot be read. Use a
-  requirements file, which pip resolves for the target, when verification
-  fails.
+  `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). This does not verify the actual libc
   version and can select incompatible wheels for older images; see
@@ -567,6 +603,13 @@ one. Poetry-only keys such as `push` are reported as unknown by
 `pycontainer build`; use `--push` instead. See
 [Dockerfile import](docs/dockerfile-import.md).
 
+Optional `[build.security.kubernetes]` and `[build.security.oci]` tables
+(`[tool.pycontainer.security.*]` in `pyproject.toml`) write deployment
+fragments to `<output_dir>/security/` without changing the image. They are
+not enforced by the image; see [runtime security
+fragments](docs/security-fragments.md) for the schema, supported versions and
+how to apply them.
+
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
 
@@ -661,6 +704,9 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
+- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
@@ -682,12 +728,9 @@ platform is built in isolation: it selects its own base manifest (registry
 builds re-select from the first resolved base-index digest), stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
-Multi-platform dependency staging requires a requirements file; detected
-virtualenvs take precedence, so exclude them (for example, `--exclude .venv`)
-to select the requirements file. Copying a host virtualenv is rejected until
-the per-platform target-closure fix
-[#190](https://github.com/spboyer/pycontainer-build/pull/190) is integrated
-([#180](https://github.com/spboyer/pycontainer-build/issues/180)).
+Virtualenv closure is verified separately against each target base. Detected
+virtualenvs take precedence; exclude them (for example, `--exclude .venv`) to
+select a requirements file instead.
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
@@ -768,6 +811,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
