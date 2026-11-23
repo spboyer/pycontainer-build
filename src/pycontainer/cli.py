@@ -92,6 +92,17 @@ def main():
     imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     # --- end import subcommand ---
+    gen=sub.add_parser("generate",help="Generate deployment artifacts for an existing image")
+    targets=gen.add_subparsers(dest="target",required=True)
+    kubernetes=targets.add_parser("kubernetes",help="Generate Kubernetes resources and a Helm chart")
+    compose=targets.add_parser("compose",help="Generate a Docker Compose service")
+    for target in (kubernetes,compose):
+        target.add_argument("--image",required=True,help="Existing image reference (no credentials)")
+        target.add_argument("--port",type=int,required=True,help="Container TCP port")
+        target.add_argument("--name",default="app",help="Resource/service name (default: app)")
+        target.add_argument("--output","-o",required=True,help="New output directory or file")
+    kubernetes.add_argument("--service-port",type=int,help="Kubernetes Service port (default: container port)")
+    compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
     if args.cmd=="import":
@@ -103,6 +114,22 @@ def main():
             parser.error(str(exc))
         print(message)
         raise SystemExit(code)
+
+    if args.cmd=="generate":
+        from .deployment import generate_compose, generate_kubernetes
+        try:
+            if args.target=="kubernetes":
+                output=generate_kubernetes(
+                    args.image,args.port,Path(args.output),name=args.name,service_port=args.service_port
+                )
+            else:
+                output=generate_compose(
+                    args.image,args.port,Path(args.output),name=args.name,host_port=args.host_port
+                )
+        except (ValueError,OSError) as exc:
+            parser.error(str(exc))
+        print("Generated:",output)
+        return
 
     devloop=args.cmd in ("skaffold-build","tilt-build")
     push=devloop or args.push
