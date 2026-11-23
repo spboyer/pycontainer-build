@@ -556,6 +556,13 @@ pycontainer build \
   --tag ghcr.io/user/myapp:v1 \
   --platform linux/amd64,linux/arm64 \
   --push
+
+# Add 32-bit ARM (exact arm/v7 variant). With --include-deps, every
+# requirement needs an armv7l wheel; there is no source-build fallback.
+pycontainer build \
+  --tag ghcr.io/user/myapp:v1 \
+  --platform linux/amd64,linux/arm64,linux/arm/v7 \
+  --push
 ```
 
 ---
