@@ -4,7 +4,7 @@ import tomllib
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
-from .config import BuildConfig
+from .config import BuildConfig, canonical_registry
 from .build_args import resolve_arguments
 from .metadata import validate_metadata
 
@@ -149,6 +149,21 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
                 and isinstance(merged.get(key), dict)
             ):
                 merged[key] = {**merged[key], **value}
+            elif (
+                key == 'registry_mirrors'
+                and isinstance(value, dict)
+                and isinstance(merged.get(key), dict)
+            ):
+                # A CLI upstream replaces that upstream's file list; others are kept.
+                cli_keys = {canonical_registry(k) for k in value}
+                merged[key] = {
+                    **{
+                        k: v
+                        for k, v in merged[key].items()
+                        if canonical_registry(k) not in cli_keys
+                    },
+                    **value,
+                }
             else:
                 merged[key] = value
 

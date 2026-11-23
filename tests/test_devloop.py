@@ -633,11 +633,16 @@ def test_devloop_cli_honors_registry_transport_options(
     run_cli(
         monkeypatch, command, "--base-image", "python:3.11-slim",
         "--insecure-registry", "localhost:5000", "--registry-ca-file", str(ca_file),
+        "--registry-mirror", "docker.io=mirror.example",
+        "--registry-mirror", "docker.io=backup.example",
     )
 
     (builder,) = recording
     assert builder.config.insecure_registries == ["localhost:5000"]
     assert builder.config.registry_ca_file == str(ca_file)
+    assert builder.config.registry_mirrors == {
+        "docker.io": ["mirror.example", "backup.example"]
+    }
     assert builder.pushes[0][0] == "localhost:5000/a:1"
 
 

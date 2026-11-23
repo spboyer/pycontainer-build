@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import tracemalloc
+import urllib.request
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -210,9 +211,449 @@ def _measure_transfer_worker(spec):
     }
 
 
+NETWORK_REGISTRY_HOST = "benchmark.registry.invalid"
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json"
+OCI_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
+THROTTLE_CHUNK_BYTES = 64 * 1024
+MIB = 1024 * 1024
+
+
+class _BandwidthLimiter:
+    """Pace bytes through a virtual link of a fixed rate."""
+
+    def __init__(self, bytes_per_second):
+        self.bytes_per_second = bytes_per_second
+        self._next_free = time.perf_counter()
+        self._lock = threading.Lock()
+
+    def wait(self, size):
+        with self._lock:
+            now = time.perf_counter()
+            self._next_free = max(self._next_free, now) + size / self.bytes_per_second
+            ready_at = self._next_free
+        delay = ready_at - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _serve_network_registry(spec):
+    """Serve a minimal Registry v2 API with injected delay and bandwidth limits.
+
+    Runs in its own process so serving work does not share the measured
+    client's interpreter, GIL or CPU accounting. Uploaded blobs are stored by
+    their declared digest without re-hashing: the client already verifies
+    local content before upload, and duplicating that work here would only
+    add contention.
+    """
+    storage = Path(spec["storage"])
+    delay_seconds = spec["request_delay_ms"] / 1000
+    rate = spec["bandwidth_mbit"] * 1_000_000 / 8 if spec["bandwidth_mbit"] else None
+    shared = spec["bandwidth_scope"] == "shared"
+    directions = {"down": _BandwidthLimiter(rate), "up": _BandwidthLimiter(rate)} if rate else {}
+    stats = {}
+    stats_lock = threading.Lock()
+
+    def limiter(direction):
+        if not rate:
+            return None
+        return directions[direction] if shared else _BandwidthLimiter(rate)
+
+    def repo_dir(repository):
+        if not repository or any(part in {"", ".", ".."} for part in repository.split("/")):
+            raise ValueError("invalid repository")
+        return storage / repository.replace("/", "__")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def _route(self):
+            path = urlsplit(self.path).path
+            if not path.startswith("/v2/"):
+                return None
+            rest = path[len("/v2/"):]
+            if "/blobs/uploads/" in rest:
+                repository, upload = rest.split("/blobs/uploads/", 1)
+                return repository, "upload", upload
+            for kind in ("manifests", "blobs"):
+                marker = f"/{kind}/"
+                if marker in rest:
+                    repository, reference = rest.rsplit(marker, 1)
+                    return repository, kind, reference
+            return None
+
+        def _count(self, repository):
+            with stats_lock:
+                stats[repository] = stats.get(repository, 0) + 1
+
+        def _respond(self, status, headers=None, body=b""):
+            time.sleep(delay_seconds)
+            self.send_response(status)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body and self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _blob_path(self, repository, digest):
+            if not digest.startswith("sha256:") or len(digest) != 71:
+                raise ValueError("invalid digest")
+            return repo_dir(repository) / "blobs" / digest.split(":", 1)[1]
+
+        def do_GET(self):
+            if self.path.startswith("/__stats__/"):
+                repository = self.path[len("/__stats__/"):]
+                body = json.dumps({"requests": stats.get(repository, 0)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._read(send_body=True)
+
+        def do_HEAD(self):
+            self._read(send_body=False)
+
+        def _read(self, send_body):
+            route = self._route()
+            if route is None or route[1] == "upload":
+                self._respond(404)
+                return
+            repository, kind, reference = route
+            self._count(repository)
+            try:
+                if kind == "manifests":
+                    target = repo_dir(repository) / "manifests" / reference.replace(":", "_")
+                    if not target.is_file():
+                        self._respond(404)
+                        return
+                    content = target.read_bytes()
+                    headers = {
+                        "Content-Type": OCI_MANIFEST_MEDIA_TYPE,
+                        "Docker-Content-Digest": f"sha256:{hashlib.sha256(content).hexdigest()}",
+                    }
+                    self._respond(200, headers, content if send_body else b"")
+                    return
+                blob = self._blob_path(repository, reference)
+            except ValueError:
+                self._respond(400)
+                return
+            if not blob.is_file():
+                self._respond(404)
+                return
+            size = blob.stat().st_size
+            time.sleep(delay_seconds)
+            self.send_response(200)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if not send_body:
+                return
+            pace = limiter("down")
+            with blob.open("rb") as source:
+                while chunk := source.read(THROTTLE_CHUNK_BYTES):
+                    if pace:
+                        pace.wait(len(chunk))
+                    self.wfile.write(chunk)
+
+        def do_POST(self):
+            route = self._route()
+            if route is None or route[1] != "upload":
+                self._respond(404)
+                return
+            self._count(route[0])
+            upload_id = uuid.uuid4().hex
+            self._respond(202, {"Location": f"/v2/{route[0]}/blobs/uploads/{upload_id}"})
+
+        def _read_body(self, target):
+            remaining = int(self.headers.get("Content-Length", "0"))
+            pace = limiter("up")
+            while remaining:
+                chunk = self.rfile.read(min(THROTTLE_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise ConnectionError("truncated benchmark upload")
+                if pace:
+                    pace.wait(len(chunk))
+                target.write(chunk)
+                remaining -= len(chunk)
+
+        def do_PUT(self):
+            route = self._route()
+            if route is None:
+                self._respond(404)
+                return
+            repository, kind, reference = route
+            self._count(repository)
+            try:
+                if kind == "manifests":
+                    content = io.BytesIO()
+                    self._read_body(content)
+                    manifests = repo_dir(repository) / "manifests"
+                    manifests.mkdir(parents=True, exist_ok=True)
+                    digest = f"sha256:{hashlib.sha256(content.getvalue()).hexdigest()}"
+                    for name in (reference, digest):
+                        (manifests / name.replace(":", "_")).write_bytes(content.getvalue())
+                    self._respond(201, {"Docker-Content-Digest": digest})
+                    return
+                if kind != "upload":
+                    self._respond(405)
+                    return
+                digest = parse_qs(urlsplit(self.path).query).get("digest", [""])[0]
+                destination = self._blob_path(repository, digest)
+            except ValueError:
+                self._respond(400)
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staged = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with staged.open("wb") as target:
+                    self._read_body(target)
+                os.replace(staged, destination)
+            except (OSError, ConnectionError):
+                staged.unlink(missing_ok=True)
+                self._respond(500)
+                return
+            self._respond(201, {"Docker-Content-Digest": digest})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    print(f"PORT {server.server_port}", flush=True)
+    watcher = threading.Thread(
+        target=lambda: (sys.stdin.read(), server.shutdown()), daemon=True
+    )
+    watcher.start()
+    server.serve_forever()
+    server.server_close()
+
+
+@contextlib.contextmanager
+def _network_registry(storage, request_delay_ms, bandwidth_mbit, bandwidth_scope):
+    spec = {
+        "storage": str(storage),
+        "request_delay_ms": request_delay_ms,
+        "bandwidth_mbit": bandwidth_mbit,
+        "bandwidth_scope": bandwidth_scope,
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--serve-registry", json.dumps(spec)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = process.stdout.readline().strip()
+        if not line.startswith("PORT "):
+            raise RuntimeError(f"Benchmark registry failed to start: {line!r}")
+        yield f"http://127.0.0.1:{int(line.split()[1])}"
+    finally:
+        process.stdin.close()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _parse_layout(value):
+    """Parse ``COUNTxMIB`` or ``MIB+MIB+...`` into per-layer byte sizes."""
+    try:
+        if "x" in value:
+            count, size = value.split("x", 1)
+            sizes = [float(size)] * int(count)
+        else:
+            sizes = [float(size) for size in value.split("+")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid layer layout {value!r}") from error
+    layer_bytes = [int(size * MIB) for size in sizes]
+    if not layer_bytes or any(size < 1 for size in layer_bytes):
+        raise argparse.ArgumentTypeError(f"invalid layer layout {value!r}")
+    return {"name": value, "layer_bytes": layer_bytes}
+
+
+def _seed_base_image(storage, repository, layer_bytes, seed):
+    """Write a synthetic base image directly into registry storage."""
+    blobs = storage / repository / "blobs"
+    layers = []
+    for index, size in enumerate(layer_bytes):
+        staged = blobs / f"layer-{index}.tmp"
+        digest = _write_transfer_fixture(staged, size, seed * 1000 + index)
+        os.replace(staged, blobs / digest.split(":", 1)[1])
+        layers.append({"mediaType": OCI_LAYER_MEDIA_TYPE, "digest": digest, "size": size})
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Env": ["PATH=/usr/local/bin:/usr/bin:/bin"], "WorkingDir": "/"},
+            "rootfs": {"type": "layers", "diff_ids": [layer["digest"] for layer in layers]},
+            "history": [{"comment": f"benchmark seed {seed}"}],
+        },
+        separators=(",", ":"),
+    ).encode()
+    config_digest = f"sha256:{hashlib.sha256(config).hexdigest()}"
+    (blobs / config_digest.split(":", 1)[1]).write_bytes(config)
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": len(config),
+            },
+            "layers": layers,
+        },
+        separators=(",", ":"),
+    ).encode()
+    manifests = storage / repository / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    (manifests / "latest").write_bytes(manifest)
+
+
+def _registry_requests(registry_url, repository):
+    with urllib.request.urlopen(f"{registry_url}/__stats__/{repository}", timeout=30) as response:
+        return json.loads(response.read())["requests"]
+
+
+def _network_client(registry_url, repository):
+    return RegistryClient(urlsplit(registry_url).netloc, repository, insecure=True)
+
+
+def _measure_network_build_worker(spec):
+    """Measure the real sequential pull -> local build -> push product path."""
+    import pycontainer.builder as builder_module
+    from pycontainer.auth import RegistryAuth
+
+    registry_url = spec["registry_url"]
+
+    class LoopbackRegistryClient(RegistryClient):
+        def __init__(self, registry, repository, **kwargs):
+            kwargs["insecure"] = True
+            super().__init__(urlsplit(registry_url).netloc, repository, **kwargs)
+
+    builder_module.RegistryClient = LoopbackRegistryClient
+    builder_module.get_registry_auth = lambda *_args, **_kwargs: RegistryAuth()
+    config = BuildConfig(
+        tag=f"{NETWORK_REGISTRY_HOST}/{spec['push_repository']}:latest",
+        base_image=f"{NETWORK_REGISTRY_HOST}/{spec['base_repository']}:latest",
+        context_dir=spec["context"],
+        output_dir=spec["output"],
+        cache_dir=spec["cache"],
+        use_cache=True,
+        include_deps=False,
+        include_paths=["app"],
+        reproducible=True,
+    )
+    timings = {}
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        started = time.perf_counter()
+        builder = ImageBuilder(config)
+        original_pull = builder._pull_base_image
+
+        def timed_pull(*args):
+            pull_started = time.perf_counter()
+            try:
+                return original_pull(*args)
+            finally:
+                timings["pull_seconds"] = time.perf_counter() - pull_started
+
+        builder._pull_base_image = timed_pull
+        builder.build()
+        build_seconds = time.perf_counter() - started
+        push_started = time.perf_counter()
+        builder.push()
+        push_seconds = time.perf_counter() - push_started
+        repeat_started = time.perf_counter()
+        builder.push()
+        repeat_push_seconds = time.perf_counter() - repeat_started
+
+    pull_seconds = timings["pull_seconds"]
+    return {
+        "pull_seconds": pull_seconds,
+        "local_build_seconds": build_seconds - pull_seconds,
+        "push_seconds": push_seconds,
+        "repeat_push_seconds": repeat_push_seconds,
+        "process_peak_rss_bytes": _peak_rss_bytes(),
+        "base_requests": _registry_requests(registry_url, spec["base_repository"]),
+        "push_requests": _registry_requests(registry_url, spec["push_repository"]),
+        "image": {
+            "blobs_dir": str(Path(spec["output"]) / "blobs" / "sha256"),
+            "layers": [layer.digest for layer in builder.layers],
+            "config": builder.config_digest,
+            "manifest": builder.manifest_digest,
+        },
+    }
+
+
+def _measure_network_probe_worker(spec):
+    """Transfer the same blobs via RegistryClient with ``workers`` threads.
+
+    This is a benchmark-only estimate of concurrency headroom, not a product
+    code path. Run with one worker it calibrates against the real sequential
+    path; dependency order (manifest, then config/layers, then manifest push)
+    and per-blob verification are preserved.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    registry_url = spec["registry_url"]
+    workers = spec["workers"]
+    destination = Path(spec["output"])
+    destination.mkdir(parents=True, exist_ok=True)
+    image = spec["image"]
+    blobs_dir = Path(image["blobs_dir"])
+
+    def run_all(function, items):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for _ in pool.map(function, items):
+                pass
+
+    started = time.perf_counter()
+    base = _network_client(registry_url, spec["base_repository"])
+    manifest, _ = base.pull_manifest("latest")
+    descriptors = [manifest["config"], *manifest["layers"]]
+    run_all(
+        lambda item: base.pull_blob(
+            item["digest"], destination / item["digest"].split(":", 1)[1], item["size"]
+        ),
+        descriptors,
+    )
+    pull_seconds = time.perf_counter() - started
+
+    push = _network_client(registry_url, spec["push_repository"])
+    blobs = [*image["layers"], image["config"]]
+    manifest_data = (blobs_dir / image["manifest"].split(":", 1)[1]).read_bytes()
+
+    def push_image():
+        push_started = time.perf_counter()
+        run_all(
+            lambda digest: push.push_blob(
+                digest, blobs_dir / digest.split(":", 1)[1], check_exists=True
+            ),
+            blobs,
+        )
+        push.push_manifest("latest", manifest_data)
+        return time.perf_counter() - push_started
+
+    push_seconds = push_image()
+    repeat_push_seconds = push_image()
+    return {
+        "workers": workers,
+        "pull_seconds": pull_seconds,
+        "push_seconds": push_seconds,
+        "repeat_push_seconds": repeat_push_seconds,
+        "process_peak_rss_bytes": _peak_rss_bytes(),
+        "base_requests": _registry_requests(registry_url, spec["base_repository"]),
+        "push_requests": _registry_requests(registry_url, spec["push_repository"]),
+    }
+
+
 def _measure_worker(spec):
     if spec["mode"] == "transfer":
         return _measure_transfer_worker(spec)
+    if spec["mode"] == "network-build":
+        return _measure_network_build_worker(spec)
+    if spec["mode"] == "network-probe":
+        return _measure_network_probe_worker(spec)
 
     context = Path(spec["context"])
     output = Path(spec["output"])
@@ -327,6 +768,153 @@ def _measured_case(name, description, specs):
         "samples": samples,
         "summary": summary,
     }
+
+
+def _median(values):
+    return statistics.median(values)
+
+
+def _summarize_network_samples(samples, workers):
+    sequential = [sample["sequential"] for sample in samples]
+    calibration = [sample["probe_1_worker"] for sample in samples]
+    concurrent = [sample[f"probe_{workers}_workers"] for sample in samples]
+
+    def transfer(result, push_key="push_seconds"):
+        return result["pull_seconds"] + result[push_key]
+
+    summary = {}
+    for label, results in (
+        ("sequential", sequential),
+        ("probe_1_worker", calibration),
+        (f"probe_{workers}_workers", concurrent),
+    ):
+        summary[label] = {
+            key: _median(result[key] for result in results)
+            for key in (
+                "pull_seconds",
+                "push_seconds",
+                "repeat_push_seconds",
+                "process_peak_rss_bytes",
+                "base_requests",
+                "push_requests",
+            )
+        }
+    summary["sequential"]["local_build_seconds"] = _median(
+        result["local_build_seconds"] for result in sequential
+    )
+    totals = [
+        result["pull_seconds"] + result["local_build_seconds"] + result["push_seconds"]
+        for result in sequential
+    ]
+    # Concurrency savings come only from the matched probe pair; the product path
+    # also differs from the probe in builder overhead, which is not a saving.
+    savings = [transfer(one) - transfer(many) for one, many in zip(calibration, concurrent)]
+    summary["sequential_build_and_push_seconds"] = _median(totals)
+    summary["sequential_transfer_share"] = _median(
+        transfer(seq) / total for seq, total in zip(sequential, totals)
+    )
+    summary["calibration_probe_to_product_transfer_ratio"] = _median(
+        transfer(probe) / transfer(seq) for seq, probe in zip(sequential, calibration)
+    )
+    summary["projected_saving_seconds"] = _median(savings)
+    summary["projected_saving_share"] = _median(
+        saving / total for saving, total in zip(savings, totals)
+    )
+    summary["projected_saving_range_seconds"] = [min(savings), max(savings)]
+    summary["repeat_push_projected_saving_seconds"] = _median(
+        one["repeat_push_seconds"] - many["repeat_push_seconds"]
+        for one, many in zip(calibration, concurrent)
+    )
+    return summary
+
+
+def _network_transfer_cases(args, root, context):
+    cases = []
+    workers = args.probe_workers
+    for bandwidth_mbit in args.bandwidth_mbit:
+        for request_delay_ms in args.request_delay_ms:
+            storage = root / f"network-registry-{bandwidth_mbit}-{request_delay_ms}"
+            with _network_registry(
+                storage, request_delay_ms, bandwidth_mbit, args.bandwidth_scope
+            ) as registry_url:
+                for layout_index, layout in enumerate(args.layer_layouts):
+                    samples = []
+                    for sample in range(args.network_repetitions):
+                        prefix = f"l{layout_index}-s{sample}"
+                        seed = (
+                            bandwidth_mbit * 1_000_000
+                            + request_delay_ms * 10_000
+                            + layout_index * 100
+                            + sample
+                        ) * 10
+                        repositories = {}
+                        for variant in ("seq", "p1", "pn"):
+                            repositories[variant] = f"base-{prefix}-{variant}"
+                            _seed_base_image(
+                                storage,
+                                repositories[variant],
+                                layout["layer_bytes"],
+                                seed,
+                            )
+                        sequential = _invoke_worker(
+                            {
+                                "mode": "network-build",
+                                "registry_url": registry_url,
+                                "base_repository": repositories["seq"],
+                                "push_repository": f"push-{prefix}-seq",
+                                "context": str(context),
+                                "output": str(root / f"network-{bandwidth_mbit}-{request_delay_ms}-{prefix}"),
+                                "cache": str(root / f"network-cache-{bandwidth_mbit}-{request_delay_ms}-{prefix}"),
+                            }
+                        )
+                        image = sequential.pop("image")
+                        probes = {}
+                        order = (1, workers) if sample % 2 == 0 else (workers, 1)
+                        for probe_workers in order:
+                            variant = "p1" if probe_workers == 1 else "pn"
+                            probes[probe_workers] = _invoke_worker(
+                                {
+                                    "mode": "network-probe",
+                                    "registry_url": registry_url,
+                                    "workers": probe_workers,
+                                    "base_repository": repositories[variant],
+                                    "push_repository": f"push-{prefix}-{variant}",
+                                    "output": str(root / f"probe-{bandwidth_mbit}-{request_delay_ms}-{prefix}-{variant}"),
+                                    "image": image,
+                                }
+                            )
+                        samples.append(
+                            {
+                                "sequential": sequential,
+                                "probe_1_worker": probes[1],
+                                f"probe_{workers}_workers": probes[workers],
+                            }
+                        )
+                    cases.append(
+                        {
+                            "name": (
+                                f"registry-network-{layout['name']}-"
+                                f"{request_delay_ms}ms-"
+                                f"{bandwidth_mbit or 'unlimited'}"
+                                f"{'Mbit' if bandwidth_mbit else ''}"
+                            ),
+                            "description": (
+                                "Real sequential base pull, local build and push through a "
+                                "separate-process loopback registry with injected per-request "
+                                "delay and bandwidth, plus benchmark-only RegistryClient probes "
+                                f"with 1 and {workers} workers."
+                            ),
+                            "network": {
+                                "request_delay_ms": request_delay_ms,
+                                "bandwidth_mbit": bandwidth_mbit or None,
+                                "bandwidth_scope": args.bandwidth_scope,
+                                "base_layer_bytes": layout["layer_bytes"],
+                            },
+                            "samples": samples,
+                            "summary": _summarize_network_samples(samples, workers),
+                        }
+                    )
+    return cases
 
 
 def _git_revision():
@@ -536,6 +1124,10 @@ def run_benchmarks(args):
             server.server_close()
             server_thread.join()
 
+        if args.layer_layouts:
+            (context / "app" / "module_00000.py").write_bytes(original_app)
+            cases.extend(_network_transfer_cases(args, root, context))
+
         return {
             "schema_version": 1,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -554,6 +1146,15 @@ def run_benchmarks(args):
                 "bytes_per_file": args.file_bytes,
                 "repetitions": args.repetitions,
                 "registry_transfer_sizes_mib": args.transfer_sizes_mib,
+                "network": {
+                    "layer_layouts": [layout["name"] for layout in args.layer_layouts],
+                    "request_delay_ms": args.request_delay_ms,
+                    "bandwidth_mbit": args.bandwidth_mbit,
+                    "bandwidth_scope": args.bandwidth_scope,
+                    "repetitions": args.network_repetitions,
+                    "probe_workers": args.probe_workers,
+                    "cache_state": "Fresh output and empty app-layer cache per sample; every sample seeds byte-identical base images into separate per-variant repositories (sequential, 1-worker and N-worker probes), so each variant pulls the same blobs cold and pushes to a fresh repository, then repeats the push (all blobs present).",
+                },
                 "base_image": "synthetic empty OCI base",
                 "excluded": [
                     "external registry pull/push",
@@ -567,6 +1168,7 @@ def run_benchmarks(args):
                 "output_bytes": "App-layer tar bytes for app-only; total local OCI output file bytes for full builds.",
                 "cache_hits": "App-layer cache hits observed during the measured build.",
                 "registry_transfer": "Per-sample loopback synthetic registry upload/download; server storage and fixture generation are excluded from the measured worker process. These are not external registry throughput results.",
+                "registry_network": "The registry runs in a separate process and sleeps request_delay_ms before every response, approximating one round trip per HTTP request. The client opens a new connection per request; real HTTPS adds TCP and TLS handshakes per request, so a delay of about three RTTs approximates one HTTPS request. Bandwidth is paced in 64 KiB chunks either across all connections (shared, one bottleneck link) or per connection (per-connection, models per-flow TCP limits). Probe workers transfer the same blobs through RegistryClient with a thread pool and are an estimate of concurrency headroom, not a product path; probe_1_worker calibrates the probe against the real sequential path. projected_saving_* are paired per-sample medians of the 1-worker minus N-worker probe transfer time; projected_saving_share divides that by the sequential product pull + local build + push total. No tracemalloc runs during network cases.",
                 "timing_gates": "None; compare trends only across matching environments and fixture parameters.",
             },
             "cases": cases,
@@ -579,10 +1181,30 @@ def main():
     parser.add_argument("--files", type=int, default=1000)
     parser.add_argument("--file-bytes", type=int, default=1024)
     parser.add_argument("--transfer-sizes-mib", type=int, nargs="+", default=[8, 32])
+    parser.add_argument(
+        "--layer-layouts",
+        type=_parse_layout,
+        nargs="*",
+        default=[_parse_layout("4x2")],
+        help="Synthetic base image layouts as COUNTxMIB or MIB+MIB+...; pass none to skip network cases.",
+    )
+    parser.add_argument("--request-delay-ms", type=int, nargs="+", default=[0, 50])
+    parser.add_argument(
+        "--bandwidth-mbit", type=int, nargs="+", default=[0], help="0 means unlimited."
+    )
+    parser.add_argument(
+        "--bandwidth-scope", choices=("shared", "per-connection"), default="shared"
+    )
+    parser.add_argument("--network-repetitions", type=int, default=3)
+    parser.add_argument("--probe-workers", type=int, default=4)
     parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
     parser.add_argument("--worker", help=argparse.SUPPRESS)
+    parser.add_argument("--serve-registry", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    if args.serve_registry:
+        _serve_network_registry(json.loads(args.serve_registry))
+        return
     if args.worker:
         print(json.dumps(_measure_worker(json.loads(args.worker))))
         return
@@ -594,6 +1216,16 @@ def main():
     ):
         parser.error(
             "--repetitions, --files, --file-bytes, and transfer sizes must be positive"
+        )
+    if (
+        args.network_repetitions < 1
+        or args.probe_workers < 2
+        or any(delay < 0 for delay in args.request_delay_ms)
+        or any(rate < 0 for rate in args.bandwidth_mbit)
+    ):
+        parser.error(
+            "--network-repetitions must be positive, --probe-workers at least 2, "
+            "and delays and bandwidths non-negative"
         )
 
     results = run_benchmarks(args)
