@@ -242,7 +242,7 @@ def output_directory_lock(output_dir):
         lock.__enter__()
     except BlockingIOError as error:
         raise RuntimeError(
-            f"Another build is using output directory {output_path}; "
+            f"Another build is using output directory {Path(output_dir).resolve()}; "
             "concurrent writes to the same output are not supported."
         ) from error
     try:
