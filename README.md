@@ -68,6 +68,9 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Experimental opt-in vulnerability gate (requires Grype 0.119.0)
+pycontainer build --tag ghcr.io/user/myapp:v1 --scan --push
+
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build --tag myapp:latest --platform linux/amd64
 
@@ -146,6 +149,28 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 ```
 
 **See [Local Development Guide](docs/local-development.md) for detailed testing instructions.**
+
+### Optional vulnerability gate
+
+`--scan` uses an external **Grype 0.119.0** executable against the complete
+selected OCI image, not the Python-only SBOM. It defaults to failing on
+high/critical findings and unknown severity, and blocks registry publication
+before authentication or uploads. Core runtime dependencies remain empty.
+
+```bash
+pycontainer build --scan --scan-report-format sarif --scan-report scan.sarif
+pycontainer build --scan --scan-threshold critical --scan-unknown ignore
+```
+
+JSON/SARIF reports include image digest, scanner version, database content
+digest/build time, policy and coverage limits, and are retained on findings
+failures. Database freshness is enforced even offline. **The adapter is
+experimental: a real Grype 0.119.0 acceptance run passed on linux/amd64 with
+a pinned database (OS and staged Python findings, whiteouts, JSON and SARIF);
+native Windows is rejected because of an upstream `oci-dir:` cache-path
+failure, and macOS/arm64 scanner hosts are unvalidated.**
+See [Vulnerability scanning](docs/vulnerability-scanning.md) for prerequisites,
+offline preparation, error behavior and the opt-in acceptance test.
 
 ---
 
@@ -351,6 +376,9 @@ By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
 - **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
+  (skipped when `cmd` is configured without `entrypoint`: the image then keeps
+  the base image's `Entrypoint` and runs `cmd`, as Docker does; an explicit
+  `entrypoint = []` / `cmd = []` clear the base image's value)
 - **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`
