@@ -219,14 +219,14 @@ def _mirror_blobs(source, target, descriptors):
             target.blob(path.read_bytes())
 
 
-def _private_mirror(image, provider):
-    """Copy real public signature evidence into a Basic-auth loopback registry."""
+def _private_mirror(image, provider, bearer=False):
+    """Copy real public signature evidence into an authenticated loopback registry."""
     from test_trust_private_registry import _Server
     from pycontainer import trust_notation
 
     registry, repository = image[0].split("/", 1)
     source = RegistryClient(registry, repository)
-    server = _Server(repository=repository)
+    server = _Server(repository=repository, bearer=bearer)
     manifest, digest = _mirror_manifest(source, server, image[1], image[1])
     for child in manifest.get("manifests", []):
         _mirror_manifest(source, server, child["digest"], child["digest"])
@@ -245,8 +245,9 @@ def _private_mirror(image, provider):
 
 
 @pytest.mark.parametrize("provider", ["cosign", "notation"])
-def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch, provider):
-    from test_trust_private_registry import BASIC, PASSWORD, USERNAME
+@pytest.mark.parametrize("bearer", [False, True])
+def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch, provider, bearer):
+    from test_trust_private_registry import BASIC, PASSWORD, TOKEN, USERNAME
     from pycontainer import trust_notation
 
     if provider == "cosign":
@@ -270,20 +271,21 @@ def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch
             "tsa_root": _require_environment("PYCONTAINER_NOTATION_TSA"),
         }
         module, name = trust_notation, "_run"
-    server = _private_mirror(image, provider)
+    server = _private_mirror(image, provider, bearer=bearer)
     secret = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
     verifier_calls = []
     real_run = getattr(module, name)
 
     def run(args, environment):
         for value in [*args, *environment.values()]:
-            assert PASSWORD not in value and secret not in value
+            assert PASSWORD not in value and secret not in value and TOKEN not in value
         verifier_calls.append(args)
         return real_run(args, environment)
 
     class LoopbackClient(RegistryClient):
         def __init__(self, *args, **kwargs):
             assert kwargs["strict_auth"] is True and kwargs["password"] == PASSWORD
+            kwargs["ca_file"] = server.ca_file
             super().__init__(*args, **kwargs)
             self.base_url = server.url + "/v2"
 
@@ -299,6 +301,7 @@ def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch
     monkeypatch.setattr(builder_module, "get_registry_auth",
                         lambda *_: RegistryAuth(username=USERNAME, password=PASSWORD))
     monkeypatch.setenv("REGISTRY_PASSWORD", PASSWORD)
+    monkeypatch.setenv("REGISTRY_TOKEN", TOKEN)
     config = BuildConfig(
         context_dir=str(tmp_path), output_dir=str(tmp_path / "output"),
         base_image=f"{image[0]}@{image[1]}", base_image_trust=policy, use_cache=False,
@@ -309,9 +312,18 @@ def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch
         with pytest.raises(_BaseBlobReached):
             ImageBuilder(config)._pull_base_image(layers, "linux", "amd64")
         assert len(verifier_calls) == 1
-        assert server.requests and all(auth == BASIC for _, auth in server.requests)
+        if bearer:
+            assert server.requests[0][1] == BASIC
+            assert server.requests[1] == ("/token", BASIC)
+            assert all(auth == f"Bearer {TOKEN}" for _, auth in server.requests[2:])
+            assert server.token_queries == [{
+                "service": ["synthetic-registry"],
+                "scope": [f"repository:{server.repository}:pull"],
+            }]
+        else:
+            assert server.requests and all(auth == BASIC for _, auth in server.requests)
         unauthenticated = RegistryClient(image[0].split("/", 1)[0], server.repository,
-                                         strict_auth=True)
+                                         strict_auth=True, ca_file=server.ca_file)
         unauthenticated.base_url = server.url + "/v2"
         with pytest.raises(Exception):
             unauthenticated.pull_manifest_bytes(image[1])

@@ -306,8 +306,8 @@ custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
              deps=['app'], skips_local_docker=True)
 ```
 
-Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
-registries and multi-platform requests are rejected.
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and
+multi-platform requests are rejected. Plain HTTP requires per-host opt-in.
 [See full documentation →](docs/skaffold-tilt.md)
 
 ### VS Code Extension
@@ -510,6 +510,19 @@ exclude-defaults = true
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+**Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
+- `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
+  (repeatable; `[build] insecure-registries = [...]`). Each build that uses
+  one logs a warning. Credentials are sent over HTTP only to loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); any other HTTP registry must be
+  anonymous.
+- `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
+  HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
+  there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -715,7 +728,7 @@ Known limitations and future enhancements:
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 - **System packages** — Verification is advisory; installing apt/apk packages
   is not available. See [system packages](docs/system-packages.md).
-- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
+- **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;

@@ -3,26 +3,30 @@ import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import ssl
 import sys
+import tempfile
 import threading
+import urllib.parse
 
 import pytest
+import trustme
 
 from pycontainer import base_trust
 from pycontainer import builder as builder_module
-from pycontainer import registry_client as registry_module
 from pycontainer import trust_notation as notation
 from pycontainer.auth import RegistryAuth
 from pycontainer.base_trust import TrustVerificationError, verify_base_image
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.registry_client import RegistryClient
+from pycontainer.registry_client import RegistryClient, RegistryRequestError
 
 
 REPOSITORY = "registry.example/team/base"
 USERNAME = "synthetic-user"
 PASSWORD = "synthetic-registry-secret"
 BASIC = "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+TOKEN = "synthetic-scoped-token"
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 INDEX = "application/vnd.oci.image.index.v1+json"
 CERT = b"synthetic signer certificate"
@@ -49,28 +53,53 @@ def _cose(cert):
 
 
 class _Server:
-    """Loopback registry that requires Basic credentials on every request."""
+    """TLS loopback registry with synthetic Basic or Bearer authentication."""
 
-    def __init__(self, credentials=BASIC, repository="team/base"):
+    def __init__(self, credentials=BASIC, repository="team/base", ca=None, bearer=False):
         self.repository = repository
         self.routes = {}
         self.requests = []
         self.credentials = credentials
+        self.bearer = bearer
+        self.challenge_realm = None
+        self.challenge_scope = f"repository:{repository}:pull"
+        self.token_queries = []
+        self.ca = ca or trustme.CA()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.ca_file = self.tempdir.name + "/ca.pem"
+        self.ca.cert_pem.write_to_path(self.ca_file)
         server = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                path = self.path.split("?", 1)[0]
+                url = urllib.parse.urlsplit(self.path)
+                path = url.path
                 server.requests.append((path, self.headers.get("Authorization")))
-                if server.credentials and self.headers.get("Authorization") != server.credentials:
-                    self._reply(401, b"{}", {"WWW-Authenticate": 'Basic realm="test"'})
+                if server.bearer and path == "/token":
+                    query = urllib.parse.parse_qs(url.query)
+                    server.token_queries.append(query)
+                    if (self.headers.get("Authorization") != server.credentials or
+                            query != {"service": ["synthetic-registry"],
+                                      "scope": [f"repository:{server.repository}:pull"]}):
+                        self._reply(403, b"{}")
+                    else:
+                        self._reply(200, _encoded({"token": TOKEN}))
                     return
+                if server.bearer and self.headers.get("Authorization") != f"Bearer {TOKEN}":
+                    self._reply(401, b"{}", {"WWW-Authenticate": (
+                        f'Bearer realm="{server.challenge_realm or server.url + "/token"}",'
+                        f'service="synthetic-registry",scope="{server.challenge_scope}"')})
+                    return
+                if server.credentials and self.headers.get("Authorization") != server.credentials:
+                    if not server.bearer:
+                        self._reply(401, b"{}", {"WWW-Authenticate": 'Basic realm="test"'})
+                        return
                 status, body, headers = server.routes.get(path, (404, b"{}", {}))
                 self._reply(status, body, headers)
 
-            def _reply(self, status, body, headers):
+            def _reply(self, status, body, headers=None):
                 self.send_response(status)
-                for key, value in headers.items():
+                for key, value in (headers or {}).items():
                     self.send_header(key, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -80,13 +109,18 @@ class _Server:
                 pass
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ca.issue_cert("127.0.0.1").configure_cert(context)
+        self.httpd.socket = context.wrap_socket(self.httpd.socket, server_side=True)
+        self.url = f"https://127.0.0.1:{self.httpd.server_address[1]}"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        self.thread.join(timeout=10)
+        self.tempdir.cleanup()
 
     def manifest(self, reference, content, media_type):
         self.routes[f"/v2/{self.repository}/manifests/{reference}"] = (
@@ -96,9 +130,7 @@ class _Server:
         self.routes[f"/v2/{self.repository}/blobs/{_digest(content)}"] = (200, content, {})
 
 
-@pytest.fixture
-def registry():
-    server = _Server()
+def _set_subject(server):
     config = _encoded({"os": "linux", "architecture": "amd64", "config": {}})
     layer = b"base layer"
     subject = _encoded({
@@ -111,12 +143,20 @@ def registry():
     server.base_blobs = {_digest(config), _digest(layer)}
     server.manifest("latest", subject, MANIFEST)
     server.manifest(server.subject_digest, subject, MANIFEST)
+    server.blob(config)
+    server.blob(layer)
+
+
+@pytest.fixture
+def registry():
+    server = _Server()
+    _set_subject(server)
     yield server
     server.close()
 
 
 def _client(server, **options):
-    options = {"username": USERNAME, "password": PASSWORD, **options}
+    options = {"username": USERNAME, "password": PASSWORD, "ca_file": server.ca_file, **options}
     client = RegistryClient("registry.example", "team/base", strict_auth=True, **options)
     client.base_url = server.url + "/v2"
     return client
@@ -260,7 +300,7 @@ def test_private_signatures_without_valid_credentials_fail_closed(
 @pytest.mark.parametrize("provider", ["cosign", "notation"])
 def test_redirected_signature_blob_never_receives_registry_credentials(
         registry, monkeypatch, tmp_path, provider):
-    storage = _Server(credentials=None)
+    storage = _Server(credentials=None, ca=registry.ca)
     try:
         if provider == "cosign":
             blobs = sorted(_serve_cosign(registry))
@@ -278,8 +318,6 @@ def test_redirected_signature_blob_never_receives_registry_credentials(
             path = f"/v2/team/base/blobs/{blob}"
             storage.routes[f"/storage/{blob}"] = registry.routes[path]
             registry.routes[path] = (307, b"", {"Location": f"{storage.url}/storage/{blob}"})
-        # Loopback storage is HTTP; HTTPS-only redirect enforcement has its own tests.
-        monkeypatch.setattr(registry_module, "_require_secure_redirect", lambda url: None)
         _verify(registry, policy)
         assert len(storage.requests) == len(blobs)
         assert all(auth is None for _, auth in storage.requests)
@@ -316,6 +354,7 @@ def test_builder_verifies_private_tag_once_before_any_base_blob(
     class LoopbackClient(RegistryClient):
         def __init__(self, *args, **kwargs):
             assert kwargs["strict_auth"] is True
+            kwargs["ca_file"] = registry.ca_file
             super().__init__(*args, **kwargs)
             self.base_url = registry.url + "/v2"
 
@@ -339,3 +378,116 @@ def test_builder_verifies_private_tag_once_before_any_base_blob(
     paths = [path for path, _ in registry.requests]
     assert paths.count("/v2/team/base/manifests/latest") == 1
     assert all(auth == BASIC for _, auth in registry.requests)
+
+
+@pytest.mark.parametrize("provider", ["cosign", "notation"])
+@pytest.mark.parametrize("failure", [None, "credentials", "scope", "realm", "ca"])
+def test_builder_discovers_signatures_with_scoped_bearer_challenge(
+        tmp_path, monkeypatch, provider, failure):
+    server = _Server(bearer=True)
+    untrusted = _Server(credentials=None, ca=server.ca) if failure == "realm" else None
+    try:
+        _set_subject(server)
+        repository = f"127.0.0.1:{server.httpd.server_address[1]}/team/base"
+        if failure == "scope":
+            server.challenge_scope = "repository:other/base:pull"
+        if untrusted:
+            server.challenge_realm = untrusted.url + "/token"
+        if provider == "cosign":
+            signature_blobs = _serve_cosign(server)
+            policy = _cosign_policy()
+
+            def run(args, environment):
+                check_verifier(args, environment)
+                return _encoded([{"critical": {
+                    "identity": {"docker-reference": repository},
+                    "image": {"docker-manifest-digest": server.subject_digest},
+                    "type": "cosign container image signature"}}])
+
+            monkeypatch.setattr(base_trust, "_run_cosign", run)
+        else:
+            signature_blobs = {_digest(_serve_notation(server))}
+            policy = _notation_policy(tmp_path)
+
+            def run(args, environment):
+                check_verifier(args, environment)
+                return ("Successfully verified signature for " + args[-1] + "\n").encode()
+
+            monkeypatch.setattr(notation, "_run", run)
+        policy["repository"] = repository
+        observed = []
+
+        def check_verifier(args, environment):
+            _assert_no_secret([*args, *environment.values()])
+            assert all(TOKEN not in value for value in [*args, *environment.values()])
+            requested_blobs = {
+                path.rsplit("/", 1)[1]
+                for path, _ in server.requests if "/blobs/" in path
+            }
+            assert requested_blobs == signature_blobs
+            assert not requested_blobs & server.base_blobs
+            observed.append(True)
+
+        _credential_environment(monkeypatch)
+        monkeypatch.setenv("REGISTRY_TOKEN", TOKEN)
+        monkeypatch.setattr(
+            builder_module, "get_registry_auth",
+            lambda *_: RegistryAuth(
+                username=USERNAME,
+                password="wrong-password" if failure == "credentials" else PASSWORD,
+            ),
+        )
+        ca_file = server.ca_file
+        if failure == "ca":
+            ca_file = str(tmp_path / "wrong-ca.pem")
+            trustme.CA().cert_pem.write_to_path(ca_file)
+        config = BuildConfig(
+            context_dir=str(tmp_path), output_dir=str(tmp_path / "output"),
+            base_image=f"{repository}:latest", base_image_trust=policy,
+            registry_ca_file=ca_file, use_cache=False,
+        )
+        layers = tmp_path / "layers"
+        layers.mkdir()
+        if failure:
+            expected = {
+                "credentials": "HTTP 403",
+                "scope": "HTTP 403",
+                "realm": "untrusted token realm",
+                "ca": "failed after 3 attempt",
+            }[failure]
+            with pytest.raises(RegistryRequestError, match=expected):
+                ImageBuilder(config)._pull_base_image(layers, "linux", "amd64")
+            assert not observed
+            assert not any("/blobs/" in path for path, _ in server.requests)
+            if untrusted:
+                assert untrusted.requests == []
+            if failure == "ca":
+                assert server.requests == []
+            elif failure != "realm":
+                assert server.token_queries == [{
+                    "service": ["synthetic-registry"],
+                    "scope": [server.challenge_scope],
+                }]
+        else:
+            pulled_layers, base_config = ImageBuilder(config)._pull_base_image(
+                layers, "linux", "amd64")
+            assert len(pulled_layers) == 1
+            assert base_config["architecture"] == "amd64"
+            assert observed == [True]
+            assert server.token_queries == [{
+                "service": ["synthetic-registry"],
+                "scope": ["repository:team/base:pull"],
+            }]
+            assert server.requests[0] == ("/v2/team/base/manifests/latest", BASIC)
+            assert server.requests[1] == ("/token", BASIC)
+            assert all(auth == f"Bearer {TOKEN}" for _, auth in server.requests[2:])
+            assert [path for path, _ in server.requests].count(
+                "/v2/team/base/manifests/latest") == 2
+            assert server.base_blobs <= {
+                path.rsplit("/", 1)[1]
+                for path, _ in server.requests if "/blobs/" in path
+            }
+    finally:
+        if untrusted:
+            untrusted.close()
+        server.close()

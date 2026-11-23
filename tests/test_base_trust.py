@@ -376,7 +376,7 @@ def test_required_manifest_rejects_duplicate_digest_headers(monkeypatch):
 
 def test_manifest_redirect_does_not_forward_registry_authorization(monkeypatch):
     client = RegistryClient("registry.example", "team/base", auth_token="secret")
-    handler = registry_module.SameOriginRedirect()
+    handler = registry_module.SafeRedirect()
 
     class Response:
         status = 200
@@ -391,16 +391,15 @@ def test_manifest_redirect_does_not_forward_registry_authorization(monkeypatch):
         def read(self, size=-1):
             return b"{}"
 
-    def fake_open(request, timeout, strict=False):
+    def fake_open(request, timeout):
         assert request.get_header("Authorization") == "Bearer secret"
-        assert not strict
         redirected = handler.redirect_request(
             request, None, 302, "Found", {}, "https://storage.example/blob"
         )
         assert not redirected.has_header("Authorization")
         return Response()
 
-    monkeypatch.setattr("pycontainer.registry_client._open_registry_request", fake_open)
+    monkeypatch.setattr(client._opener, "open", fake_open)
     client._make_request("GET", "https://registry.example/v2/team/base/manifests/latest")
 
 
@@ -409,7 +408,6 @@ def test_manifest_redirect_does_not_forward_registry_authorization(monkeypatch):
     [
         ("https://registry.example/v2/team/base/manifest", True),
         ("https://storage.example/v2/team/base/manifest", False),
-        ("http://registry.example/v2/team/base/manifest", False),
         ("https://registry.example:444/v2/team/base/manifest", False),
     ],
 )
@@ -420,10 +418,12 @@ def test_redirect_retains_authorization_only_on_the_same_origin(target, authoriz
         request.add_unredirected_header("Authorization", "Bearer secret")
     else:
         request.add_header("Authorization", "Bearer secret")
-    redirected = registry_module.SameOriginRedirect().redirect_request(
+    redirected = registry_module.SafeRedirect().redirect_request(
         request, None, 302, "Found", {}, target
     )
-    assert redirected.get_header("Authorization") == ("Bearer secret" if authorized else None)
+    assert redirected.get_header("Authorization") == (
+        "Bearer secret" if authorized and not unredirected else None
+    )
 
 
 @pytest.mark.parametrize(
@@ -432,8 +432,8 @@ def test_redirect_retains_authorization_only_on_the_same_origin(target, authoriz
 )
 def test_required_blob_redirect_chain_rejects_insecure_targets(target):
     request = urllib.request.Request("https://storage.example/blob")
-    with pytest.raises(registry_module.RegistryRequestError, match="insecure"):
-        registry_module.SecureRegistryRedirect().redirect_request(
+    with pytest.raises(registry_module.RegistryRequestError):
+        registry_module.SafeRedirect().redirect_request(
             request, None, 302, "Found", {}, target
         )
 
@@ -441,7 +441,7 @@ def test_required_blob_redirect_chain_rejects_insecure_targets(target):
 def test_required_blob_redirect_chain_strips_cross_origin_authorization():
     request = urllib.request.Request("https://storage.example/blob")
     request.add_header("Authorization", "Bearer secret")
-    redirected = registry_module.SecureRegistryRedirect().redirect_request(
+    redirected = registry_module.SafeRedirect().redirect_request(
         request, None, 302, "Found", {}, "https://other.example/blob"
     )
     assert redirected.get_header("Authorization") is None
@@ -467,14 +467,14 @@ def test_required_registry_requests_use_secure_redirect_handler(monkeypatch):
         def open(self, request, timeout):
             return Response()
 
-    def build_opener(handler):
-        observed.append(handler)
+    def build_opener(*handlers):
+        observed.extend(handlers)
         return Opener()
 
     monkeypatch.setattr(registry_module.urllib.request, "build_opener", build_opener)
     client = RegistryClient("registry.example", "team/base", strict_auth=True)
     client._make_request("GET", "https://registry.example/v2/team/base/manifests/latest")
-    assert isinstance(observed[0], registry_module.SecureRegistryRedirect)
+    assert any(isinstance(handler, registry_module.SafeRedirect) for handler in observed)
 
 
 def test_required_first_blob_redirect_cannot_downgrade_to_http(monkeypatch):
@@ -487,7 +487,7 @@ def test_required_first_blob_redirect_cannot_downgrade_to_http(monkeypatch):
 
     monkeypatch.setattr(registry_module.urllib.request, "build_opener", lambda *_: Opener())
     client = RegistryClient("registry.example", "team/base", strict_auth=True)
-    with pytest.raises(registry_module.RegistryRequestError, match="insecure"):
+    with pytest.raises(registry_module.RegistryRequestError, match="downgrade"):
         client._open_blob_response("https://registry.example/v2/team/base/blobs/sha256:abc")
 
 
@@ -774,9 +774,14 @@ def test_required_auth_rejects_untrusted_external_token_realm(monkeypatch):
     def no_request(*args, **kwargs):
         raise AssertionError("credentials were sent to an untrusted realm")
 
-    monkeypatch.setattr("pycontainer.registry_client._open_registry_request", no_request)
+    monkeypatch.setattr(client._opener, "open", no_request)
     with pytest.raises(RuntimeError, match="untrusted token realm"):
         client._get_bearer_token({"realm": "https://evil.example/token"})
+
+
+def test_required_auth_rejects_insecure_registry_even_on_loopback():
+    with pytest.raises(registry_module.RegistryAuthenticationError, match="plain HTTP"):
+        RegistryClient("127.0.0.1:5000", "team/base", strict_auth=True, insecure=True)
 
 
 def test_required_auth_allows_pinned_realm_without_forwarding_redirected_credentials(
@@ -801,14 +806,14 @@ def test_required_auth_allows_pinned_realm_without_forwarding_redirected_credent
         def read(self, size=-1):
             return b'{"token":"synthetic-token"}'
 
-    def open_request(request, timeout, strict=False):
-        assert strict
+    def open_request(request, timeout):
         assert request.get_header("Authorization").startswith("Basic ")
-        redirected = registry_module.SameOriginRedirect().redirect_request(
-            request, None, 302, "Found", {}, "https://storage.example/token"
-        )
-        assert not redirected.has_header("Authorization")
+        for target in ("https://auth.example/other", "https://storage.example/token"):
+            redirected = registry_module.SafeRedirect().redirect_request(
+                request, None, 302, "Found", {}, target
+            )
+            assert not redirected.has_header("Authorization")
         return Response()
 
-    monkeypatch.setattr("pycontainer.registry_client._open_registry_request", open_request)
+    monkeypatch.setattr(client._opener, "open", open_request)
     assert client._get_bearer_token({"realm": realm}) == "synthetic-token"

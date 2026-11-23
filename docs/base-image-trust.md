@@ -125,10 +125,12 @@ exact HTTPS URL is explicitly pinned:
 auth_realm = "https://auth.example.com/token"
 ```
 
-This setting belongs in `[build.base_image_trust]`. Authorization is retained
-for same-origin redirects but is not forwarded to a different origin; base
-metadata, token-service, and blob redirect chains in required mode must use
-HTTPS.
+This setting belongs in `[build.base_image_trust]`. Metadata authorization is
+retained on same-origin redirects but not forwarded to a different origin;
+token-exchange and blob-download credentials are not forwarded on redirects.
+Base metadata, token-service, and blob redirect chains in required mode must
+use HTTPS, even when a host is listed in `insecure_registries`. For a private
+CA, configure `registry_ca_file`; this does not disable certificate validation.
 
 ## Private registries
 
@@ -141,9 +143,12 @@ arguments, environment or configuration. Missing, unauthorized or malformed
 signature evidence fails before any base config or layer is fetched.
 
 This has been exercised with real Cosign and Notation verifiers against real
-public signatures served by a local registry that requires Basic
-authentication (see below). No hosted private registry (for example ACR, ECR,
-GAR or GHCR with private access) has been exercised.
+public signatures served by a local TLS registry requiring Basic or scoped
+Bearer authentication (see below). No hosted private registry (for example
+ACR, ECR, GAR or GHCR with private access) has been exercised.
+Hermetic tests also exercise both discovery paths through a TLS loopback registry
+with a scoped Bearer challenge and synthetic credentials; verifier results in
+those tests are simulated.
 
 ## Opt-in real-provider checks
 
@@ -190,10 +195,10 @@ with the correct TSA root. The fixture contains public certificates and signed
 data, not private keys. Neither local check tests remote discovery.
 
 `test_real_verifier_with_authenticated_private_registry` copies the pinned
-Quay Cosign and MCR Notation signatures into a loopback registry that requires
-Basic authentication. It then runs the real verifiers through the builder and
-checks that every request is authenticated, that unauthenticated reads fail,
-and that the verifier arguments and environment contain no credentials.
+Quay Cosign and MCR Notation signatures into a TLS loopback registry using
+synthetic Basic or scoped Bearer credentials. It then runs the real verifiers
+through the builder and checks that unauthenticated reads fail and that the
+verifier arguments and environment contain no credentials.
 
 Positive verification after signer expiry is exercised only with the local
 timestamped COSE fixture above. No registry-hosted signature from an expired
