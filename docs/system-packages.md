@@ -80,3 +80,17 @@ mapped. Detection needs a recognized base distro and is skipped otherwise.
   10,000 `status.d` records); or when the distro's package database is
   absent. Debian packages count as installed only with an `ok installed`
   status in every record that lists them.
+
+## Planned installation (not available)
+
+Installing packages with the distro's own `apt` or `apk` is planned in #31.
+It must run inside the opt-in isolated execution backend from #22, never on
+the host, and that backend does not exist yet. No configuration option enables
+installation, and detected packages will never be installed implicitly.
+
+`pycontainer.system_install` contains only fail-closed groundwork that runs no
+package manager: checks for apt settings that weaken signature verification,
+and parsers for offline resolution output. It does not download packages or
+repository metadata. See the
+[installation design](plans/2026-11-22-system-package-installation.md) for
+the planned flow, the trust boundaries and the remaining blockers.
