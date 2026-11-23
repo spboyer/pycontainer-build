@@ -596,6 +596,21 @@ az acr login --name myregistry
 pycontainer build --tag myapp:latest --base-image python:3.11-slim
 ```
 
+For offline or air-gapped builds, load the base image from disk instead of a
+registry; no credentials or daemon are used:
+
+```bash
+skopeo copy docker://python:3.11-slim oci:./base:3.11-slim   # or: docker save python:3.11-slim -o python.tar
+pycontainer build --tag myapp:latest --base-image oci:./base:3.11-slim
+pycontainer build --tag myapp:latest --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+For `--include-deps`, the local image config must explicitly declare
+`PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
+`PYTHON_LIBC`, even when its tag claims an official Python image.
+See [Local base images](../README.md#local-base-images) for selection rules,
+verification, and limitations.
+
 #### Issue: "Dependencies not found in image"
 
 **Solution**: Ensure `--include-deps` and dependencies are installed:

@@ -15,6 +15,7 @@ import pytest
 
 import pycontainer.builder as builder_module
 import pycontainer.dependency_cache as dependency_cache
+import pycontainer.dependencies as dependencies
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import CacheIndexError, LayerCache
 from pycontainer.config import BuildConfig
@@ -27,13 +28,16 @@ from pycontainer.dependency_cache import (
 )
 
 from test_dependency_staging import BASE_CONFIG, _write_wheel
-from test_lockfiles import _write_uv_project, indexes  # noqa: F401 - pytest fixture
+from test_lockfiles import _named_wheel, _write_uv_project, indexes  # noqa: F401 - pytest fixture
 
 SECRET = "hunter2-secret"
 
 
 @pytest.fixture(autouse=True)
 def _no_ambient_pip(monkeypatch):
+    for name in [name for name in os.environ if name.upper().startswith("PIP_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
     monkeypatch.setattr(dependency_cache, "ambient_pip_settings", lambda: [])
 
 
@@ -147,6 +151,56 @@ def test_locked_build_hit_makes_no_index_requests(tmp_path, monkeypatch, indexes
     assert _image(second) == _image(first)
 
 
+def test_hash_pinned_target_markers_reuse_only_the_matching_architecture(
+    tmp_path, monkeypatch, capsys
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    wheelhouse = context / "wheelhouse"
+    root = _named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            'marker-amd==1.0; platform_machine == "x86_64"',
+            'marker-arm==1.0; platform_machine == "aarch64"',
+        ],
+    )
+    amd = _named_wheel(wheelhouse, "marker-amd")
+    arm = _named_wheel(wheelhouse, "marker-arm")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f"marker-root==1.0 --hash=sha256:{_sha(root)}\n"
+        f'marker-amd==1.0; platform_machine == "x86_64" --hash=sha256:{_sha(amd)}\n'
+        f'marker-arm==1.0; platform_machine == "aarch64" --hash=sha256:{_sha(arm)}\n'
+    )
+
+    x86 = _builder(tmp_path, monkeypatch, context, "x86", platform="linux/amd64")
+    x86.build()
+    aarch64 = _builder(tmp_path, monkeypatch, context, "arm", platform="linux/arm64")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], {**BASE_CONFIG, "architecture": arch}),
+    )
+    aarch64.build()
+
+    assert set(_image(x86)[3]) == {("marker-root", "1.0"), ("marker-amd", "1.0")}
+    assert set(_image(aarch64)[3]) == {("marker-root", "1.0"), ("marker-arm", "1.0")}
+    assert x86.layers[0].digest != aarch64.layers[0].digest
+    capsys.readouterr()
+
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "arm-hit", platform="linux/arm64")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], {**BASE_CONFIG, "architecture": arch}),
+    )
+    hit.build()
+
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert _image(hit) == _image(aarch64)
+
+
 KEY_DEFAULTS = dict(
     source_kind="requirements",
     os_name="linux",
@@ -155,6 +209,7 @@ KEY_DEFAULTS = dict(
     python_full_version="3.11.8",
     base_image="python:3.11-slim",
     base_config=BASE_CONFIG,
+    base_image_tag_verified=True,
     workdir="/app",
     reproducible=True,
 )
@@ -256,13 +311,113 @@ def _lock_key(url, text="fixture-dep==1.0 --hash=sha256:" + "a" * 64):
     ).layer
 
 
+@pytest.mark.parametrize("source_kind", ["requirements", "lock"])
+def test_cache_key_tracks_the_installer_target_marker_environment(
+    tmp_path, monkeypatch, source_kind
+):
+    context = _project(tmp_path)
+    key = (
+        (lambda: _key(context))
+        if source_kind == "requirements"
+        else (lambda: _lock_key("https://pypi.org/simple"))
+    )
+    before = key()
+    original = dependencies._target_marker_environment
+
+    def changed(*args, **kwargs):
+        return {**original(*args, **kwargs), "implementation_version": "3.11.99"}
+
+    monkeypatch.setattr(dependency_cache, "_target_marker_environment", changed)
+
+    assert key() != before
+
+
+def test_cache_does_not_reuse_the_pre_target_marker_backend(tmp_path, monkeypatch):
+    context = _project(tmp_path)
+    current_backend = dependency_cache.INSTALLER_BACKEND
+    monkeypatch.setattr(dependency_cache, "INSTALLER_BACKEND", "pip-target-v1")
+    legacy_key = _key(context)
+    cache = LayerCache(tmp_path / "cache")
+    cache.store_bytes(legacy_key, b"legacy dependency layer", ["requirements.txt"])
+
+    monkeypatch.setattr(dependency_cache, "INSTALLER_BACKEND", current_backend)
+
+    assert cache.get_entry(_key(context)) is None
+
+
+def test_lock_selection_is_recomputed_for_a_different_target(tmp_path, monkeypatch):
+    context = _write_uv_project(tmp_path / "context")
+    for path in (context / "pyproject.toml", context / "uv.lock"):
+        path.write_text(
+            path.read_text().replace("sys_platform == 'win32'", "platform_machine == 'aarch64'")
+        )
+    builder = _builder(tmp_path, monkeypatch, context, "out")
+
+    amd = builder._lock_selection(BASE_CONFIG, "linux", "amd64", base_image_tag_verified=True)
+    arm = builder._lock_selection(
+        {**BASE_CONFIG, "architecture": "arm64"},
+        "linux", "arm64", base_image_tag_verified=True,
+    )
+
+    assert {package.name for package in amd.packages} == {"fixture-dep"}
+    assert {package.name for package in arm.packages} == {"fixture-dep", "colorama"}
+
+
+def test_unknown_full_version_cannot_reuse_known_marker_environment(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project(tmp_path)
+    wheel = next((context / "wheelhouse").iterdir())
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f'fixture-dep==1.0; python_full_version >= "3.11.1" --hash=sha256:{_sha(wheel)}\n'
+    )
+    _builder(tmp_path, monkeypatch, context, "known").build()
+    existing = _dependency_keys(tmp_path / "cache")
+    capsys.readouterr()
+
+    unknown = _builder(tmp_path, monkeypatch, context, "unknown")
+    unknown_config = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11"]},
+    }
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], unknown_config),
+    )
+    with pytest.raises(ValueError, match="python_full_version"):
+        unknown.build()
+
+    assert "Dependency layer cache hit" not in capsys.readouterr().out
+    assert _dependency_keys(tmp_path / "cache") == existing
+
+
+def test_unverified_base_cannot_reuse_a_trusted_dependency_layer(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project(tmp_path)
+    _builder(tmp_path, monkeypatch, context, "trusted").build()
+    capsys.readouterr()
+    _forbid_install(monkeypatch)
+
+    unverified = _builder(
+        tmp_path, monkeypatch, context, "unverified",
+        base_image="python:3.11-slim@sha256:" + "a" * 64,
+    )
+    with pytest.raises(ValueError, match="Python ABI"):
+        unverified.build()
+
+    assert "Dependency layer cache hit" not in capsys.readouterr().out
+
+
 def test_index_credentials_are_dropped_but_never_alias_query_routing():
     plain = _lock_key("https://pkgs.example.invalid/simple")
 
-    assert _lock_key("https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple/") == plain
+    assert _lock_key("https://${INDEX_USER}:${INDEX_TOKEN}@pkgs.example.invalid/simple") == plain
     assert _lock_key(f"https://user:{SECRET}@pkgs.example.invalid/simple") == plain
     assert _lock_key("https://pkgs.example.invalid/other/simple") != plain
     for url in (
+        "https://pkgs.example.invalid/simple?",
         "https://pkgs.example.invalid/simple?feed=tenant-a",
         "https://pkgs.example.invalid/simple?feed=tenant-b",
         "https://pkgs.example.invalid/simple?token=${INDEX_TOKEN}",
@@ -276,6 +431,39 @@ def test_index_credentials_are_dropped_but_never_alias_query_routing():
         _lock_key("https://pkgs.example.invalid/simple", "fixture-dep==1.0")
 
 
+def test_find_links_url_path_trailing_slashes_do_not_alias(tmp_path):
+    context = _project(tmp_path)
+    requirements = context / "requirements.txt"
+    content = requirements.read_text().replace(
+        "./wheelhouse", "https://pkgs.example.invalid/wheels"
+    )
+    requirements.write_text(content)
+    without_slash = _key(context)
+    requirements.write_text(content.replace("/wheels", "/wheels/"))
+
+    assert _key(context) != without_slash
+
+
+def test_utf16_file_used_as_requirement_and_constraint_is_checked_in_both_roles(tmp_path):
+    context = _project(tmp_path)
+    (context / "requirements.txt").write_text(
+        "-r shared.txt\n-c shared.txt\n", encoding="utf-16"
+    )
+    shared = context / "shared.txt"
+    shared.write_text("fixture-dep==1.0\n", encoding="utf-16")
+    with pytest.raises(DependencyCacheMiss, match="not fully pinned"):
+        _key(context)
+
+    shared.write_text(
+        "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-16"
+    )
+    original = _key(context)
+    shared.write_text(
+        "fixture-dep==1.0 --hash=sha256:" + "b" * 64 + "\n", encoding="utf-16"
+    )
+    assert _key(context) != original
+
+
 @pytest.mark.parametrize(
     "requirements, reason",
     [
@@ -285,6 +473,11 @@ def test_index_credentials_are_dropped_but_never_alias_query_routing():
         ("--no-deps\nfixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n", "--no-deps"),
         (
             "--index-url https://pkgs.example.invalid/simple?feed=a\n"
+            "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
+            "query string",
+        ),
+        (
+            "--find-links https://pkgs.example.invalid/wheels?feed=a\n"
             "fixture-dep==1.0 --hash=sha256:" + "a" * 64 + "\n",
             "query string",
         ),
@@ -556,7 +749,7 @@ def test_parse_pip_config_keys_sanitized_settings_and_rejects_unprovable_ones():
         "freeze.all='true'\n"
     )
     assert rows == [
-        [":env:", "index-url", "https://pkgs.example.invalid/simple"],
+        [":env:", "index-url", "https://pkgs.example.invalid/simple/"],
         ["install", "only-binary", ":all:"],
     ]
     for line, reason in [

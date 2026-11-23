@@ -16,6 +16,8 @@ daemon without discussing the trade-off first.
 - `dependency_cache.py`: dependency-layer cache key, eligibility and inventory.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -33,21 +35,29 @@ currently has no `__main__.py`.
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings.
+content, normalized relative paths, workdir, and reproducibility settings, plus
+the context-relative hardlink targets `tarfile` emits (never inode numbers or
+absolute paths); key version 3 invalidated earlier keys that lacked them.
 Index updates are locked and atomically replaced; cache blobs are verified
-before reuse. A malformed index raises an explicit `CacheIndexError`; missing
-or corrupt blobs are discarded and rebuilt.
+before reuse. A malformed index raises an explicit `CacheIndexError` with a
+remediation message; missing or corrupt blobs are discarded and rebuilt. A
+saved `--cache-dir` can be restored to another absolute path and checkout on
+the same OS (`tests/test_cache_portability.py`); source modes are part of the
+key, so Windows and Linux caches are not interchangeable. The non-gating
+`cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
+cross-OS restore outcomes.
 
 A staged dependency layer is reused only for a provably hash-pinned closure
 (lock selection, or fully `==`/`--hash` requirements including nested inputs);
 everything unprovable is an explicit `DependencyCacheMiss` with a secret-free
 reason. Keys hold target tags, Python, workdir, pip version, sanitized index
 identity (no userinfo, placeholders or query values; query-bearing URLs miss),
-allowlisted ambient pip settings and host markers for plain requirements, and
-`INSTALLER_BACKEND`. A backend change that alters marker evaluation (e.g. #178's
-target-marker bootstrap) must bump `INSTALLER_BACKEND` and key its marker
+the installer's exact target marker environment, allowlisted ambient pip
+settings for plain requirements, and `INSTALLER_BACKEND`. A backend change that
+alters marker evaluation must bump `INSTALLER_BACKEND` and key its marker
 environment. The inventory entry is stored after the layer and must name its
-digest; a hit runs no pip and makes no network requests.
+digest; a hit runs no pip install and makes no network requests. Plain
+requirements still read the local pip configuration before lookup.
 
 ## Setup and verified checks
 
@@ -96,18 +106,43 @@ a pass/fail gate. A passing layout assertion is not evidence that an image
 starts in a container runtime. Do not silently remove, mock away, or claim
 success for unrun integration tests.
 
-An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
-and a running Docker daemon:
-`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+A real OCI import/startup check runs on Linux/WSL with Skopeo and a running
+Docker daemon:
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json`.
 It pulls the selected base image, imports the generated layout into Docker, and
-starts a container. To test only dependency importability in the real target
-base image, without Skopeo, add `--dependency-layer-only`. These checks are not
-part of the default test suite or CI.
+starts a container. `--platform` must match the daemon; emulated runs fail
+rather than count as evidence. `--evidence` writes a passed or failed JSON
+record. To test only dependency importability in the real target base image,
+without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+It is not part of default pytest.
+
+`.github/workflows/runtime-check.yml` runs the full check natively on
+`linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
+same-repository PRs, pushes to main and release tags.
+`scripts/verify_runtime_evidence.py` then requires exactly one passing full
+record per target for the current commit, workflow run and attempt; missing,
+skipped, failed, emulated, partial, stale or duplicate evidence fails the gate
+and is listed separately as not validated. Re-run all jobs, not just failed
+jobs, to produce fresh evidence for every target. The release job depends on
+this gate, re-verifies evidence for its own attempt and appends the summary to
+the release notes. Only targets listed as validated have runtime evidence.
+
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
+
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
-and 3.15. The benchmark includes synthetic loopback registry transfers at
+and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
 multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
 does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
@@ -146,7 +181,6 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- CLI defaults can overwrite TOML settings.
 - PyPI installation of this project returned HTTP 404 during the 2026-11-19
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
@@ -159,8 +193,41 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
-source distributions and cross-compilation are not supported.
+`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
+registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
+glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
+Local image names/annotations are not provenance either. The shared
+`target_wheel_platform` helper defaults to requiring explicit metadata;
+`base_image_tag_verified=True` permits tag inference only for tag-only registry
+pulls. Local sources must leave it false. Unsupported metadata and metadata
+conflicting with a verified tag-only pull fail before pip runs.
+`target_python_version` uses the same default-false keyword; digest and
+unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
+`PYTHON_VERSION`. Both helpers validate before lockfile, requirements or venv
+staging. Staged packages are importable under `<workdir>/.python`; source
+distributions and cross-compilation are not supported.
+
+`dependencies.install_requirements` runs pip through `_pip_target.py`, which
+forces every `pip._vendor.packaging` marker evaluation (requirement-file roots,
+extras, transitive `Requires-Dist`) onto the target environment and fails
+closed on `platform_release`, `platform_version`, unknown variables, or
+`python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
+pip's vendored `packaging`; a self-test refuses to install if that changes.
+Virtualenv staging cannot re-resolve, so `venv_markers.py` verifies the copied
+closure instead: roots (requirements file, pyproject dependencies, optional
+dependencies, dependency groups) and installed `Requires-Dist`/egg-info
+`requires.txt` are re-evaluated for each target, failing on missing,
+unknown-marker, or possibly-requested extra/group requirements. An extra is
+ruled out only if every Windows/Linux/macOS CPython host of the venv minor
+(narrowed to posix by a `lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`,
+or to Windows by a `Lib` site-packages layout) would have installed one of its
+missing requirements; `python_version` is
+shared only when the venv minor is established (`python3.X` path or
+`pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
+root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic
+dependency files, Poetry/PDM/Hatch/setuptools/Flit tables) fail closed when they
+mention host markers, and unreadable dynamic dependencies always fail closed.
 
 Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
@@ -169,6 +236,11 @@ markers for the target (never the host) and installs the selection through
 index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
 ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
+Poetry checks locked and legacy Python ranges and recorded applicable root,
+transitive and extra dependencies; Poetry and uv cannot reconstruct dependency
+metadata omitted from a lock. uv limited environments must match the recorded
+supported markers and include the target; unverifiable marker normalization
+and unknown target values fail closed.
 Plain requirements keep ambient pip configuration.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`. Non-registry sources fail; never add an
@@ -182,3 +254,22 @@ Roadmap: `spboyer/pycontainer-build#66`. Reuse existing issues before opening
 another; do not close duplicate candidates without preserving their scope.
 Keep fixes separate from the documentation audit. Commit on a feature branch
 using conventional commit messages; never put credentials in code or issues.
+
+
+<!-- github-knowledge-base-start -->
+## Knowledge Base
+
+### Purpose
+
+This repository uses the Knowledge Base at [https://github.com/spboyer/pycontainer-build](https://github.com/spboyer/pycontainer-build) on branch `main`.
+
+### Required behavior
+
+1. Before changing code, read `docs/index.md` from that branch.
+2. Use the index to open only the knowledge files relevant to the task.
+3. If the index is unavailable, stop and report that the Knowledge Base could not be loaded.
+
+### Source of truth
+
+Generated knowledge tracks the code. When the knowledge and code disagree, trust the code.
+<!-- github-knowledge-base-end -->

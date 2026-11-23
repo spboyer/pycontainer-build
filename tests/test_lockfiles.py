@@ -2,8 +2,10 @@ import hashlib
 import http.server
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
 import tarfile
 import threading
 import tomllib
@@ -15,6 +17,7 @@ import pytest
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import (
+    _PIP_TARGET_SCRIPT,
     _merge_site_packages,
     install_locked_requirements,
     validate_requirements,
@@ -27,6 +30,7 @@ from pycontainer.lockfiles import (
     detect_lockfile,
     load_lockfile,
     pdm_content_hash,
+    pipfile_hash,
     poetry_content_hash,
     preflight_lockfile,
     target_environment,
@@ -104,11 +108,191 @@ def test_poetry_package_optional_flag_does_not_override_main_marker(tmp_path, ro
     before, socksio = text.split('name = "socksio"', 1)
     socksio = socksio.replace("optional = false", "optional = true", 1)
     if root_extra:
+        manifest = context / "pyproject.toml"
+        project = manifest.read_text(encoding="utf-8").replace("httpx[socks]>=0.27", "httpx>=0.27")
+        manifest.write_text(project, encoding="utf-8")
+        metadata = tomllib.loads(text)["metadata"]
         socksio = socksio.replace('groups = ["main"]', 'groups = ["main"]\nmarkers = "extra == \'proxy\'"', 1)
+        socksio = socksio.replace(metadata["content-hash"], poetry_content_hash(tomllib.loads(project)), 1)
     lock.write_text(before + 'name = "socksio"' + socksio, encoding="utf-8")
 
     selection = load_lockfile(context, Path("poetry.lock"), PY311)
     assert ("socksio" in _selected(selection)) is not root_extra
+
+
+@pytest.mark.parametrize(
+    ("constraint", "version", "accepted"),
+    [
+        (">=3.11,<3.14", "3.14.4", False),
+        ("^3.11", "3.12.4", True),
+        ("^3.11", "3.10.9", False),
+        ("~3.11", "3.12.4", False),
+        ("*", "3.12.4", True),
+    ],
+)
+def test_poetry_legacy_python_range_is_enforced(tmp_path, constraint, version, accepted):
+    context = _copy(tmp_path, "poetry")
+    manifest = context / "pyproject.toml"
+    text = manifest.read_text(encoding="utf-8").replace('requires-python = ">=3.10"\n', "")
+    text += f'\n[tool.poetry.dependencies]\npython = "{constraint}"\n'
+    manifest.write_text(text, encoding="utf-8")
+    lock = context / "poetry.lock"
+    content = lock.read_text(encoding="utf-8")
+    metadata = tomllib.loads(content)["metadata"]
+    before, after = content.split("[metadata]", 1)
+    after = after.replace(
+        f'python-versions = "{metadata["python-versions"]}"',
+        f'python-versions = "{constraint}"',
+        1,
+    ).replace(metadata["content-hash"], poetry_content_hash(tomllib.loads(text)), 1)
+    lock.write_text(before + "[metadata]" + after, encoding="utf-8")
+    environment = target_environment("linux", "amd64", version.rsplit(".", 1)[0], version)
+
+    if accepted:
+        assert load_lockfile(context, Path("poetry.lock"), environment).packages
+    else:
+        with pytest.raises(LockfileError, match="requires Python"):
+            load_lockfile(context, Path("poetry.lock"), environment)
+
+
+def test_poetry_rejects_unverifiable_python_constraint(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    lock = context / "poetry.lock"
+    content = lock.read_text(encoding="utf-8")
+    before, after = content.split("[metadata]", 1)
+    metadata = tomllib.loads("[metadata]" + after)["metadata"]
+    after = after.replace(
+        f'python-versions = "{metadata["python-versions"]}"',
+        'python-versions = "^3.11 || ^4.0"',
+        1,
+    )
+    lock.write_text(before + "[metadata]" + after, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Unsupported Poetry Python constraint"):
+        load_lockfile(context, Path("poetry.lock"), PY312)
+
+
+def _drop_poetry_package(lock, missing):
+    parts = lock.read_text(encoding="utf-8").split("[[package]]\n")
+    lock.write_text(
+        parts[0] + "".join("[[package]]\n" + part for part in parts[1:] if not part.startswith(f'name = "{missing}"\n')),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("missing", ["click", "httpcore", "socksio"])
+def test_poetry_rejects_missing_locked_dependencies(tmp_path, missing):
+    context = _copy(tmp_path, "poetry")
+    _drop_poetry_package(context / "poetry.lock", missing)
+
+    with pytest.raises(LockfileError, match=missing):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+@pytest.mark.parametrize("missing", ["exceptiongroup", "pluggy"])
+def test_poetry_does_not_require_inactive_dependencies(tmp_path, missing):
+    context = _copy(tmp_path, "poetry")
+    _drop_poetry_package(context / "poetry.lock", missing)
+
+    assert missing not in _selected(load_lockfile(context, Path("poetry.lock"), PY311))
+
+
+def test_poetry_requires_target_conditional_transitive_dependency(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    _drop_poetry_package(context / "poetry.lock", "exceptiongroup")
+    python310 = target_environment("linux", "amd64", "3.10", "3.10.9")
+
+    with pytest.raises(LockfileError, match="exceptiongroup"):
+        load_lockfile(context, Path("poetry.lock"), python310)
+
+
+def test_poetry_rejects_wrong_transitive_version(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    lock = context / "poetry.lock"
+    text = lock.read_text(encoding="utf-8").replace(
+        'name = "httpcore"\nversion = "1.0.9"',
+        'name = "httpcore"\nversion = "2.0.0"',
+        1,
+    )
+    lock.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="httpcore"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+@pytest.mark.parametrize("constraint", ["1.0.9", "1.0.*"])
+def test_poetry_accepts_exact_or_wildcard_dependency_constraints(tmp_path, constraint):
+    context = _copy(tmp_path, "poetry")
+    lock = context / "poetry.lock"
+    text = lock.read_text(encoding="utf-8").replace(
+        'httpcore = "==1.*"', f'httpcore = "{constraint}"', 1
+    )
+    lock.write_text(text, encoding="utf-8")
+
+    assert _selected(load_lockfile(context, Path("poetry.lock"), PY311))["httpcore"] == "1.0.9"
+
+
+def test_poetry_rejects_package_with_incompatible_python_range(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    lock = context / "poetry.lock"
+    before, after = lock.read_text(encoding="utf-8").split('name = "click"', 1)
+    after = after.replace('python-versions = ">=3.10"', 'python-versions = ">=3.12"', 1)
+    lock.write_text(before + 'name = "click"' + after, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="click.*requires Python"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+def test_poetry_checks_transitively_requested_extras(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    manifest = context / "pyproject.toml"
+    project = manifest.read_text(encoding="utf-8").replace("httpx[socks]>=0.27", "httpx>=0.27")
+    manifest.write_text(project, encoding="utf-8")
+    lock = context / "poetry.lock"
+    text = lock.read_text(encoding="utf-8").replace(
+        'httpcore = "==1.*"', 'httpcore = {version = "==1.*", extras = ["socks"]}', 1
+    )
+    before, after = text.split("[metadata]", 1)
+    metadata = tomllib.loads("[metadata]" + after)["metadata"]
+    after = after.replace(metadata["content-hash"], poetry_content_hash(tomllib.loads(project)), 1)
+    lock.write_text(before + "[metadata]" + after, encoding="utf-8")
+    _drop_poetry_package(lock, "socksio")
+
+    with pytest.raises(LockfileError, match="socksio"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
+def test_poetry_does_not_require_unrequested_dependency_extra(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    manifest = context / "pyproject.toml"
+    project = manifest.read_text(encoding="utf-8").replace("httpx[socks]>=0.27", "httpx>=0.27")
+    manifest.write_text(project, encoding="utf-8")
+    lock = context / "poetry.lock"
+    before, after = lock.read_text(encoding="utf-8").split("[metadata]", 1)
+    metadata = tomllib.loads("[metadata]" + after)["metadata"]
+    after = after.replace(metadata["content-hash"], poetry_content_hash(tomllib.loads(project)), 1)
+    lock.write_text(before + "[metadata]" + after, encoding="utf-8")
+    _drop_poetry_package(lock, "socksio")
+
+    assert "socksio" not in _selected(load_lockfile(context, Path("poetry.lock"), PY311))
+
+
+def test_poetry_checks_legacy_manifest_root_dependencies(tmp_path):
+    context = _copy(tmp_path, "poetry")
+    project = (
+        '[tool.poetry]\nname = "lockdemo"\nversion = "0.1.0"\n'
+        '[tool.poetry.dependencies]\npython = ">=3.10"\nclick = ">=8.1"\n'
+    )
+    (context / "pyproject.toml").write_text(project, encoding="utf-8")
+    lock = context / "poetry.lock"
+    before, after = lock.read_text(encoding="utf-8").split("[metadata]", 1)
+    metadata = tomllib.loads("[metadata]" + after)["metadata"]
+    after = after.replace(metadata["content-hash"], poetry_content_hash(tomllib.loads(project)), 1)
+    lock.write_text(before + "[metadata]" + after, encoding="utf-8")
+    _drop_poetry_package(lock, "click")
+
+    with pytest.raises(LockfileError, match="click"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
 
 
 def test_pipenv_lock_rejects_target_python_mismatch(tmp_path):
@@ -139,6 +323,117 @@ def test_uv_freshness_compares_markers_semantically(tmp_path):
 
     with pytest.raises(LockfileError, match="out of date"):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_freshness_accepts_equivalent_python_specifier_order(tmp_path):
+    context = _copy(tmp_path, "uv")
+    manifest = context / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace(
+        'requires-python = ">=3.10"', 'requires-python = "<4,>=3.10"'
+    ))
+    lock = context / "uv.lock"
+    lock.write_text(lock.read_text().replace(
+        'requires-python = ">=3.10"', 'requires-python = ">=3.10,<4"', 1
+    ))
+
+    assert _selected(load_lockfile(context, Path("uv.lock"), PY311)) == EXPECTED_311
+
+
+def _set_uv_environments(context, project_markers, lock_markers):
+    manifest = context / "pyproject.toml"
+    manifest.write_text(manifest.read_text() + f"\n[tool.uv]\nenvironments = {json.dumps(project_markers)}\n")
+    lock = context / "uv.lock"
+    lock.write_text(lock.read_text().replace(
+        'requires-python = ">=3.10"\n',
+        'requires-python = ">=3.10"\n' + f"supported-markers = {json.dumps(lock_markers)}\n",
+        1,
+    ))
+
+
+def test_uv_rejects_target_outside_locked_environments(tmp_path):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(context, ["sys_platform == 'win32'"], ["sys_platform == 'win32'"])
+
+    with pytest.raises(LockfileError, match="does not support the target"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_accepts_matching_locked_environment(tmp_path):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(context, ["sys_platform == 'linux'"], ["sys_platform == 'linux'"])
+
+    assert _selected(load_lockfile(context, Path("uv.lock"), PY311)) == EXPECTED_311
+
+
+def test_uv_rejects_changed_locked_environments(tmp_path):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(context, ["sys_platform == 'linux'"], ["sys_platform == 'win32'"])
+
+    with pytest.raises(LockfileError, match="Cannot verify.*environments"):
+        preflight_lockfile(context, Path("uv.lock"))
+    with pytest.raises(LockfileError, match="Cannot verify.*environments"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_environment_normalization_does_not_change_marker_literals(tmp_path):
+    context = _copy(tmp_path, "uv")
+    project_marker = "sys_platform == 'linux' or platform_system == 'python_version >= \"3.13\"'"
+    lock_marker = "sys_platform == 'linux' or platform_system == 'python_full_version >= \"3.13\"'"
+    _set_uv_environments(context, [project_marker], [lock_marker])
+
+    with pytest.raises(LockfileError, match="Cannot verify.*environments"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        ["platform_release >= '6'"],
+        ["sys_platform == 'linux'", "platform_release >= '6'"],
+    ],
+)
+def test_uv_rejects_unknown_locked_environment_marker(tmp_path, markers):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(context, markers, markers)
+
+    with pytest.raises(LockfileError, match="platform_release is unknown"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_uv_accepts_normalized_python_environment_marker(tmp_path):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(context, ["python_version >= '3.13'"], ["python_full_version >= '3.13'"])
+    supported = target_environment("linux", "amd64", "3.13", "3.13.4")
+
+    assert _selected(load_lockfile(context, Path("uv.lock"), supported))["iniconfig"] == "2.1.0"
+    with pytest.raises(LockfileError, match="does not support the target"):
+        load_lockfile(context, Path("uv.lock"), PY312)
+
+
+def test_uv_accepts_normalized_compound_python_environment_marker(tmp_path):
+    context = _copy(tmp_path, "uv")
+    _set_uv_environments(
+        context,
+        ["python_version >= '3.13' and sys_platform == 'linux'"],
+        ["python_full_version >= '3.13' and sys_platform == 'linux'"],
+    )
+    supported = target_environment("linux", "amd64", "3.13", "3.13.4")
+
+    assert _selected(load_lockfile(context, Path("uv.lock"), supported))["iniconfig"] == "2.1.0"
+    with pytest.raises(LockfileError, match="does not support the target"):
+        load_lockfile(context, Path("uv.lock"), PY312)
+
+
+@pytest.mark.parametrize(
+    ("minor", "full"),
+    [("3.13", "3.13.0rc1"), ("3.12", "3.13.4")],
+)
+def test_lock_requires_consistent_final_target_version(tmp_path, minor, full):
+    context = _copy(tmp_path, "uv")
+    environment = target_environment("linux", "amd64", minor, full)
+
+    with pytest.raises(LockfileError, match="consistent, final full target Python version"):
+        load_lockfile(context, Path("uv.lock"), environment)
 
 
 @pytest.mark.parametrize("manifest_index", ["https://new.example.invalid/simple", None])
@@ -254,6 +549,14 @@ def test_poetry_records_each_packages_source(tmp_path):
     assert [url for url, _ in selection.requirement_sets()] == ["https://pypi.org/simple", PRIVATE]
 
 
+def test_poetry_checks_dependency_closure_with_multiple_sources(tmp_path):
+    context = _poetry_with_source(tmp_path, "supplemental")
+    _drop_poetry_package(context / "poetry.lock", "httpcore")
+
+    with pytest.raises(LockfileError, match="httpcore"):
+        load_lockfile(context, Path("poetry.lock"), PY311)
+
+
 def test_poetry_source_missing_from_manifest_is_stale(tmp_path):
     context = _poetry_with_source(tmp_path, "supplemental", declared=False)
 
@@ -363,6 +666,39 @@ def test_package_selected_from_two_indexes_fails():
         _finalize(packages, "uv.lock")
 
 
+def test_pipenv_uses_implicit_default_source_for_unindexed_packages(tmp_path):
+    context = _copy(tmp_path, "pipenv")
+    manifest = context / "Pipfile"
+    text = manifest.read_text(encoding="utf-8")
+    text = text.replace("https://pypi.org/simple", "https://mirror.example.invalid/simple")
+    text = text.replace('click = ">=8.1"\n', "").replace('iniconfig = "==2.0.0"\n', "")
+    manifest.write_text(text, encoding="utf-8")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["default"].pop("click")
+    lock["default"].pop("iniconfig")
+    lock["_meta"]["sources"][0]["url"] = "https://mirror.example.invalid/simple"
+    lock["_meta"]["hash"]["sha256"] = pipfile_hash(tomllib.loads(text))
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+    assert selection.index_urls == ("https://mirror.example.invalid/simple",)
+
+
+def test_pipenv_rejects_missing_default_source(tmp_path):
+    context = _copy(tmp_path, "pipenv")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["_meta"]["sources"] = []
+    for entry in lock["default"].values():
+        entry.pop("index", None)
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="no default source"):
+        load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+
 def _write_uv_project(
     context, wheel=None, *, registry="https://pypi.org/simple", digest=None, declare_index=True
 ):
@@ -448,6 +784,90 @@ def test_uv_lock_missing_root_dependency_edge_fails(tmp_path):
 
     with pytest.raises(LockfileError, match="does not lock click"):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+@pytest.mark.parametrize(
+    ("marker", "message"),
+    [
+        ("python_full_version >= '3.12'", "does not identify one locked package"),
+        ("platform_release >= '6'", "platform_release is unknown"),
+    ],
+)
+def test_uv_rejects_invalid_single_candidate_resolution_marker(tmp_path, marker, message):
+    context = _copy(tmp_path, "uv")
+    lock = context / "uv.lock"
+    before, after = lock.read_text(encoding="utf-8").split('name = "iniconfig"\nversion = "2.0.0"', 1)
+    after = after.replace("python_full_version < '3.12'", marker, 1)
+    lock.write_text(before + 'name = "iniconfig"\nversion = "2.0.0"' + after, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match=message):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_marker_literal_matching_an_unknown_variable_is_not_treated_as_variable(tmp_path):
+    context = _write_uv_project(tmp_path / "ctx")
+    for path in (context / "pyproject.toml", context / "uv.lock"):
+        path.write_text(path.read_text().replace(
+            "sys_platform == 'win32'", "platform_system == 'platform_release'"
+        ))
+
+    selection = load_lockfile(context, Path("uv.lock"), PY311)
+
+    assert "fixture-dep" in _selected(selection)
+    assert "colorama" not in _selected(selection)
+
+
+@pytest.mark.parametrize("has_extra_dependencies", [False, True])
+def test_uv_root_extra_without_dependency_edge(tmp_path, has_extra_dependencies):
+    context = _write_uv_project(tmp_path / "ctx")
+    manifest = context / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace("fixture-dep==1.0", "fixture-dep[empty]==1.0"))
+    lock = context / "uv.lock"
+    text = lock.read_text().replace(
+        '{ name = "fixture-dep", specifier = "==1.0" }',
+        '{ name = "fixture-dep", extras = ["empty"], specifier = "==1.0" }',
+    )
+    if has_extra_dependencies:
+        text += '\n[package.optional-dependencies]\nempty = [{ name = "missing-dependency" }]\n'
+    lock.write_text(text)
+
+    if has_extra_dependencies:
+        with pytest.raises(LockfileError, match="does not lock fixture-dep"):
+            load_lockfile(context, Path("uv.lock"), PY311)
+    else:
+        assert "fixture-dep" in _selected(load_lockfile(context, Path("uv.lock"), PY311))
+
+
+@pytest.mark.parametrize("parent", ["root", "transitive"])
+def test_uv_explicit_empty_extra_without_optional_dependencies(tmp_path, parent):
+    context = _write_uv_project(tmp_path / "ctx")
+    lock = context / "uv.lock"
+    text = lock.read_text()
+    if parent == "root":
+        manifest = context / "pyproject.toml"
+        manifest.write_text(manifest.read_text().replace("fixture-dep==1.0", "fixture-dep[empty]==1.0"))
+        text = text.replace(
+            '{ name = "fixture-dep" },', '{ name = "fixture-dep", extra = ["empty"] },', 1
+        ).replace(
+            '{ name = "fixture-dep", specifier = "==1.0" }',
+            '{ name = "fixture-dep", extras = ["empty"], specifier = "==1.0" }',
+        )
+    else:
+        text += f"""
+dependencies = [{{ name = "empty-child", extra = ["empty"] }}]
+
+[[package]]
+name = "empty-child"
+version = "1.0"
+source = {{ registry = "https://pypi.org/simple" }}
+wheels = [{{ url = "https://example.invalid/empty_child-1.0-py3-none-any.whl", hash = "sha256:{'2' * 64}" }}]
+"""
+    lock.write_text(text)
+
+    selected = _selected(load_lockfile(context, Path("uv.lock"), PY311))
+    assert "fixture-dep" in selected
+    if parent == "transitive":
+        assert "empty-child" in selected
 
 
 def test_uv_lock_without_wheels_fails(tmp_path):
@@ -561,6 +981,81 @@ def _layer_names(layer):
         return archive.getnames()
 
 
+@pytest.mark.parametrize(
+    ("base_image", "environment", "wheel_tag"),
+    [
+        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
+            "cp311-cp311-musllinux_1_2_x86_64",
+        ),
+    ],
+)
+def test_locked_build_uses_verified_base_abi_and_libc(
+    tmp_path, monkeypatch, indexes, base_image, environment, wheel_tag
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(context / "wheelhouse", tag=wheel_tag)
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=recorded.url)
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+
+    builder.build()
+
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+    assert not rogue.requests
+
+
+@pytest.mark.parametrize(
+    ("base_image", "environment", "message"),
+    [
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython"],
+            "unverified",
+        ),
+        ("python@sha256:" + "a" * 64, ["PYTHON_LIBC=musl-1.2"], "Python ABI"),
+        ("python:3.11-slim", ["PYTHON_LIBC=musl-1.2"], "conflicts"),
+    ],
+)
+def test_locked_build_rejects_unverified_base_before_pip(
+    tmp_path, monkeypatch, base_image, environment, message
+):
+    context = _write_uv_project(tmp_path / "context")
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran before validating the base image"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        builder.build()
+
+
 def test_locked_build_installs_only_from_recorded_index_reproducibly(tmp_path, monkeypatch, indexes):
     context = tmp_path / "context"
     wheel = _write_wheel(context / "wheelhouse")
@@ -632,7 +1127,8 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     site_packages.parent.mkdir()
 
     install_locked_requirements(
-        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None
+        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None,
+        base_image_tag_verified=True,
     )
 
     assert {path.name for path in site_packages.iterdir()} >= {"fixture_dep", "other_dep"}
@@ -640,6 +1136,70 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     assert not [path for path in index_b.requests if "fixture" in path]
     assert any("fixture" in path for path in index_a.requests)
     assert any("other" in path for path in index_b.requests)
+
+
+def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, monkeypatch, indexes):
+    wheelhouse = tmp_path / "wheels"
+    first = _named_wheel(wheelhouse, "marker-first")
+    second = _named_wheel(wheelhouse, "marker-second")
+    index_a, index_b, rogue = (indexes(first, second) for _ in range(3))
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
+    digest = lambda wheel: (f"sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}",)
+    selection = LockSelection(
+        "uv",
+        Path("uv.lock"),
+        (
+            LockedPackage("marker-first", "1.0", digest(first), index_a.url),
+            LockedPackage("marker-second", "1.0", digest(second), index_b.url),
+        ),
+    )
+    requirements = []
+    # Lock selection normally removes markers; exercise each pip invocation directly.
+    for index, text in selection.requirement_sets():
+        for name in ("marker-first", "marker-second"):
+            text = text.replace(
+                f"{name}==1.0 ",
+                f"{name}==1.0; python_version == '3.9' and "
+                "platform_machine == 'aarch64' and sys_platform == 'linux' ",
+            )
+        requirements.append((index, text))
+    site_packages = tmp_path / "stage" / "site-packages"
+    site_packages.parent.mkdir()
+    commands = []
+    environments = []
+    popen = subprocess.Popen
+
+    def record_pip(command, *args, **kwargs):
+        commands.append(command)
+        environments.append(kwargs["env"])
+        return popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", record_pip)
+
+    install_locked_requirements(
+        requirements, site_packages, tmp_path, "linux", "arm64", "3.9",
+        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18"]}},
+        base_image_tag_verified=True,
+    )
+
+    bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
+    assert len(commands) == 2
+    assert all(command[1:3] == ["-c", bootstrap] for command in commands)
+    assert all(
+        {"--isolated", "--no-deps", "--require-hashes"} <= set(command)
+        for command in commands
+    )
+    assert all(
+        {key.upper(): value for key, value in env.items() if key.upper().startswith("PIP_")}
+        == {"PIP_CONFIG_FILE": os.devnull}
+        for env in environments
+    )
+    assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
+    assert any("marker-first" in path for path in index_a.requests)
+    assert any("marker-second" in path for path in index_b.requests)
+    assert not [path for path in index_a.requests if "marker-second" in path]
+    assert not [path for path in index_b.requests if "marker-first" in path]
+    assert not rogue.requests
 
 
 @pytest.mark.parametrize(
@@ -876,6 +1436,8 @@ def test_cli_and_toml_select_lockfile_options(tmp_path, monkeypatch):
         (["requests[socks]==2.32.3 ; python_version < '3.12' \\", "    --hash sha256:" + "a" * 64], True),
         (["requests==2.32.3"], False),
         (["requests>=2,<3 --hash=sha256:" + "a" * 64], False),
+        (["-e."], False),
+        (["-e ."], False),
         (["-r base.txt", "idna==3.7 --hash=sha256:" + "b" * 64], False),
         (["-c constraints.txt", "idna==3.7 --hash=sha256:" + "b" * 64], True),
     ],
@@ -887,6 +1449,23 @@ def test_requirements_hash_pinning_detection(tmp_path, lines, pinned):
     requirements.write_text("\n".join(lines) + "\n")
 
     assert validate_requirements(requirements, tmp_path) is pinned
+
+
+@pytest.mark.parametrize(
+    "includes",
+    ["-r shared.txt\n-c shared.txt\n", "-c shared.txt\n-r shared.txt\n"],
+)
+def test_requirements_also_used_as_constraints_still_need_hashes(tmp_path, monkeypatch, includes):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(includes)
+    shared = tmp_path / "shared.txt"
+    shared.write_text("fixture-dep==1.0\n")
+    monkeypatch.setattr(
+        "pycontainer.dependencies.MAX_REQUIREMENTS_BYTES",
+        requirements.stat().st_size + shared.stat().st_size,
+    )
+
+    assert not validate_requirements(requirements, tmp_path)
 
 
 def test_unhashed_requirements_warn_that_layer_is_not_reproducible(tmp_path, monkeypatch, caplog):

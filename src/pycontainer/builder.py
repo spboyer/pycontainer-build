@@ -186,7 +186,13 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
-from .cache import LayerCache
+from .local_image import (
+    check_local_image_bounds,
+    open_local_image_source,
+    parse_local_image_reference,
+    verify_layer_diff_ids,
+)
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .dependency_cache import (
     MAX_INVENTORY_BYTES,
     DependencyCacheMiss,
@@ -204,6 +210,7 @@ from .dependency_groups import (
     plan_groups,
 )
 from .sbom import generate_sbom
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_locked_requirements,
@@ -212,6 +219,7 @@ from .dependencies import (
     stage_virtualenv,
     target_python_full_version,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 from .lockfiles import LockSelection, detect_lockfile, load_lockfile, preflight_lockfile, target_environment
@@ -294,12 +302,21 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         locked_names = ()
         if self.config.include_deps and self._uses_lockfile():
             locked_names = tuple(
                 package.name
-                for package in self._lock_selection(base_config, os_name, arch).packages
+                for package in self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                    ),
+                ).packages
             )
         report_system_packages(self.config, base_layers, locked_names)
         variant = (
@@ -405,30 +422,58 @@ class ImageBuilder:
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
-        """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
+        """Pull or load the base image, return (base_layers, base_config)."""
+        self._base_image_name=self.config.base_image
+        requested_variant = parse_platform_variant(self.config.platform)
+        local=parse_local_image_reference(self.config.base_image)
+        if local is None:
+            registry, repo, reference=parse_image_reference(self.config.base_image)
+            auth=get_registry_auth(registry)
+            client=RegistryClient(
+                registry,
+                repo,
+                auth_token=auth.bearer_token,
+                username=auth.username,
+                password=auth.password,
+            )
+            return self._read_base_image(client, reference, layers_dir, os_name, arch)
+
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
         )
-        
+        print(f"Loading local base image {self.config.base_image} for {target}...")
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+        ) as source:
+            base_layers, base_config = self._read_base_image(
+                source, None, layers_dir, os_name, arch
+            )
+            verify_layer_diff_ids(base_layers, base_config)
+            self._base_image_name=source.source_name
+        return base_layers, base_config
+
+    def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Resolve and validate a base image through a registry or local source."""
+        local = reference is None
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        if not local:
+            print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
-            expected_digest=reference if reference.startswith("sha256:") else None,
+            expected_digest=(
+                reference if reference and reference.startswith("sha256:") else None
+            ),
         )
 
         selected_variant = None
@@ -482,6 +527,8 @@ class ImageBuilder:
             )
             for index, descriptor in enumerate(layer_descriptors, 1)
         ]
+        if local:
+            check_local_image_bounds(config_size, [size for _, size, _ in validated_layers])
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
@@ -532,13 +579,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -640,6 +687,8 @@ class ImageBuilder:
                     print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _uses_lockfile(self) -> bool:
@@ -683,19 +732,22 @@ class ImageBuilder:
         self._dependency_source_cache = source
         return source
 
-    def _lock_selection(self, base_config, os_name, arch):
-        cached = getattr(self, "_lock_selection_cache", None)
-        if cached is not None:
-            return cached
+    def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
         _, relative = self._dependency_source()
         environment = target_environment(
             os_name,
             arch,
-            target_python_version(self.config.base_image, base_config),
+            target_python_version(
+                getattr(self, "_base_image_name", self.config.base_image), base_config,
+                base_image_tag_verified=base_image_tag_verified,
+            ),
             target_python_full_version(base_config),
         )
+        cached = getattr(self, "_lock_selection_cache", None)
+        if cached is not None and cached[0] == environment:
+            return cached[1]
         selection = load_lockfile(Path(self.config.context_dir), relative, environment)
-        self._lock_selection_cache = selection
+        self._lock_selection_cache = (environment, selection)
         return selection
 
     def _grouped_dependency_source(self):
@@ -739,13 +791,28 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        version = target_python_version(self.config.base_image, base_config)
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         cache_key = None
         if self.cache:
             try:
                 cache_key = self._dependency_cache_key(
-                    source_kind, source_value, base_config, os_name, arch, version
+                    source_kind, source_value, base_config, os_name, arch, version,
+                    base_image_name, base_image_tag_verified,
                 )
             except DependencyCacheMiss as miss:
                 print(f"Dependency layer cache miss: {miss}.")
@@ -758,7 +825,10 @@ class ImageBuilder:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if source_kind == "lock":
-                selection = self._lock_selection(base_config, os_name, arch)
+                selection = self._lock_selection(
+                    base_config, os_name, arch,
+                    base_image_tag_verified=base_image_tag_verified,
+                )
                 print(
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
@@ -770,8 +840,9 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             elif source_kind == "requirements":
                 install_requirements(
@@ -781,12 +852,20 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / DEFAULT_REQUIREMENTS_FILE,
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")
@@ -866,8 +945,23 @@ class ImageBuilder:
                     "Grouped dependencies reserve the .python directory; "
                     "application files cannot overwrite it."
                 )
-        version = target_python_version(self.config.base_image, base_config)
-        selection = self._lock_selection(base_config, os_name, arch)
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        selection = self._lock_selection(
+            base_config, os_name, arch,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         plan = plan_groups(
             selection, self.config.dependency_layer_strategy,
             self.config.stable_dependencies, self.config.frequent_dependencies,
@@ -879,7 +973,8 @@ class ImageBuilder:
         if self.cache:
             try:
                 cache_key = self._dependency_cache_key(
-                    source_kind, source_value, base_config, os_name, arch, version
+                    source_kind, source_value, base_config, os_name, arch, version,
+                    base_image_name, base_image_tag_verified,
                 )
             except DependencyCacheMiss as miss:
                 print(f"Dependency group cache miss: {miss}.")
@@ -895,7 +990,8 @@ class ImageBuilder:
             print(f"Staging {len(selection.packages)} locked packages from {selection.path.as_posix()}...")
             install_locked_requirements(
                 selection.requirement_sets(), site_packages, Path(self.config.context_dir),
-                os_name, arch, version, self.config.base_image, base_config,
+                os_name, arch, version, base_image_name, base_config,
+                base_image_tag_verified=base_image_tag_verified,
             )
             script_owners = {}
             create_console_entrypoints(site_packages, stage_root / "bin", owners=script_owners)
@@ -915,6 +1011,7 @@ class ImageBuilder:
                     )
                     scoped = self._dependency_cache_key(
                         source_kind, source_value, base_config, os_name, arch, version,
+                        base_image_name, base_image_tag_verified,
                         selection_override=subset,
                     )
                     files_key = self.cache._compute_files_digest(
@@ -985,7 +1082,10 @@ class ImageBuilder:
             print(f"✓ Dependency group cache hit ({group}, {layer.digest[:19]}...)")
         return layers
 
-    def _dependency_cache_key(self, source_kind, source_value, base_config, os_name, arch, version, selection_override=None):
+    def _dependency_cache_key(
+        self, source_kind, source_value, base_config, os_name, arch, version,
+        base_image_name, base_image_tag_verified, selection_override=None,
+    ):
         ctx = Path(self.config.context_dir)
         common = dict(
             source_kind=source_kind,
@@ -994,13 +1094,17 @@ class ImageBuilder:
             arch=arch,
             python_version=version,
             python_full_version=target_python_full_version(base_config),
-            base_image=self.config.base_image,
+            base_image=base_image_name,
             base_config=base_config,
+            base_image_tag_verified=base_image_tag_verified,
             workdir=self.config.workdir,
             reproducible=self.config.reproducible,
         )
         if source_kind == "lock":
-            selection = selection_override or self._lock_selection(base_config, os_name, arch)
+            selection = selection_override or self._lock_selection(
+                base_config, os_name, arch,
+                base_image_tag_verified=base_image_tag_verified,
+            )
             return dependency_cache_key(
                 requirement_sets=selection.requirement_sets(),
                 lock_name=selection.path.as_posix(),
@@ -1082,11 +1186,11 @@ class ImageBuilder:
                 return self._publish_cached_layer(layers_dir, *cached, "app-cache")
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -1101,6 +1205,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -1112,6 +1217,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(

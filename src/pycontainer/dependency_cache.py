@@ -17,19 +17,20 @@ import sys
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
-from .dependencies import _is_hash_pinned, _target_options, scan_requirements
+from .dependencies import (
+    _is_hash_pinned,
+    _target_marker_environment,
+    _target_options,
+    scan_requirements,
+)
 
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
-# Identifies how markers are evaluated during staging. Locks are marker-evaluated
-# for the target before an isolated --no-deps install; plain requirements leave
-# transitive markers to pip on the builder host. A backend that changes marker
-# evaluation (for example a target-marker bootstrap) must change this value and
-# key its own marker environment.
-INSTALLER_BACKEND = "pip-target-v1"
+# Bump when the installer changes layer-affecting behavior such as marker evaluation.
+INSTALLER_BACKEND = "pip-target-v2"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -109,6 +110,7 @@ def dependency_cache_key(
     base_config: Optional[dict],
     workdir: str,
     reproducible: bool,
+    base_image_tag_verified: bool = False,
     requirements: Optional[Path] = None,
     requirement_sets: Sequence[Tuple[str, str]] = (),
     lock_name: Optional[str] = None,
@@ -143,8 +145,14 @@ def dependency_cache_key(
         "target": {
             "os": os_name,
             "arch": arch,
-            "pip_options": _target_options(os_name, arch, python_version, base_image, base_config),
+            "pip_options": _target_options(
+                os_name, arch, python_version, base_image, base_config,
+                base_image_tag_verified=base_image_tag_verified,
+            ),
             "python": python_full_version or python_version,
+            "marker_environment": _target_marker_environment(
+                os_name, arch, python_version, base_config
+            ),
         },
         "builder": {
             "installer": INSTALLER_BACKEND,
@@ -173,10 +181,10 @@ def sanitize_url(value: str) -> str:
         raise DependencyCacheMiss(
             "an index or find-links URL uses an environment placeholder in its host or path"
         )
-    if parts.query:
+    if "?" in value.split("#", 1)[0]:
         # A query can route to another tenant or feed, so it is not a safe credential to drop.
         raise DependencyCacheMiss("an index or find-links URL has a query string")
-    return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/"), "", ""))
+    return urlunsplit((parts.scheme.lower(), host.lower(), parts.path, "", ""))
 
 
 def _key_token(token: str) -> str:
@@ -240,8 +248,6 @@ def _requirements_inputs(requirements: Path, context_dir: Path) -> Tuple[List[di
                 "find_links": find_links,
             }
         )
-    # pip evaluates top-level and transitive markers, except python_version, against the builder host.
-    inputs.append({"host_markers": _host_marker_environment()})
     return inputs, tuple(source_files)
 
 
@@ -285,20 +291,6 @@ def _file_digest(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
-
-
-def _host_marker_environment() -> Dict[str, str]:
-    return {
-        "implementation_name": sys.implementation.name,
-        "os_name": os.name,
-        "platform_machine": platform.machine(),
-        "platform_python_implementation": platform.python_implementation(),
-        "platform_release": platform.release(),
-        "platform_system": platform.system(),
-        "platform_version": platform.version(),
-        "python_full_version": platform.python_version(),
-        "sys_platform": sys.platform,
-    }
 
 
 def ambient_pip_settings() -> List[List[str]]:

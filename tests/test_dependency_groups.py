@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import pycontainer.builder as builder_module
+import pycontainer.dependency_cache as dependency_cache_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
@@ -413,6 +414,61 @@ def test_grouping_preserves_target_markers_extras_and_target_cache_identity(
     assert "creating stable dependency layer" in capsys.readouterr().out.lower()
     assert arm.layers[0].digest == amd.layers[0].digest
     assert arm.layers[1].digest != amd.layers[1].digest
+
+
+@pytest.mark.parametrize("change", ["installer", "marker_environment"])
+def test_group_cache_invalidates_for_target_marker_backend(
+    tmp_path, monkeypatch, indexes, change
+):
+    context, wheels, _index = _fixture(tmp_path, indexes)
+    calls = []
+
+    def install(_requirements, destination, *_args, **kwargs):
+        calls.append(kwargs)
+        destination.mkdir(parents=True, exist_ok=True)
+        for wheel in wheels.values():
+            with zipfile.ZipFile(wheel) as archive:
+                archive.extractall(destination)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    _builder(tmp_path, monkeypatch, context, "cold", **options).build()
+    _builder(tmp_path, monkeypatch, context, "warm", **options).build()
+    assert len(calls) == 1
+
+    if change == "installer":
+        monkeypatch.setattr(dependency_cache_module, "INSTALLER_BACKEND", "pip-target-v1")
+    else:
+        original = dependency_cache_module._target_marker_environment
+        monkeypatch.setattr(
+            dependency_cache_module, "_target_marker_environment",
+            lambda *args: {**original(*args), "implementation_version": "3.11.99"},
+        )
+
+    _builder(tmp_path, monkeypatch, context, "changed", **options).build()
+    assert len(calls) == 2
+    assert all(call["base_image_tag_verified"] for call in calls)
+
+
+@pytest.mark.parametrize("base_image", ["oci:local-base:python:3.11-slim", "python:3.11-slim@sha256:" + "a" * 64])
+def test_grouping_does_not_infer_local_or_digest_target_from_tag(
+    tmp_path, monkeypatch, indexes, base_image
+):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    builder = _builder(
+        tmp_path, monkeypatch, context, "unverified",
+        base_image=base_image, dependency_layer_strategy="explicit",
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, *_args: ([], {"os": "linux", "architecture": "amd64"}),
+    )
+    monkeypatch.setattr(
+        builder_module, "install_locked_requirements",
+        lambda *_args, **_kwargs: pytest.fail("unverified target invoked pip"),
+    )
+    with pytest.raises(ValueError, match="PYTHON_IMPLEMENTATION|PYTHON_VERSION"):
+        builder.build()
 
 
 def test_grouping_fails_closed_for_requirements_sources(tmp_path, monkeypatch):
