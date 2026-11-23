@@ -381,6 +381,41 @@ def test_enabling_scanning_after_index_build_rejects_push_before_auth(
     with pytest.raises(ValueError, match="scanning.*multi-platform"):
         builder.push(show_progress=False)
     assert (tmp_path / "out" / "index.json").read_bytes() == original_index
+
+
+@pytest.mark.parametrize(
+    "entrypoint,cmd,expected_entrypoint,expected_cmd",
+    [
+        (None, ["/bin/sh", "-c", 'echo "$NAME"'], "inherited", ["/bin/sh", "-c", 'echo "$NAME"']),
+        (None, ["python", "app.py"], "inherited", ["python", "app.py"]),
+        (None, [], "inherited", None),
+        ([], None, None, "inherited"),
+        ([], [], None, None),
+    ],
+    ids=["shell-cmd", "exec-cmd", "clear-cmd", "clear-entrypoint", "clear-both"],
+)
+def test_platform_commands_inherit_and_clear_independently(
+    tmp_path, monkeypatch, entrypoint, cmd, expected_entrypoint, expected_cmd
+):
+    runtime = {
+        arch: {"Entrypoint": [f"{arch}-entrypoint"], "Cmd": [f"{arch}-base-cmd"]}
+        for arch in ("amd64", "arm64")
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=runtime),
+        entrypoint=entrypoint, cmd=cmd,
+    )
+    builder.build()
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        assert config.get("Entrypoint") == (
+            runtime[arch]["Entrypoint"] if expected_entrypoint == "inherited"
+            else expected_entrypoint
+        )
+        assert config.get("Cmd") == (
+            runtime[arch]["Cmd"] if expected_cmd == "inherited" else expected_cmd
+        )
     with pytest.raises(ValueError):
         normalize_platforms("linux/amd64,,linux/arm64")
 
