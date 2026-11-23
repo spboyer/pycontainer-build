@@ -228,10 +228,14 @@ it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
 - **`TOOMANYREQUESTS` / HTTP 429** (`RegistryRateLimitError`): the reset time
   comes from `Retry-After`. Sign in (Docker Hub grants higher pull limits to
   authenticated users), wait for the reset, or use a registry mirror. Only
-  safe reads (`GET`/`HEAD`) are retried, at most twice with delays capped at
-  5 seconds; when `Retry-After` is longer than that cap the build fails
-  immediately instead of retrying into the same limit. Uploads, upload
-  initiation and manifest `PUT`s are never retried.
+  safe reads (`GET`/`HEAD`) have at most two transient retries per request,
+  with delays capped at 5 seconds; when `Retry-After` is longer than that cap
+  the build fails immediately instead of retrying into the same limit. Uploads,
+  upload initiation and manifest `PUT`s are not retried for transient errors;
+  a request refused with a 401 bearer challenge can be replayed once after
+  authentication. Invalid or negative numeric `Retry-After` values use bounded
+  backoff. Very large intervals are reported in seconds without a UTC date
+  when the date is out of range.
 - **HTTP 413, 507, `*QUOTA*` codes or quota messages**
   (`RegistryQuotaError`): the error names the rejected upload size. Free space
   in the repository, raise its quota or reduce the image size.
@@ -245,7 +249,9 @@ when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
 
 Error bodies are treated as untrusted: at most five errors are shown, each
 message is truncated, control characters are removed, and authorization
-values, tokens and the configured credentials are replaced with `[REDACTED]`.
+values, tokens and the configured credentials, including URL-encoded forms,
+are replaced with `[REDACTED]`.
+Registry hosts and HTTP(S) URLs in error details omit userinfo and query strings.
 
 ## Deleting and Pruning Images
 
