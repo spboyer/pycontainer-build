@@ -193,6 +193,22 @@ def test_selected_symlink_chain_is_preserved(tmp_path):
 
     assert ("app/src/chain.py", tarfile.SYMTYPE, "alias.py") in members
 
+
+def test_nested_symlink_target_uses_posix_separators(tmp_path):
+    context = _context(tmp_path)
+    (context / "shared").mkdir()
+    (context / "shared" / "data.py").write_text("value = 1\n")
+    _link(context / "src" / "data.py", os.path.join("..", "shared", "data.py"))
+    _link(context / "direct.py", os.path.join("shared", "data.py"))
+
+    _, members, _ = _app_layer(
+        context, tmp_path, use_cache=False,
+        include_paths=["src", "shared", "direct.py"],
+    )
+
+    assert ("app/src/data.py", tarfile.SYMTYPE, "../shared/data.py") in members
+    assert ("app/direct.py", tarfile.SYMTYPE, "shared/data.py") in members
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -212,7 +228,6 @@ def test_symlink_to_unselected_file_is_rejected(tmp_path, overrides):
         _app_layer(context, tmp_path, use_cache=False, **overrides)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows resolves '..' in link targets lexically")
 @pytest.mark.parametrize(
     "selection",
     [

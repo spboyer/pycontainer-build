@@ -19,7 +19,7 @@ from .fs_utils import file_lock
 
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
-_CACHE_KEY_VERSION = 3
+_CACHE_KEY_VERSION = 4
 
 
 def app_layer_arcname(workdir: str, relative_path: Path) -> str:
@@ -174,7 +174,7 @@ class LayerCache:
             if stat.S_ISLNK(metadata.st_mode):
                 record["kind"] = "symlink"
                 record["content"] = hashlib.sha256(
-                    os.fsencode(os.readlink(abs_path))
+                    os.fsencode(os.readlink(abs_path).replace(os.sep, "/"))
                 ).hexdigest()
             elif stat.S_ISREG(metadata.st_mode):
                 record["kind"] = "file"

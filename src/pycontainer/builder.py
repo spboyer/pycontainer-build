@@ -1338,20 +1338,20 @@ class ImageBuilder:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
                     arc=app_layer_arcname(self.config.workdir, rel)
+                    tarinfo=tar.gettarinfo(abs_path, arcname=arc)
+                    if tarinfo.issym():
+                        tarinfo.linkname=tarinfo.linkname.replace(os.sep, "/")
                     if self.config.reproducible:
-                        tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
                         tarinfo.uid=0
                         tarinfo.gid=0
                         tarinfo.uname="root"
                         tarinfo.gname="root"
-                        if tarinfo.isfile():
-                            with open(abs_path, 'rb') as f:
-                                tar.addfile(tarinfo, f)
-                        else:
-                            tar.addfile(tarinfo)
+                    if tarinfo.isfile():
+                        with open(abs_path, 'rb') as f:
+                            tar.addfile(tarinfo, f)
                     else:
-                        tar.add(abs_path,arcname=arc)
+                        tar.addfile(tarinfo)
                 hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]

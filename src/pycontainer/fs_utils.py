@@ -5,6 +5,7 @@ import os
 import stat
 import time
 from contextlib import contextmanager
+from itertools import dropwhile
 from pathlib import Path, PureWindowsPath
 
 
@@ -282,8 +283,9 @@ def select_context_files(base, include_paths, excludes):
     files = list(
         iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
     )
-    # Lexical membership keeps the link valid inside the image; resolved
-    # membership stops ``..`` after an in-context link from naming other files.
+    # Lexical membership keeps the link valid inside the image. A ``..`` after
+    # a descending component could climb out of a pruned directory link that
+    # the image lacks, so targets may only climb first and then descend.
     lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
     resolved_paths = {
         os.path.normcase(os.path.realpath(path))
@@ -292,9 +294,17 @@ def select_context_files(base, include_paths, excludes):
     }
     for path, relative in files:
         if path.is_symlink():
-            target = path.parent / os.readlink(path)
+            text = os.readlink(path)
+            parts = [
+                part
+                for part in text.replace(os.altsep or os.sep, os.sep).split(os.sep)
+                if part not in ("", ".")
+            ]
+            climbs = len(parts) - len(list(dropwhile(lambda part: part == "..", parts)))
+            target = path.parent / text
             if (
-                os.path.normcase(os.path.abspath(target)) not in lexical_paths
+                ".." in parts[climbs:]
+                or os.path.normcase(os.path.abspath(target)) not in lexical_paths
                 or os.path.normcase(os.path.realpath(target)) not in resolved_paths
             ):
                 raise ValueError(
