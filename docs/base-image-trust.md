@@ -92,14 +92,15 @@ timestamp. An invalid or unavailable timestamp fails verification.
 The implementation snapshots the single matching signature envelope into an
 isolated temporary OCI layout and uses a generated **strict**, exact-scope
 policy. This prevents another signature with a partially matching subject or a
-`skip` policy from satisfying the pinned signer. It currently accepts only one
-matching, tagged single-signer COSE_Sign1 signature; JWS, multi-signer COSE,
-arbitrary Notation policies, plugins, and authenticated private-registry
-signature discovery are not supported. Discovery is isolated from local
-Notation and registry credentials and fails closed when evidence is unavailable.
-Notation v1.3.2 and its experimental OCI-layout mode have been exercised;
-other versions are not guaranteed compatible. Historical verification after a
-signer's certificate has expired has not yet been independently demonstrated.
+`skip` policy from satisfying the pinned signer. It accepts a tagged
+single-signer COSE_Sign1 or flattened single-signer JWS signature. For JWS, it
+also checks that the envelope's leaf certificate matches the pinned
+fingerprint before Notation verifies the signature and certificate chain.
+Multi-signer envelopes, arbitrary Notation policies, plugins, and authenticated
+private-registry signature discovery are not supported. Discovery is isolated
+from local Notation and registry credentials and fails closed when evidence is
+unavailable. Notation v1.3.2 and its experimental OCI-layout mode have been
+exercised; other versions are not guaranteed compatible.
 
 ## Registry authentication
 
@@ -149,7 +150,14 @@ $env:PYCONTAINER_NOTATION_ROOT = "C:\verified\signing-root.crt"
 $env:PYCONTAINER_NOTATION_TSA = "C:\verified\timestamp-root.crt"
 $env:PYCONTAINER_NOTATION_EXPIRED_ROOT = "C:\verified\ratify.crt"
 python -m pytest tests\test_trust_real.py -q -o addopts= -m registry_integration
+python -m pytest tests\test_trust_notation.py -q -o addopts= -m registry_integration
 ```
 
 Each test skips if its required environment variables are absent; inspect the
-test result rather than treating skipped checks as provider compatibility.
+test result rather than treating skipped checks as provider compatibility. The
+second command signs a local test layout as JWS and exercises the real Notation
+verifier with simulated registry discovery. It also checks a COSE signature
+generated on 2026-11-23 using a local test TSA: its signer expired on
+2026-11-23, its TSA root expires on 2036-11-20, and verification succeeds only
+with the correct TSA root. The fixture contains public certificates and signed
+data, not private keys. Neither local check tests remote discovery.

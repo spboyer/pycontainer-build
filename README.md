@@ -412,7 +412,9 @@ Registry signature verification is **opt-in**. Configure
 subset for one exact repository. Verification is bound to the resolved digest
 before base-image config or layer downloads; a required policy rejects local
 OCI and Docker archives. A dry run validates the policy's shape but does not
-verify an image.
+verify an image. The Notation subset supports single-signer COSE_Sign1 and
+flattened JWS; authenticated private-registry signature discovery is not yet
+supported.
 
 See [Base image trust](docs/base-image-trust.md) for configuration, verifier
 and trust-material setup, limitations, and opt-in real-provider checks.

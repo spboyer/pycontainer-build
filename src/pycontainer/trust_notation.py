@@ -1,5 +1,8 @@
 """Verify a single, fingerprint-pinned Notation signature in an isolated layout."""
 
+import base64
+import binascii
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -28,7 +31,7 @@ _MEDIA = {
 }
 _SIGNATURE = "application/vnd.cncf.notary.signature"
 _OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
-_ENVELOPES = {"application/cose"}
+_ENVELOPES = {"application/cose", "application/jose+json"}
 _MAX_MANIFEST = 4 * 1024 * 1024
 _MAX_ENVELOPE = 16 * 1024 * 1024
 _MAX_OUTPUT = 4 * 1024 * 1024
@@ -92,6 +95,108 @@ def _write_blob(layout, data):
 
 def _encode(obj):
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _unique_json(data):
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise NotationTrustError("Duplicate JWS JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    try:
+        text = data.decode("utf-8")
+        if text.startswith("\ufeff"):
+            raise ValueError("JSON byte order mark")
+        return json.loads(
+            text, object_pairs_hook=object_pairs, parse_constant=reject_constant,
+        )
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise NotationTrustError("Invalid JWS JSON") from exc
+
+
+def _decode_jws_base64(value, *, url=False):
+    if not isinstance(value, str) or not value:
+        raise NotationTrustError("Invalid JWS encoding")
+    try:
+        if url:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+                raise NotationTrustError("Invalid JWS base64url")
+            data = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+            canonical = base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+        else:
+            data = base64.b64decode(value, validate=True)
+            canonical = base64.b64encode(data).decode("ascii")
+    except (ValueError, binascii.Error) as exc:
+        raise NotationTrustError("Invalid JWS encoding") from exc
+    if not data or canonical != value:
+        raise NotationTrustError("Noncanonical JWS encoding")
+    return data
+
+
+def _check_jws_envelope(envelope, fingerprint):
+    obj = _unique_json(envelope)
+    if not isinstance(obj, dict) or set(obj) != {"payload", "protected", "header", "signature"}:
+        raise NotationTrustError("Only flattened single-signer JWS is supported")
+    _decode_jws_base64(obj["payload"], url=True)
+    _decode_jws_base64(obj["signature"], url=True)
+    protected = _unique_json(_decode_jws_base64(obj["protected"], url=True))
+    header = obj["header"]
+    prefix = "io.cncf.notary."
+    allowed_protected = {"alg", "cty", "crit", prefix + "signingScheme",
+                         prefix + "signingTime", prefix + "authenticSigningTime",
+                         prefix + "expiry"}
+    allowed_header = {"x5c", prefix + "timestampSignature", prefix + "signingAgent"}
+    if (not isinstance(protected, dict) or not isinstance(header, dict)
+            or set(protected) - allowed_protected or set(header) - allowed_header
+            or set(protected) & set(header)
+            or not isinstance(protected.get("alg"), str)
+            or protected["alg"] not in {"PS256", "PS384", "PS512", "ES256", "ES384", "ES512"}
+            or protected.get("cty") != "application/vnd.cncf.notary.payload.v1+json"
+            or protected.get(prefix + "signingScheme") not in ("notary.x509", "notary.x509.signingAuthority")):
+        raise NotationTrustError("Invalid JWS headers")
+    critical = protected.get("crit")
+    required_critical = {prefix + "signingScheme"}
+    optional_critical = {prefix + "authenticSigningTime", prefix + "expiry"}
+    if (not isinstance(critical, list) or not all(isinstance(item, str) for item in critical)
+            or len(critical) != len(set(critical))
+            or not required_critical <= set(critical)
+            or set(critical) - (required_critical | optional_critical)
+            or any(item not in protected for item in critical)
+            or any(item in protected and item not in critical for item in optional_critical)
+            or (protected[prefix + "signingScheme"] == "notary.x509.signingAuthority"
+                and prefix + "authenticSigningTime" not in critical)):
+        raise NotationTrustError("Invalid JWS critical headers")
+    signing_time = prefix + "signingTime"
+    authentic_time = prefix + "authenticSigningTime"
+    if ((protected[prefix + "signingScheme"] == "notary.x509"
+         and (signing_time not in protected or authentic_time in protected))
+            or (protected[prefix + "signingScheme"] == "notary.x509.signingAuthority"
+                and (authentic_time not in protected or signing_time in protected))):
+        raise NotationTrustError("Invalid JWS signing time")
+    for key in (signing_time, authentic_time, prefix + "expiry"):
+        if key in protected:
+            value = protected[key]
+            if (not isinstance(value, str) or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value)):
+                raise NotationTrustError("Invalid JWS timestamp")
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise NotationTrustError("Invalid JWS timestamp") from exc
+    chain = header.get("x5c")
+    if not isinstance(chain, list) or not 1 <= len(chain) <= 16:
+        raise NotationTrustError("Invalid JWS certificate chain")
+    certificates = [_decode_jws_base64(cert) for cert in chain]
+    if any(len(cert) > 1024 * 1024 for cert in certificates):
+        raise NotationTrustError("JWS certificate exceeds size limit")
+    if hashlib.sha256(certificates[0]).hexdigest() != fingerprint:
+        raise NotationTrustError("JWS signer fingerprint does not match policy")
 
 
 def verify_notation(policy: dict[str, str], repository: str, digest: str,
@@ -234,8 +339,10 @@ def _verify_notation(policy, repository, digest, manifest, manifest_bytes, clien
         if _digest(envelope_bytes) != envelope["digest"]:
             raise NotationTrustError("Invalid signature envelope digest")
         # A tagged COSE_Sign1 has one signer; COSE_Sign may contain multiple.
-        if not envelope_bytes.startswith(b"\xd2\x84"):
+        if envelope_media == "application/cose" and not envelope_bytes.startswith(b"\xd2\x84"):
             raise NotationTrustError("Only tagged single-signer COSE_Sign1 is supported")
+        if envelope_media == "application/jose+json":
+            _check_jws_envelope(envelope_bytes, fingerprint)
         _write_blob(layout, manifest_bytes)
         empty_digest = _write_blob(layout, b"{}")
         wrapper = {"schemaVersion": 2, "mediaType": _OCI_MANIFEST,

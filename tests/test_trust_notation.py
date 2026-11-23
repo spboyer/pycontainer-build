@@ -1,7 +1,9 @@
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
 
@@ -307,3 +309,244 @@ def test_multi_signer_cose_is_rejected(case, monkeypatch):
     with pytest.raises(notation.NotationTrustError, match="single-signer"):
         invoke(case)
     assert len(observed) == 1
+
+
+def _jws_case(case, envelope):
+    client = case[3]
+    client.envelope = envelope
+    client.descriptor.update(
+        digest=digest(envelope), size=len(envelope), mediaType="application/jose+json"
+    )
+    client.raw = encode(client.manifest)
+    client.signature_digest = digest(client.raw)
+    case[4].update(digest=client.signature_digest, mediaType="application/jose+json")
+
+
+def _jws(cert=b"test certificate"):
+    protected = encode({
+        "alg": "PS256",
+        "cty": "application/vnd.cncf.notary.payload.v1+json",
+        "crit": ["io.cncf.notary.signingScheme"],
+        "io.cncf.notary.signingScheme": "notary.x509",
+        "io.cncf.notary.signingTime": "2026-01-01T00:00:00Z",
+    })
+    b64url = lambda data: base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+    return {
+        "payload": b64url(b"payload"),
+        "protected": b64url(protected),
+        "header": {"x5c": [base64.b64encode(cert).decode()]},
+        "signature": b64url(b"signature"),
+    }
+
+
+def test_flattened_jws_is_bound_to_pinned_certificate(case, monkeypatch):
+    cert = b"test certificate"
+    fingerprint = hashlib.sha256(cert).hexdigest()
+    case[0]["signer_fingerprint"] = fingerprint
+    case[4]["certificates"][0]["SHA256Fingerprint"] = fingerprint
+    _jws_case(case, encode(_jws(cert)))
+    observed = runner(case, monkeypatch)
+    invoke(case)
+    assert len(observed) == 2
+
+
+@pytest.mark.parametrize("change", [
+    "wrong-certificate", "general-jws", "duplicate-root", "duplicate-header",
+    "duplicate-protected", "protected-x5c", "noncanonical-x5c", "padding",
+    "unencoded-payload", "invalid-algorithm", "overlapping-header", "alternate-key",
+    "unknown-critical", "malformed-critical", "missing-content-type", "nan",
+    "bom", "utf16", "missing-signing-time", "wrong-scheme-time", "invalid-time",
+])
+def test_jws_ambiguous_or_unpinned_envelopes_fail(case, monkeypatch, change):
+    cert = b"test certificate"
+    fingerprint = hashlib.sha256(cert).hexdigest()
+    case[0]["signer_fingerprint"] = fingerprint
+    case[4]["certificates"][0]["SHA256Fingerprint"] = fingerprint
+    obj = _jws(cert)
+    if change == "wrong-certificate":
+        obj["header"]["x5c"] = [base64.b64encode(b"other cert").decode()]
+    elif change == "general-jws":
+        obj["signatures"] = []
+    elif change == "protected-x5c":
+        obj["protected"] = base64.urlsafe_b64encode(encode({
+            "alg": "PS256", "x5c": [base64.b64encode(b"other cert").decode()]
+        })).rstrip(b"=").decode()
+    elif change == "noncanonical-x5c":
+        obj["header"]["x5c"][0] += "\n"
+    elif change == "padding":
+        obj["signature"] += "="
+    elif change == "unencoded-payload":
+        obj["protected"] = base64.urlsafe_b64encode(
+            encode({"alg": "PS256", "b64": False, "crit": ["b64"]})
+        ).rstrip(b"=").decode()
+    elif change == "duplicate-protected":
+        obj["protected"] = base64.urlsafe_b64encode(
+            b'{"alg":"PS256","alg":"PS256"}'
+        ).rstrip(b"=").decode()
+    elif change == "invalid-algorithm":
+        obj["protected"] = base64.urlsafe_b64encode(
+            encode({"alg": []})
+        ).rstrip(b"=").decode()
+    elif change == "overlapping-header":
+        obj["header"]["alg"] = "PS256"
+    elif change == "alternate-key":
+        obj["header"]["jwk"] = {}
+    elif change in ("unknown-critical", "malformed-critical", "missing-content-type",
+                    "missing-signing-time", "wrong-scheme-time", "invalid-time"):
+        protected = json.loads(base64.urlsafe_b64decode(obj["protected"] + "==="))
+        if change == "unknown-critical":
+            protected["crit"].append("unknown")
+        elif change == "malformed-critical":
+            protected["crit"] = [None]
+        elif change == "missing-content-type":
+            del protected["cty"]
+        elif change == "missing-signing-time":
+            del protected["io.cncf.notary.signingTime"]
+        elif change == "wrong-scheme-time":
+            protected["io.cncf.notary.signingScheme"] = "notary.x509.signingAuthority"
+            protected["io.cncf.notary.authenticSigningTime"] = "2026-01-01T00:00:00Z"
+            protected["crit"].append("io.cncf.notary.authenticSigningTime")
+        else:
+            protected["io.cncf.notary.signingTime"] = "2026-02-31T00:00:00Z"
+        obj["protected"] = base64.urlsafe_b64encode(encode(protected)).rstrip(b"=").decode()
+    raw = encode(obj)
+    if change == "duplicate-root":
+        raw = raw[:-1] + b',"signature":"other"}'
+    elif change == "duplicate-header":
+        raw = raw.replace(b'"header":{', b'"header":{"x5c":[],')
+    elif change == "nan":
+        raw = raw.replace(b'"header":{', b'"header":{"other":NaN,')
+    elif change == "bom":
+        raw = b"\xef\xbb\xbf" + raw
+    elif change == "utf16":
+        raw = raw.decode().encode("utf-16")
+    _jws_case(case, raw)
+    observed = runner(case, monkeypatch)
+    with pytest.raises(notation.NotationTrustError):
+        invoke(case)
+    assert len(observed) == 1
+
+
+@pytest.mark.registry_integration
+def test_real_notation_verifies_local_jws_snapshot(case, monkeypatch, tmp_path):
+    binary = os.environ.get("PYCONTAINER_NOTATION_BIN")
+    if not binary:
+        pytest.skip("Set PYCONTAINER_NOTATION_BIN to a verified Notation executable")
+    config = tmp_path / "signer"
+    layout = tmp_path / "signed-layout"
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    policy, manifest, raw, client, signature = case
+    subject = signature["signedArtifact"]
+    (blobs / digest(raw)[7:]).write_bytes(raw)
+    (layout / "oci-layout").write_bytes(encode({"imageLayoutVersion": "1.0.0"}))
+    (layout / "index.json").write_bytes(encode({"schemaVersion": 2, "manifests": [subject]}))
+    env = os.environ.copy()
+    env.update({"NOTATION_CONFIG": str(config), "NOTATION_EXPERIMENTAL": "1",
+                "HOME": str(tmp_path), "USERPROFILE": str(tmp_path)})
+    for args in (
+        ["cert", "generate-test", "--default", "pycontainer-jws-test"],
+        ["sign", "--oci-layout", "--signature-format", "jws", f"{layout}@{digest(raw)}"],
+    ):
+        subprocess.run([binary, *args], env=env, check=True, capture_output=True, timeout=30)
+    index = json.loads((layout / "index.json").read_bytes())
+    signature_descriptor = next(item for item in index["manifests"] if item["digest"] != digest(raw))
+    client.raw = (blobs / signature_descriptor["digest"][7:]).read_bytes()
+    client.signature_digest = digest(client.raw)
+    client.manifest = json.loads(client.raw)
+    client.descriptor = client.manifest["layers"][0]
+    client.envelope = (blobs / client.descriptor["digest"][7:]).read_bytes()
+    parsed = json.loads(client.envelope)
+    fingerprint = hashlib.sha256(base64.b64decode(parsed["header"]["x5c"][0])).hexdigest()
+    identity = "CN=pycontainer-jws-test,O=Notary,L=Seattle,ST=WA,C=US"
+    policy.update(binary=binary, identity=identity, signer_fingerprint=fingerprint,
+                  trust_root=str(config / "localkeys" / "pycontainer-jws-test.crt"))
+    signature.update(digest=client.signature_digest, mediaType="application/jose+json",
+                     certificates=[{"issuedTo": identity, "SHA256Fingerprint": fingerprint}])
+
+    original_run = notation._run
+
+    def run(args, environment):
+        if args[1] == "inspect":
+            return encode({"Signatures": [signature]})
+        return original_run(args, environment)
+
+    monkeypatch.setattr(notation, "_run", run)
+    invoke(case)
+
+    policy["signer_fingerprint"] = "0" * 64
+    signature["certificates"][0]["SHA256Fingerprint"] = "0" * 64
+    with pytest.raises(notation.NotationTrustError, match="fingerprint"):
+        invoke(case)
+    policy["signer_fingerprint"] = fingerprint
+    signature["certificates"][0]["SHA256Fingerprint"] = fingerprint
+
+    subprocess.run(
+        [binary, "cert", "generate-test", "untrusted-jws-test"],
+        env=env, check=True, capture_output=True, timeout=30,
+    )
+    root = policy["trust_root"]
+    policy["trust_root"] = str(config / "localkeys" / "untrusted-jws-test.crt")
+    with pytest.raises(notation.NotationTrustError):
+        invoke(case)
+    policy["trust_root"] = root
+
+    signature_bytes = base64.urlsafe_b64decode(parsed["signature"] + "===")
+    parsed["signature"] = base64.urlsafe_b64encode(
+        bytes([signature_bytes[0] ^ 1]) + signature_bytes[1:]
+    ).rstrip(b"=").decode()
+    _jws_case(case, encode(parsed))
+    with pytest.raises(notation.NotationTrustError):
+        invoke(case)
+
+
+@pytest.mark.registry_integration
+def test_real_notation_trusted_timestamp_after_signer_expiry(monkeypatch, tmp_path):
+    binary = os.environ.get("PYCONTAINER_NOTATION_BIN")
+    if not binary:
+        pytest.skip("Set PYCONTAINER_NOTATION_BIN to a verified Notation executable")
+    fixture_path = Path(__file__).parent / "fixtures" / "notation-expired-timestamp.json"
+    fixture = json.loads(fixture_path.read_bytes())
+    raw = base64.b64decode(fixture["subject"], validate=True)
+    manifest_raw = base64.b64decode(fixture["signature_manifest"], validate=True)
+    signature_manifest = json.loads(manifest_raw)
+    subject = signature_manifest["subject"]
+    client = Client(subject)
+    client.raw = manifest_raw
+    client.manifest = signature_manifest
+    client.signature_digest = digest(manifest_raw)
+    client.descriptor = signature_manifest["layers"][0]
+    client.envelope = base64.b64decode(fixture["envelope"], validate=True)
+    cert = tmp_path / "signer.crt"
+    tsa = tmp_path / "tsa.crt"
+    wrong_tsa = tmp_path / "wrong-tsa.crt"
+    cert.write_text(fixture["signer_certificate"])
+    tsa.write_text(fixture["tsa_root"])
+    wrong_tsa.write_text(fixture["wrong_tsa_root"])
+    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(fixture["signer_certificate"])).hexdigest()
+    identity = "CN=signer,O=Notary,ST=WA,C=US"
+    policy = {
+        "provider": "notation", "repository": REPOSITORY, "identity": identity,
+        "signer_fingerprint": fingerprint, "trust_root": str(cert), "tsa_root": str(tsa),
+        "binary": binary,
+    }
+    signature = {
+        "digest": client.signature_digest, "mediaType": client.descriptor["mediaType"],
+        "signedArtifact": subject,
+        "certificates": [{"issuedTo": identity, "SHA256Fingerprint": fingerprint}],
+    }
+    real_run = notation._run
+
+    def run(args, environment):
+        if args[1] == "inspect":
+            return encode({"Signatures": [signature]})
+        return real_run(args, environment)
+
+    monkeypatch.setattr(notation, "_run", run)
+    notation.verify_notation(policy, REPOSITORY, digest(raw), json.loads(raw), raw, client)
+    policy["tsa_root"] = str(wrong_tsa)
+    with pytest.raises(notation.NotationTrustError):
+        notation.verify_notation(policy, REPOSITORY, digest(raw), json.loads(raw), raw, client)
+    del policy["tsa_root"]
+    with pytest.raises(notation.NotationTrustError):
+        notation.verify_notation(policy, REPOSITORY, digest(raw), json.loads(raw), raw, client)
