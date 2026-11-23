@@ -230,7 +230,7 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
     def record(name):
         def fake(*args, base_image_tag_verified=False, variant=None, **kwargs):
             seen.append((name, base_image_tag_verified, variant))
-            return "3.11"
+            return [] if name == "install" else "3.11"
         return fake
 
     monkeypatch.setattr(builder_module, "target_python_version", record("version"))
@@ -262,6 +262,7 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     def fake_install(requirements, site_packages, context, os_name, arch, version,
                      base_image, base_config, variant=None, *, base_image_tag_verified):
         installs.append((arch, variant, version, base_image_tag_verified))
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     base_image = "python:3.11-slim"
@@ -377,6 +378,7 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(f"ARCH = {arch!r}\n")
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     builder = _builder(
@@ -396,6 +398,70 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         assert not any("native_" in name and arch not in name for name in names)
 
 
+def test_multi_platform_pull_and_push_use_registry_transport_settings(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry()
+    pull_client = registry.client
+    clients = []
+
+    def record_pull(host, repo, **kwargs):
+        clients.append((host, repo, kwargs["insecure"], kwargs["ca_file"]))
+        return pull_client(host, repo, **kwargs)
+
+    registry.client = record_pull
+    monkeypatch.setattr(
+        "pycontainer.registry_client.create_registry_ssl_context", lambda _path: None
+    )
+    builder = _builder(
+        tmp_path, monkeypatch, registry,
+        insecure_registries=["registry.example"],
+        registry_ca_file="synthetic-ca.pem",
+    )
+    builder.build()
+    push_client = FakePushClient()
+
+    def record_push(host, repo, **kwargs):
+        clients.append((host, repo, kwargs["insecure"], kwargs["ca_file"]))
+        return push_client(host, repo, **kwargs)
+
+    monkeypatch.setattr(builder_module, "RegistryClient", record_push)
+    builder.push(show_progress=False)
+
+    assert clients == [
+        ("registry.example", "library/python", True, "synthetic-ca.pem"),
+        ("registry.example", "library/python", True, "synthetic-ca.pem"),
+        ("registry.example", "team/app", True, "synthetic-ca.pem"),
+    ]
+    assert any(call[0] == "index" and call[1] == "v1" for call in push_client.calls)
+
+
+def test_multi_platform_rejects_shipped_credentials_before_cache_and_publication(
+    tmp_path, monkeypatch
+):
+    ctx = _context(tmp_path, requirements=True)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), ctx=ctx,
+        use_cache=True, cache_dir=str(tmp_path / "cache"),
+    )
+    builder.build()
+    out = tmp_path / "out"
+    previous_index = (out / "index.json").read_bytes()
+    previous_tag = (out / "refs" / "tags" / "v1").read_bytes()
+    (ctx / "requirements.txt").write_text(
+        "--index-url https://synthetic-user:synthetic-secret@example.invalid/simple\n"
+    )
+
+    def unexpected_cache_lookup(*args, **kwargs):
+        pytest.fail("credential check must run before cache lookup")
+
+    monkeypatch.setattr(builder.cache, "get_layer", unexpected_cache_lookup)
+    with pytest.raises(ValueError, match="literal credentials") as error:
+        builder.build()
+
+    assert "synthetic-secret" not in str(error.value)
+    assert (out / "index.json").read_bytes() == previous_index
+    assert (out / "refs" / "tags" / "v1").read_bytes() == previous_tag
+
+
 def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, monkeypatch):
     ctx = _context(tmp_path, requirements=True)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
@@ -405,6 +471,7 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
 
     def fake_install(requirements, site_packages, context, os_name, arch, version, base_image, base_config, **kwargs):
         installs.append(arch)
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     builder = _builder(
@@ -690,6 +757,7 @@ def test_arm_v7_index_selects_exact_variant_and_round_trips_it(tmp_path, monkeyp
     def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
         installs.append((arch, kwargs.get("variant"), base_config.get("variant")))
         (site_packages / f"native_{arch}").mkdir(parents=True)
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     builder = _builder(

@@ -1072,9 +1072,12 @@ def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, mo
     )
     for name in (
         "transitive-amd", "transitive-arm", "transitive-armv7",
-        "new-patch", "root-amd", "root-arm", "root-armv7",
+        "new-patch", "root-amd", "root-arm", "root-armv7", "injected-dep",
     ):
         _write_named_wheel(wheelhouse, name)
+    injected_requirements = tmp_path / "host-requirements.txt"
+    injected_requirements.write_text("injected-dep\n")
+    monkeypatch.setenv("PIP_REQUIREMENT", str(injected_requirements))
     (context / "requirements.txt").write_text(
         "--no-index\n--find-links ./wheelhouse\n"
         "marker-root\n"
@@ -1715,11 +1718,12 @@ def test_virtualenv_errors_do_not_disclose_direct_url_credentials(tmp_path, monk
     context = tmp_path / "context"
     _write_base_venv(context, {"venv-root": []})
     (context / "requirements.txt").write_text(
-        "venv-root @ https://user:secret@example.invalid/package.whl\n"
+        "venv-root @ https://user:synthetic-pw-147@example.invalid/package.whl\n"
     )
-    with pytest.raises(ValueError, match="direct URL dependency") as error:
+    # A literal-credential root is rejected as a shipped input before closure checks.
+    with pytest.raises(ValueError, match="URL with literal credentials") as error:
         _stage_base_venv(tmp_path, monkeypatch, context)
-    assert "secret" not in str(error.value)
+    assert "synthetic-pw-147" not in str(error.value)
 
 @pytest.mark.parametrize("marker", ['extra == "speed"', 'sys_platform == "win32"'])
 def test_virtualenv_unrecorded_extra_with_direct_url_is_unverifiable(

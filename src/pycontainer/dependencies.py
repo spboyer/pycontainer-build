@@ -10,11 +10,19 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
+from .credentials import (
+    PLACEHOLDER,
+    find_credentials,
+    known_secrets,
+    redact,
+    url_has_credentials,
+)
 from .venv_markers import declared_roots, host_environments, venv_layout_os
 
 
@@ -67,6 +75,37 @@ _PIP_OVERRIDE_OPTIONS = {
     "--target",
     "--user",
 }
+# Host pip settings that only choose and authenticate to an index; every other
+# PIP_* variable or pip config key could change target selection and is ignored.
+_PIP_ENVIRONMENT_ALLOWED = {
+    "PIP_CERT",
+    "PIP_CLIENT_CERT",
+    "PIP_CONFIG_FILE",
+    "PIP_DEFAULT_TIMEOUT",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+    "PIP_INDEX_URL",
+    "PIP_KEYRING_PROVIDER",
+    "PIP_NO_INDEX",
+    "PIP_PROXY",
+    "PIP_REQUIRE_HASHES",
+    "PIP_RETRIES",
+    "PIP_TIMEOUT",
+    "PIP_TRUSTED_HOST",
+}
+_PIP_CONFIG_ALLOWED = sorted(
+    name[4:].lower().replace("_", "-")
+    for name in _PIP_ENVIRONMENT_ALLOWED - {"PIP_CONFIG_FILE"}
+)
+_PIP_STDERR_LIMIT = 1024 * 1024
+_PIP_EXCERPT_LINES = 6
+_PIP_EXCERPT_LINE_CHARS = 300
+_AUTH_HINT = (
+    "Provide index credentials to the builder through PIP_INDEX_URL or "
+    "PIP_EXTRA_INDEX_URL, a pip config file, .netrc (or NETRC), keyring with "
+    "PIP_KEYRING_PROVIDER=import or subprocess, or ${VAR} placeholders in the "
+    "requirements file."
+)
 
 
 def _base_image_parts(base_image: str) -> Tuple[str, str]:
@@ -264,8 +303,9 @@ def install_requirements(
     variant: Optional[str] = None,
     *,
     base_image_tag_verified: bool = False,
-) -> None:
-    validate_requirements(requirements, context_dir)
+) -> List[Path]:
+    """Install target wheels and return the validated requirements files."""
+    requirement_files = _scan_requirements(requirements, context_dir)[1]
     target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -275,9 +315,12 @@ def install_requirements(
             os_name, arch, python_version, base_config, variant
         ),
         "error_file": str(error_file),
+        "allowed_config_keys": _PIP_CONFIG_ALLOWED,
     }
     command = [
         sys.executable,
+        # Ignore PYTHONPATH/PYTHONHOME so host modules cannot shadow the pinned pip.
+        "-E",
         "-c",
         _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
         json.dumps(marker_config),
@@ -298,50 +341,51 @@ def install_requirements(
         "-r",
         str(requirements),
     ]
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "TMP": str(destination.parent),
-            "TEMP": str(destination.parent),
-            "TMPDIR": str(destination.parent),
-        }
-    )
-    with open(os.devnull, "wb") as null_output:
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=context_dir,
-                env=environment,
-                stdout=null_output,
-                stderr=null_output,
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                "Unable to start pip for target dependency installation."
-            ) from exc
-        try:
-            started = time.monotonic()
-            while True:
-                try:
-                    returncode = process.wait(timeout=0.5)
-                    break
-                except subprocess.TimeoutExpired:
-                    _check_stage_limits(destination.parent)
-                    if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
-                        raise TimeoutError(
-                            f"Target dependency installation for {target} exceeded "
-                            f"{INSTALL_TIMEOUT_SECONDS} seconds."
-                        )
-        except BaseException:
-            _stop_process(process)
-            raise
+    environment = _pip_environment(destination.parent)
+    # pip logs index HTTP failures only at debug level, so keep its debug log in
+    # host temp space (never the tarred stage) to classify authentication errors.
+    with tempfile.TemporaryDirectory(prefix="pycontainer-pip-") as diagnostics:
+        pip_log = Path(diagnostics) / "pip.log"
+        with open(Path(diagnostics) / "stderr.txt", "w+b") as pip_errors:
+            try:
+                process = subprocess.Popen(
+                    [*command, "--log", str(pip_log)],
+                    cwd=context_dir,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=pip_errors,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    "Unable to start pip for target dependency installation."
+                ) from exc
+            try:
+                started = time.monotonic()
+                while True:
+                    try:
+                        returncode = process.wait(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        _check_stage_limits(destination.parent)
+                        if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
+                            raise TimeoutError(
+                                f"Target dependency installation for {target} exceeded "
+                                f"{INSTALL_TIMEOUT_SECONDS} seconds."
+                            )
+            except BaseException:
+                _stop_process(process)
+                raise
+            pip_errors.seek(0)
+            pip_output = pip_errors.read(_PIP_STDERR_LIMIT).decode("utf-8", "replace")
+        pip_debug = _read_tail(pip_log, _PIP_STDERR_LIMIT) if returncode else ""
 
+    secrets = known_secrets(environment, _placeholder_names(requirement_files))
     if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
-        details = _read_marker_error(error_file)
+        details = redact(_read_marker_error(error_file), secrets)
         if returncode == _MARKER_ERROR_EXIT:
             raise ValueError(
                 "Cannot evaluate dependency environment markers for target "
-                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"{target}, CPython {python_version}; refusing to stage an "
                 f"incomplete dependency set. {details}"
             )
         raise RuntimeError(
@@ -350,18 +394,153 @@ def install_requirements(
         )
     if returncode:
         raise RuntimeError(
-            "Target dependency installation failed. Only wheels compatible with "
-            f"{target}, CPython {python_version}, and binary-only resolution "
-            f"are supported. {_NO_SOURCE_FALLBACK}"
-            + (_ARMV7_WHEEL_NOTE if arch == "arm" else "")
+            _pip_failure_message(
+                redact(pip_output, secrets),
+                os_name,
+                arch,
+                python_version,
+                redact(pip_debug, secrets),
+                variant,
+            )
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
         if scripts_dir.exists():
             shutil.rmtree(scripts_dir)
     _drop_external_record_entries(destination)
+    reject_credentialed_direct_urls(destination)
 
     _check_stage_limits(destination.parent)
+    return requirement_files
+
+
+def _pip_environment(temporary_dir: Path) -> dict:
+    environment = {}
+    ignored = []
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper.startswith(("PIP_", "_PIP_")) and upper not in _PIP_ENVIRONMENT_ALLOWED:
+            ignored.append(upper)
+            continue
+        environment[name] = value
+    if ignored:
+        print(
+            "Ignoring host pip settings that could change target dependency "
+            f"selection: {', '.join(sorted(ignored))}"
+        )
+    environment.update(
+        {
+            "TMP": str(temporary_dir),
+            "TEMP": str(temporary_dir),
+            "TMPDIR": str(temporary_dir),
+        }
+    )
+    return environment
+
+
+def _placeholder_names(requirement_files: Iterable[Path]) -> List[str]:
+    names = set()
+    for path in requirement_files:
+        names.update(
+            PLACEHOLDER.findall(path.read_text(encoding="utf-8", errors="replace"))
+        )
+    return sorted(names)
+
+
+_PROXY_AUTH_FAILURE = re.compile(r"\b407\b[^\n]*proxy authentication", re.IGNORECASE)
+_INDEX_AUTH_FAILURE = re.compile(
+    r"\b(401|403)\b[^\n]*(unauthori[sz]ed|forbidden|client error|credentials not correct)",
+    re.IGNORECASE,
+)
+_CONNECTION_FAILURE = re.compile(
+    r"NewConnectionError|Failed to establish a new connection|ConnectTimeout"
+    r"|ReadTimeout|SSLError|CERTIFICATE_VERIFY_FAILED|ProxyError"
+    r"|Name or service not known|getaddrinfo failed|nodename nor servname"
+)
+
+
+def _pip_failure_message(
+    pip_output: str,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    pip_debug: str = "",
+    variant: Optional[str] = None,
+) -> str:
+    """Classify a failed install from redacted pip stderr and debug log text."""
+    excerpt = _pip_excerpt(pip_output, pip_debug)
+    details = f" pip reported (redacted): {excerpt}" if excerpt else ""
+    diagnostics = f"{pip_output}\n{pip_debug}"
+    if _PROXY_AUTH_FAILURE.search(diagnostics):
+        return (
+            "Proxy authentication failed while installing target dependencies "
+            "(HTTP 407). Check the proxy credentials available to the builder."
+            + details
+        )
+    if _INDEX_AUTH_FAILURE.search(diagnostics):
+        return (
+            "Authentication to a package index failed (HTTP 401/403) while "
+            f"installing target dependencies. {_AUTH_HINT}" + details
+        )
+    if _CONNECTION_FAILURE.search(diagnostics):
+        return (
+            "Could not reach the package index while installing target "
+            "dependencies. Check the index URL, network, proxy and TLS settings."
+            + details
+        )
+    return (
+        "Target dependency installation failed. Only wheels compatible with "
+        f"{_target_text(os_name, arch, variant)}, CPython {python_version}, and binary-only resolution "
+        f"are supported. {_NO_SOURCE_FALLBACK}"
+        + (_ARMV7_WHEEL_NOTE if arch == "arm" else "")
+        + details
+    )
+
+
+def _pip_excerpt(pip_output: str, pip_debug: str = "") -> str:
+    errors = [
+        line.strip() for line in pip_output.splitlines() if line.strip()
+    ]
+    relevant = [line for line in errors if line.startswith("ERROR:")] or errors[-3:]
+    seen = set()
+    for line in pip_debug.splitlines():
+        if (
+            _PROXY_AUTH_FAILURE.search(line)
+            or _INDEX_AUTH_FAILURE.search(line)
+            or _CONNECTION_FAILURE.search(line)
+        ):
+            message = line.strip().split(" ", 1)[-1]
+            if message not in seen:
+                seen.add(message)
+                relevant.insert(0, message)
+    return " | ".join(
+        line[:_PIP_EXCERPT_LINE_CHARS] for line in relevant[:_PIP_EXCERPT_LINES]
+    )
+
+
+def _read_tail(path: Path, limit: int) -> str:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - limit))
+            return handle.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return ""
+
+
+def reject_credentialed_direct_urls(site_packages: Path) -> None:
+    for direct_url in sorted(site_packages.glob("*.dist-info/direct_url.json")):
+        try:
+            url = json.loads(direct_url.read_text(encoding="utf-8")).get("url", "")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise ValueError(
+                f"Cannot validate installed package source metadata: {direct_url.parent.name}"
+            ) from exc
+        if isinstance(url, str) and url_has_credentials(url):
+            raise ValueError(
+                f"Installed package metadata {direct_url.parent.name}/direct_url.json "
+                "records a URL with credentials; refusing to place it in the image."
+            )
 
 
 def _read_marker_error(error_file: Path) -> str:
@@ -390,11 +569,14 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def _read_requirements_text(path: Path) -> str:
-    data = path.read_bytes()
+def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return data.decode("utf-16")
-    return data.decode("utf-8-sig")
+        return data.decode("utf-16", errors)
+    return data.decode("utf-8-sig", errors)
+
+
+def _read_requirements_text(path: Path) -> str:
+    return _decode_requirements(path.read_bytes())
 
 
 def validate_requirements(
@@ -407,6 +589,16 @@ def validate_requirements(
 
     Constraint-file requirement lines are appended to ``constraints`` when given.
     """
+    return _scan_requirements(requirements, context_dir, check_overrides, constraints)[0]
+
+
+def _scan_requirements(
+    requirements: Path,
+    context_dir: Path,
+    check_overrides: bool = True,
+    constraints: Optional[List[str]] = None,
+) -> Tuple[List[str], List[Path]]:
+    """Validate a context-local requirements graph; return root lines and files."""
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
@@ -431,9 +623,11 @@ def validate_requirements(
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
 
+        text = _read_requirements_text(path)
+        reject_literal_credentials(path, text, context_root)
         logical_lines = []
         continuation = ""
-        for raw_line in _read_requirements_text(path).splitlines():
+        for raw_line in text.splitlines():
             if raw_line.rstrip().endswith("\\"):
                 continuation += raw_line.rstrip()[:-1] + " "
                 continue
@@ -490,7 +684,66 @@ def validate_requirements(
                     )
                 included_path = (path.parent / include).resolve(strict=True)
                 pending.append((included_path, include_constraint))
-    return roots
+    return roots, sorted({path for path, _ in visited})
+
+
+def reject_literal_credentials(path: Path, text: str, context_root: Path) -> None:
+    findings = find_credentials(text)
+    if not findings:
+        return
+    try:
+        shown = path.resolve().relative_to(context_root.resolve()).as_posix()
+    except ValueError:
+        shown = path.name
+    locations = ", ".join(f"line {line} ({url})" for line, url in findings[:5])
+    raise ValueError(
+        f"{shown} contains a URL with literal credentials at {locations}; "
+        "refusing to build because build-context files can be copied into "
+        "image layers. Reference secrets as ${VAR} placeholders, which pip "
+        "expands at install time, or supply them through PIP_INDEX_URL, a pip "
+        "config file, .netrc or keyring."
+    )
+
+
+def reject_shipped_credentials(
+    files: Iterable[Tuple[Path, Path]],
+    context_dir: Path,
+    requirement_paths: Iterable[Path] = (),
+) -> None:
+    """Fail before app-layer creation when pip inputs that would ship hold credentials."""
+    context_root = Path(context_dir).resolve()
+    requirement_set = {Path(path).resolve() for path in requirement_paths}
+    # pip runs from the context, so relative credential-file variables resolve there.
+    configured = {
+        name: (context_root / os.environ[name]).resolve()
+        for name in ("PIP_CONFIG_FILE", "NETRC")
+        if os.environ.get(name) and os.environ[name] != os.devnull
+    }
+    for source, relative in files:
+        name = relative.name.lower()
+        resolved = Path(source).resolve()
+        if name in {".netrc", "_netrc"} or resolved == configured.get("NETRC"):
+            raise ValueError(
+                f"{relative.as_posix()} is a credentials file and would be copied into "
+                "the image; exclude it from the build context."
+            )
+        if not (
+            name in {"pip.conf", "pip.ini"}
+            or re.fullmatch(r"(requirements|constraints).*\.(txt|in)", name)
+            or resolved in requirement_set
+            or resolved == configured.get("PIP_CONFIG_FILE")
+        ):
+            continue
+        with open(source, "rb") as handle:
+            data = handle.read(MAX_REQUIREMENTS_BYTES + 1)
+        if len(data) > MAX_REQUIREMENTS_BYTES:
+            raise ValueError(
+                f"{relative.as_posix()} is too large to scan for credentials "
+                f"(over {MAX_REQUIREMENTS_BYTES} bytes) and would be copied into the "
+                "image; shrink it or exclude it from the build context."
+            )
+        text = _decode_requirements(data, "replace")
+        reject_literal_credentials(Path(source), text, context_root)
 
 
 def stage_virtualenv(
