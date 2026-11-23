@@ -909,7 +909,14 @@ def _target_config(arch, python_version="3.11.8"):
     return {
         **BASE_CONFIG,
         "architecture": arch,
-        "config": {"Env": [f"PYTHON_VERSION={python_version}"], "WorkingDir": "/"},
+        "config": {
+            "Env": [
+                "PYTHON_IMPLEMENTATION=CPython",
+                f"PYTHON_VERSION={python_version}",
+                "PYTHON_LIBC=glibc-2.17",
+            ],
+            "WorkingDir": "/",
+        },
     }
 
 def _multi_platform_marker_builder(tmp_path, monkeypatch, context):
