@@ -535,6 +535,17 @@ def test_layer_libc_rejects_linked_metadata_or_ancestors(tmp_path, name, link_ty
         _layer_libc_config([layer])
 
 
+def test_layer_libc_accepts_usr_merged_lib_symlink_for_glibc(tmp_path):
+    link = tarfile.TarInfo("lib")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "usr/lib"
+    layer = _base_metadata_layer(
+        tmp_path, [("lib", link), ("var/lib/dpkg/status", _dpkg_libc())]
+    )
+    config = _layer_libc_config([layer])
+    assert "PYTHON_LIBC=glibc-2.36" in config["config"]["Env"]
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [

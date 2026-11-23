@@ -84,7 +84,7 @@ def _path(name):
     return path.as_posix()
 
 
-def _layer_records(layer, deadline):
+def _layer_records(layer, deadline, expected):
     updates = {}
     deleted = set()
     with ExitStack() as stack:
@@ -137,10 +137,9 @@ def _layer_records(layer, deadline):
                         if removed == candidate or removed in candidate.parents:
                             deleted.add(database)
                     continue
-                ancestor = any(
-                    path in PurePosixPath(database).parents for database in _DATABASES
-                )
-                if ancestor and not member.isdir():
+                # Only the target database's ancestors matter: usr-merged Debian
+                # layers link lib -> usr/lib, an ancestor of the APK database.
+                if path in PurePosixPath(expected).parents and not member.isdir():
                     raise ValueError("Base libc metadata has a non-directory or linked ancestor.")
                 if name not in _DATABASES:
                     continue
@@ -210,13 +209,13 @@ def _package_version(text, family, architecture):
 def infer_libc_from_layers(layers, family, architecture, machine):
     """Read effective package metadata; the caller establishes source provenance."""
     deadline = time.monotonic() + INSPECTION_TIMEOUT_SECONDS
+    expected = "var/lib/dpkg/status" if family == "glibc" else "lib/apk/db/installed"
     files = {}
     for layer in layers:
-        deleted, updates = _layer_records(layer, deadline)
+        deleted, updates = _layer_records(layer, deadline, expected)
         for name in deleted:
             files.pop(name, None)
         files.update(updates)
-    expected = "var/lib/dpkg/status" if family == "glibc" else "lib/apk/db/installed"
     if set(files) != {expected}:
         raise ValueError(
             "Cannot validate target libc from absent or ambiguous base metadata. "
