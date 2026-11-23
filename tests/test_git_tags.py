@@ -1113,7 +1113,10 @@ def test_git_tags_preserve_multi_platform_layout_and_partial_push_accounting(
     from pycontainer import builder as builder_module
     from pycontainer.auth import RegistryAuth
     from pycontainer.registry_client import RegistryRequestError
+    from pycontainer.release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
+    notes = tmp_path / "release-notes.md"
+    notes.write_text("Version notes\n", encoding="utf-8")
     config = _config(
         release_repo,
         output_dir=str(tmp_path / "out"),
@@ -1124,6 +1127,7 @@ def test_git_tags_preserve_multi_platform_layout_and_partial_push_accounting(
         latest_tag=True,
         manifest_annotations={"example.manifest": "manifest-value"},
         index_annotations={"example.index": "index-value"},
+        release_notes_file=str(notes),
     )
     builder = ImageBuilder(config)
     monkeypatch.setattr(
@@ -1138,6 +1142,8 @@ def test_git_tags_preserve_multi_platform_layout_and_partial_push_accounting(
     for image in builder.platform_images:
         manifest = json.loads((tmp_path / "out" / "blobs" / "sha256" / image.manifest_digest.split(":")[1]).read_text())
         assert manifest["annotations"]["example.manifest"] == "manifest-value"
+        image_config = json.loads((tmp_path / "out" / "blobs" / "sha256" / image.config_digest.split(":")[1]).read_text())
+        assert image_config["config"]["Labels"][DEFAULT_RELEASE_NOTES_LABEL] == "Version notes\n"
     assert [
         item["annotations"]["org.opencontainers.image.ref.name"]
         for item in layout["manifests"]
