@@ -18,8 +18,8 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import (
     _PIP_TARGET_SCRIPT,
-    _analyze_requirements,
     _merge_site_packages,
+    _scan_requirements,
     install_locked_requirements,
     install_requirements,
     staged_packages,
@@ -824,6 +824,35 @@ def test_index_urls_reject_query_secrets_and_injected_directives(tmp_path, regis
 
     with pytest.raises(LockfileError, match=message):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+@pytest.mark.parametrize("lock_format", ["uv", "poetry", "pipenv", "pdm"])
+@pytest.mark.parametrize(
+    "url, message",
+    [
+        (
+            "https://dl.cloudsmith.io/aB3dE5fG7hJ9kL1mN3pQ5rS/org/repo/python/simple",
+            "literal credentials",
+        ),
+        ("https://example.com/simple?${INDEX_KEY}=${INDEX_TOKEN}", "placeholder in a query name"),
+    ],
+)
+def test_recorded_index_urls_reject_path_tokens_and_query_name_placeholders(
+    tmp_path, monkeypatch, lock_format, url, message
+):
+    monkeypatch.setitem(globals(), "PRIVATE", url)
+    if lock_format == "uv":
+        context, lock = _write_uv_project(tmp_path / "ctx", registry=url), "uv.lock"
+    elif lock_format == "poetry":
+        context, lock = _poetry_with_source(tmp_path, "supplemental"), "poetry.lock"
+    elif lock_format == "pipenv":
+        context, lock = _pipenv_sources(tmp_path), "Pipfile.lock"
+    else:
+        context, lock = _pdm_with_sources(tmp_path, ("pypi", url)), "pdm.lock"
+
+    with pytest.raises(LockfileError, match=message) as error:
+        load_lockfile(context, Path(lock), PY311)
+    assert "aB3dE5fG7hJ9kL1mN3pQ5rS" not in str(error.value)
 
 
 def test_uv_lock_missing_root_dependency_edge_fails(tmp_path):
@@ -2218,7 +2247,7 @@ def test_requirements_hash_pinning_detection(tmp_path, lines, pinned):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("\n".join(lines) + "\n")
 
-    _, hash_pinned = _analyze_requirements(requirements, tmp_path)
+    _, _, hash_pinned = _scan_requirements(requirements, tmp_path)
     assert hash_pinned is pinned
 
 
@@ -2236,7 +2265,7 @@ def test_requirements_also_used_as_constraints_still_need_hashes(tmp_path, monke
         requirements.stat().st_size + shared.stat().st_size,
     )
 
-    roots, hash_pinned = _analyze_requirements(requirements, tmp_path)
+    roots, _, hash_pinned = _scan_requirements(requirements, tmp_path)
     assert roots == ["fixture-dep==1.0"]
     assert not hash_pinned
 

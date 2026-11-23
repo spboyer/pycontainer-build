@@ -186,8 +186,8 @@ def _measure_transfer_worker(spec):
     source = Path(spec["source"])
     destination = Path(spec["destination"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    client = RegistryClient("benchmark.invalid", "benchmark")
-    client.base_url = spec["registry_url"]
+    registry = urlsplit(spec["registry_url"])
+    client = RegistryClient(registry.netloc, "benchmark", insecure=True)
 
     tracemalloc.start()
     started = time.perf_counter()

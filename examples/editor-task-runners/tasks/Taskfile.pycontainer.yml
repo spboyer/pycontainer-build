@@ -1,0 +1,10 @@
+version: "3"
+
+tasks:
+  build:
+    cmds:
+      - python -m pycontainer.cli build --context . --config pycontainer.toml
+
+  dry-run:
+    cmds:
+      - python -m pycontainer.cli build --context . --config pycontainer.toml --dry-run

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
+from .credentials import url_has_credentials
 from ._venv_closure import ClosureError as _MarkerStructureError, _walk as _walk_marker
 from .dependencies import _read_staged_distributions
 
@@ -303,8 +304,16 @@ def _index_url(url: str, source: str) -> Optional[str]:
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.fragment:
         raise LockfileError(f"Unsupported package index URL for {source}.")
     userinfo = parts.netloc.rsplit("@", 1)[0].split(":", 1) if "@" in parts.netloc else []
-    query_values = [pair.split("=", 1)[-1] for pair in parts.query.split("&") if pair]
-    if any(_PLACEHOLDER.sub("", part) for part in [*userinfo, *query_values]):
+    query_pairs = [pair.partition("=") for pair in parts.query.split("&") if pair]
+    query_values = [value for _, _, value in query_pairs]
+    if any("$" in name or "%24" in name.lower() for name, _, _ in query_pairs):
+        raise LockfileError(
+            f"Package index URL for {source} uses a placeholder in a query name; only "
+            "credentials and query values may be ${VARIABLE} placeholders."
+        )
+    if url_has_credentials(url) or any(
+        _PLACEHOLDER.sub("", part) for part in [*userinfo, *query_values]
+    ):
         raise LockfileError(
             f"Package index URL for {source} contains literal credentials or query values; use "
             "${VARIABLE} placeholders, netrc or keyring instead."
