@@ -432,6 +432,14 @@ pycontainer build \
   setuptools or Flit tables mentioning host markers fail, as do unreadable
   dynamic dependencies. Unmarked declarations in those unparsed sources are
   not verified. Use a requirements file when a virtualenv cannot be verified.
+  Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
+  `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
+  placeholders in the requirements file, including in URL paths. Literal
+  credentials in requirements files (URL userinfo, secret-like query values
+  and recognized URL path tokens) are rejected, and host pip settings that
+  could change target selection (for example `PIP_PLATFORM` or
+  `PIP_NO_BINARY`) are ignored; see
+  [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
