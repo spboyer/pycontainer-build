@@ -179,7 +179,11 @@ def _select_index_descriptor(
         f"variant. Available platforms: {available_text}."
     )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
-from .project import detect_entrypoint, default_include_paths, find_dependencies
+from .project import (
+    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    default_include_paths, find_dependencies,
+)
+from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
 from .registry_client import (
     RegistryClient,
@@ -316,6 +320,17 @@ class ImageBuilder:
         return timing.phase(name) if timing else nullcontext()
 
     def build(self):
+        self._conda_warning_emitted = False
+        if conda_prefix(self.config.context_dir, ".") is not None:
+            raise ValueError(
+                "The build context is inside a host Conda environment; use a "
+                "source-only build context to avoid copying host environment files. "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` and select that "
+                "file with --requirements and --include-deps."
+            )
+        if self.config.include_deps:
+            self._check_conda_dependencies()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
@@ -406,7 +421,8 @@ class ImageBuilder:
 
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
-                                layer_diff_ids=[layer.digest for layer in app_layers])
+                                layer_diff_ids=[layer.digest for layer in app_layers],
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -702,6 +718,10 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        if self.config.stop_signal:
+            print(f"  Stop Signal: {self.config.stop_signal}")
+        if self.config.volumes:
+            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
@@ -713,6 +733,51 @@ class ImageBuilder:
         if self.config.cache_to:
             print(f"  Cache To: {self.config.cache_to}")
 
+    def _check_conda_dependencies(self):
+        ctx = Path(self.config.context_dir)
+        relative = relative_context_path(self.config.requirements_file)
+        signals = detect_conda_inputs(
+            ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
+            selected_paths=self.context_include_paths,
+        )
+        requirements = ctx / relative
+        requirements_exist = requirements.is_file()
+        conda_requirements = requirements_exist and (
+            relative.name in CONDA_FILES
+            or requirements.resolve().name in CONDA_FILES
+        )
+        requirements_prefix = (
+            conda_prefix(ctx, relative) if requirements_exist else None
+        )
+        if conda_requirements or requirements_prefix is not None:
+            if relative not in signals:
+                signals.append(relative)
+        if not signals:
+            return False
+        if (
+            conda_requirements
+            or not requirements_exist
+            or requirements_prefix is not None
+        ):
+            raise ValueError(
+                f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` in your Conda "
+                "environment, then select that file with --requirements and "
+                "--include-deps. Conda-only packages must be provided by the base "
+                "image; host Conda environments are never copied."
+            )
+        if not requirements.resolve().is_relative_to(ctx.resolve()):
+            raise ValueError("Requirements file must stay inside the build context.")
+        if not getattr(self, "_conda_warning_emitted", False):
+            logger.warning(
+                "Conda inputs ignored (%s); installing only pip requirements from %s. "
+                "Conda-only packages are not staged.",
+                ", ".join(path.as_posix() for path in signals), relative.as_posix(),
+            )
+            self._conda_warning_emitted = True
+        return True
+
     def _create_deps_layer(
         self,
         layers_dir: Path,
@@ -723,15 +788,15 @@ class ImageBuilder:
     ) -> Optional[OCILayer]:
         """Create a target-compatible dependency layer from a venv or requirements."""
         ctx=Path(self.config.context_dir)
+        prefer_requirements = self._check_conda_dependencies()
         deps_paths=find_dependencies(
             ctx,
             self.config.requirements_file,
             exclude_paths=self.dependency_excludes,
             exclude_defaults=False,
+            prefer_requirements=prefer_requirements,
         )
-        requirements_relative = Path(self.config.requirements_file)
-        if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
-            raise ValueError("Requirements path must be relative and stay inside the build context.")
+        requirements_relative = relative_context_path(self.config.requirements_file)
         is_requirements = any(
             relative == requirements_relative for _, relative in deps_paths
         )
