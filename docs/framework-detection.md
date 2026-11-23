@@ -8,7 +8,7 @@ provide the packages in the base image.
 | Framework | Evidence | Default entrypoint | Ports |
 |---|---|---|---|
 | FastAPI | Module-level assignment to `FastAPI(...)`, including imported aliases | `uvicorn <module>:<variable> --host 0.0.0.0 --port 8000` | 8000 |
-| Flask | Module-level assignment to `Flask(...)`, including imported aliases | `flask run --host=0.0.0.0 --port=5000` | 5000 |
+| Flask | A `Flask(...)` construction, including imported aliases and app factories | `flask run --host=0.0.0.0 --port=5000` | 5000 |
 | Django | Root `manage.py` referring to Django | `python manage.py runserver 0.0.0.0:8000` | 8000 |
 | Streamlit | A script importing Streamlit and the `streamlit` dependency | `streamlit run <file> --server.address=0.0.0.0 --server.port=8501` | 8501 |
 | Gradio | A script creating and launching `Blocks` or `Interface`, and the `gradio` dependency | `python <file>` | 7860 |
@@ -42,9 +42,10 @@ the image working directory, including an `env -C` directory change.
 Multiple FastAPI or Celery applications or multiple Streamlit or Gradio
 scripts cannot be selected safely: the build asks for an explicit entrypoint
 or command. A FastAPI app passed to another app's `mount(...)` is a
-sub-application, not a root candidate. Any Flask application, including an
-app factory, uses one `flask run` entrypoint because Flask discovers the app
-itself. An unlaunched Gradio application and a Celery app without an
+sub-application, not a root candidate. Flask constructions share one
+`flask run` entrypoint. Flask normally searches an `app` or `wsgi` module;
+other layouts or ambiguous apps may need `FLASK_APP` or an explicit command.
+An unlaunched Gradio application and a Celery app without an
 importable module-level name also require an explicit entrypoint. FastAPI
 factories without a module-level app binding require explicit commands.
 A valid higher-precedence framework still wins over ambiguous lower-precedence
