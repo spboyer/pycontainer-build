@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import tarfile
 import threading
 import tomllib
@@ -15,6 +16,7 @@ import pytest
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import (
+    _PIP_TARGET_SCRIPT,
     _merge_site_packages,
     install_locked_requirements,
     validate_requirements,
@@ -1151,6 +1153,7 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
         ),
     )
     requirements = []
+    # Lock selection normally removes markers; exercise each pip invocation directly.
     for index, text in selection.requirement_sets():
         for name in ("marker-first", "marker-second"):
             text = text.replace(
@@ -1161,6 +1164,14 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
         requirements.append((index, text))
     site_packages = tmp_path / "stage" / "site-packages"
     site_packages.parent.mkdir()
+    commands = []
+    popen = subprocess.Popen
+
+    def record_pip(command, *args, **kwargs):
+        commands.append(command)
+        return popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", record_pip)
 
     install_locked_requirements(
         requirements, site_packages, tmp_path, "linux", "arm64", "3.9",
@@ -1168,6 +1179,9 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
         base_image_tag_verified=True,
     )
 
+    bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
+    assert len(commands) == 2
+    assert all(command[1:3] == ["-c", bootstrap] for command in commands)
     assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
     assert any("marker-first" in path for path in index_a.requests)
     assert any("marker-second" in path for path in index_b.requests)

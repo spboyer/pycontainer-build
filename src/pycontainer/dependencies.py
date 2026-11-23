@@ -1,6 +1,8 @@
 """Target-aware staging for Python runtime dependencies."""
+import codecs
 import configparser
 import csv
+import json
 import logging
 import os
 import re
@@ -14,6 +16,8 @@ from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
+from .venv_markers import declared_roots, venv_layout_os, verify_virtualenv_markers
+
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
 logger = logging.getLogger(__name__)
@@ -26,6 +30,11 @@ _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
+_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+_PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
+_MARKER_ERROR_EXIT = 86
+_PATCH_ERROR_EXIT = 87
+_MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
 _SUPPORTED_LIBC = {
     "glibc-2.17": "manylinux_2_17",
     "musl-1.2": "musllinux_1_2",
@@ -209,6 +218,29 @@ def validate_target_platform(os_name: str, arch: str) -> None:
         )
 
 
+def _target_marker_environment(
+    os_name: str, arch: str, python_version: str, base_config: Optional[dict]
+) -> dict:
+    """PEP 508 marker values for the target; omitted keys are unknown and fail closed."""
+    validate_target_platform(os_name, arch)
+    environment = {
+        "implementation_name": "cpython",
+        "os_name": "posix",
+        "platform_machine": _MARKER_MACHINES[arch],
+        "platform_python_implementation": "CPython",
+        "platform_system": "Linux",
+        "python_version": python_version,
+        "sys_platform": "linux",
+    }
+    full_version = _base_environment(base_config).get("PYTHON_VERSION", "")
+    if re.fullmatch(r"\d+\.\d+\.\d+", full_version) and (
+        ".".join(full_version.split(".")[:2]) == python_version
+    ):
+        environment["python_full_version"] = full_version
+        environment["implementation_version"] = full_version
+    return environment
+
+
 def install_requirements(
     requirements: Path,
     destination: Path,
@@ -234,16 +266,26 @@ def install_requirements(
     destination.mkdir(parents=True, exist_ok=True)
     # Locked installs use only the generated --index-url: no pip config files or PIP_* options.
     locked_options = ["--isolated", "--no-deps", "--require-hashes"] if locked else []
+    error_file = destination.parent / _MARKER_ERROR_FILE
+    marker_config = {
+        "environment": _target_marker_environment(
+            os_name, arch, python_version, base_config
+        ),
+        "error_file": str(error_file),
+    }
     command = [
         sys.executable,
-        "-m",
-        "pip",
+        "-c",
+        _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
+        json.dumps(marker_config),
         "install",
         "--disable-pip-version-check",
         "--no-input",
         "--no-cache-dir",
         "--no-compile",
         *locked_options,
+        # pip's conflict check evaluates markers of the host's installed packages.
+        "--no-warn-conflicts",
         "--target",
         str(destination),
         *_target_options(
@@ -294,6 +336,18 @@ def install_requirements(
             _stop_process(process)
             raise
 
+    if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
+        details = _read_marker_error(error_file)
+        if returncode == _MARKER_ERROR_EXIT:
+            raise ValueError(
+                "Cannot evaluate dependency environment markers for target "
+                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"incomplete dependency set. {details}"
+            )
+        raise RuntimeError(
+            "The builder's pip cannot evaluate environment markers for the target "
+            f"platform; refusing to use host markers. {details}"
+        )
     if returncode:
         hint = (
             " Locked artifacts must match their recorded hashes."
@@ -363,6 +417,15 @@ def _merge_site_packages(source: Path, destination: Path) -> None:
             os.replace(path, target)
 
 
+def _read_marker_error(error_file: Path) -> str:
+    try:
+        return error_file.read_text(encoding="utf-8", errors="replace")[:4096].strip()
+    except OSError:
+        return "No marker diagnostics were produced."
+    finally:
+        error_file.unlink(missing_ok=True)
+
+
 def _drop_external_record_entries(site_packages: Path) -> None:
     # Launcher entries point outside site-packages, and their hashes differ per build on Windows.
     for record in sorted(site_packages.glob("*.dist-info/RECORD")):
@@ -380,14 +443,24 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def validate_requirements(requirements: Path, context_dir: Path) -> bool:
-    """Validate includes and options; return whether every requirement is hash-pinned."""
+def _read_requirements_text(path: Path) -> str:
+    data = path.read_bytes()
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
+def _inspect_requirements(
+    requirements: Path, context_dir: Path, check_overrides: bool = True
+) -> Tuple[bool, List[str]]:
+    """Validate requirements files and collect their pinning status and root lines."""
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     counted_files = set()
     total_bytes = 0
     hash_pinned = True
+    roots = []
     while pending:
         path, is_constraint = pending.pop()
         visit = (path, is_constraint)
@@ -411,7 +484,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
 
         logical_lines = []
         continuation = ""
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
+        for raw_line in _read_requirements_text(path).splitlines():
             if raw_line.rstrip().endswith("\\"):
                 continuation += raw_line.rstrip()[:-1] + " "
                 continue
@@ -434,25 +507,32 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
                 hash_pinned = False
             for option in options:
                 name = option.split("=", 1)[0]
-                if name in _PIP_OVERRIDE_OPTIONS:
+                if check_overrides and name in _PIP_OVERRIDE_OPTIONS:
                     raise ValueError(
                         f"Requirements files cannot override target install option {name}."
                     )
 
             include = None
+            include_constraint = is_constraint
             option = options[0]
             if option in {"-r", "--requirement", "-c", "--constraint"}:
                 if len(options) != 2:
                     raise ValueError(f"Invalid requirements include in {path}.")
                 include = options[1]
+                include_constraint |= option in {"-c", "--constraint"}
             elif option.startswith("--requirement="):
                 include = option.split("=", 1)[1]
             elif option.startswith("--constraint="):
                 include = option.split("=", 1)[1]
+                include_constraint = True
             elif option.startswith("-r") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
             elif option.startswith("-c") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
+                include_constraint = True
+            elif not option.startswith("-") and not is_constraint:
+                requirement = re.sub(r"(^|\s)#.*$", "", line)
+                roots.append(re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip())
 
             if include is not None:
                 if include.startswith(("http://", "https://", "file://")):
@@ -461,8 +541,13 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
                         "use a local file inside the build context."
                     )
                 included_path = (path.parent / include).resolve(strict=True)
-                pending.append((included_path, is_constraint or option.startswith(("-c", "--constraint"))))
-    return hash_pinned
+                pending.append((included_path, include_constraint))
+    return hash_pinned, roots
+
+
+def validate_requirements(requirements: Path, context_dir: Path) -> bool:
+    """Validate includes and options; return whether every requirement is hash-pinned."""
+    return _inspect_requirements(requirements, context_dir)[0]
 
 
 def _is_hash_pinned(options: List[str]) -> bool:
@@ -489,6 +574,9 @@ def stage_virtualenv(
     python_version: str,
     os_name: str,
     arch: str,
+    base_config: Optional[dict] = None,
+    context_dir: Optional[Path] = None,
+    requirements: Optional[Path] = None,
 ) -> None:
     validate_target_platform(os_name, arch)
     files = list(dependencies)
@@ -503,7 +591,7 @@ def stage_virtualenv(
         raise ValueError("Dependencies from multiple virtualenv site-packages roots are unsupported.")
 
     root = next(iter(site_roots), ())
-    _validate_virtualenv_version(files, root, python_version)
+    version_established = _validate_virtualenv_version(files, root, python_version)
     destination.mkdir(parents=True, exist_ok=True)
     total_bytes = 0
     total_files = 0
@@ -524,11 +612,59 @@ def stage_virtualenv(
         shutil.copy2(source, target)
     _check_stage_limits(destination)
     _validate_wheel_metadata(destination, python_version)
+    _verify_virtualenv_targets(
+        destination,
+        os_name,
+        arch,
+        python_version,
+        base_config,
+        context_dir,
+        requirements,
+        version_established,
+        venv_layout_os(root, _read_venv_config(files, root)),
+    )
+
+
+def _verify_virtualenv_targets(
+    site_packages: Path,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_config: Optional[dict],
+    context_dir: Optional[Path],
+    requirements: Optional[Path],
+    version_established: bool,
+    host_os_name: Optional[str] = None,
+) -> None:
+    root_lines = (
+        _inspect_requirements(requirements, context_dir, check_overrides=False)[1]
+        if context_dir is not None and requirements is not None and requirements.is_file()
+        else []
+    )
+    roots = declared_roots(context_dir, root_lines) if context_dir is not None else []
+    errors = verify_virtualenv_markers(
+        site_packages,
+        _target_marker_environment(os_name, arch, python_version, base_config),
+        roots,
+        shared_python_version=version_established,
+        host_os_name=host_os_name,
+    )
+    if errors:
+        shown = "; ".join(errors[:10])
+        more = f"; and {len(errors) - 10} more" if len(errors) > 10 else ""
+        raise ValueError(
+            "The virtualenv was resolved with another environment's markers and is "
+            f"incomplete or unverifiable for target {os_name}/{arch}, CPython "
+            f"{python_version}; refusing to stage it. Use a requirements file so pip "
+            f"resolves for the target. {shown}{more}"
+        )
 
 
 def _validate_virtualenv_version(
     files: List[Tuple[Path, Path]], root: Tuple[str, ...], python_version: str
-) -> None:
+) -> bool:
+    """Reject a mismatched venv Python; return whether its version was established."""
+    established = False
     for _, relative in files:
         match = re.search(r"(?:^|/)python(\d+\.\d+)/site-packages/", relative.as_posix())
         if match and match.group(1) != python_version:
@@ -536,20 +672,32 @@ def _validate_virtualenv_version(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
-    if not files:
-        return
-    context_root = files[0][0]
-    for _ in root:
-        context_root = context_root.parent
-    venv_config = context_root / "pyvenv.cfg"
-    if venv_config.is_file():
-        text = venv_config.read_text(errors="replace")
-        match = re.search(r"(?im)^\s*version\s*=\s*(\d+\.\d+)", text)
+        established |= bool(match)
+    text = _read_venv_config(files, root)
+    if text is not None:
+        match = re.search(r"(?im)^\s*version(?:_info)?\s*=\s*(\d+\.\d+)", text)
         if match and match.group(1) != python_version:
             raise ValueError(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
+        established |= bool(match)
+    return established
+
+
+def _read_venv_config(files: List[Tuple[Path, Path]], root: Tuple[str, ...]) -> Optional[str]:
+    """Return the text of the pyvenv.cfg enclosing the site-packages root, if any."""
+    if not files:
+        return None
+    source, relative = files[0]
+    context_root = source
+    for _ in relative.parts:
+        context_root = context_root.parent
+    venv_dirs = [context_root.joinpath(*root[:index]) for index in range(len(root) - 1, 0, -1)]
+    venv_config = next(
+        (path / "pyvenv.cfg" for path in venv_dirs if (path / "pyvenv.cfg").is_file()), None
+    )
+    return venv_config.read_text(errors="replace") if venv_config is not None else None
 
 
 def _validate_virtualenv_file(source: Path, relative: Path) -> None:
