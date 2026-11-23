@@ -37,6 +37,23 @@ UPSTREAM_AUTH = RegistryAuth(username="upstream-user", password="upstream-secret
 UPSTREAM_HEADER = "Basic dXBzdHJlYW0tdXNlcjp1cHN0cmVhbS1zZWNyZXQ="
 
 
+@pytest.mark.parametrize("mirrors", [{}, {"upstream.example": ["mirror.example"]}])
+def test_base_pull_ignores_destination_environment_credentials(tmp_path, monkeypatch, mirrors):
+    monkeypatch.setenv("REGISTRY_TOKEN", "destination-secret")
+    monkeypatch.setenv("REGISTRY_USERNAME", "destination-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "destination-password")
+    monkeypatch.setattr(auth_module.DockerConfigAuthProvider, "get_credentials", lambda *_: None)
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(tmp_path), registry_mirrors=mirrors, use_cache=False,
+    ))
+    client = builder._base_image_client("upstream.example", "app")
+    if mirrors:
+        client = client._client(1)
+    assert client.auth_token is None
+    assert client.username is None
+    assert client.password is None
+
+
 def _digest(data):
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
 

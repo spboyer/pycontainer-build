@@ -1,0 +1,32 @@
+# Copy to .gitlab-ci.yml in the application repository.
+stages: [build]
+
+build-image:
+  image: python:3.11
+  stage: build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true" && ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG)'
+  cache:
+    key: pycontainer-linux-amd64-py311-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pycontainer-cache/
+  before_script:
+    - python -m venv .ci-venv
+    - . .ci-venv/bin/activate
+    - python -m pip install --no-deps "git+https://github.com/spboyer/pycontainer-build.git@7bdec100c773d9a51e5aae63eb0d4456894ae43f"
+  script:
+    - |
+      set -eu
+      set +x
+      export REGISTRY_USERNAME="$CI_REGISTRY_USER"
+      export REGISTRY_PASSWORD="$CI_JOB_TOKEN"
+      unset REGISTRY_TOKEN GITHUB_TOKEN
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        if ! printf '%s\n' "$CI_COMMIT_TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "Release tags must be stable semantic versions, e.g. v1.2.3." >&2
+          exit 1
+        fi
+        python .ci/pycontainer_ci.py build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" --semver-tags --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --exclude .ci --push --no-progress
+      else
+        python .ci/pycontainer_ci.py build --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" --base-image python:3.11-slim --platform linux/amd64 --context . --cache-dir "$CI_PROJECT_DIR/.pycontainer-cache" --exclude .pycontainer-cache --exclude .ci-venv --exclude .ci --push --no-progress
+      fi

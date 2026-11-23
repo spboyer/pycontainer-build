@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig, canonical_registry
+from .metadata import validate_metadata
 
 
 BUILD_TABLE = "[build]"
@@ -131,10 +132,18 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
     merged = _normalize_config_keys(file_config, "Config file")
     cli_args = _normalize_config_keys(cli_args, "CLI options")
 
+    metadata_fields = ("labels", "manifest_annotations", "index_annotations")
+    for source, values in (("Config file", merged), ("CLI options", cli_args)):
+        for key in metadata_fields:
+            if key in values:
+                validate_metadata(
+                    values[key], f"{source} {key}", protect_reference=key != "labels"
+                )
+
     for key, value in cli_args.items():
         if value is not None:
             if (
-                key in ('env', 'labels')
+                key in ('env', *metadata_fields)
                 and isinstance(value, dict)
                 and isinstance(merged.get(key), dict)
             ):

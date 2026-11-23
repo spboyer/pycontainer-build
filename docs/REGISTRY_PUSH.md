@@ -388,12 +388,13 @@ This makes subsequent pushes much faster.
 
 ### Registry errors, rate limits and quotas
 
-Registry failures report the operation, registry host, HTTP status and the
-OCI distribution error codes from the response body, for example:
+Registry failures report the operation, registry host and HTTP status.
+Distribution error codes and messages are used to classify failures, but
+transfer response bodies are omitted because they can echo image metadata:
 
 ```text
-Manifest pull failed with HTTP 429 from registry-1.docker.io: TOOMANYREQUESTS:
-You have reached your pull rate limit. The registry rate limit was exceeded;
+Manifest pull failed with HTTP 429 from registry-1.docker.io: (response details omitted)
+The registry rate limit was exceeded;
 it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
 100 remaining. Authenticate to the registry ...
 ```
@@ -420,11 +421,10 @@ Run with `--verbose` to log Docker Hub style `RateLimit-Limit` and
 `RateLimit-Remaining` headers. A warning is printed once per registry client
 when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
 
-Error bodies are treated as untrusted: at most five errors are shown, each
-message is truncated, control characters are removed, and authorization
-values, tokens and the configured credentials, including URL-encoded forms,
-are replaced with `[REDACTED]`.
-Registry hosts and HTTP(S) URLs in error details omit userinfo and query strings.
+Token-exchange error bodies are treated as untrusted: at most five errors are
+shown, messages are truncated, control characters are removed, and credentials
+are replaced with `[REDACTED]`. Registry hosts and HTTP(S) URLs in error
+details omit userinfo and query strings.
 
 ## Authentication Priority
 

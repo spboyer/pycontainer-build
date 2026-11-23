@@ -9,6 +9,7 @@ pycontainer import Dockerfile                          # print report and snippe
 pycontainer import Dockerfile --output pyproject.toml  # write a new file
 pycontainer import Dockerfile -o pyproject.toml --force
 pycontainer import Dockerfile --build-arg PY=3.12
+pycontainer import Dockerfile --shell '["/bin/bash", "-c"]'
 ```
 
 ## Output safety
@@ -52,10 +53,79 @@ and `[tool.pycontainer]` is rejected instead of silently picking one.
 | `ENTRYPOINT` | `entrypoint` |
 | `CMD` | `cmd` |
 | `USER` | `user` |
+| `STOPSIGNAL` | `stop_signal` |
+| `VOLUME` | `volumes` |
+| `SHELL` (exec form) | shell used for later shell-form `CMD`/`ENTRYPOINT` |
 
-Shell-form `CMD`/`ENTRYPOINT` become `["/bin/sh", "-c", "<command>"]`.
 `ARG`/`ENV` substitution (`$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR:+alt}`)
-is applied; `--build-arg KEY=VALUE` overrides ARG defaults.
+is applied to the instructions Docker expands at build time, including
+`STOPSIGNAL` and `VOLUME`; `--build-arg KEY=VALUE` overrides ARG defaults.
+Like Docker, `CMD`/`ENTRYPOINT` text is not substituted; the shell expands it
+when the container starts.
+
+`STOPSIGNAL` values are normalized the way Docker parses them (`term`, `15`
+and `SIGTERM` all become `SIGTERM`; numbers use Linux numbering, and aliases
+such as `IOT` map to their canonical names like `SIGABRT`). Unknown
+signals produce a warning and are skipped. `VOLUME` accepts JSON or
+space-separated paths; trailing slashes are removed and relative or unsafe
+paths produce a warning. Volumes are image metadata only: nothing is mounted
+at build time.
+
+## Shell-form commands
+
+Exec-form `CMD`/`ENTRYPOINT` arrays are imported unchanged. Shell-form text
+(including JSON-looking text that is not a valid JSON string array) is kept
+verbatim, quotes and all, and wrapped with the current shell:
+
+- The default shell is `["/bin/sh", "-c"]`.
+- `--shell JSON` sets the initial shell, for example
+  `--shell '["/bin/bash", "-c"]'`. It must be a non-empty JSON array of
+  strings with a non-empty executable first and no NUL characters; malformed
+  values are rejected.
+- A Dockerfile `SHELL ["…"]` instruction changes the shell for later
+  `CMD`/`ENTRYPOINT` instructions in the final stage, overriding `--shell`.
+  It still produces a warning, because `RUN` is never executed and OCI has no
+  field to record the shell for later images. A malformed `SHELL` produces a
+  warning and is ignored.
+
+Compatibility boundary:
+
+- The importer never runs command text on the build host; the shell only runs
+  inside the container at startup.
+- Docker inherits a `SHELL` set by the base image's own Dockerfile; OCI images
+  do not record it, so pass `--shell` when the base image changed its shell.
+- The shell must exist in the target image. A distroless base produces a
+  warning because it typically has no shell; prefer exec form there.
+- A `CMD`-only import does not get an auto-detected or framework entrypoint:
+  like Docker, the image keeps the base image's `Entrypoint` (if any) and runs
+  the imported `CMD` under it. Set `entrypoint` to run `cmd` as its arguments.
+  Exec-form `ENTRYPOINT []` / `CMD []` clear the base image's value.
+
+To check a converted shell-form command in a real runtime (Linux/WSL with
+Skopeo and a running Docker daemon; not part of the default tests or CI):
+
+```bash
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --shell-command --base-image python:3.11-slim
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --shell-command --shell '["/bin/bash", "-c"]'
+```
+
+It imports a quoted shell-form `ENTRYPOINT`, builds the image, imports it into
+Docker, runs it and compares the exact output. The requested `--platform` must
+match the Docker daemon. An optional `--evidence` record is tagged
+`shell-command` and does not satisfy the separate full-startup release gate.
+
+For `CMD`-only imports, use the separate verifier on a disposable Docker host
+with Skopeo:
+
+```bash
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --cmd-only --evidence cmd-only-evidence.json
+```
+
+It builds a base with a known entrypoint, imports shell- and exec-form
+`CMD` Dockerfiles with no `ENTRYPOINT`, and checks the exact output of each
+container. The same-repository PR runtime workflow runs this check on the
+exact PR head on Linux/amd64 and uploads a separate `cmd-only-runtime-evidence`
+artifact. It does not substitute for the full-startup release evidence.
 
 ## Parsing
 
@@ -67,8 +137,10 @@ bodies are handled. Only the final stage of a multi-stage build is imported.
 
 Nothing is dropped silently. Each of these produces a `WARNING` line with the
 Dockerfile line number: `RUN`, `COPY`/`ADD` (including `--from`), `HEALTHCHECK`,
-`VOLUME`, `SHELL`, `STOPSIGNAL`, `ONBUILD`, `MAINTAINER`, unknown instructions,
-non-final stages, `FROM scratch`, UDP ports and undefined variables.
+`SHELL` (even when applied), `ONBUILD`, `MAINTAINER`, unknown instructions,
+non-final stages (including their `VOLUME`/`STOPSIGNAL`), `FROM scratch`, UDP
+ports, undefined variables, invalid `STOPSIGNAL`/`VOLUME` values and
+shell-form commands on distroless bases.
 
 Because `RUN` is never executed, install dependencies on the host and use
 `include_deps = true` / `requirements_file`; project files are selected with
