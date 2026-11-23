@@ -576,6 +576,9 @@ pycontainer build --tag myapp:latest --base-image oci:./base:3.11-slim
 pycontainer build --tag myapp:latest --base-image docker-archive:./python.tar:python:3.11-slim
 ```
 
+For `--include-deps`, the local image config must explicitly declare
+`PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
+`PYTHON_LIBC`, even when its tag claims an official Python image.
 See [Local base images](../README.md#local-base-images) for selection rules,
 verification, and limitations.
 
