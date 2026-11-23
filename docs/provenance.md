@@ -101,7 +101,9 @@ context-relative `requirementsFile` when dependencies are included.
 wheels into an evidence directory, hashes each file, installs **only those
 files** offline (`--no-index --no-deps`), re-hashes them to confirm they did not
 change, and requires a one-to-one match between the wheels and the installed
-distributions. Every hashed `RECORD` entry, except relocated console scripts,
+distributions. Download resolution evaluates environment markers for the
+target and fails closed if a required target value is unknown. Every hashed
+`RECORD` entry, except relocated console scripts,
 must match the installed file. A lock
 file, requirements file or SBOM inventory is never treated as proof of what was
 installed.
@@ -161,8 +163,6 @@ cosign's transparency log defaults.
   wrong key. Keyless signing, registries without the Referrers API, GHCR, ACR
   and Docker Hub have not been validated.
 - Notation has no attestation path.
-- Dependency environment markers are evaluated on the build host
-  ([#142](https://github.com/spboyer/pycontainer-build/issues/142)).
 - Multi-tag pushes are not atomic; see the [signing guide](image-signing.md).
 
 ## Real-registry test

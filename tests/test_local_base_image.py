@@ -1,8 +1,10 @@
 """Local OCI-layout and Docker-save base images (issue #20)."""
+import bz2
 import gzip
 import hashlib
 import io
 import json
+import lzma
 import tarfile
 from pathlib import Path
 from unittest.mock import patch
@@ -457,6 +459,54 @@ def test_oci_layout_rejects_wrong_diff_id(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
 
 
+NOT_PLAIN_TAR = {
+    "gzip": lambda data: gzip.compress(data, mtime=0),
+    "zstd": lambda data: b"\x28\xb5\x2f\xfd" + data,
+    "bzip2": bz2.compress,
+    "xz": lzma.compress,
+    "garbage": lambda data: b"not a tar header".ljust(1024, b"\x01"),
+    "truncated": lambda data: data[:600],
+    "corrupt-later-header": lambda data: data[:1024] + b"\x01" * 512 + data[1536:],
+}
+
+
+@pytest.mark.parametrize("encoding", sorted(NOT_PLAIN_TAR))
+def test_oci_plain_tar_layer_rejects_non_tar_bytes_matching_diff_id(
+    tmp_path, offline, encoding
+):
+    layout = Layout(tmp_path / "base")
+    data = NOT_PLAIN_TAR[encoding](layer_tar({"a": b"a"}))
+    layer = layout.blob(data, OCI_TAR_LAYER)
+    config = layout.blob(image_config([sha(data)]), "application/vnd.oci.image.config.v1+json")
+    manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": config, "layers": [layer]}
+    layout.add(layout.blob(json.dumps(manifest).encode(), manifest["mediaType"]))
+    with pytest.raises(BlobIntegrityError, match="uncompressed tar"):
+        build(tmp_path, f"oci:{layout.root}")
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+@pytest.mark.parametrize("encoding", ["bzip2", "xz"])
+def test_docker_archive_rejects_unsupported_compressed_layer(tmp_path, offline, encoding):
+    archive = tmp_path / "base.tar"
+    data = NOT_PLAIN_TAR[encoding](layer_tar({"a": b"a"}))
+    docker_archive(archive, [(["base:v1"], "amd64", [data])], modern=True)
+    with pytest.raises(BlobIntegrityError, match="uncompressed tar"):
+        build(tmp_path, f"docker-archive:{archive}")
+
+
+def test_oci_plain_tar_layer_accepts_empty_tar(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    empty = layer_tar({})
+    layer = layout.blob(empty, OCI_TAR_LAYER)
+    config = layout.blob(image_config([sha(empty)]), "application/vnd.oci.image.config.v1+json")
+    manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": config, "layers": [layer]}
+    layout.add(layout.blob(json.dumps(manifest).encode(), manifest["mediaType"]))
+    build(tmp_path, f"oci:{layout.root}")
+    assert (tmp_path / "out" / "index.json").exists()
+
+
 def test_oci_layout_rejects_bad_layout_marker_and_corrupt_manifest(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     descriptor, platform, _ = layout.image(b"x")
@@ -901,12 +951,12 @@ def test_nested_oci_index_entry_limit(tmp_path, depth, count):
             assert len(read_nested_index()["manifests"]) == count
 
 
-def local_source_with_env(tmp_path, transport, name, env):
+def local_source_with_env(tmp_path, transport, name, env, arch="amd64"):
     tar = layer_tar({"etc/marker": b"musl"})
     if transport == "oci":
         layout = Layout(tmp_path / "base")
         layer = layout.blob(tar, OCI_TAR_LAYER)
-        config = json.loads(image_config([sha(tar)]))
+        config = json.loads(image_config([sha(tar)], arch=arch))
         config["config"]["Env"].extend(env)
         config_descriptor = layout.blob(
             json.dumps(config).encode(), "application/vnd.oci.image.config.v1+json"
@@ -924,7 +974,7 @@ def local_source_with_env(tmp_path, transport, name, env):
         layout.write_index()
         return f"oci:{layout.root}"
     archive = tmp_path / "base.tar"
-    docker_archive(archive, [([name], "amd64", [tar])], env=env)
+    docker_archive(archive, [([name], arch, [tar])], env=env)
     return f"docker-archive:{archive}"
 
 
@@ -981,6 +1031,59 @@ def test_local_source_name_does_not_determine_libc(
             else:
                 pip.assert_not_called()
                 assert builder._dependency_site_packages
+
+
+@pytest.mark.parametrize(("arch", "machine"), [("amd64", "x86_64"), ("arm64", "aarch64")])
+def test_local_source_verifies_virtualenv_closure_for_target(tmp_path, offline, arch, machine):
+    base_image = local_source_with_env(
+        tmp_path,
+        "oci",
+        "docker.io/library/python:3.11-slim",
+        ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17"],
+        arch=arch,
+    )
+    context = tmp_path / "context"
+    site_packages = context / ".venv" / "lib" / "python3.11" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (context / "app.py").write_text("print('hello')\n")
+
+    def write_dist(name, version, requirements=""):
+        dist = site_packages / f"{name.replace('-', '_')}-{version}.dist-info"
+        dist.mkdir()
+        (dist / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{requirements}\n"
+        )
+        (dist / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+
+    write_dist(
+        "app-lib",
+        "1.0",
+        f'Requires-Dist: target-only>=2; platform_machine == "{machine}"\n'
+        'Requires-Dist: windows-only; sys_platform == "win32"\n',
+    )
+
+    def builder(output):
+        return ImageBuilder(
+            BuildConfig(
+                tag="app:v1",
+                base_image=base_image,
+                platform=f"linux/{arch}",
+                context_dir=str(context),
+                output_dir=str(tmp_path / output),
+                include_deps=True,
+                use_cache=False,
+            )
+        )
+
+    with pytest.raises(ValueError, match="target-only.*not installed"):
+        builder("missing").build()
+
+    write_dist("target-only", "2.0")
+    image = builder("complete")
+    image.build()
+    assert {name for name, _ in image._staged_packages} == {"app-lib", "target-only"}
 
 
 @pytest.mark.parametrize("transport", ["oci", "docker"])

@@ -17,7 +17,7 @@ from pycontainer.provenance import (
     parse_verified_attestations,
 )
 
-from test_dependency_staging import BASE_CONFIG, _write_wheel
+from test_dependency_staging import BASE_CONFIG, _write_named_wheel, _write_wheel
 from test_signing import FakeRegistry, _use_registry
 
 BASE_INDEX = "sha256:" + "1" * 64
@@ -164,6 +164,48 @@ def test_wheel_evidence_uses_verified_base_tag_for_target_selection(tmp_path, mo
     builder.build()
     dependencies = builder.provenance_statement["predicate"]["buildDefinition"]["resolvedDependencies"]
     assert any(item["annotations"]["kind"] == "installed-wheel" for item in dependencies)
+
+
+@pytest.mark.parametrize(("arch", "expected"), [("amd64", "marker-amd"), ("arm64", "marker-arm")])
+def test_wheel_evidence_resolves_target_markers(tmp_path, arch, expected):
+    context = tmp_path / "context"
+    context.mkdir()
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=[
+        'marker-amd; platform_machine == "x86_64"',
+        'marker-arm; platform_machine == "aarch64"',
+    ])
+    for name in ("marker-amd", "marker-arm"):
+        _write_named_wheel(wheelhouse, name)
+    requirements = context / "requirements.txt"
+    requirements.write_text("--no-index\n--find-links ./wheelhouse\nmarker-root\n")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    wheels = install_requirements(
+        requirements, tmp_path / "site", context, "linux", arch, "3.11",
+        "python:3.11-slim", BASE_CONFIG, evidence_dir=evidence,
+    )
+    assert {wheel["name"] for wheel in wheels} == {"marker-root", expected}
+    for wheel in wheels:
+        original = (wheelhouse / wheel["filename"]).read_bytes()
+        assert wheel["sha256"] == hashlib.sha256(original).hexdigest()
+
+
+def test_wheel_evidence_rejects_unknown_target_markers(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    _write_named_wheel(context / "wheelhouse", "marker-root", requires=[
+        'marker-kernel; platform_release >= "5"',
+    ])
+    requirements = context / "requirements.txt"
+    requirements.write_text("--no-index\n--find-links ./wheelhouse\nmarker-root\n")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    with pytest.raises(ValueError, match="platform_release"):
+        install_requirements(
+            requirements, tmp_path / "site", context, "linux", "arm64", "3.11",
+            "python:3.11-slim", BASE_CONFIG, evidence_dir=evidence,
+        )
 
 
 def test_evidence_mode_rejects_tampered_installs_and_non_wheel_downloads(tmp_path):
@@ -698,6 +740,36 @@ def test_cli_rejects_provenance_dry_run_and_unpushed_attestation(tmp_path, monke
             "--attest-provenance",
         )
     assert "requires --push" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_accepts_configured_attestation_on_implicit_push(tmp_path, monkeypatch, command):
+    pushed = []
+
+    class FakeBuilder:
+        def __init__(self, config):
+            assert config.attest_provenance
+
+        def build(self):
+            return "built"
+
+        def push(self, **kwargs):
+            pushed.append(kwargs["registry_url"])
+            return kwargs["registry_url"]
+
+    def config_from_file(path, overrides):
+        return BuildConfig(**{**COSIGN_KEY, **overrides})
+
+    monkeypatch.setattr(cli, "config_from_file", config_from_file)
+    monkeypatch.setattr(cli, "ImageBuilder", FakeBuilder)
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "registry.example/app:v1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "registry.example/app:v1")
+    _run_cli(monkeypatch, command, "--config", str(tmp_path / "pycontainer.toml"))
+    assert pushed == ["registry.example/app:v1"]
 
 
 def test_cli_verify_provenance_reports_and_fails_closed(monkeypatch, capsys):

@@ -76,6 +76,7 @@ class BuildConfig:
     provenance_verify_key: Optional[str] = None
     provenance_certificate_identity: Optional[str] = None
     provenance_certificate_oidc_issuer: Optional[str] = None
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -83,6 +84,11 @@ class BuildConfig:
         self.system_packages = validate_system_packages(self.system_packages)
         self.validate_signing()
         self.validate_provenance()
+        if self.security is not None:
+            from .security import validate_security
+
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

@@ -1,8 +1,10 @@
 """Target-aware staging for Python runtime dependencies."""
 import base64
+import codecs
 import configparser
 import csv
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -15,9 +17,13 @@ from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from .venv_markers import declared_roots, host_environments, venv_layout_os
+
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
+MAX_METADATA_BYTES = 1024 * 1024
+CLOSURE_TIMEOUT_SECONDS = 120
 MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
 INSTALL_TIMEOUT_SECONDS = 300
@@ -26,6 +32,13 @@ _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
 }
+_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+_PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
+_VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
+_CLOSURE_HEADERS = ("Metadata-Version", "Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
+_MARKER_ERROR_EXIT = 86
+_PATCH_ERROR_EXIT = 87
+_MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
 _SUPPORTED_LIBC = {
     "glibc-2.17": "manylinux_2_17",
     "musl-1.2": "musllinux_1_2",
@@ -201,6 +214,29 @@ def validate_target_platform(os_name: str, arch: str) -> None:
         )
 
 
+def _target_marker_environment(
+    os_name: str, arch: str, python_version: str, base_config: Optional[dict]
+) -> dict:
+    """PEP 508 marker values for the target; omitted keys are unknown and fail closed."""
+    validate_target_platform(os_name, arch)
+    environment = {
+        "implementation_name": "cpython",
+        "os_name": "posix",
+        "platform_machine": _MARKER_MACHINES[arch],
+        "platform_python_implementation": "CPython",
+        "platform_system": "Linux",
+        "python_version": python_version,
+        "sys_platform": "linux",
+    }
+    full_version = _base_environment(base_config).get("PYTHON_VERSION", "")
+    if re.fullmatch(r"\d+\.\d+\.\d+", full_version) and (
+        ".".join(full_version.split(".")[:2]) == python_version
+    ):
+        environment["python_full_version"] = full_version
+        environment["implementation_version"] = full_version
+    return environment
+
+
 def install_requirements(
     requirements: Path,
     destination: Path,
@@ -222,10 +258,18 @@ def install_requirements(
     validate_requirements(requirements, context_dir)
 
     destination.mkdir(parents=True, exist_ok=True)
+    error_file = destination.parent / _MARKER_ERROR_FILE
+    marker_config = {
+        "environment": _target_marker_environment(
+            os_name, arch, python_version, base_config
+        ),
+        "error_file": str(error_file),
+    }
     pip = [
         sys.executable,
-        "-m",
-        "pip",
+        "-c",
+        _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
+        json.dumps(marker_config),
     ]
     common = ["--disable-pip-version-check", "--no-input", "--no-cache-dir"]
     target = _target_options(
@@ -247,6 +291,7 @@ def install_requirements(
             [*pip, "download", *common, "--dest", str(wheelhouse), *target,
              "-r", str(requirements)],
             context_dir, evidence_dir, failure,
+            error_file, os_name, arch, python_version,
         )
         wheels = _hash_wheelhouse(wheelhouse)
         install_inputs = ["--no-index", "--no-deps", *(str(wheelhouse / w["filename"]) for w in wheels)]
@@ -255,13 +300,18 @@ def install_requirements(
         "install",
         *common,
         "--no-compile",
+        # pip's conflict check evaluates markers of the host's installed packages.
+        "--no-warn-conflicts",
         "--target",
         str(destination),
         *target,
         *install_inputs,
     ]
     if wheels != []:
-        _run_pip(command, context_dir, destination.parent, failure)
+        _run_pip(
+            command, context_dir, destination.parent, failure,
+            error_file, os_name, arch, python_version,
+        )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
         if scripts_dir.exists():
@@ -277,7 +327,10 @@ def install_requirements(
     return wheels
 
 
-def _run_pip(command: List[str], cwd: Path, work_dir: Path, failure: str) -> None:
+def _run_pip(
+    command: List[str], cwd: Path, work_dir: Path, failure: str,
+    error_file: Path, os_name: str, arch: str, python_version: str,
+) -> None:
     environment = dict(os.environ)
     environment.update(
         {
@@ -316,6 +369,18 @@ def _run_pip(command: List[str], cwd: Path, work_dir: Path, failure: str) -> Non
             _stop_process(process)
             raise
 
+    if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
+        details = _read_marker_error(error_file)
+        if returncode == _MARKER_ERROR_EXIT:
+            raise ValueError(
+                "Cannot evaluate dependency environment markers for target "
+                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"incomplete dependency set. {details}"
+            )
+        raise RuntimeError(
+            "The builder's pip cannot evaluate environment markers for the target "
+            f"platform; refusing to use host markers. {details}"
+        )
     if returncode:
         raise RuntimeError(failure)
 
@@ -387,6 +452,15 @@ def _verify_installed_wheels(site_packages: Path, wheels: List[Dict[str, object]
                 raise RuntimeError(f"Installed file does not match its RECORD: {relative}")
 
 
+def _read_marker_error(error_file: Path) -> str:
+    try:
+        return error_file.read_text(encoding="utf-8", errors="replace")[:4096].strip()
+    except OSError:
+        return "No marker diagnostics were produced."
+    finally:
+        error_file.unlink(missing_ok=True)
+
+
 def _drop_external_record_entries(site_packages: Path) -> None:
     # Launcher entries point outside site-packages, and their hashes differ per build on Windows.
     for record in sorted(site_packages.glob("*.dist-info/RECORD")):
@@ -404,14 +478,31 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def validate_requirements(requirements: Path, context_dir: Path) -> None:
+def _read_requirements_text(path: Path) -> str:
+    data = path.read_bytes()
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
+def validate_requirements(
+    requirements: Path,
+    context_dir: Path,
+    check_overrides: bool = True,
+    constraints: Optional[List[str]] = None,
+) -> List[str]:
+    """Validate requirements files and return their root requirement lines.
+
+    Constraint-file requirement lines are appended to ``constraints`` when given.
+    """
     context_root = context_dir.resolve()
-    pending = [requirements.resolve(strict=True)]
+    pending = [(requirements.resolve(strict=True), False)]
     visited = set()
     total_bytes = 0
+    roots = []
     while pending:
-        path = pending.pop()
-        if path in visited:
+        path, constraint = pending.pop()
+        if (path, constraint) in visited:
             continue
         try:
             path.relative_to(context_root)
@@ -419,7 +510,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
             raise ValueError(
                 f"Requirements include must stay inside the build context: {path}"
             ) from exc
-        visited.add(path)
+        visited.add((path, constraint))
         size = path.stat().st_size
         total_bytes += size
         if total_bytes > MAX_REQUIREMENTS_BYTES:
@@ -430,7 +521,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
 
         logical_lines = []
         continuation = ""
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
+        for raw_line in _read_requirements_text(path).splitlines():
             if raw_line.rstrip().endswith("\\"):
                 continuation += raw_line.rstrip()[:-1] + " "
                 continue
@@ -448,25 +539,36 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                 continue
             for option in options:
                 name = option.split("=", 1)[0]
-                if name in _PIP_OVERRIDE_OPTIONS:
+                if check_overrides and name in _PIP_OVERRIDE_OPTIONS:
                     raise ValueError(
                         f"Requirements files cannot override target install option {name}."
                     )
 
             include = None
+            include_constraint = constraint
             option = options[0]
             if option in {"-r", "--requirement", "-c", "--constraint"}:
                 if len(options) != 2:
                     raise ValueError(f"Invalid requirements include in {path}.")
                 include = options[1]
+                include_constraint |= option in {"-c", "--constraint"}
             elif option.startswith("--requirement="):
                 include = option.split("=", 1)[1]
             elif option.startswith("--constraint="):
                 include = option.split("=", 1)[1]
+                include_constraint = True
             elif option.startswith("-r") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
             elif option.startswith("-c") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
+                include_constraint = True
+            elif not option.startswith("-"):
+                requirement = re.sub(r"(^|\s)#.*$", "", line)
+                requirement = re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip()
+                if not constraint:
+                    roots.append(requirement)
+                elif constraints is not None:
+                    constraints.append(requirement)
 
             if include is not None:
                 if include.startswith(("http://", "https://", "file://")):
@@ -475,7 +577,8 @@ def validate_requirements(requirements: Path, context_dir: Path) -> None:
                         "use a local file inside the build context."
                     )
                 included_path = (path.parent / include).resolve(strict=True)
-                pending.append(included_path)
+                pending.append((included_path, include_constraint))
+    return roots
 
 
 def stage_virtualenv(
@@ -484,6 +587,9 @@ def stage_virtualenv(
     python_version: str,
     os_name: str,
     arch: str,
+    base_config: Optional[dict] = None,
+    context_dir: Optional[Path] = None,
+    requirements: Optional[Path] = None,
 ) -> None:
     validate_target_platform(os_name, arch)
     files = list(dependencies)
@@ -498,7 +604,7 @@ def stage_virtualenv(
         raise ValueError("Dependencies from multiple virtualenv site-packages roots are unsupported.")
 
     root = next(iter(site_roots), ())
-    _validate_virtualenv_version(files, root, python_version)
+    version_established = _validate_virtualenv_version(files, root, python_version)
     destination.mkdir(parents=True, exist_ok=True)
     total_bytes = 0
     total_files = 0
@@ -519,11 +625,143 @@ def stage_virtualenv(
         shutil.copy2(source, target)
     _check_stage_limits(destination)
     _validate_wheel_metadata(destination, python_version)
+    _verify_target_closure(
+        destination,
+        os_name,
+        arch,
+        python_version,
+        base_config,
+        context_dir,
+        requirements,
+        version_established,
+        venv_layout_os(root, _read_venv_config(files, root)),
+    )
+
+
+def _verify_target_closure(
+    site_packages: Path,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_config: Optional[dict],
+    context_dir: Optional[Path],
+    requirements: Optional[Path],
+    version_established: bool,
+    host_os_name: Optional[str] = None,
+) -> None:
+    """Reject staged packages whose target-active requirements are not installed."""
+    constraint_lines: List[str] = []
+    root_lines = (
+        validate_requirements(
+            requirements, context_dir, check_overrides=False, constraints=constraint_lines
+        )
+        if context_dir is not None and requirements is not None and requirements.is_file()
+        else []
+    )
+    roots = declared_roots(context_dir, root_lines) if context_dir is not None else []
+    legacy = sorted(
+        path.name
+        for pattern in ("*.egg-info", "*.egg", "*.egg-link")
+        for path in site_packages.glob(pattern)
+    )
+    if legacy:
+        raise ValueError(
+            "Cannot verify the target dependency closure of egg distributions: "
+            f"{', '.join(legacy)}. Reinstall them as wheels or use a requirements file."
+        )
+    distributions = []
+    for dist_info in sorted(site_packages.glob("*.dist-info")):
+        metadata = dist_info / "METADATA"
+        if not metadata.is_file() or metadata.is_symlink():
+            raise ValueError(f"Virtualenv package is missing METADATA: {dist_info.name}")
+        if metadata.stat().st_size > MAX_METADATA_BYTES:
+            raise ValueError(
+                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
+                f"{dist_info.name}"
+            )
+        try:
+            text = metadata.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
+        message = Parser().parsestr(text, headersonly=True)
+        if message.defects:
+            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
+        headers = {
+            name: [str(value) for value in message.get_all(name, [])]
+            for name in _CLOSURE_HEADERS
+        }
+        distributions.append(
+            {
+                "path": f"{dist_info.name}/METADATA",
+                "directory": dist_info.name[: -len(".dist-info")],
+                "headers": headers,
+            }
+        )
+    if not distributions and not any(lines for _, _, lines in roots):
+        return
+
+    environment = _target_marker_environment(os_name, arch, python_version, base_config)
+    request = {
+        "environment": environment,
+        "hosts": host_environments(environment, version_established, host_os_name),
+        "distributions": distributions,
+        "roots": roots,
+        "constraints": constraint_lines,
+    }
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-P",
+                "-c",
+                _VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8"),
+            ],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=site_packages.parent,
+            timeout=CLOSURE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Virtualenv dependency verification exceeded {CLOSURE_TIMEOUT_SECONDS} seconds."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError("Unable to start virtualenv dependency verification.") from exc
+    try:
+        outcome = json.loads(result.stdout)
+    except ValueError:
+        outcome = None
+    problems = outcome.get("problems") if isinstance(outcome, dict) else None
+    if (
+        not isinstance(outcome, dict)
+        or "fatal" in outcome
+        or result.returncode
+        or not isinstance(problems, list)
+        or not all(isinstance(problem, str) for problem in problems)
+    ):
+        details = outcome.get("fatal", "") if isinstance(outcome, dict) else ""
+        raise RuntimeError(
+            "Virtualenv dependency verification needs pip's packaging library in the "
+            "builder interpreter and could not evaluate target markers; refusing to "
+            f"stage an unverified dependency set. {details}".rstrip()
+        )
+    if problems:
+        raise ValueError(
+            f"Virtualenv dependencies are incomplete or unverifiable for target "
+            f"{os_name}/{arch}, CPython {python_version}; refusing to stage: "
+            + "; ".join(problems)
+            + ". Use a requirements file so pip resolves dependencies for the target."
+        )
 
 
 def _validate_virtualenv_version(
     files: List[Tuple[Path, Path]], root: Tuple[str, ...], python_version: str
-) -> None:
+) -> bool:
+    """Reject a mismatched venv Python; return whether its version was established."""
+    established = False
     for _, relative in files:
         match = re.search(r"(?:^|/)python(\d+\.\d+)/site-packages/", relative.as_posix())
         if match and match.group(1) != python_version:
@@ -531,25 +769,42 @@ def _validate_virtualenv_version(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
-    if not files:
-        return
-    context_root = files[0][0]
-    for _ in root:
-        context_root = context_root.parent
-    venv_config = context_root / "pyvenv.cfg"
-    if venv_config.is_file():
-        text = venv_config.read_text(errors="replace")
-        match = re.search(r"(?im)^\s*version\s*=\s*(\d+\.\d+)", text)
+        established |= bool(match)
+    text = _read_venv_config(files, root)
+    if text is not None:
+        match = re.search(r"(?im)^\s*version(?:_info)?\s*=\s*(\d+\.\d+)", text)
         if match and match.group(1) != python_version:
             raise ValueError(
                 f"Virtualenv targets Python {match.group(1)}, but the image targets "
                 f"Python {python_version}."
             )
+        established |= bool(match)
+    return established
+
+
+def _read_venv_config(files: List[Tuple[Path, Path]], root: Tuple[str, ...]) -> Optional[str]:
+    """Return the text of the pyvenv.cfg enclosing the site-packages root, if any."""
+    if not files:
+        return None
+    source, relative = files[0]
+    context_root = source
+    for _ in relative.parts:
+        context_root = context_root.parent
+    venv_dirs = [context_root.joinpath(*root[:index]) for index in range(len(root) - 1, 0, -1)]
+    venv_config = next(
+        (path / "pyvenv.cfg" for path in venv_dirs if (path / "pyvenv.cfg").is_file()), None
+    )
+    return venv_config.read_text(errors="replace") if venv_config is not None else None
 
 
 def _validate_virtualenv_file(source: Path, relative: Path) -> None:
     if source.is_symlink():
         raise ValueError(f"Symlinked virtualenv dependencies are unsupported: {relative}")
+    if source.name == "direct_url.json" and source.parent.name.endswith(".dist-info"):
+        raise ValueError(
+            "Virtualenv direct URL metadata is unsupported because it can contain "
+            f"credentials: {relative}. Use a requirements file instead."
+        )
     suffix = source.suffix.lower()
     if suffix in _NATIVE_SUFFIXES or ".so." in source.name.lower():
         raise ValueError(
@@ -669,7 +924,7 @@ def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
             "sys.exit(_value())\n"
         )
         script = scripts_dir / name
-        script.write_text(content)
+        script.write_text(content, encoding="utf-8", newline="\n")
         script.chmod(0o755)
     _check_stage_limits(scripts_dir.parent)
 
