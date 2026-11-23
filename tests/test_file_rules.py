@@ -416,6 +416,19 @@ def test_excluded_pyproject_is_not_used_for_entrypoint(tmp_path, monkeypatch):
     assert manifest["config"]["Entrypoint"] == ["python", "-m", "app"]
 
 
+def test_entrypoint_metadata_name_is_case_sensitive(tmp_path):
+    context = _context(tmp_path)
+    (context / "PYPROJECT.TOML").write_text(
+        '[project.scripts]\nrun = "secret_module"\n'
+    )
+    (context / "secret_module.py").write_text("print('secret')\n")
+    builder = ImageBuilder(_config(
+        context, tmp_path, [],
+        include_paths=["app.py", "PYPROJECT.TOML", "secret_module.py"],
+    ))
+    assert builder._entrypoint() == ["python", "-m", "app"]
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_excluded_local_script_module_is_not_used_for_entrypoint(tmp_path, monkeypatch, dry_run):
     context = _context(tmp_path)

@@ -23,18 +23,18 @@ def detect_python_version(context_dir):
 
 def detect_entrypoint(context_dir, *, files=None):
     ctx=Path(context_dir); py=ctx/'pyproject.toml'
-    if (files is None or Path("pyproject.toml") in files) and py.exists():
+    selected=None if files is None else {Path(path).as_posix() for path in files}
+    if (selected is None or "pyproject.toml" in selected) and py.exists():
         data=tomllib.loads(py.read_text())
         proj=data.get("project",{}); scripts=proj.get("scripts") or {}
         if scripts:
             name,target=next(iter(scripts.items()))
             if isinstance(target,str) and ":" not in target:
                 parts=target.split(".")
-                if files is not None and all(part.isidentifier() for part in parts):
+                if selected is not None and all(part.isidentifier() for part in parts):
                     module=Path(*parts)
                     candidates=(module.with_suffix(".py"), module/"__main__.py")
                     existing=[path for path in candidates if (ctx/path).is_file()]
-                    selected={path.as_posix() for path in files}
                     if existing and not any(path.as_posix() in selected for path in existing):
                         raise ValueError(
                             f"Entrypoint module {target!r} exists in the build context "
