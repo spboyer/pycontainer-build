@@ -90,6 +90,33 @@ class TestSkopeoTagReferences(unittest.TestCase):
                 self._assert_resolves(f"oci:{layout}", builder, layout)
                 self._assert_resolves(f"oci:{layout}:{name}", builder, layout)
 
+    def test_multi_platform_encoded_references_select_the_index(self):
+        names = [
+            "myapp:latest",
+            "pycontainer-6d796170703a5f646576",
+            "pycontainer-6d796170703a76315f",
+            "pycontainer-6d796170703a76312e2e32",
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            context = root / "context"
+            context.mkdir()
+            (context / "app.py").write_text("print('hello')\n")
+            layout = root / "layout"
+            builder = ImageBuilder(BuildConfig(
+                tag="myapp:latest",
+                tags=["_dev", "v1_", "v1..2"],
+                context_dir=str(context),
+                output_dir=str(layout),
+                platform="linux/amd64,linux/arm64",
+                include_deps=False,
+                use_cache=False,
+            ))
+            with patch.object(builder, "_pull_base_image", return_value=([], None)):
+                builder.build()
+            for name in names:
+                self._assert_resolves(f"oci:{layout}:{name}", builder, layout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

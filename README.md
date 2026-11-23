@@ -68,11 +68,17 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Experimental opt-in vulnerability gate (requires Grype 0.119.0)
+pycontainer build --tag ghcr.io/user/myapp:v1 --scan --push
+
 # Build for different platform (e.g., amd64 from ARM Mac)
 pycontainer build --tag myapp:latest --platform linux/amd64
 
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
+
+# Preview pruning old versions (dry run by default; --execute to delete)
+pycontainer registry prune ghcr.io/user/myapp --keep 5
 ```
 
 ### Output
@@ -147,6 +153,29 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 
 **See [Local Development Guide](docs/local-development.md) for detailed testing instructions.**
 
+### Optional vulnerability gate
+
+`--scan` uses an external **Grype 0.119.0** executable against the complete
+selected OCI image, not the Python-only SBOM. It defaults to failing on
+high/critical findings and unknown severity, and blocks registry publication
+before authentication or uploads. Multi-platform indexes cannot be scanned;
+build and scan each platform separately. Core runtime dependencies remain empty.
+
+```bash
+pycontainer build --scan --scan-report-format sarif --scan-report scan.sarif
+pycontainer build --scan --scan-threshold critical --scan-unknown ignore
+```
+
+JSON/SARIF reports include image digest, scanner version, database content
+digest/build time, policy and coverage limits, and are retained on findings
+failures. Database freshness is enforced even offline. **The adapter is
+experimental: a real Grype 0.119.0 acceptance run passed on linux/amd64 with
+a pinned database (OS and staged Python findings, whiteouts, JSON and SARIF);
+native Windows is rejected because of an upstream `oci-dir:` cache-path
+failure, and macOS/arm64 scanner hosts are unvalidated.**
+See [Vulnerability scanning](docs/vulnerability-scanning.md) for prerequisites,
+offline preparation, error behavior and the opt-in acceptance test.
+
 ---
 
 ## ✨ Features
@@ -163,6 +192,9 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
+  dry-run-by-default semver `registry prune` that never deletes digests shared
+  with retained tags ([guide](docs/REGISTRY_CLEANUP.md))
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
@@ -351,6 +383,9 @@ By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
 - **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
+  (skipped when `cmd` is configured without `entrypoint`: the image then keeps
+  the base image's `Entrypoint` and runs `cmd`, as Docker does; an explicit
+  `entrypoint = []` / `cmd = []` clear the base image's value)
 - **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`
@@ -387,7 +422,9 @@ pycontainer build \
   requirements file as target-compatible binary wheels, or copy a verified
   pure-Python venv. Requirements files, including generated lock selections,
   are limited to 1 MiB; staging is limited to 300 seconds, 512 MiB, and 100,000 files;
-  supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
+  supported targets are `linux/amd64`, `linux/arm64` and `linux/arm/v7` with
+  CPython (`linux/arm/v7` uses `armv7l` wheel tags; `linux/arm` without the
+  `v7` variant is rejected). A venv
   must match the target Python minor version and contain only pure-Python
   packages. Dependencies are placed under `<workdir>/.python`, added to
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
@@ -467,13 +504,18 @@ pycontainer build \
   `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
   Virtualenvs do not record selected extras or groups. An extra or group
-  counts as not requested only when it is missing a requirement that any
-  Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
-  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
-  its target requirements are not satisfied, verification fails rather than
-  guessing.
+  counts as not requested only when it is missing a requirement that the
+  venv's creator host provably would have installed. Only facts the venv
+  establishes are used: CPython, the venv's Python minor version when known,
+  and the OS family from the layout (`lib/pythonX.Y/site-packages` with a
+  POSIX `pyvenv.cfg` `home` is non-Windows; MSYS2 CPython is Windows with that
+  layout; `Lib/site-packages` is Windows). Markers on any other host value,
+  such as `platform_machine` or a specific non-Windows `sys_platform`, are
+  unknown rather than assumed, so a requirement like
+  `fast; extra == "speed" and platform_machine != "armv7l"` cannot rule the
+  extra out. Otherwise, if its target requirements are not satisfied,
+  verification fails rather than guessing; install the extra into the venv or
+  use a requirements file instead.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
@@ -550,6 +592,10 @@ is added as a dependency:
 The build context must be writable: temporary `.pycontainer-lockfile-*`
 directories hold generated requirements, are excluded from images, and are
 removed after staging.
+
+The lockfile's project manifest must resolve inside the build context. Symlinks
+to files within the context are supported; dangling or external links are
+rejected. Path checks do not protect against concurrent filesystem changes.
 
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
@@ -660,6 +706,19 @@ exclude-paths = ["src/generated", "fixtures/**"]
 exclude-defaults = true
 ```
 
+Context traversal never follows directory symlinks or Windows junctions. A
+linked include root (including auto-detected `src`, `app` or a virtualenv)
+fails the build; nested directory links are skipped. A selected file symlink
+must use a relative target that resolves to an existing file inside the
+context and that is itself selected (exclusions win); it is stored as a link
+with `/` separators. A target may climb with leading `..` components, but not
+above the context root, and may not use `..` after descending into a directory.
+Absolute, dangling, cyclic, out-of-context and unselected-target file links
+fail the build. A context directory that is itself a symlink is still
+supported. These checks are not a defense against the context changing during
+a build, and they do not cover explicitly named inputs such as requirements or
+manifest files.
+
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
@@ -682,15 +741,30 @@ error handling, and custom-directory inspection.
 
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
+- `--label KEY=VALUE` — Set an image-config label; repeat to add labels
+- `--manifest-annotation KEY=VALUE` — Set an image-manifest annotation; repeat to add annotations
+- `--index-annotation KEY=VALUE` — Set a local layout-index annotation; repeat to add annotations
+- `--release-notes FILE` — Embed a UTF-8 release notes file (at most 8 KiB after
+  line endings become LF) in the `io.github.spboyer.pycontainer.release-notes`
+  label; `--release-notes-label KEY` selects another key
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
-  `linux/arm64` or `linux/arm/v7`)
+  `linux/arm64` or `linux/arm/v7`), or a comma-separated subset of
+  `linux/amd64,linux/arm64,linux/arm/v7` to build an OCI image index
 - `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
   as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
 - `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+Labels inherit from the base image; their precedence is CLI, configuration
+file, detected framework, then base image. Manifest and index annotations are
+separate from labels and are not inherited from the base. For a single-image
+build, index annotations are in the local `index.json`; registry pushes publish
+the image manifest, not that layout index. Metadata is visible to image
+consumers and registries: **do not put secrets in labels or annotations**.
+See [metadata configuration and integration details](docs/metadata.md).
 
 **Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
 - `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
@@ -701,6 +775,11 @@ error handling, and custom-directory inspection.
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+- `--registry-mirror UPSTREAM=MIRROR` — Pull base images through `MIRROR`
+  before `UPSTREAM` (repeatable, tried in order; `[build.registry_mirrors]`).
+  Pushes never use mirrors, and mirrors never receive upstream credentials.
+  See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
+
 Registry connections are direct: environment/system proxy settings are ignored.
 URLs containing embedded credentials are rejected; use the credential providers
 or authentication flags instead.
@@ -756,6 +835,8 @@ config = BuildConfig(
     workdir="/app",
     env={"DEBUG": "false", "ENV": "production"},
     labels={"version": "1.0", "maintainer": "team@example.com"},
+    manifest_annotations={"org.opencontainers.image.title": "myapp"},
+    index_annotations={"org.opencontainers.image.description": "myapp layout"},
     include_paths=["src/", "lib/", "pyproject.toml"],
     exclude_paths=["src/generated", "fixtures/**"],
     entrypoint=["python", "-m", "myapp"],
@@ -777,10 +858,17 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
 maintainer = "team@example.com"
 version = "1.0.0"
+
+[build.manifest_annotations]
+"org.opencontainers.image.title" = "myapp"
+
+[build.index_annotations]
+"org.opencontainers.image.description" = "myapp layout"
 
 [build.env]
 PORT = "8080"
@@ -943,6 +1031,52 @@ metadata fail before base layers are downloaded. Base-image references may
 include a registry port or an immutable `@sha256:...` digest. Platform
 selection writes target metadata; it does not cross-compile dependencies.
 
+Multi-platform image indexes (`--platform linux/amd64,linux/arm64,linux/arm/v7`
+or TOML `platform = "linux/amd64,linux/arm64"`) accept only `linux/amd64`,
+`linux/arm64` and `linux/arm/v7`; other targets, including `linux/arm` without
+a variant, are rejected. `linux/arm/v7` selects the exact `arm`/`v7` base
+manifest (never v5 or v6) and records `variant: v7` in the image config and
+index descriptor. Its dependencies install only as `armv7l` wheels
+(`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
+other targets). Many packages do not publish `armv7l` wheels; such builds fail
+explicitly, and source builds or host binaries are never used as a fallback. Each
+platform is built in isolation: it selects its own base manifest, stages its own
+wheel-only dependency layer, and shares the byte-identical application layer
+(its cache key needs no platform input; dependency layers are never cached).
+Virtualenv closure is verified separately against each target base. Explicit
+dependencies and detected lockfiles take precedence over virtualenvs; otherwise,
+exclude a virtualenv (for example, `--exclude .venv`) to select `requirements.txt`.
+The output `index.json` and tag refs point at the image index only after
+every platform manifest, config, platform field and DiffID has been verified;
+a failed platform leaves earlier tags untouched. A local `oci:` base must
+keep the same layout `index.json` for every platform and until publication;
+a change fails the build instead of mixing base versions. A registry base tag
+is read once: every platform selects from that first verified base index or
+manifest snapshot and fetches its platform manifest by descriptor digest, so a
+tag that moves mid-build cannot mix snapshots. The snapshot must match a
+`sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
+unrecognized header algorithm cannot be verified: it is kept as an opaque
+value, the first snapshot is still reused for every platform, and the tag is
+not treated as verified provenance for libc or Python version inference. If a pinned
+platform manifest can no longer be fetched, the build fails before the layout
+`index.json` or refs are written (a reused output directory may still contain
+an earlier build's index). Push uploads blobs, then
+platform manifests and the index by digest, and moves tags last. Registry v2
+has no atomic multi-tag update: tags are pushed one at a time, so if a later
+tag fails, earlier tags in the same push may already point at the new index.
+On a tag push error, the exception lists confirmed pushes, the failed or
+unknown-outcome reference, and references not attempted, even with
+`--no-progress`. `builder.pushed_refs` contains only confirmed successes from
+the current index push; no rollback is attempted.
+SBOM generation is not yet supported for index builds. A local single-platform
+`docker-archive:` base cannot satisfy an index build. Lockfile, requirements and
+transitive dependency markers are evaluated separately for each target, and
+unknown target marker values fail the build. Hermetic layout and protocol
+checks do not prove that images start. The optional
+`scripts/check_runtime_image.py --multi-platform-index` check builds an index,
+imports its native target with Skopeo, and starts it; see
+[runtime testing](docs/TESTING.md).
+
 ---
 
 ## 🛠️ Development
@@ -1005,6 +1139,7 @@ This style is intentional for the experimental phase.
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
+- **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
 
 ### External References
 

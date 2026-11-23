@@ -17,12 +17,6 @@ _SHARED_VARIABLES = {
     "platform_python_implementation",
     "python_version",
 }
-# Plausible hosts that created the virtualenv; an unrequested extra must be provable on each.
-_VENV_HOSTS = (
-    ("win32", "Windows", "nt", ("AMD64", "ARM64", "x86")),
-    ("linux", "Linux", "posix", ("x86_64", "aarch64")),
-    ("darwin", "Darwin", "posix", ("x86_64", "arm64")),
-)
 
 _POSIX_LIB_DIR = re.compile(r"python\d+\.\d+t?")
 _VENV_HOME = re.compile(r"(?im)^\s*home\s*=\s*(\S.*?)\s*$")
@@ -45,23 +39,19 @@ def venv_layout_os(site_root: Tuple[str, ...], venv_config: Optional[str] = None
     return None
 
 
-def host_environments(
+def host_facts(
     environment: dict, shared_python_version: bool, host_os_name: Optional[str]
-) -> List[dict]:
-    """Marker environments of the plausible hosts that created the virtualenv."""
+) -> dict:
+    """Marker values established for the host that created the virtualenv.
+
+    Every other marker variable is unknown: the creating host may have been any
+    platform or machine, so an unrequested extra must be provable for all of them.
+    """
     shared = _SHARED_VARIABLES if shared_python_version else _SHARED_VARIABLES - {"python_version"}
-    return [
-        {
-            **{key: environment[key] for key in shared if key in environment},
-            "sys_platform": sys_platform,
-            "platform_system": system,
-            "os_name": os_name,
-            "platform_machine": machine,
-        }
-        for sys_platform, system, os_name, machines in _VENV_HOSTS
-        if host_os_name in (None, os_name)
-        for machine in machines
-    ]
+    facts = {key: environment[key] for key in shared if key in environment}
+    if host_os_name is not None:
+        facts["os_name"] = host_os_name
+    return facts
 
 
 def _string_list(value) -> List[str]:

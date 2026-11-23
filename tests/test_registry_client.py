@@ -4,10 +4,12 @@ import hashlib
 import io
 import json
 import logging
+import ssl
 import threading
 import traceback
 import urllib.error
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -187,6 +189,36 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
 
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
+
+
+def _manifest_with_header(monkeypatch, header):
+    client = RegistryClient("registry.example", "team/app")
+    body = json.dumps({"schemaVersion": 2, "mediaType": "application/test"}).encode()
+    monkeypatch.setattr(
+        client, "_make_request",
+        lambda *args, **kwargs: (200, body, {"Docker-Content-Digest": header(body)}),
+    )
+    return client, body
+
+
+def test_pull_manifest_verifies_sha512_digest_header(monkeypatch):
+    client, body = _manifest_with_header(
+        monkeypatch, lambda body: "sha512:" + hashlib.sha512(body).hexdigest()
+    )
+    _, digest = client.pull_manifest("latest")
+    assert digest == "sha512:" + hashlib.sha512(body).hexdigest()
+
+    forged = "sha512:" + hashlib.sha512(b"other").hexdigest()
+    client, _ = _manifest_with_header(monkeypatch, lambda body: forged)
+    with pytest.raises(BlobIntegrityError, match="digest does not match") as error:
+        client.pull_manifest("latest")
+    assert forged not in str(error.value)
+
+
+def test_pull_manifest_returns_unsupported_digest_header_opaquely(monkeypatch):
+    client, body = _manifest_with_header(monkeypatch, lambda body: "blake3:" + "0" * 64)
+    _, digest = client.pull_manifest("latest")
+    assert digest == "blake3:" + "0" * 64
 
 def test_registry_client_construction():
     """Test RegistryClient initialization."""
@@ -405,6 +437,121 @@ def test_pull_blob_streams_and_atomically_publishes_verified_content(
     assert all(0 < size <= TRANSFER_CHUNK_SIZE for size in response.read_sizes)
     assert not list(destination.parent.glob(".*.tmp"))
     assert not client.pull_blob(digest, destination, len(content))
+
+
+def test_pull_blob_reuses_one_opener_per_client(tmp_path, monkeypatch):
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[len(requests)]
+            requests.append(request)
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
+        return openers[-1][0]
+
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+
+    for content in contents:
+        digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        assert client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+
+    assert len(requests) == 2
+    assert len(openers) == 1
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert isinstance(client._ssl_context, ssl.SSLContext)
+    assert client._ssl_context.verify_mode == ssl.CERT_REQUIRED
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    context = client._ssl_context
+    assert client._get_blob_opener() is openers[0][0]
+    assert client._ssl_context is context
+
+
+def test_push_only_client_does_not_build_blob_opener(tmp_path, monkeypatch):
+    def unexpected_opener(*_handlers):
+        pytest.fail("Push-only clients must not initialize the blob TLS opener")
+
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", unexpected_opener
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.ssl.create_default_context", unexpected_opener
+    )
+
+    def make_request(method, *_args, **_kwargs):
+        if method == "POST":
+            return 202, b"", {"Location": "/v2/team/app/blobs/uploads/test"}
+        return 201, b"", {}
+
+    monkeypatch.setattr(
+        client, "_make_request", make_request
+    )
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"push-only")
+    digest = f"sha256:{hashlib.sha256(blob.read_bytes()).hexdigest()}"
+    assert client.push_blob(digest, blob, check_exists=False)
+    assert client.push_manifest("latest", b"{}")
+
+
+def test_concurrent_first_blob_pulls_share_one_opener(tmp_path, monkeypatch):
+    import threading
+
+    contents = [b"first blob", b"second blob"]
+    openers = []
+    both_building = threading.Barrier(2, timeout=0.5)
+
+    class Opener:
+        def open(self, request, timeout):
+            content = contents[int(request.full_url.endswith(digests[1]))]
+            return _Response(content, headers={"Content-Length": str(len(content))})
+
+    def build_opener(*handlers):
+        openers.append((Opener(), handlers))
+        try:
+            both_building.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return openers[-1][0]
+
+    digests = [f"sha256:{hashlib.sha256(c).hexdigest()}" for c in contents]
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener", build_opener
+    )
+    results = []
+
+    def pull(index):
+        digest, content = digests[index], contents[index]
+        results.append(
+            client.pull_blob(digest, tmp_path / digest.split(":", 1)[1], len(content))
+        )
+
+    threads = [threading.Thread(target=pull, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == [True, True]
+    assert len(openers) == 1
+    assert isinstance(client._ssl_context, ssl.SSLContext)
+    https_handlers = [
+        handler for handler in openers[0][1]
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    assert [handler._context for handler in https_handlers] == [client._ssl_context]
+    assert client._get_blob_opener() is openers[0][0]
 
 
 def test_pull_blob_rejects_corrupt_existing_blob_without_overwriting(
@@ -690,7 +837,7 @@ def _patch_urlopen(monkeypatch, handler):
     return requests, delays
 
 
-def test_denied_manifest_push_reports_registry_operation_code_and_message(
+def test_denied_manifest_push_reports_operation_and_permission_hint(
     monkeypatch,
 ):
     client = RegistryClient("registry.example", "team/app")
@@ -711,7 +858,8 @@ def test_denied_manifest_push_reports_registry_operation_code_and_message(
     message = str(error.value)
     assert not isinstance(error.value, (RegistryRateLimitError, RegistryQuotaError))
     assert "Manifest push failed with HTTP 403 from registry.example" in message
-    assert "DENIED: requested access to the resource is denied" in message
+    assert "(response details omitted)" in message
+    assert "requested access to the resource is denied" not in message
     assert "push permission" in message
     assert len(requests) == 1
     assert delays == []
@@ -742,7 +890,8 @@ def test_rate_limit_with_long_retry_after_fails_fast_with_reset_time(monkeypatch
     message = str(error.value)
     assert error.value.retry_after_seconds == 3600
     assert "registry-1.docker.io" in message
-    assert "TOOMANYREQUESTS: You have reached your pull rate limit." in message
+    assert "(response details omitted)" in message
+    assert "You have reached your pull rate limit." not in message
     assert "resets in about 3600 seconds" in message
     assert "0 of 100 remaining" in message
     assert "Authenticate" in message
@@ -951,7 +1100,7 @@ def test_error_bodies_are_truncated_sanitized_and_redacted(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     message = str(error.value)
     assert len(message) < 1000
@@ -984,7 +1133,7 @@ def test_error_body_redacts_complete_credential_fields(monkeypatch, detail):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "marker-first" not in str(error.value)
     assert "marker-second" not in str(error.value)
@@ -1011,7 +1160,7 @@ def test_error_body_redacts_overlapping_credentials_and_username(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "sensitive-user" not in str(error.value)
     assert "distinct-suffix" not in str(error.value)
@@ -1033,7 +1182,7 @@ def test_error_body_redacts_credentials_and_query_in_urls(monkeypatch, structure
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "storage.example/layer" in str(error.value)
     for secret in ("marker-user", "marker-password", "marker-signature", "marker-token"):
@@ -1051,7 +1200,7 @@ def test_error_body_redacts_malformed_url(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "[REDACTED URL]" in str(error.value)
     for secret in ("marker-user", "marker-password", "marker-signature"):
@@ -1070,9 +1219,9 @@ def test_malformed_and_oversized_error_json_is_summarized(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as malformed:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
     with pytest.raises(RegistryRequestError) as oversized:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert '{"errors": [{"code": "DENIED"' in str(malformed.value)
     message = str(oversized.value)
@@ -1092,7 +1241,7 @@ def test_deeply_nested_error_body_is_summarized(monkeypatch):
     )
 
     with pytest.raises(RegistryRequestError) as error:
-        client.push_manifest("latest", b"{}")
+        client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert "HTTP 400" in str(error.value)
     assert "..." in str(error.value)
@@ -1123,7 +1272,7 @@ def test_omitted_distribution_error_still_controls_classification(
         client.push_manifest("latest", b"{}")
 
     assert hint in str(error.value).lower()
-    assert "1 more error(s) omitted" in str(error.value)
+    assert "(response details omitted)" in str(error.value)
 
 
 @pytest.mark.parametrize("structured", [True, False])
@@ -1322,6 +1471,179 @@ def test_invalid_token_challenge_hides_http_error_traceback(monkeypatch):
     assert reason_token not in "".join(traceback.format_exception(error.value))
 
 
+@pytest.mark.parametrize("operation", ["manifest", "blob"])
+def test_auth_replay_failure_hides_initial_http_error_traceback(
+    tmp_path, monkeypatch, operation
+):
+    reason_token = "synthetic-initial-challenge-secret"
+    client = RegistryClient("registry.example", "team/app")
+    requests = []
+    acquisitions = []
+
+    def acquire(params):
+        acquisitions.append(params)
+        return "synthetic-replay-token"
+
+    def open_request(request, timeout):
+        requests.append(request)
+        if len(requests) == 1:
+            headers = Message()
+            headers["Www-Authenticate"] = (
+                'Bearer realm="https://auth.example/token"'
+            )
+            raise urllib.error.HTTPError(
+                request.full_url, 401, f"Bearer {reason_token}", headers,
+                io.BytesIO(b""),
+            )
+        assert request.get_header("Authorization") == "Bearer synthetic-replay-token"
+        if operation == "manifest":
+            return _Response(b"oversized")
+        return _Response(
+            status=307,
+            headers={"Location": "https://user:synthetic-password@storage.example/blob"},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", acquire)
+    monkeypatch.setattr(client._opener, "open", open_request)
+    monkeypatch.setattr(client, "_get_blob_opener", lambda: client._opener)
+    monkeypatch.setattr("pycontainer.registry_client.MAX_MANIFEST_BYTES", 1)
+    expected = "exceeds 1 bytes" if operation == "manifest" else "credentials"
+    with pytest.raises(RegistryRequestError, match=expected) as error:
+        if operation == "manifest":
+            client.pull_manifest("latest")
+        else:
+            digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    assert len(requests) == 2
+    assert len(acquisitions) == 1
+    assert reason_token not in str(error.value)
+    assert reason_token not in "".join(traceback.format_exception(error.value))
+    assert error.value.__context__ is None
+    assert error.value.__cause__ is None
+    if operation == "blob":
+        assert not (tmp_path / "blob").exists()
+
+
+class _SyntheticExchangeFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize("operation", ["manifest", "blob"])
+@pytest.mark.parametrize("failure", ["invalid-utf8", "unexpected"])
+def test_token_exchange_failure_hides_initial_http_error_traceback(
+    tmp_path, monkeypatch, operation, failure
+):
+    reason_token = "synthetic-401-reason-secret"
+    client = RegistryClient("registry.example", "team/app")
+    requests = []
+
+    def open_request(request, timeout):
+        requests.append(request.full_url)
+        if request.full_url.startswith("https://auth.example/"):
+            if failure == "unexpected":
+                raise _SyntheticExchangeFailure("synthetic exchange failure")
+            return _Response(b"\xff")
+        headers = Message()
+        headers["Www-Authenticate"] = 'Bearer realm="https://auth.example/token"'
+        raise urllib.error.HTTPError(
+            request.full_url, 401, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(client._opener, "open", open_request)
+    monkeypatch.setattr(client, "_get_blob_opener", lambda: client._opener)
+    expected = (
+        (RegistryAuthenticationError, "not valid JSON")
+        if failure == "invalid-utf8"
+        else (_SyntheticExchangeFailure, "synthetic exchange failure")
+    )
+    with pytest.raises(expected[0], match=expected[1]) as error:
+        if operation == "manifest":
+            client.pull_manifest("latest")
+        else:
+            digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    assert len(requests) == 2
+    assert client._bearer_token is None
+    rendered = "".join(traceback.format_exception(error.value))
+    assert reason_token not in str(error.value)
+    assert reason_token not in rendered
+    assert "HTTPError" not in rendered
+
+
+def test_blob_redirect_error_hides_redirect_http_error_traceback(
+    tmp_path, monkeypatch
+):
+    reason_token = "synthetic-redirect-reason-secret"
+    headers = Message()
+    headers["Location"] = "https://user:synthetic-password@storage.example/blob"
+
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 307, f"Redirect {reason_token}", headers,
+                io.BytesIO(b""),
+            )
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", lambda request, timeout: pytest.fail())
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+    with pytest.raises(RegistryRequestError, match="credentials") as error:
+        client.pull_blob(digest, tmp_path / "blob", 1)
+
+    rendered = "".join(traceback.format_exception(error.value))
+    for secret in (reason_token, "synthetic-password"):
+        assert secret not in str(error.value)
+        assert secret not in rendered
+    assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize("rewind_fails", [False, True])
+def test_auth_upload_replay_preserves_nonzero_body_offset(monkeypatch, rewind_fails):
+    reason_token = "synthetic-upload-challenge-secret"
+    requests = []
+
+    class UploadBody(io.BytesIO):
+        def seek(self, offset, whence=0):
+            if rewind_fails and requests:
+                raise OSError("Upload rewind failed")
+            return super().seek(offset, whence)
+
+    body = UploadBody(b"prefix-payload")
+    body.seek(len(b"prefix-"))
+    client = RegistryClient("registry.example", "team/app")
+
+    def open_request(request, timeout):
+        requests.append((request, request.data.read()))
+        if len(requests) == 1:
+            headers = Message()
+            headers["Www-Authenticate"] = (
+                'Bearer realm="https://auth.example/token"'
+            )
+            raise urllib.error.HTTPError(
+                request.full_url, 401, f"Bearer {reason_token}", headers,
+                io.BytesIO(b""),
+            )
+        assert request.get_header("Authorization") == "Bearer synthetic-upload-token"
+        return _Response(status=201)
+
+    monkeypatch.setattr(client._opener, "open", open_request)
+    monkeypatch.setattr(client, "_get_bearer_token", lambda params: "synthetic-upload-token")
+    url = f"{client.base_url}/team/app/blobs/uploads/test"
+    if rewind_fails:
+        with pytest.raises(OSError, match="Upload rewind failed") as error:
+            client._make_request("PUT", url, data=body)
+        assert len(requests) == 1
+        assert reason_token not in str(error.value)
+        assert reason_token not in "".join(traceback.format_exception(error.value))
+        assert error.value.__context__ is None
+    else:
+        assert client._make_request("PUT", url, data=body)[0] == 201
+        assert [payload for _, payload in requests] == [b"payload", b"payload"]
+
+
 def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
     tmp_path, monkeypatch, caplog
 ):
@@ -1444,7 +1766,7 @@ def test_url_encoded_credentials_are_redacted(monkeypatch, operation):
         if operation == "network":
             client._make_request("PUT", url, data=b"")
         else:
-            client.push_manifest("latest", b"{}")
+            client._get_bearer_token({"realm": "https://auth.example/token"})
 
     assert token not in str(error.value)
     assert encoded_token not in str(error.value)

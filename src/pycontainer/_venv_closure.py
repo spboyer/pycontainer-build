@@ -19,6 +19,8 @@ MAX_PROBLEMS = 20
 
 EXTRA_OPS = {"==", "!=", "in", "not in"}
 CONTAINMENT_OPS = {"in", "not in"}
+# The value CPython reports on Windows (os_name "nt") and never elsewhere.
+WINDOWS_VALUES = {"sys_platform": "win32", "platform_system": "Windows"}
 
 
 class ClosureError(Exception):
@@ -90,6 +92,50 @@ def _canonical_extras(markers, canonical):
     return rewritten
 
 
+def _all3(values):
+    if any(value is False for value in values):
+        return False
+    return True if all(value is True for value in values) else None
+
+
+def _any3(values):
+    if any(value is True for value in values):
+        return True
+    return False if all(value is False for value in values) else None
+
+
+def _kleene(markers, atom):
+    """Evaluate `markers` like packaging, with None for atoms of unknown value."""
+    groups = [[]]
+    for item in markers:
+        if isinstance(item, list):
+            groups[-1].append(_kleene(item, atom))
+        elif isinstance(item, tuple) and len(item) == 3:
+            groups[-1].append(atom(item))
+        elif item == "or":
+            groups.append([])
+        elif item != "and":
+            raise ClosureError("unrecognized marker structure")
+    return _any3([_all3(group) for group in groups])
+
+
+def _implied(item, facts):
+    """sys_platform/platform_system ==/!= their Windows value, implied by a known os_name."""
+    os_name = facts.get("os_name")
+    lhs, op, rhs = item
+    kinds = (type(lhs).__name__, type(rhs).__name__)
+    if (
+        os_name not in {"nt", "posix"}
+        or str(op.value) not in {"==", "!="}
+        or kinds not in {("Variable", "Value"), ("Value", "Variable")}
+    ):
+        return None
+    variable, literal = (lhs, rhs) if kinds[0] == "Variable" else (rhs, lhs)
+    if WINDOWS_VALUES.get(variable.value) != literal.value:
+        return None
+    return (os_name == "nt") == (str(op.value) == "==")
+
+
 def main():
     if sys.path and sys.path[0] in {"", "."}:
         del sys.path[0]
@@ -121,6 +167,31 @@ def main():
         def check(text, extra):
             return normalized(Marker(text)).evaluate(dict(probe, extra=extra))
 
+        def three_valued(form, extra, facts):
+            """Marker value for a host known only by `facts`; None when it is not determined."""
+            known = set(facts) | {"extra"}
+            env = dict(facts, extra=extra)
+
+            def atom(item):
+                variables = {
+                    node.value for node in item if type(node).__name__ == "Variable"
+                }
+                if not variables <= known:
+                    return _implied(item, facts)
+                single = copy.copy(form)
+                single._markers = [item]
+                try:
+                    return bool(single.evaluate(env))
+                except (InvalidSpecifier, InvalidVersion, UndefinedComparison):
+                    return None
+
+            return _kleene(form._markers, atom)
+
+        def tri(text, extra=""):
+            return three_valued(
+                normalized(Marker(text)), extra, {"os_name": "posix", "python_version": "3.11"}
+            )
+
         machine = environment["platform_machine"]
         other = "aarch64" if machine == "x86_64" else "x86_64"
         probe = dict(environment, extra="")
@@ -143,6 +214,19 @@ def main():
             or not check('extra in "a,b"', "")
             or not check('"Speed" in extra', "speed-ups")
             or check('extra not in "other,Speed_Ups"', "peed-ups")
+            or tri('extra == "Foo_Bar"', "foo-bar") is not True
+            or tri('extra == "speed" and platform_machine != "armv7l"', "speed") is not None
+            or tri('sys_platform != "win32"') is not True
+            or tri('"Windows" == platform_system') is not False
+            or tri('sys_platform == "linux"') is not None
+            or tri('os_name == "posix" and python_version >= "3"') is not True
+            or tri('platform_machine == "x" and python_version < "3"') is not False
+            or tri('platform_machine == "x" or python_version >= "3"') is not True
+            or tri('platform_machine == "x" and python_version < "3" or os_name == "posix"')
+            is not True
+            or tri('(platform_machine == "x" or os_name == "nt") and python_version >= "3"')
+            is not None
+            or tri('platform_release >= "1"') is not None
         ):
             raise ClosureError("target marker self-test failed")
     except Exception as exc:
@@ -171,26 +255,30 @@ def main():
             return extra == ""
         return evaluate(requirement, extra, environment) is not False
 
-    hosts = request.get("hosts", [])
+    # Only marker values the virtualenv establishes for the host that created it;
+    # every other variable (platform_machine, ...) may have had any value.
+    facts = request.get("host", {})
 
-    def host_state(requirement, extra, host, label):
+    def host_value(requirement, extra):
         if requirement.parsed.marker is None:
             return extra == ""
-        if requirement.info[2] or not requirement.info[0] <= set(host) | {"extra"}:
+        if requirement.info[2]:
             # Legacy and current packaging disagree on substring matches of
             # differently spelled extras, so containment cannot prove a host.
             return None
-        return evaluate(requirement, extra, host)
+        form = (
+            requirement.normalized
+            if "extra" in requirement.info[0]
+            else requirement.parsed.marker
+        )
+        return three_valued(form, extra, facts)
 
     def unrequested(missing, extra, label):
-        """Whether every plausible venv host would have installed one of `missing` for it."""
-        return bool(missing and hosts) and all(
-            any(
-                host_state(requirement, extra, host, label) is True
-                and (not extra or host_state(requirement, "", host, label) is False)
-                for requirement in missing
-            )
-            for host in hosts
+        """Whether the venv host would have installed one of `missing` for it, whatever its unknowns."""
+        return any(
+            host_value(requirement, extra) is True
+            and (not extra or host_value(requirement, "") is False)
+            for requirement in missing
         )
 
     def not_installed(requirements):

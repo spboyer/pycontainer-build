@@ -25,7 +25,7 @@ from .credentials import (
     redact,
     url_has_credentials,
 )
-from .venv_markers import declared_roots, host_environments, venv_layout_os
+from .venv_markers import declared_roots, host_facts, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -42,8 +42,16 @@ INSTALL_TIMEOUT_SECONDS = 300
 _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
+    ("linux", "arm"): "manylinux2014_armv7l",
 }
-_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+# 32-bit ARM wheels are tagged armv7l, so only the v7 variant may use them.
+_REQUIRED_VARIANTS = {("linux", "arm"): "v7"}
+SUPPORTED_TARGETS_TEXT = "linux/amd64, linux/arm64 and linux/arm/v7"
+_NO_SOURCE_FALLBACK = (
+    "Source builds and host binaries are never used as a fallback."
+)
+_ARMV7_WHEEL_NOTE = " Many packages do not publish armv7l wheels."
+_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64", "arm": "armv7l"}
 _PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
 _VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
 _CLOSURE_HEADERS = ("Metadata-Version", "Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
@@ -296,13 +304,14 @@ def target_wheel_platforms(
     base_config: Optional[dict],
     *,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> List[str]:
     """Return wheel platform tags through the selected libc bound, newest first.
 
     Image names alone are not provenance: libc comes from explicit PYTHON_LIBC
     metadata or, for verified tag-only official pulls, a mapped codename.
     """
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     floor = _PIP_PLATFORMS[(os_name, arch)]
     machine = floor[len(_FLOOR_GLIBC_PREFIX):]
     family, minor = _target_libc(base_image, base_config, base_image_tag_verified)
@@ -320,8 +329,10 @@ def target_wheel_platforms(
 def target_libc_config(
     os_name: str, arch: str, base_image: str, base_config: Optional[dict],
     base_layers: Iterable, *, base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> Optional[dict]:
     """Add layer-derived libc only to staging config for verified official tag pulls."""
+    validate_target_platform(os_name, arch, variant)
     repository, image_tag = _base_image_parts(base_image)
     if (
         not base_image_tag_verified
@@ -331,7 +342,6 @@ def target_libc_config(
         or _codename_libc(image_tag)
     ):
         return base_config
-    validate_target_platform(os_name, arch)
     from .base_libc import infer_libc_from_layers
 
     family = "musl" if _is_alpine_tag(image_tag) else "glibc"
@@ -352,11 +362,13 @@ def target_wheel_platform(
     base_config: Optional[dict],
     *,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> str:
     """Validate libc and return the most specific compatible wheel platform."""
     return target_wheel_platforms(
         os_name, arch, base_image, base_config,
         base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
     )[0]
 
 
@@ -368,10 +380,12 @@ def _target_options(
     base_config: Optional[dict] = None,
     *,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> List[str]:
     platforms = target_wheel_platforms(
         os_name, arch, base_image, base_config,
         base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
     )
     major, minor = python_version.split(".")
     return [
@@ -386,19 +400,30 @@ def _target_options(
     ]
 
 
-def validate_target_platform(os_name: str, arch: str) -> None:
-    if (os_name, arch) not in _PIP_PLATFORMS:
+def _target_text(os_name: str, arch: str, variant: Optional[str]) -> str:
+    return f"{os_name}/{arch}" + (f"/{variant}" if variant else "")
+
+
+def validate_target_platform(
+    os_name: str, arch: str, variant: Optional[str] = None
+) -> None:
+    required = _REQUIRED_VARIANTS.get((os_name, arch))
+    if (os_name, arch) not in _PIP_PLATFORMS or (
+        required is not None and variant != required
+    ):
         raise ValueError(
-            f"Dependency staging does not support target platform {os_name}/{arch}; "
-            "supported targets are linux/amd64 and linux/arm64."
+            "Dependency staging does not support target platform "
+            f"{_target_text(os_name, arch, variant)}; supported targets are "
+            f"{SUPPORTED_TARGETS_TEXT}."
         )
 
 
 def _target_marker_environment(
-    os_name: str, arch: str, python_version: str, base_config: Optional[dict]
+    os_name: str, arch: str, python_version: str, base_config: Optional[dict],
+    variant: Optional[str] = None,
 ) -> dict:
     """PEP 508 marker values for the target; omitted keys are unknown and fail closed."""
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     environment = {
         "implementation_name": "cpython",
         "os_name": "posix",
@@ -426,6 +451,7 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
+    variant: Optional[str] = None,
     *,
     locked: bool = False,
     base_image_tag_verified: bool = False,
@@ -434,6 +460,7 @@ def install_requirements(
     target_options = _target_options(
         os_name, arch, python_version, base_image, base_config,
         base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
     )
     _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
@@ -443,13 +470,14 @@ def install_requirements(
             "`pip-compile --generate-hashes`.",
             requirements.name,
         )
+    target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
     locked_options = ["--no-deps", "--require-hashes"] if locked else []
     error_file = destination.parent / _MARKER_ERROR_FILE
     marker_config = {
         "environment": _target_marker_environment(
-            os_name, arch, python_version, base_config
+            os_name, arch, python_version, base_config, variant
         ),
         "error_file": str(error_file),
         "allowed_config_keys": _PIP_CONFIG_ALLOWED,
@@ -504,7 +532,7 @@ def install_requirements(
                         _check_stage_limits(destination.parent)
                         if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
                             raise TimeoutError(
-                                f"Target dependency installation exceeded "
+                                f"Target dependency installation for {target} exceeded "
                                 f"{INSTALL_TIMEOUT_SECONDS} seconds."
                             )
             except BaseException:
@@ -520,7 +548,7 @@ def install_requirements(
         if returncode == _MARKER_ERROR_EXIT:
             raise ValueError(
                 "Cannot evaluate dependency environment markers for target "
-                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"{target}, CPython {python_version}; refusing to stage an "
                 f"incomplete dependency set. {details}"
             )
         raise RuntimeError(
@@ -540,6 +568,7 @@ def install_requirements(
                 arch,
                 python_version,
                 redact(pip_debug, secrets),
+                variant,
             ) + hint
         )
 
@@ -604,6 +633,7 @@ def _pip_failure_message(
     arch: str,
     python_version: str,
     pip_debug: str = "",
+    variant: Optional[str] = None,
 ) -> str:
     """Classify a failed install from redacted pip stderr and debug log text."""
     excerpt = _pip_excerpt(pip_output, pip_debug)
@@ -628,8 +658,10 @@ def _pip_failure_message(
         )
     return (
         "Target dependency installation failed. Only wheels compatible with "
-        f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
-        "are supported." + details
+        f"{_target_text(os_name, arch, variant)}, CPython {python_version}, and binary-only resolution "
+        f"are supported. {_NO_SOURCE_FALLBACK}"
+        + (_ARMV7_WHEEL_NOTE if arch == "arm" else "")
+        + details
     )
 
 
@@ -916,8 +948,9 @@ def stage_virtualenv(
     base_config: Optional[dict] = None,
     context_dir: Optional[Path] = None,
     requirements: Optional[Path] = None,
+    variant: Optional[str] = None,
 ) -> None:
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     files = list(dependencies)
     site_roots = set()
     for source, relative in files:
@@ -961,6 +994,7 @@ def stage_virtualenv(
         requirements,
         version_established,
         venv_layout_os(root, _read_venv_config(files, root)),
+        variant,
     )
 
 
@@ -974,6 +1008,7 @@ def _verify_target_closure(
     requirements: Optional[Path],
     version_established: bool,
     host_os_name: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> None:
     """Reject staged packages whose target-active requirements are not installed."""
     constraint_lines: List[str] = []
@@ -999,10 +1034,10 @@ def _verify_target_closure(
     if not distributions and not any(lines for _, _, lines in roots):
         return
 
-    environment = _target_marker_environment(os_name, arch, python_version, base_config)
+    environment = _target_marker_environment(os_name, arch, python_version, base_config, variant)
     request = {
         "environment": environment,
-        "hosts": host_environments(environment, version_established, host_os_name),
+        "host": host_facts(environment, version_established, host_os_name),
         "distributions": distributions,
         "roots": roots,
         "constraints": constraint_lines,
@@ -1050,7 +1085,7 @@ def _verify_target_closure(
     if problems:
         raise ValueError(
             f"Virtualenv dependencies are incomplete or unverifiable for target "
-            f"{os_name}/{arch}, CPython {python_version}; refusing to stage: "
+            f"{_target_text(os_name, arch, variant)}, CPython {python_version}; refusing to stage: "
             + "; ".join(problems)
             + ". Use a requirements file so pip resolves dependencies for the target."
         )

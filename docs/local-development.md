@@ -497,14 +497,18 @@ pycontainer build \
   --base-image python:3.11-slim-bookworm \
   --include-deps
 
-# Build for both platforms and push
-for PLATFORM in linux/amd64 linux/arm64; do
-  ARCH=$(echo $PLATFORM | cut -d/ -f2)
-  pycontainer build \
-    --tag ghcr.io/user/myapp:${ARCH} \
-    --platform $PLATFORM \
-    --push
-done
+# Build one OCI image index for both platforms and push it under one tag
+pycontainer build \
+  --tag ghcr.io/user/myapp:v1 \
+  --platform linux/amd64,linux/arm64 \
+  --push
+
+# Add 32-bit ARM (exact arm/v7 variant). With --include-deps, every
+# requirement needs an armv7l wheel; there is no source-build fallback.
+pycontainer build \
+  --tag ghcr.io/user/myapp:v1 \
+  --platform linux/amd64,linux/arm64,linux/arm/v7 \
+  --push
 ```
 
 ---

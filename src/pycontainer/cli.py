@@ -1,10 +1,11 @@
 import argparse, json, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
     TILT_PLACEHOLDER_TAG,
@@ -15,6 +16,12 @@ from .devloop import (
     write_reference,
 )
 
+def _metadata_argument(value: str) -> tuple[str, str]:
+    key, separator, item = value.partition("=")
+    if not separator or not key.strip():
+        raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
+    return key, item
+
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
     for stream in (sys.stdout, sys.stderr):
@@ -23,6 +30,26 @@ def _tolerate_unencodable_output():
         if not encoding or reconfigure is None: continue
         try: "\u2713".encode(encoding)
         except (UnicodeEncodeError, LookupError): reconfigure(errors="replace")
+
+def _run_registry(parser, args):
+    from .blob_store import BlobIntegrityError
+    from .registry_cleanup import RegistryConfirmationError, run_delete, run_prune
+    from .registry_client import RegistryRequestError
+    if args.username and not (args.password or os.getenv('REGISTRY_PASSWORD')):
+        parser.error("--username requires --password or REGISTRY_PASSWORD.")
+    if args.username and not args.password:
+        args.password=os.getenv('REGISTRY_PASSWORD')
+    if args.registry_cmd=="prune" and args.keep<1:
+        parser.error("--keep must be at least 1.")
+    if args.registry_cmd=="prune" and args.page_size is not None and args.page_size<1:
+        parser.error("--page-size must be at least 1.")
+    try:
+        return run_delete(args) if args.registry_cmd=="delete" else run_prune(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    except (RegistryRequestError, RegistryConfirmationError, BlobIntegrityError) as exc:
+        print(f"Error: {exc}",file=sys.stderr)
+        return 1
 
 def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
@@ -40,6 +67,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--insecure-registry",dest="insecure_registries",action="append",metavar="HOST[:PORT]",help="Use plain HTTP for this exact registry host[:port] (repeatable; unsafe outside trusted networks)")
     b.add_argument("--registry-ca-file",metavar="PATH",help="Trust an additional PEM CA bundle for registry HTTPS (verification stays enabled)")
+    b.add_argument("--registry-mirror",dest="registry_mirrors",action="append",metavar="UPSTREAM=MIRROR",help="Pull base images from UPSTREAM through MIRROR host[:port] first (repeatable, tried in order; pushes never use mirrors)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
@@ -64,7 +92,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     if platform:
-        b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
+        b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list of linux/amd64, linux/arm64 and linux/arm/v7 to build an OCI image index")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
     b.add_argument(
         "--sbom",
@@ -77,6 +105,20 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
+    b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
+    b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
+    b.add_argument("--release-notes",dest="release_notes_file",metavar="FILE",help="Embed a UTF-8 release notes file (max 8 KiB after LF normalization) as an image label; relative to the build context")
+    b.add_argument("--release-notes-label",dest="release_notes_label",metavar="KEY",help=f"Label key for --release-notes (default: {DEFAULT_RELEASE_NOTES_LABEL})")
+    b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
+    b.add_argument("--scan-executable",help="Grype executable path or name")
+    b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
+    b.add_argument("--scan-unknown",choices=("fail","ignore"),help="Unknown severity policy (default: fail)")
+    b.add_argument("--scan-report-format",choices=("json","sarif"),help="Report format (default: json)")
+    b.add_argument("--scan-report",help="Report destination (default: output directory)")
+    b.add_argument("--scan-offline",action="store_true",default=None,help="Use an imported database without updates; freshness still enforced")
+    b.add_argument("--scan-db-dir",help="Grype database cache (default: ~/.pycontainer/grype-db)")
+    b.add_argument("--scan-db-max-age-hours",type=int,help="Maximum database build age (default: 120 hours)")
     b.add_argument("--stop-signal",help="OCI StopSignal, e.g. SIGTERM or SIGRTMIN+3 (overrides the base image value)")
     b.add_argument("--volume",dest="volumes",action="append",help="Declare an absolute container path as an OCI volume (repeatable; merged with base volumes; metadata only, no mount is created)")
 
@@ -100,6 +142,24 @@ def main():
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    reg=sub.add_parser("registry",help="Delete or prune images in a registry")
+    reg_sub=reg.add_subparsers(dest="registry_cmd",required=True)
+    rd=reg_sub.add_parser("delete",help="Delete one manifest digest (removes every tag pointing to it)")
+    rd.add_argument("reference",help="Image reference with an explicit tag or @sha256 digest")
+    rp=reg_sub.add_parser("prune",help="Delete older semantic-version tags; dry run unless --execute")
+    rp.add_argument("repository",help="Repository without a tag, e.g. ghcr.io/user/app")
+    rp.add_argument("--keep",type=int,required=True,help="Number of highest semantic versions to keep (>= 1)")
+    rp.add_argument("--match",default="*",help="Glob selecting tags to consider (default: *)")
+    rp.add_argument("--protect",action="append",help="Glob of tags never pruned (repeatable)")
+    rp.add_argument("--page-size",type=int,help="Tags requested per page (registry may cap it)")
+    mode=rp.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run",action="store_true",help="Only print the plan (default)")
+    mode.add_argument("--execute",action="store_true",help="Delete the planned digests after confirmation")
+    for command in (rd, rp):
+        command.add_argument("--yes",action="store_true",help="Confirm deletion without prompting")
+        command.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
+        command.add_argument("--password",help="Registry password/token (or use env vars)")
+    rd.add_argument("--dry-run",action="store_true",help="Resolve and print the digest without deleting")
     history=sub.add_parser("history",help="Inspect or delete local build history")
     history_actions=history.add_subparsers(dest="history_action",required=True)
     for action in ("list", "clear"):
@@ -118,6 +178,8 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="registry":
+        raise SystemExit(_run_registry(parser,args))
     if args.cmd=="history":
         try:
             store=BuildHistory(args.history_dir)
@@ -164,6 +226,15 @@ def main():
     if push and username and not (password or os.getenv('REGISTRY_PASSWORD')):
         parser.error("--username requires --password or REGISTRY_PASSWORD.")
 
+    registry_mirrors=None
+    if args.registry_mirrors:
+        registry_mirrors={}
+        for entry in args.registry_mirrors:
+            upstream,separator,mirror=entry.partition("=")
+            if not separator or not upstream or not mirror or "=" in mirror:
+                parser.error(f"Invalid --registry-mirror {entry!r}: expected UPSTREAM=MIRROR, e.g. docker.io=mirror.example.com.")
+            registry_mirrors.setdefault(upstream,[]).append(mirror)
+
     tag_args=getattr(args,"tag",None)
     cli_overrides={
         'tag': tag_args[0] if tag_args else None,
@@ -191,10 +262,25 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'labels': dict(args.labels) if args.labels is not None else None,
+        'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
+        'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
+        'release_notes_file': args.release_notes_file,
+        'release_notes_label': args.release_notes_label,
+        'scan': args.scan,
+        'scan_executable': args.scan_executable,
+        'scan_threshold': args.scan_threshold,
+        'scan_unknown': args.scan_unknown,
+        'scan_report_format': args.scan_report_format,
+        'scan_report': args.scan_report,
+        'scan_offline': args.scan_offline,
+        'scan_db_dir': args.scan_db_dir,
+        'scan_db_max_age_hours': args.scan_db_max_age_hours,
         'stop_signal': args.stop_signal,
         'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
         'registry_ca_file': args.registry_ca_file,
+        'registry_mirrors': registry_mirrors,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
@@ -238,11 +324,16 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+    from .scanning import ScanError
     try:
         builder=ImageBuilder(cfg)
         out=builder.build()
+    except ReleaseNotesError as exc:
+        parser.error(str(exc))
     except HistoryStorageError as exc:
         parser.exit(1,f"Build history error: {exc}\n")
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
     print("Built:", out)
     
     if push:
@@ -250,12 +341,15 @@ def main():
             password=os.getenv('REGISTRY_PASSWORD')
         if args.cmd=="tilt-build" and push_target is None:
             push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
-        pushed=builder.push(
-            registry_url=push_target,
-            username=username,
-            password=password,
-            show_progress=not args.no_progress,
-        )
+        try:
+            pushed=builder.push(
+                registry_url=push_target,
+                username=username,
+                password=password,
+                show_progress=not args.no_progress,
+            )
+        except ScanError as exc:
+            parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
         if getattr(args,"output_ref",None):
             write_reference(Path(args.output_ref),pushed)
             print("Wrote image reference to", args.output_ref)

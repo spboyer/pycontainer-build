@@ -1,0 +1,35 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "runtime-lock-check"
+version = "1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "runtime-pure" },
+    { name = "runtime-platform" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "runtime-pure", specifier = "==1.0" },
+    { name = "runtime-platform", specifier = "==2.0" },
+]
+
+[[package]]
+name = "runtime-pure"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/runtime_pure-1.0-py3-none-any.whl", hash = "sha256:11f2e429ada7f6d50cd2793c3f3483047a84561e9d8e41c83f9837bd0ae69f9b" },
+]
+
+[[package]]
+name = "runtime-platform"
+version = "2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://example.invalid/runtime_platform-2.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:21083b6b03a540d4d35360ff4d5c4827875e8d9ea08e349ae1f17003ae275d27" },
+    { url = "https://example.invalid/runtime_platform-2.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:d2992edcd8df89d1dfc4339f9d57cea35c7aa8201609032680d3d525e470daf8" },
+]

@@ -255,6 +255,70 @@ This applies to both HTTP and HTTPS, including custom-CA connections.
 - The Poetry, Hatch, and VS Code integrations do not expose these options;
   use the CLI or `pycontainer.toml`.
 
+## Base-Image Registry Mirrors
+
+Base-image pulls can go through pull-through mirrors before the upstream
+registry. Mirrors never apply to `--push`, which always goes straight to the
+registry named in `--tag`.
+
+```bash
+pycontainer build --tag ghcr.io/me/app:v1 --base-image python:3.11-slim \
+  --registry-mirror docker.io=mirror.example.com \
+  --registry-mirror docker.io=backup.example.com:5000
+```
+
+```toml
+[build.registry_mirrors]
+"docker.io" = ["mirror.example.com", "backup.example.com:5000"]
+"ghcr.io" = ["ghcr-mirror.example.com"]
+```
+
+- Keys and values are `host[:port]` only: no scheme, path, or credentials.
+  `docker.io`, `index.docker.io`, and `registry-1.docker.io` are the same
+  upstream. A mirror keeps the upstream repository path; Docker Hub
+  official images keep the `library/` prefix (`library/python`). Path-prefixed
+  mirrors (for example Harbor proxy projects) are not supported.
+- Mirrors are tried in order, then the upstream. `--registry-mirror` for an
+  upstream replaces that upstream's list from `pycontainer.toml`; lists for
+  other upstreams are kept.
+- Mirrors use the same transport as any registry: HTTPS with
+  `--registry-ca-file` trust, or plain HTTP only when the mirror host is also
+  listed in `--insecure-registry`.
+- `--verbose` names the host(s) that served the pull (`Served by: ...`).
+
+### Fallback rules
+
+| Mirror response | Behavior |
+| --- | --- |
+| Connection failure (including TLS verification and an unreachable token realm) | Warn; skip this mirror for the rest of the pull |
+| HTTP 5xx after the normal retry budget (registry or token realm) | Warn; skip this mirror for the rest of the pull |
+| HTTP 401/403 (including token exchange) | Warn about mirror credentials; skip this mirror for the rest of the pull |
+| HTTP 404 | Warn; try the next host for this object only |
+| HTTP 429 or quota errors | Fail; no fallback |
+| Digest or size mismatch | Fail closed; no fallback, nothing published |
+| Refused credentials or token realm (for example credentials over HTTP) | Fail; no fallback |
+
+An error from the upstream, after every mirror is exhausted, is reported as
+it would be without mirrors.
+
+### Credentials and integrity
+
+- Each mirror gets credentials only for its own host: its exact Docker
+  config entry, Azure CLI for `*.azurecr.io`, or `GITHUB_TOKEN` for
+  `ghcr.io`. `REGISTRY_TOKEN`, `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`,
+  `--registry-*` flags, and upstream credentials are never sent to a mirror.
+  Upstream credentials are resolved only if the upstream is actually
+  contacted.
+- Manifests requested by digest and every config/layer blob are verified
+  against their descriptor digest and size, whichever host serves them.
+- A tag is resolved by the mirror that serves it. Pin base images by digest
+  (`python:3.11-slim@sha256:...`) if a mirror should not be trusted to
+  resolve tags.
+
+Tests use separate in-process loopback registries with synthetic
+credentials; no real mirror product (Docker Hub mirror, Harbor, Nexus,
+Artifactory, ACR cache rules) has been verified in CI.
+
 ## Programmatic Usage
 
 ```python
@@ -324,12 +388,13 @@ This makes subsequent pushes much faster.
 
 ### Registry errors, rate limits and quotas
 
-Registry failures report the operation, registry host, HTTP status and the
-OCI distribution error codes from the response body, for example:
+Registry failures report the operation, registry host and HTTP status.
+Distribution error codes and messages are used to classify failures, but
+transfer response bodies are omitted because they can echo image metadata:
 
 ```text
-Manifest pull failed with HTTP 429 from registry-1.docker.io: TOOMANYREQUESTS:
-You have reached your pull rate limit. The registry rate limit was exceeded;
+Manifest pull failed with HTTP 429 from registry-1.docker.io: (response details omitted)
+The registry rate limit was exceeded;
 it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
 100 remaining. Authenticate to the registry ...
 ```
@@ -356,11 +421,15 @@ Run with `--verbose` to log Docker Hub style `RateLimit-Limit` and
 `RateLimit-Remaining` headers. A warning is printed once per registry client
 when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
 
-Error bodies are treated as untrusted: at most five errors are shown, each
-message is truncated, control characters are removed, and authorization
-values, tokens and the configured credentials, including URL-encoded forms,
-are replaced with `[REDACTED]`.
-Registry hosts and HTTP(S) URLs in error details omit userinfo and query strings.
+Token-exchange error bodies are treated as untrusted: at most five errors are
+shown, messages are truncated, control characters are removed, and credentials
+are replaced with `[REDACTED]`. Registry hosts and HTTP(S) URLs in error
+details omit userinfo and query strings.
+
+## Deleting and Pruning Images
+
+To delete images or prune old semantic versions from a registry, see the
+[Registry Cleanup Guide](REGISTRY_CLEANUP.md). Pruning is a dry run by default.
 
 ## Authentication Priority
 
