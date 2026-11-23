@@ -923,8 +923,7 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 (`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
-platform is built in isolation: it selects its own base manifest (registry
-builds re-select from the first resolved base-index digest), stages its own
+platform is built in isolation: it selects its own base manifest, stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
 Virtualenv closure is verified separately against each target base. Detected
@@ -934,7 +933,16 @@ The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
 keep the same layout `index.json` for every platform and until publication;
-a change fails the build instead of mixing base versions. Push uploads blobs, then
+a change fails the build instead of mixing base versions. A registry base tag
+is read once: every platform selects from that first verified base index or
+manifest snapshot and fetches its platform manifest by descriptor digest, so a
+tag that moves mid-build cannot mix snapshots. The snapshot must match a
+`sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
+unrecognized header algorithm is recorded as the locally computed `sha256` of
+the received bytes, never assumed to be served by the registry. If a pinned
+platform manifest can no longer be fetched, the build fails before the layout
+`index.json` or refs are written (a reused output directory may still contain
+an earlier build's index). Push uploads blobs, then
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.

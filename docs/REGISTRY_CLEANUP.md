@@ -19,8 +19,11 @@ pycontainer registry delete ghcr.io/user/app@sha256:<digest> --yes
 
 The reference must contain an explicit tag or `@sha256:` digest; an implied
 `latest` is rejected. A tag is first resolved to its manifest digest with a
-verified `GET` (the returned body must match the `Docker-Content-Digest`
-header), and the digest is what gets deleted.
+verified `GET` (the returned body must match a `sha256:` or `sha512:`
+`Docker-Content-Digest` header), and the digest is what gets deleted. Only
+`sha256` digests can be deleted; an unrecognized header algorithm resolves to
+the body's locally computed `sha256`, and a registry that does not serve that
+digest fails the delete explicitly.
 
 ## Prune old semantic versions
 
@@ -74,7 +77,11 @@ protected. Two old tags sharing one digest produce a single `DELETE`.
 
 Resolving every tag costs one manifest `GET` per tag. On registries with pull
 quotas, such as Docker Hub, this counts against the limit. A tag that cannot be
-resolved, or a digest that is not `sha256`, aborts the whole plan.
+resolved, or a `sha512` digest, aborts the whole plan. A tag whose
+`Docker-Content-Digest` uses an unrecognized algorithm resolves to its body's
+locally computed `sha256`; retention compares those body digests, and if the
+registry does not serve that digest, `--execute` stops at the first failed
+`DELETE` and reports what was already deleted.
 
 ## Limitations and guarantees
 

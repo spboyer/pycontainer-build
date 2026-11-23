@@ -1135,12 +1135,22 @@ class RegistryClient:
         digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
             "docker-content-digest"
         )
-        if digest and digest.startswith("sha256:") and digest != body_digest:
+        if not digest:
+            return manifest, body_digest
+        if digest.startswith("sha512:"):
+            expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
+        elif digest.startswith("sha256:"):
+            expected_header = body_digest
+        else:
+            # Unsupported algorithms cannot be verified; report the locally computed
+            # sha256 instead and never assume the registry serves it as an alias.
+            return manifest, body_digest
+        if digest != expected_header:
             raise BlobIntegrityError(
                 f"Registry-reported manifest digest does not match its body "
                 f"digest {body_digest}."
             )
-        return manifest, digest or body_digest
+        return manifest, digest
 
     def delete_manifest(self, digest: str) -> None:
         """Delete a manifest by digest exactly once; the request is never retried."""
