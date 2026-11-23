@@ -30,10 +30,20 @@ _MEDIA = {
     "application/vnd.docker.distribution.manifest.list.v2+json",
 }
 _SIGNATURE = "application/vnd.cncf.notary.signature"
+_INHERITED_ENVIRONMENT = frozenset({"SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "TZ"})
 _OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 _ENVELOPES = {"application/cose", "application/jose+json"}
 _MAX_MANIFEST = 4 * 1024 * 1024
 _MAX_ENVELOPE = 16 * 1024 * 1024
+_MAX_ENVELOPE_TOTAL = 64 * 1024 * 1024
+_MAX_REFERRERS = 1000
+_MAX_CANDIDATES = 16
+_MAX_CERTIFICATES = 16
+_MAX_CERTIFICATE = 1024 * 1024
+_MAX_CBOR_DEPTH = 16
+_MAX_CBOR_ITEMS = 1024
+_INDEX = "application/vnd.oci.image.index.v1+json"
+_COSE_X5CHAIN = 33
 _MAX_OUTPUT = 4 * 1024 * 1024
 _TIMEOUT = 120
 
@@ -139,7 +149,8 @@ def _decode_jws_base64(value, *, url=False):
     return data
 
 
-def _check_jws_envelope(envelope, fingerprint):
+def _check_jws_envelope(envelope, fingerprint=None):
+    """Strictly parse a flattened JWS and return its leaf certificate."""
     obj = _unique_json(envelope)
     if not isinstance(obj, dict) or set(obj) != {"payload", "protected", "header", "signature"}:
         raise NotationTrustError("Only flattened single-signer JWS is supported")
@@ -190,13 +201,196 @@ def _check_jws_envelope(envelope, fingerprint):
             except ValueError as exc:
                 raise NotationTrustError("Invalid JWS timestamp") from exc
     chain = header.get("x5c")
-    if not isinstance(chain, list) or not 1 <= len(chain) <= 16:
+    if not isinstance(chain, list) or not 1 <= len(chain) <= _MAX_CERTIFICATES:
         raise NotationTrustError("Invalid JWS certificate chain")
     certificates = [_decode_jws_base64(cert) for cert in chain]
-    if any(len(cert) > 1024 * 1024 for cert in certificates):
+    if any(len(cert) > _MAX_CERTIFICATE for cert in certificates):
         raise NotationTrustError("JWS certificate exceeds size limit")
-    if hashlib.sha256(certificates[0]).hexdigest() != fingerprint:
+    if fingerprint is not None and hashlib.sha256(certificates[0]).hexdigest() != fingerprint:
         raise NotationTrustError("JWS signer fingerprint does not match policy")
+    return certificates[0]
+
+
+class _CborTag:
+    __slots__ = ("tag", "value")
+
+    def __init__(self, tag, value):
+        self.tag, self.value = tag, value
+
+
+def _cbor_item(data, pos, depth):
+    if depth > _MAX_CBOR_DEPTH or pos >= len(data):
+        raise NotationTrustError("Invalid COSE encoding")
+    initial = data[pos]
+    major, info = initial >> 5, initial & 0x1F
+    pos += 1
+    if info < 24:
+        value = info
+    elif info <= 27:
+        width = 1 << (info - 24)
+        if pos + width > len(data):
+            raise NotationTrustError("Truncated COSE encoding")
+        value = int.from_bytes(data[pos:pos + width], "big")
+        pos += width
+    else:
+        raise NotationTrustError("Indefinite or reserved COSE encoding")
+    if major == 0:
+        return value, pos
+    if major == 1:
+        return -1 - value, pos
+    if major in (2, 3):
+        end = pos + value
+        if end > len(data):
+            raise NotationTrustError("Truncated COSE string")
+        chunk = data[pos:end]
+        if major == 3:
+            try:
+                chunk = chunk.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise NotationTrustError("Invalid COSE text") from exc
+        return chunk, end
+    if major in (4, 5):
+        if value > _MAX_CBOR_ITEMS:
+            raise NotationTrustError("COSE structure exceeds size limit")
+        if major == 4:
+            items = []
+            for _ in range(value):
+                item, pos = _cbor_item(data, pos, depth + 1)
+                items.append(item)
+            return items, pos
+        result = {}
+        for _ in range(value):
+            key, pos = _cbor_item(data, pos, depth + 1)
+            if type(key) not in (int, str) or key in result:
+                raise NotationTrustError("Invalid or duplicate COSE map key")
+            result[key], pos = _cbor_item(data, pos, depth + 1)
+        return result, pos
+    if major == 6:
+        item, pos = _cbor_item(data, pos, depth + 1)
+        return _CborTag(value, item), pos
+    return _CborTag(-1, value), pos
+
+
+def _cbor_decode(data):
+    item, end = _cbor_item(data, 0, 0)
+    if end != len(data):
+        raise NotationTrustError("Trailing COSE data")
+    return item
+
+
+def _cose_leaf(envelope):
+    """Return the leaf of a single-signer COSE_Sign1 envelope's unprotected x5chain."""
+    message = _cbor_decode(envelope)
+    if (not isinstance(message, _CborTag) or message.tag != 18
+            or not isinstance(message.value, list) or len(message.value) != 4):
+        raise NotationTrustError("Only tagged single-signer COSE_Sign1 is supported")
+    protected_bytes, unprotected, payload, signature = message.value
+    if (not isinstance(protected_bytes, bytes) or not protected_bytes
+            or not isinstance(unprotected, dict) or not isinstance(payload, bytes)
+            or not isinstance(signature, bytes) or not signature):
+        raise NotationTrustError("Invalid COSE_Sign1 structure")
+    protected = _cbor_decode(protected_bytes)
+    if (not isinstance(protected, dict) or _COSE_X5CHAIN in protected
+            or set(protected) & set(unprotected)):
+        raise NotationTrustError("Invalid COSE headers")
+    chain = unprotected.get(_COSE_X5CHAIN)
+    if isinstance(chain, bytes):
+        chain = [chain]
+    if (not isinstance(chain, list) or not 1 <= len(chain) <= _MAX_CERTIFICATES
+            or not all(isinstance(cert, bytes) and 0 < len(cert) <= _MAX_CERTIFICATE
+                       for cert in chain)):
+        raise NotationTrustError("Invalid COSE certificate chain")
+    return chain[0]
+
+
+def _leaf_certificate(envelope, media_type):
+    if media_type == "application/cose":
+        return _cose_leaf(envelope)
+    return _check_jws_envelope(envelope)
+
+
+def _referrer_index(client, digest):
+    """Discover signature descriptors via the referrers API or its tag fallback."""
+    found = client.pull_referrers(digest, _SIGNATURE, _MAX_MANIFEST)
+    if found is None:
+        tagged = client.pull_optional_manifest_bytes("sha256-" + digest[7:], _MAX_MANIFEST)
+        if tagged is None:
+            raise NotationTrustError("No Notation signature evidence was found")
+        index = tagged[0]
+    else:
+        index = found[0]
+    manifests = index.get("manifests") if isinstance(index, dict) else None
+    if (not isinstance(manifests, list) or index.get("schemaVersion") != 2
+            or index.get("mediaType") != _INDEX or len(manifests) > _MAX_REFERRERS):
+        raise NotationTrustError("Invalid or unbounded Notation referrers index")
+    candidates = {}
+    for item in manifests:
+        if not isinstance(item, dict) or item.get("artifactType") != _SIGNATURE:
+            continue
+        descriptor = _descriptor(item, {"mediaType": _OCI_MANIFEST})
+        if descriptor["size"] > _MAX_MANIFEST:
+            raise NotationTrustError("Notation signature manifest exceeds size limit")
+        previous = candidates.setdefault(descriptor["digest"], descriptor)
+        if previous["size"] != descriptor["size"]:
+            raise NotationTrustError("Conflicting Notation signature descriptors")
+    if not candidates:
+        raise NotationTrustError("No Notation signature evidence was found")
+    if len(candidates) > _MAX_CANDIDATES:
+        raise NotationTrustError("Too many Notation signatures to evaluate")
+    return list(candidates.values())
+
+
+def _fetch_candidate(client, descriptor, subject, directory, budget):
+    signature_digest = descriptor["digest"]
+    signature_manifest, actual_digest, raw = client.pull_manifest_bytes(
+        signature_digest, expected_digest=signature_digest, expected_size=descriptor["size"])
+    if (not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_MANIFEST
+            or actual_digest != signature_digest or _digest(raw) != signature_digest
+            or _json(raw) != signature_manifest or not isinstance(signature_manifest, dict)
+            or signature_manifest.get("schemaVersion") != 2
+            or signature_manifest.get("mediaType") != _OCI_MANIFEST):
+        raise NotationTrustError("Invalid signature manifest")
+    _descriptor(signature_manifest.get("subject"), subject)
+    config_descriptor = signature_manifest.get("config")
+    if (signature_manifest.get("artifactType") != _SIGNATURE
+            and (not isinstance(config_descriptor, dict) or config_descriptor.get("mediaType") != _SIGNATURE)):
+        raise NotationTrustError("Not a Notation signature manifest")
+    layers = signature_manifest.get("layers")
+    if not isinstance(layers, list) or len(layers) != 1:
+        raise NotationTrustError("Signature manifest must contain exactly one envelope")
+    envelope = _descriptor(layers[0])
+    if envelope["mediaType"] not in _ENVELOPES or envelope["size"] > _MAX_ENVELOPE:
+        raise NotationTrustError("Invalid signature envelope")
+    if envelope["size"] > budget:
+        raise NotationTrustError("Notation signature evidence exceeds size limit")
+    blob = directory / envelope["digest"][7:]
+    if not client.pull_blob(envelope["digest"], blob, envelope["size"]):
+        raise NotationTrustError("Cannot fetch signature envelope")
+    if not blob.is_file() or blob.is_symlink() or blob.stat().st_size != envelope["size"]:
+        raise NotationTrustError("Invalid signature envelope size")
+    envelope_bytes = blob.read_bytes()
+    if _digest(envelope_bytes) != envelope["digest"]:
+        raise NotationTrustError("Invalid signature envelope digest")
+    return envelope, envelope_bytes
+
+
+def _select_pinned_envelope(client, digest, subject, fingerprint, directory):
+    """Return the one discovered envelope whose actual leaf matches the pin."""
+    directory.mkdir()
+    matches = []
+    budget = _MAX_ENVELOPE_TOTAL
+    for descriptor in _referrer_index(client, digest):
+        envelope, envelope_bytes = _fetch_candidate(
+            client, descriptor, subject, directory, budget)
+        budget -= envelope["size"]
+        leaf = _leaf_certificate(envelope_bytes, envelope["mediaType"])
+        if hashlib.sha256(leaf).hexdigest() == fingerprint:
+            matches.append((envelope, envelope_bytes))
+    if not matches:
+        raise NotationTrustError("No Notation signature matches the pinned signer fingerprint")
+    if len(matches) != 1:
+        raise NotationTrustError("Expected exactly one signature from the pinned signer")
+    return matches[0]
 
 
 def verify_notation(policy: dict[str, str], repository: str, digest: str,
@@ -277,72 +471,21 @@ def _verify_notation(policy, repository, digest, manifest, manifest_bytes, clien
             "trustedIdentities": ["x509.subject: " + identity],
         }]}
         (config / "trustpolicy.json").write_bytes(_encode(trust_policy))
-        env = os.environ.copy()
-        for name in list(env):
-            if name.startswith("NOTATION_") or name in (
-                    "DOCKER_CONFIG", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-                    "XDG_CACHE_HOME", "HOME", "USERPROFILE", "APPDATA",
-                    "LOCALAPPDATA", "REGISTRY_AUTH_FILE", "DOCKER_AUTH_CONFIG"):
-                env.pop(name, None)
+        # Verification is offline, so nothing beyond OS essentials is inherited;
+        # registry credentials in the builder's environment never reach Notation.
+        env = {name: value for name, value in os.environ.items()
+               if name.upper() in _INHERITED_ENVIRONMENT}
         env.update({"NOTATION_CONFIG": str(config), "DOCKER_CONFIG": str(base / "docker"),
                     "REGISTRY_AUTH_FILE": str(base / "empty-auth.json"),
                     "XDG_CONFIG_HOME": str(base), "XDG_DATA_HOME": str(base),
                     "XDG_CACHE_HOME": str(base), "HOME": str(base), "USERPROFILE": str(base),
                     "APPDATA": str(base), "LOCALAPPDATA": str(base), "PATH": "",
                     "NOTATION_EXPERIMENTAL": "1"})
-        inspection = _json(_run([executable, "inspect", "--output", "json",
-                                 repository + "@" + digest], env))
-        signatures = inspection.get("Signatures") if isinstance(inspection, dict) else None
-        if not isinstance(signatures, list) or not signatures or len(signatures) > 100:
-            raise NotationTrustError("No bounded Notation signature evidence")
-        candidates = []
-        for signature in signatures:
-            if not isinstance(signature, dict):
-                continue
-            certs = signature.get("certificates")
-            if (isinstance(certs, list) and certs and isinstance(certs[0], dict)
-                    and certs[0].get("issuedTo") == identity
-                    and certs[0].get("SHA256Fingerprint") == fingerprint
-                    and signature.get("mediaType") in _ENVELOPES):
-                _descriptor(signature.get("signedArtifact"), subject)
-                candidate = signature.get("digest")
-                if isinstance(candidate, str) and _DIGEST.fullmatch(candidate):
-                    candidates.append((candidate, signature["mediaType"]))
-        if len(candidates) != 1:
-            raise NotationTrustError("Expected exactly one matching signature")
-        signature_digest, envelope_media = candidates[0]
-        signature_manifest, actual_digest, raw = client.pull_manifest_bytes(
-            signature_digest, expected_digest=signature_digest)
-        if (not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_MANIFEST
-                or actual_digest != signature_digest or _digest(raw) != signature_digest
-                or _json(raw) != signature_manifest or not isinstance(signature_manifest, dict)
-                or signature_manifest.get("schemaVersion") != 2
-                or signature_manifest.get("mediaType") != _OCI_MANIFEST):
-            raise NotationTrustError("Invalid signature manifest")
-        _descriptor(signature_manifest.get("subject"), subject)
-        config_descriptor = signature_manifest.get("config")
-        if (signature_manifest.get("artifactType") != _SIGNATURE
-                and (not isinstance(config_descriptor, dict) or config_descriptor.get("mediaType") != _SIGNATURE)):
-            raise NotationTrustError("Not a Notation signature manifest")
-        layers = signature_manifest.get("layers")
-        if not isinstance(layers, list) or len(layers) != 1:
-            raise NotationTrustError("Signature manifest must contain exactly one envelope")
-        envelope = _descriptor(layers[0])
-        if envelope["mediaType"] != envelope_media or envelope["size"] > _MAX_ENVELOPE:
-            raise NotationTrustError("Invalid signature envelope")
-        blob = layout / "blobs" / "sha256" / envelope["digest"][7:]
-        if not client.pull_blob(envelope["digest"], blob, envelope["size"]):
-            raise NotationTrustError("Cannot fetch signature envelope")
-        if not blob.is_file() or blob.is_symlink() or blob.stat().st_size != envelope["size"]:
-            raise NotationTrustError("Invalid signature envelope size")
-        envelope_bytes = blob.read_bytes()
-        if _digest(envelope_bytes) != envelope["digest"]:
-            raise NotationTrustError("Invalid signature envelope digest")
-        # A tagged COSE_Sign1 has one signer; COSE_Sign may contain multiple.
-        if envelope_media == "application/cose" and not envelope_bytes.startswith(b"\xd2\x84"):
-            raise NotationTrustError("Only tagged single-signer COSE_Sign1 is supported")
-        if envelope_media == "application/jose+json":
+        envelope, envelope_bytes = _select_pinned_envelope(
+            client, digest, subject, fingerprint, base / "candidates")
+        if envelope["mediaType"] == "application/jose+json":
             _check_jws_envelope(envelope_bytes, fingerprint)
+        _write_blob(layout, envelope_bytes)
         _write_blob(layout, manifest_bytes)
         empty_digest = _write_blob(layout, b"{}")
         wrapper = {"schemaVersion": 2, "mediaType": _OCI_MANIFEST,

@@ -11,13 +11,25 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict
 
-from .blob_store import digest_filename
-from .registry_client import parse_image_reference
+from .blob_store import BlobIntegrityError, digest_filename
+from .registry_client import RegistryRequestError, parse_image_reference
 
 
 VERIFIER_TIMEOUT_SECONDS = 180
 MAX_VERIFIER_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_TRUST_MATERIAL_BYTES = 4 * 1024 * 1024
+MAX_COSIGN_SIGNATURE_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_COSIGN_SIGNATURE_BLOB_BYTES = 1024 * 1024
+MAX_COSIGN_SIGNATURES = 64
+_COSIGN_SIGNATURE_MEDIA = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+_INDEX_MEDIA = (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+)
+_IMAGE_MEDIA = tuple(sorted(_COSIGN_SIGNATURE_MEDIA))
 
 
 class TrustVerificationError(RuntimeError):
@@ -221,6 +233,12 @@ def run_bounded_verifier(command, environment, timeout, output_limit, label) -> 
     return bytes(output)
 
 
+_COSIGN_INHERITED_ENVIRONMENT = frozenset({
+    "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "TZ", "HTTP_PROXY", "HTTPS_PROXY",
+    "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+})
+
+
 def _run_cosign(command, environment) -> bytes:
     executable = resolve_verifier_executable(command[0])
     if executable is None:
@@ -231,12 +249,104 @@ def _run_cosign(command, environment) -> bytes:
     )
 
 
-def _verify_cosign(policy: Dict[str, str], repository: str, digest: str) -> None:
+def _bounded_descriptor(value, label: str, max_size: int, media_types=None) -> dict:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("digest"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["digest"])
+        or type(value.get("size")) is not int
+        or not 0 < value["size"] <= max_size
+        or not isinstance(value.get("mediaType"), str)
+        or (media_types is not None and value["mediaType"] not in media_types)
+    ):
+        raise TrustVerificationError(f"Cosign {label} descriptor is invalid or too large.")
+    return value
+
+
+def _stage_cosign_layout(
+    client, layout: Path, digest: str, manifest: dict, manifest_bytes: bytes
+) -> None:
+    """Fetch tag-schema Cosign evidence through the strict registry client."""
+    found = client.pull_optional_manifest_bytes(
+        f"sha256-{digest[7:]}.sig", MAX_COSIGN_SIGNATURE_MANIFEST_BYTES
+    )
+    if found is None:
+        raise TrustVerificationError(
+            "No Cosign signature evidence was found for the base-image digest."
+        )
+    signatures, signatures_digest, signatures_bytes = found
+    media_type = signatures.get("mediaType")
+    layers = signatures.get("layers")
+    if (
+        signatures.get("schemaVersion") != 2
+        or media_type not in _COSIGN_SIGNATURE_MEDIA
+        or not isinstance(layers, list)
+        or not 1 <= len(layers) <= MAX_COSIGN_SIGNATURES
+    ):
+        raise TrustVerificationError("Cosign signature manifest has an unsupported shape.")
+    subject = signatures.get("subject")
+    if subject is not None and (not isinstance(subject, dict) or subject.get("digest") != digest):
+        raise TrustVerificationError("Cosign signature manifest names another subject.")
+    descriptors = [_bounded_descriptor(
+        signatures.get("config"), "config", MAX_COSIGN_SIGNATURE_BLOB_BYTES,
+    )] + [
+        _bounded_descriptor(
+            layer, "signature", MAX_COSIGN_SIGNATURE_BLOB_BYTES,
+            {"application/vnd.dev.cosign.simplesigning.v1+json"},
+        )
+        for layer in layers
+    ]
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    for descriptor in {item["digest"]: item for item in descriptors}.values():
+        if not client.pull_blob(
+            descriptor["digest"], blobs / descriptor["digest"][7:], descriptor["size"]
+        ):
+            raise TrustVerificationError("Cosign signature blob could not be fetched.")
+    (blobs / digest[7:]).write_bytes(manifest_bytes)
+    (blobs / signatures_digest[7:]).write_bytes(signatures_bytes)
+    subject_media = manifest.get("mediaType")
+    if subject_media not in _INDEX_MEDIA + _IMAGE_MEDIA:
+        raise TrustVerificationError("Base-image subject has no supported media type.")
+    subject_kind = (
+        "dev.cosignproject.cosign/imageIndex"
+        if subject_media in _INDEX_MEDIA
+        else "dev.cosignproject.cosign/image"
+    )
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": subject_media,
+                "size": len(manifest_bytes),
+                "digest": digest,
+                "annotations": {"kind": subject_kind},
+            },
+            {
+                "mediaType": media_type,
+                "size": len(signatures_bytes),
+                "digest": signatures_digest,
+                "annotations": {"kind": "dev.cosignproject.cosign/sigs"},
+            },
+        ],
+    }
+    (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}', encoding="utf-8")
+    (layout / "index.json").write_text(json.dumps(index), encoding="utf-8")
+
+
+def _verify_cosign(
+    policy: Dict[str, str], repository: str, digest: str,
+    manifest: dict, manifest_bytes: bytes, client,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="pycontainer-trust-") as directory:
         root = Path(directory)
+        layout = root / "layout"
+        _stage_cosign_layout(client, layout, digest, manifest, manifest_bytes)
         command = [
             policy.get("binary", "cosign"),
             "verify",
+            "--local-image",
             "--check-claims=true",
             "--insecure-ignore-tlog=false",
             "--insecure-ignore-sct=false",
@@ -255,16 +365,12 @@ def _verify_cosign(policy: Dict[str, str], repository: str, digest: str) -> None
             trusted_root = root / "trusted-root.json"
             _copy_material(policy["trust_root"], trusted_root)
             command.append(f"--trusted-root={trusted_root}")
-        command.append(f"{repository}@{digest}")
+        command.append(str(layout))
+        # Only OS essentials plus proxy/CA settings (keyless TUF and Rekor access)
+        # are inherited, so builder registry credentials never reach Cosign.
         environment = {
             key: value for key, value in os.environ.items()
-            if not key.upper().startswith(("COSIGN_", "SIGSTORE_", "AWS_", "AZURE_", "GOOGLE_"))
-            and key.upper() not in {
-                "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME", "XDG_CACHE_HOME", "DOCKER_CONFIG", "DOCKER_AUTH_CONFIG",
-                "REGISTRY_AUTH_FILE", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN",
-                "REGISTRY_USERNAME", "REGISTRY_PASSWORD", "DOCKER_USERNAME", "DOCKER_PASSWORD",
-            }
+            if key.upper() in _COSIGN_INHERITED_ENVIRONMENT
         }
         environment.update({
             "HOME": str(root), "USERPROFILE": str(root), "APPDATA": str(root),
@@ -321,7 +427,10 @@ def verify_base_image(
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise TrustVerificationError("Base-image subject is not valid JSON.") from error
     if policy["provider"] == "cosign":
-        _verify_cosign(policy, repository, digest)
+        try:
+            _verify_cosign(policy, repository, digest, manifest, manifest_bytes, client)
+        except (OSError, ValueError, BlobIntegrityError, RegistryRequestError) as error:
+            raise TrustVerificationError(f"Cosign verification failed: {error}") from error
     else:
         from .trust_notation import NotationTrustError, verify_notation
 
