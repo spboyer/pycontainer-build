@@ -285,6 +285,27 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Skaffold and Tilt
+
+Use pycontainer as a custom builder for the Kubernetes inner loop. It builds
+without a Docker daemon and pushes to a registry the cluster pulls from:
+
+```yaml
+# skaffold.yaml (build.local.push: true is required)
+custom:
+  buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+```
+
+```python
+# Tiltfile
+custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
+             deps=['app'], skips_local_docker=True)
+```
+
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
+registries and multi-platform requests are rejected.
+[See full documentation →](docs/skaffold-tilt.md)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:
@@ -668,6 +689,7 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
@@ -735,6 +757,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
