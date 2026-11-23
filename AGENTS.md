@@ -34,8 +34,13 @@ Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
 content, normalized relative paths, workdir, and reproducibility settings.
 Index updates are locked and atomically replaced; cache blobs are verified
-before reuse. A malformed index raises an explicit `CacheIndexError`; missing
-or corrupt blobs are discarded and rebuilt.
+before reuse. A malformed index raises an explicit `CacheIndexError` with a
+remediation message; missing or corrupt blobs are discarded and rebuilt. A
+saved `--cache-dir` can be restored to another absolute path and checkout on
+the same OS (`tests/test_cache_portability.py`); source modes are part of the
+key, so Windows and Linux caches are not interchangeable. The non-gating
+`cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
+cross-OS restore outcomes.
 
 ## Setup and verified checks
 
