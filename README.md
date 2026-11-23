@@ -331,9 +331,10 @@ pycontainer build \
 
 **Base Image & Dependencies**:
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
-- `--include-deps` — Stage importable dependencies from a lockfile, a
-  requirements file, or a venv as target-compatible binary wheels. Requirements installs
-  are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
+- `--include-deps` — Stage importable dependencies from a lockfile or
+  requirements file as target-compatible binary wheels, or copy a verified
+  pure-Python venv. Requirements files, including generated lock selections,
+  are limited to 1 MiB; staging is limited to 300 seconds, 512 MiB, and 100,000 files;
   supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
   must match the target Python minor version and contain only pure-Python
   packages. Dependencies are placed under `<workdir>/.python`, added to
@@ -343,6 +344,29 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Environment markers in the requirements file and in transitive
+  `Requires-Dist` metadata are evaluated for the target (`linux`, the target
+  machine, CPython and the base image's Python version), not the build host.
+  Markers on `platform_release` or `platform_version`, and on
+  `python_full_version` or `implementation_version` when the base image does not declare a full
+  `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
+  cannot be re-resolved, so it is verified instead: root requirements (the
+  requirements file and pyproject `[project]` dependencies, optional
+  dependencies and dependency groups) and every installed `Requires-Dist` are
+  re-evaluated for each target, and the build fails if a requirement the
+  target needs is missing, uses an unknown marker value, or belongs to an extra
+  or group whose request cannot be ruled out. An extra or group counts as not
+  requested only when it is missing a requirement that any Windows, Linux or
+  macOS CPython host of the venv's Python version would have installed; a
+  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
+  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
+  layout), and `Lib/site-packages` to Windows. Only
+  package presence is checked, not versions; extra host-only packages are
+  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
+  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
+  also fail the build, as do dynamic dependencies that cannot be read. Use a
+  requirements file, which pip resolves for the target, when verification
+  fails.
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
@@ -374,11 +398,13 @@ none is added as a dependency:
    Poetry and PDM content hashes, the Pipfile hash, or uv's recorded
    requirements. A stale lock fails; run `poetry lock`, `pipenv lock`,
    `pdm lock`, or `uv lock` and rebuild.
-2. Environment markers are evaluated for the target image, not the build host,
-   so a Windows-only or `python_version` fork resolves for the container's
-   Linux CPython. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
+2. Root and recorded transitive markers are evaluated for each target image,
+   not the build host, so platform and Python forks select the container's
+   dependencies. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
 3. The exact locked versions and their recorded hashes are installed with
    `pip --no-deps --require-hashes` as target wheels and included in the SBOM.
+   Pip does not resolve transitive dependencies in this mode: the lock must
+   record the complete target graph and a matching wheel hash for each target.
 
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
@@ -451,8 +477,32 @@ inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
-- Invalidates on file content changes (mtime + size checks)
+- Invalidates when file contents, relative paths, permission bits, the
+  workdir or reproducibility settings change (mtime is ignored for
+  reproducible builds)
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Saving and restoring the cache (offline export/import):** the `--cache-dir`
+directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only
+relative source paths, so it can be archived or saved by CI (for example with
+`actions/cache`) and restored to a different absolute path and checkout
+location. A restored cache produces cache hits and an identical OCI manifest,
+config and layers. Partial restores are handled as follows:
+
+- Blobs without `index.json`: a clean miss; the layer is rebuilt and indexed.
+- `index.json` with missing or corrupt blobs: those entries are discarded and
+  rebuilt.
+- Malformed `index.json`: the build fails with `CacheIndexError`; delete the
+  reported `index.json` (cached layers are rebuilt) or rerun with `--no-cache`.
+- Concurrent builds may share a restored directory; index updates are locked.
+
+Caches are portable between machines of the same OS, not across operating
+systems: Windows reports source files as mode `0o666`, Linux checkouts as
+`0o644`/`0o755`, and the mode is recorded in the layer, so a cache saved on
+Windows misses on Linux (and vice versa) by design. Windows checkouts with
+`core.autocrlf` also change file content. Key saved caches on the OS. Blobs
+left without an index entry are not counted or evicted; delete the directory to
+reclaim them. See [GitHub Actions](docs/github-actions.md#caching-application-layers).
 
 ### Python API
 

@@ -262,6 +262,8 @@ class ImageBuilder:
             return self._build_image()
 
     def _build_image(self):
+        self._dependency_source_cache = None
+        self._lock_selection_cache = {}
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -637,9 +639,6 @@ class ImageBuilder:
         return source
 
     def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
-        cached = getattr(self, "_lock_selection_cache", None)
-        if cached is not None:
-            return cached
         _, relative = self._dependency_source()
         environment = target_environment(
             os_name,
@@ -650,9 +649,13 @@ class ImageBuilder:
             ),
             target_python_full_version(base_config),
         )
-        selection = load_lockfile(Path(self.config.context_dir), relative, environment)
-        self._lock_selection_cache = selection
-        return selection
+        key = (os_name, arch, environment["python_version"], environment["python_full_version"])
+        cache = getattr(self, "_lock_selection_cache", None)
+        if cache is None:
+            cache = self._lock_selection_cache = {}
+        if key not in cache:
+            cache[key] = load_lockfile(Path(self.config.context_dir), relative, environment)
+        return cache[key]
 
     def _create_deps_layer(
         self,
@@ -739,7 +742,14 @@ class ImageBuilder:
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / DEFAULT_REQUIREMENTS_FILE,
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")

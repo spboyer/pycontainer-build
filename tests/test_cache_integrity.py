@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import CacheIndexError, CacheIntegrityError, LayerCache
 from pycontainer.config import BuildConfig
+from pycontainer.fs_utils import file_lock
 
 
 def _digest(data):
@@ -25,6 +27,80 @@ def _store_cache_entry(cache_dir, source_path, relative_path, layer_path, digest
         digest,
         Path(layer_path),
     )
+
+
+def _acquire_contended_lock(lock_path, waiting, acquired):
+    import msvcrt
+
+    original_locking = msvcrt.locking
+
+    def observe_locking(fd, mode, length):
+        try:
+            return original_locking(fd, mode, length)
+        except OSError:
+            if mode == msvcrt.LK_NBLCK:
+                waiting.set()
+            raise
+
+    msvcrt.locking = observe_locking
+    with file_lock(lock_path):
+        acquired.set()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows byte-range locking")
+def test_empty_windows_lock_reports_nonblocking_contention(tmp_path):
+    import msvcrt
+
+    lock_path = tmp_path / "index.lock"
+    with lock_path.open("a+b") as holder:
+        msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            with pytest.raises(BlockingIOError, match="Lock is already held"):
+                with file_lock(lock_path, blocking=False):
+                    pytest.fail("contended lock was acquired")
+            assert lock_path.stat().st_size == 0
+        finally:
+            holder.seek(0)
+            msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
+
+    with file_lock(lock_path, blocking=False):
+        pass
+    assert lock_path.read_bytes() == b"\0"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows byte-range locking")
+def test_empty_windows_lock_waits_for_another_process(tmp_path):
+    import msvcrt
+
+    lock_path = tmp_path / "index.lock"
+    context = multiprocessing.get_context("spawn")
+    waiting = context.Event()
+    acquired = context.Event()
+    process = context.Process(
+        target=_acquire_contended_lock, args=(str(lock_path), waiting, acquired)
+    )
+    with lock_path.open("a+b") as holder:
+        msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
+        process.start()
+        try:
+            deadline = time.monotonic() + 30
+            while not waiting.wait(timeout=0.1) and process.is_alive():
+                if time.monotonic() >= deadline:
+                    break
+            assert waiting.is_set(), f"lock contention not observed; exit code: {process.exitcode}"
+            assert not acquired.is_set()
+        finally:
+            holder.seek(0)
+            msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                pytest.fail("contended lock process did not finish")
+
+    assert process.exitcode == 0
+    assert acquired.is_set()
+    assert lock_path.read_bytes() == b"\0"
 
 
 def test_cache_invalidation_when_content_changes_with_same_size_and_mtime(tmp_path):
