@@ -120,7 +120,7 @@ class MatrixPublicationError(RuntimeError):
 
 
 class PythonMatrixBuilder:
-    def __init__(self, config: BuildConfig):
+    def __init__(self, config: BuildConfig, history_timer=None):
         self.config = config
         self.targets = matrix_targets(config)
         self.default = config.default_python_version or config.python_versions[0]
@@ -141,9 +141,11 @@ class PythonMatrixBuilder:
                 config, base_image=base, output_dir=str(Path(config.output_dir) / f"py{version}"),
                 tag=tags[0], tags=tags[1:], latest_tag=False, semver_tags=False,
                 python_versions=[], python_matrix={}, default_python_version=None,
+                record_history=False,
                 exclude_paths=[*excludes, "**/.pycontainer-build-*.lock"],
             )
             child = ImageBuilder(child_config)
+            child._history_timer = history_timer
             child.expected_python_version = version
             self.children[version] = child
 

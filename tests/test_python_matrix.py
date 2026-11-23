@@ -12,6 +12,7 @@ from pycontainer.builder import ImageBuilder, LayerIntegrityError
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 from pycontainer.fs_utils import output_directory_lock
+from pycontainer.history import BuildHistory, BuildTiming, HistoryStorageError
 from pycontainer.local_image import LocalImageError
 from pycontainer.python_matrix import MatrixPublicationError, PythonMatrixBuilder, matrix_targets
 from pycontainer.python_matrix import verify_python_version
@@ -103,6 +104,75 @@ def test_bases_tags_default_and_independent_layouts(tmp_path, monkeypatch):
                 for entry in layout["manifests"]} == set(expected)
     assert {minor for minor, _ in pulls} == {"3.11", "3.12"}
     assert not (root / "index.json").exists()
+
+
+def test_matrix_history_records_one_run_with_all_child_phases(tmp_path, monkeypatch):
+    history_dir = tmp_path / "history"
+    matrix_build, _, _ = matrix(
+        tmp_path, monkeypatch, platform="linux/amd64,linux/arm64",
+        record_history=True, history_dir=str(history_dir),
+    )
+    phases = []
+    original = BuildTiming.phase
+
+    def phase(timing, name):
+        phases.append(name)
+        return original(timing, name)
+
+    monkeypatch.setattr(BuildTiming, "phase", phase)
+    ImageBuilder(matrix_build.config).build()
+    records = BuildHistory(history_dir).list()
+    assert len(records) == 1
+    assert records[0]["status"] == "success"
+    assert {"base_image", "application"} <= records[0]["phases_ns"].keys()
+    assert phases.count("base_image") == 4
+    assert phases.count("application") == 2
+
+
+def test_matrix_history_records_failure_and_blocks_publication(tmp_path, monkeypatch):
+    history_dir = tmp_path / "history"
+    matrix_build, _, _ = matrix(
+        tmp_path, monkeypatch, record_history=True, history_dir=str(history_dir),
+    )
+    original = ImageBuilder._pull_base_image
+
+    def fail_later(child, *args):
+        if child.expected_python_version == "3.12":
+            raise RuntimeError("synthetic build failure")
+        return original(child, *args)
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", fail_later)
+    builder = ImageBuilder(matrix_build.config)
+    with pytest.raises(RuntimeError, match="synthetic build failure"):
+        builder.build()
+    records = BuildHistory(history_dir).list()
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert "base_image" in records[0]["phases_ns"]
+    with pytest.raises(RuntimeError, match="every Python"):
+        builder.push()
+
+
+def test_matrix_history_storage_failure_stops_build(tmp_path, monkeypatch):
+    matrix_build, _, _ = matrix(
+        tmp_path, monkeypatch, record_history=True, history_dir=str(tmp_path / "history"),
+    )
+    monkeypatch.setattr(
+        BuildHistory, "append",
+        lambda self, record: (_ for _ in ()).throw(HistoryStorageError("synthetic storage failure")),
+    )
+    with pytest.raises(HistoryStorageError, match="synthetic storage failure"):
+        ImageBuilder(matrix_build.config).build()
+
+
+def test_matrix_dry_run_does_not_record_history(tmp_path, monkeypatch):
+    history_dir = tmp_path / "history"
+    matrix_build, _, _ = matrix(
+        tmp_path, monkeypatch, record_history=True, history_dir=str(history_dir),
+        dry_run=True,
+    )
+    ImageBuilder(matrix_build.config).build()
+    assert not history_dir.exists()
 
 
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])

@@ -483,6 +483,23 @@ def test_skaffold_cli_ignores_config_tags_and_dry_run(tmp_path, monkeypatch, rec
 
 
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_forwards_history_options(tmp_path, monkeypatch, recording, command):
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    history_dir = tmp_path / "history"
+    run_cli(monkeypatch, command, "--record-history", "--history-dir", str(history_dir))
+
+    (builder,) = recording
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(history_dir)
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
 def test_devloop_cli_honors_registry_transport_options(
     tmp_path, monkeypatch, recording, command
 ):

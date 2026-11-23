@@ -86,6 +86,8 @@ class BuildConfig:
     python_versions: List[str] = field(default_factory=list)
     python_matrix: Dict[str, str] = field(default_factory=dict)
     default_python_version: Optional[str] = None
+    record_history: bool = False
+    history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
     security: Optional[dict] = None
