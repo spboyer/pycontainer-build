@@ -5,6 +5,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
+
 SBOM_FORMATS = ("spdx", "cyclonedx")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 _REGISTRY_HOST = re.compile(
@@ -108,6 +110,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    manifest_annotations: Optional[Dict[str, str]] = None
+    index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
     scan_executable: str = "grype"
     scan_threshold: str = "high"
@@ -124,10 +128,15 @@ class BuildConfig:
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
+    release_notes_file: Optional[str] = None
+    release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
 
     def __post_init__(self):
+        from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
+        self.validate_metadata()
+        validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
         if self.scan_threshold not in SCAN_SEVERITIES:
             raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
@@ -169,6 +178,16 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def validate_metadata(self) -> None:
+        from .metadata import validate_metadata
+
+        for name in ("labels", "manifest_annotations", "index_annotations"):
+            validate_metadata(
+                getattr(self, name),
+                name,
+                protect_reference=name != "labels",
+            )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

@@ -5,6 +5,7 @@ from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
     TILT_PLACEHOLDER_TAG,
@@ -14,6 +15,12 @@ from .devloop import (
     tilt_expected_reference,
     write_reference,
 )
+
+def _metadata_argument(value: str) -> tuple[str, str]:
+    key, separator, item = value.partition("=")
+    if not separator or not key.strip():
+        raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
+    return key, item
 
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
@@ -74,6 +81,11 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
+    b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
+    b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
+    b.add_argument("--release-notes",dest="release_notes_file",metavar="FILE",help="Embed a UTF-8 release notes file (max 8 KiB after LF normalization) as an image label; relative to the build context")
+    b.add_argument("--release-notes-label",dest="release_notes_label",metavar="KEY",help=f"Label key for --release-notes (default: {DEFAULT_RELEASE_NOTES_LABEL})")
     b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
     b.add_argument("--scan-executable",help="Grype executable path or name")
     b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
@@ -194,6 +206,11 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'labels': dict(args.labels) if args.labels is not None else None,
+        'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
+        'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
+        'release_notes_file': args.release_notes_file,
+        'release_notes_label': args.release_notes_label,
         'scan': args.scan,
         'scan_executable': args.scan_executable,
         'scan_threshold': args.scan_threshold,
@@ -254,6 +271,8 @@ def main():
     try:
         builder=ImageBuilder(cfg)
         out=builder.build()
+    except ReleaseNotesError as exc:
+        parser.error(str(exc))
     except HistoryStorageError as exc:
         parser.exit(1,f"Build history error: {exc}\n")
     except ScanError as exc:
