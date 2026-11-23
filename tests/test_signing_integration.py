@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from pycontainer import signing as signing_module
 from pycontainer.auth import get_registry_auth
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
@@ -23,6 +24,20 @@ GITHUB_CLAIM_VARIABLES = (
     ("trigger", "PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER"),
 )
 VERIFIER_TIMEOUT_SECONDS = 300
+# Cosign v2 and v3 diagnostics observed for rejected trust inputs; the
+# sigstore-go form covers Cosign v3's new-bundle verification path.
+IDENTITY_MISMATCH = (
+    "none of the expected identities matched what was in the certificate",
+    "no matching CertificateIdentity found",
+)
+WORKFLOW_SHA_MISMATCH = (
+    "expected GitHub Workflow SHA not found in certificate",
+    "no matching CertificateIdentity found",
+)
+KEY_MISMATCH = (
+    "invalid signature when validating ASN.1 encoded signature",
+    "transparency log certificate does not match",
+)
 
 
 def _required(name):
@@ -155,16 +170,66 @@ def _verifier_executable(name):
     return executable
 
 
-def _run_verifier(args, subject, capture=False):
+def _run_verifier(args, subject, capture=False, capture_errors=False):
     try:
         return subprocess.run(
             [*args, "--", subject], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, text=True, errors="replace",
+            stderr=subprocess.PIPE if capture_errors else subprocess.DEVNULL,
+            text=True, errors="replace",
             timeout=VERIFIER_TIMEOUT_SECONDS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         pytest.fail("The independent signature verifier failed to run or timed out.")
+
+
+def _failure_category(stderr):
+    """Name a fixed failure category without exposing verifier diagnostics."""
+    lowered = stderr.lower()
+    for category, markers in (
+        ("no signatures were found", ("no signatures found",)),
+        ("registry authorization failed", ("unauthorized", "denied")),
+        ("a network operation timed out", ("timeout", "deadline exceeded")),
+    ):
+        if any(marker in lowered for marker in markers):
+            return category
+    return "unrecognized"
+
+
+def _require_mismatch(stderr, name, reasons):
+    if not any(reason in stderr for reason in reasons):
+        pytest.fail(
+            f"Verification with a {name} failed for a reason other than a trust "
+            f"mismatch ({_failure_category(stderr)}), so the rejection is inconclusive."
+        )
+
+
+def _assert_trust_mismatch(args, subject, name, reasons):
+    """Require rejection specifically because the trust input does not match."""
+    result = _run_verifier(args, subject, capture_errors=True)
+    assert result.returncode != 0, f"Independent verification accepted a {name}."
+    _require_mismatch(result.stderr, name, reasons)
+
+
+class _VerifierErrorRecorder:
+    """Delegate to subprocess, keeping product verifier stderr in memory only."""
+
+    def __init__(self):
+        self.verify_errors = []
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    def run(self, args, **kwargs):
+        if len(args) < 2 or args[1] != "verify":
+            return subprocess.run(args, **kwargs)
+        result = subprocess.run(args, **{**kwargs, "stderr": subprocess.PIPE})
+        stderr = result.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        self.verify_errors.append(stderr or "")
+        result.stderr = None
+        return result
 
 
 def _github_claim_args():
@@ -216,6 +281,23 @@ def _record_evidence(mode, platform, subject, log_indexes):
         )
 
 
+def _wrong_trust(mode, executable):
+    """Return build settings, verifier arguments and mismatch reasons for untrusted material."""
+    if mode == "cosign-key":
+        key = _required("PYCONTAINER_COSIGN_TEST_WRONG_PUBLIC_KEY")
+        return {"sign_verify_key": key}, [executable, "verify", f"--key={key}"], KEY_MISMATCH
+    identity = _required("PYCONTAINER_COSIGN_TEST_IDENTITY") + ".invalid"
+    issuer = _required("PYCONTAINER_COSIGN_TEST_ISSUER")
+    return (
+        {"sign_certificate_identity": identity},
+        [
+            executable, "verify", f"--certificate-identity={identity}",
+            f"--certificate-oidc-issuer={issuer}",
+        ],
+        IDENTITY_MISMATCH,
+    )
+
+
 def _check_keyless_trust_boundaries(executable, subject):
     """Require exact keyless trust to pass and each wrong trust input to fail."""
     identity = _required("PYCONTAINER_COSIGN_TEST_IDENTITY")
@@ -230,23 +312,18 @@ def _check_keyless_trust_boundaries(executable, subject):
         "Independent verification rejected the exact identity, issuer and workflow claims."
     )
     wrong_trust = {
-        "wrong identity": [
-            executable, "verify", f"--certificate-identity={identity}.invalid",
-            f"--certificate-oidc-issuer={issuer}",
-        ],
-        "wrong issuer": [
+        "wrong identity": (_wrong_trust("cosign-keyless", executable)[1], IDENTITY_MISMATCH),
+        "wrong issuer": ([
             executable, "verify", f"--certificate-identity={identity}",
             f"--certificate-oidc-issuer={issuer.rstrip('/')}/invalid",
-        ],
+        ], IDENTITY_MISMATCH),
     }
     if claims:
-        wrong_trust["wrong workflow commit"] = [
+        wrong_trust["wrong workflow commit"] = ([
             *exact, "--certificate-github-workflow-sha=" + "0" * 40,
-        ]
-    for name, args in wrong_trust.items():
-        assert _run_verifier(args, subject).returncode != 0, (
-            f"Independent verification accepted a {name}."
-        )
+        ], WORKFLOW_SHA_MISMATCH)
+    for name, (args, reasons) in wrong_trust.items():
+        _assert_trust_mismatch(args, subject, name, reasons)
     assert _run_verifier(exact, subject).returncode == 0, (
         "Exact trust was rejected after the negative checks, so they are inconclusive."
     )
@@ -336,12 +413,7 @@ def test_real_provider_wrong_trust_fails_before_tags(
     registry, repo = _test_repository()
     settings, verifier = _provider_settings(mode)
     verifier[0] = _verifier_executable(verifier[0])
-    if mode == "cosign-key":
-        wrong = {"sign_verify_key": _required("PYCONTAINER_COSIGN_TEST_WRONG_PUBLIC_KEY")}
-    else:
-        wrong = {
-            "sign_certificate_identity": settings["sign_certificate_identity"] + ".invalid",
-        }
+    wrong, wrong_verifier, reasons = _wrong_trust(mode, verifier[0])
     config = _signing_config(
         tmp_path, registry, repo, platform, {**settings, **wrong}, "-wrong-trust",
     )
@@ -349,15 +421,21 @@ def test_real_provider_wrong_trust_fails_before_tags(
     assert _published_tags(registry, repo, tags) == [], "A requested tag already exists."
 
     _use_synthetic_base(monkeypatch)
+    recorder = _VerifierErrorRecorder()
+    monkeypatch.setattr(signing_module, "subprocess", recorder)
     builder = ImageBuilder(config)
     builder.build()
     with pytest.raises(SigningError, match="^Verifying the signature of "):
         builder.push(show_progress=False)
+    monkeypatch.setattr(signing_module, "subprocess", subprocess)
+    assert len(recorder.verify_errors) == 1, "The product did not run exactly one verification."
+    _require_mismatch(recorder.verify_errors[0], "wrong trust input", reasons)
 
     assert _published_tags(registry, repo, tags) == [], (
         "A requested tag moved after build-time verification rejected the signature."
     )
     subject = f"{registry}/{repo}@{builder.index_digest or builder.manifest_digest}"
+    _assert_trust_mismatch(wrong_verifier, subject, "wrong trust input", reasons)
     assert _run_verifier(verifier, subject).returncode == 0, (
         "The correct trust inputs rejected the signature, so the product failure "
         "is not attributable to the wrong trust input."
