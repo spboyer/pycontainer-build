@@ -213,6 +213,48 @@ def test_dry_run_redacts_values_in_non_expandable_fields(tmp_path, capsys):
     assert "8000" not in output
 
 
+def test_security_validation_redacts_interpolated_platform():
+    with pytest.raises(ValueError, match="Linux targets only") as error:
+        BuildConfig(
+            platform="${PLATFORM}",
+            build_args={"PLATFORM": "windows/amd64"},
+            security={"kubernetes": {"read_only_root_filesystem": True}},
+        )
+    assert "windows/amd64" not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_security_fragment_dry_run_redacts_build_arguments(tmp_path, capsys):
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[], dry_run=True,
+        build_args={"NAME": "security"},
+        security={"kubernetes": {"read_only_root_filesystem": True}},
+    )
+    ImageBuilder(config).build()
+    output = capsys.readouterr().out
+    assert "security" not in output
+    assert "<redacted>/kubernetes-<redacted>-context.json" in output
+
+
+def test_security_fragment_output_path_redacts_build_arguments(tmp_path, monkeypatch, caplog):
+    value = "private-output-value"
+    (tmp_path / "app.py").write_text("print('hello')")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"],
+        output_dir=str(tmp_path / "${OUTPUT}"), use_cache=False,
+        build_args={"OUTPUT": value},
+        security={"kubernetes": {"read_only_root_filesystem": True}},
+    )
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    with caplog.at_level(logging.INFO):
+        ImageBuilder(config).build()
+
+    assert (tmp_path / value / "security" / "kubernetes-security-context.json").is_file()
+    assert "Security fragment saved" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
 @pytest.mark.parametrize("operation", ["pull", "push"])
 def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, caplog, operation):
     value = "private-registry"
