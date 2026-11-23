@@ -338,7 +338,7 @@ def test_target_wheel_staging_uses_each_minor_and_architecture(tmp_path, monkeyp
     (Path(build.config.context_dir) / "requirements.txt").write_text("synthetic==1\n")
     targets = []
 
-    def install(requirements, site, ctx, os_name, arch, version, base, config):
+    def install(requirements, site, ctx, os_name, arch, version, base, config, **_):
         targets.append((version, os_name, arch))
         site.mkdir()
         (site / "synthetic.py").write_text(f"TARGET = '{version}/{arch}'\n")
@@ -415,7 +415,7 @@ def test_dependency_failure_on_later_minor_starts_no_push(tmp_path, monkeypatch)
     build, _, _ = matrix(tmp_path, monkeypatch, include_deps=True)
     (Path(build.config.context_dir) / "requirements.txt").write_text("synthetic==1\n")
 
-    def install(requirements, site, ctx, os_name, arch, version, base, config):
+    def install(requirements, site, ctx, os_name, arch, version, base, config, **_):
         if version == "3.12":
             raise RuntimeError("No compatible wheels for Python 3.12")
         site.mkdir()
