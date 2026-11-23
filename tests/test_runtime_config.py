@@ -140,6 +140,7 @@ def test_built_layout_serializes_fields_with_consistent_descriptors(tmp_path, mo
             use_cache=False,
             stop_signal="SIGTERM",
             volumes=["/srv/uploads"],
+            tags=["stable"],
         )
     )
     builder.build()
@@ -148,15 +149,20 @@ def test_built_layout_serializes_fields_with_consistent_descriptors(tmp_path, mo
     builder.build()
     assert (output / "index.json").read_bytes() == first_index
     index = json.loads(first_index)
+    assert len(index["manifests"]) == 2
     manifest_desc = index["manifests"][0]
     manifest_bytes = (blobs / manifest_desc["digest"].split(":", 1)[1]).read_bytes()
-    assert hashlib.sha256(manifest_bytes).hexdigest() == manifest_desc["digest"].split(":", 1)[1]
-    assert len(manifest_bytes) == manifest_desc["size"]
-    config_desc = json.loads(manifest_bytes)["config"]
+    for descriptor in index["manifests"]:
+        assert hashlib.sha256(manifest_bytes).hexdigest() == descriptor["digest"].split(":", 1)[1]
+        assert len(manifest_bytes) == descriptor["size"]
+    manifest = json.loads(manifest_bytes)
+    config_desc = manifest["config"]
     config_bytes = (blobs / config_desc["digest"].split(":", 1)[1]).read_bytes()
     assert hashlib.sha256(config_bytes).hexdigest() == config_desc["digest"].split(":", 1)[1]
     assert len(config_bytes) == config_desc["size"]
-    config = json.loads(config_bytes)["config"]
+    image = json.loads(config_bytes)
+    assert len(image["rootfs"]["diff_ids"]) == len(manifest["layers"])
+    config = image["config"]
     assert config["StopSignal"] == "SIGTERM"
     assert config["Volumes"] == {"/data": {}, "/srv/uploads": {}, "/var/lib/base": {}}
 
