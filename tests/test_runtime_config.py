@@ -10,6 +10,7 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 from pycontainer.oci import build_config_json
+from pycontainer.security import KUBERNETES_FRAGMENT, SECURITY_DIR
 
 BASE = {
     "architecture": "amd64",
@@ -158,6 +159,53 @@ def test_built_layout_serializes_fields_with_consistent_descriptors(tmp_path, mo
     config = json.loads(config_bytes)["config"]
     assert config["StopSignal"] == "SIGTERM"
     assert config["Volumes"] == {"/data": {}, "/srv/uploads": {}, "/var/lib/base": {}}
+
+
+def test_security_fragment_coexists_with_runtime_metadata(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hi')\n")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image", lambda self, layers_dir, os_name, arch: ([], BASE)
+    )
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        '[build]\nstop_signal = "SIGINT"\nvolumes = ["/srv/uploads", "/data"]\n'
+        '[build.security.kubernetes]\nread_only_root_filesystem = true\n'
+    )
+    secured_output = tmp_path / "secured"
+    secured_config = config_from_file(
+        config_path,
+        {
+            "context_dir": str(context),
+            "output_dir": str(secured_output),
+            "use_cache": False,
+            "stop_signal": "SIGTERM",
+        },
+    )
+    secured = ImageBuilder(secured_config)
+    secured.build()
+
+    plain = ImageBuilder(
+        BuildConfig(
+            context_dir=str(context),
+            output_dir=str(tmp_path / "plain"),
+            use_cache=False,
+            stop_signal="SIGTERM",
+            volumes=["/srv/uploads", "/data"],
+        )
+    )
+    plain.build()
+
+    assert (secured.config_digest, secured.manifest_digest) == (
+        plain.config_digest, plain.manifest_digest
+    )
+    config_blob = secured_output / "blobs" / "sha256" / secured.config_digest.split(":", 1)[1]
+    image_config = json.loads(config_blob.read_bytes())["config"]
+    assert image_config["StopSignal"] == "SIGTERM"
+    assert image_config["Volumes"] == {"/data": {}, "/srv/uploads": {}, "/var/lib/base": {}}
+    fragment = secured_output / SECURITY_DIR / KUBERNETES_FRAGMENT
+    assert json.loads(fragment.read_text()) == {"readOnlyRootFilesystem": True}
 
 
 @pytest.mark.parametrize("alias", ["SIGIOT", "SIGCLD", "SIGPOLL"])

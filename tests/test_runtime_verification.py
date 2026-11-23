@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,10 +91,12 @@ def test_gate_passes_only_with_full_evidence_for_every_target(tmp_path):
     ("shell_command", "mode"),
     [(False, "oci-import-startup"), (True, "shell-command")],
 )
+@pytest.mark.parametrize("startup_fails", [False, True], ids=["passed", "failed-startup"])
 def test_runtime_modes_preserve_release_evidence_boundary(
-    tmp_path, monkeypatch, shell_command, mode
+    tmp_path, monkeypatch, shell_command, mode, startup_fails
 ):
     configs = []
+    calls = []
 
     class FakeBuilder:
         def __init__(self, config):
@@ -109,6 +112,7 @@ def test_runtime_modes_preserve_release_evidence_boundary(
             (output / "sbom.json").write_text('{"name": "runtime-fixture"}')
 
     def run(command, **kwargs):
+        calls.append(command)
         if command[:2] == ["docker", "version"]:
             stdout = "linux/arm64" if ".Os" in command[-1] else "28.0.0"
         elif command[:3] == ["docker", "image", "inspect"]:
@@ -116,6 +120,10 @@ def test_runtime_modes_preserve_release_evidence_boundary(
         elif command[:2] == ["skopeo", "--version"]:
             stdout = "skopeo version 1.13.3"
         elif command[:2] == ["docker", "run"]:
+            if startup_fails:
+                raise subprocess.CalledProcessError(
+                    1, command, output="startup failed", stderr="container error"
+                )
             stdout = (
                 runtime_check.SHELL_COMMAND_EXPECTED
                 if shell_command
@@ -135,16 +143,24 @@ def test_runtime_modes_preserve_release_evidence_boundary(
     args = ["--platform", "linux/arm64", "--evidence", str(evidence_path)]
     if shell_command:
         args += ["--shell-command", "--shell", '["/bin/bash", "-c"]']
-    runtime_check.main(args)
+    if startup_fails:
+        with pytest.raises(subprocess.CalledProcessError):
+            runtime_check.main(args)
+    else:
+        runtime_check.main(args)
     record = json.loads(evidence_path.read_text())
 
-    assert record["status"] == "passed"
+    assert record["status"] == ("failed" if startup_fails else "passed")
     assert record["mode"] == mode
     assert configs[0].platform == "linux/arm64"
+    assert any(command[:3] == ["docker", "image", "rm"] for command in calls)
     reason = verifier.rejection_reason(
         record, "linux/arm64", COMMIT, RUN_ID, RUN_ATTEMPT
     )
-    if shell_command:
+    if startup_fails:
+        assert "CalledProcessError" in record["error"]
+        assert reason.startswith("check failed:")
+    elif shell_command:
         assert configs[0].entrypoint[:2] == ["/bin/bash", "-c"]
         assert "not a full OCI import and startup" in reason
     else:
