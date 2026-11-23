@@ -159,8 +159,20 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
-source distributions and cross-compilation are not supported.
+`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
+registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
+glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
+Local image names/annotations are not provenance either. The shared
+`target_wheel_platform` helper defaults to requiring explicit metadata;
+`base_image_tag_verified=True` permits tag inference only for tag-only registry
+pulls. Local sources must leave it false. Unsupported metadata and metadata
+conflicting with a verified tag-only pull fail before pip runs.
+`target_python_version` uses the same default-false keyword; digest and
+unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
+`PYTHON_VERSION`. Both helpers validate before lockfile, requirements or venv
+staging. Staged packages are importable under `<workdir>/.python`; source
+distributions and cross-compilation are not supported.
 
 Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
@@ -169,6 +181,11 @@ markers for the target (never the host) and installs the selection through
 index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
 ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
+Poetry checks locked and legacy Python ranges and recorded applicable root,
+transitive and extra dependencies; Poetry and uv cannot reconstruct dependency
+metadata omitted from a lock. uv limited environments must match the recorded
+supported markers and include the target; unverifiable marker normalization
+and unknown target values fail closed.
 Plain requirements keep ambient pip configuration.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`. Non-registry sources fail; never add an

@@ -343,6 +343,18 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to lockfile,
+  requirements and virtualenv staging alike.
 - `--requirements FILE` — Install this requirements file (`[build]
   requirements-file`). A requirements file that is not fully pinned with
   `==` versions and `--hash` values logs a warning that the dependency layer
@@ -379,9 +391,22 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+Poetry's Python and dependency ranges support PEP 440 constraints, exact
+versions, wildcards, and single caret or tilde constraints; other
+Poetry-specific combinations are rejected. Applicable Poetry root and
+recorded transitive dependencies, including requested extras, must be present
+at compatible locked versions. Poetry and uv graph checks rely on the lock's
+recorded dependency metadata and cannot reconstruct dependencies omitted
+from the lock itself. uv extras without recorded dependencies are treated
+as empty, consistent with uv.
 uv registry URLs must match the current `[[tool.uv.index]]` declarations
 or the implicit PyPI index; settings from `uv.toml` and legacy index options
-are not supported.
+are not supported. Limited-resolution uv locks are accepted only when their
+recorded supported markers match the configured environments after supported
+normalization and include the target; unverifiable marker equivalence and
+unknown target marker values fail explicitly. Normalization supports
+`python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
+unrecognized equivalences are rejected even if they are logically equal.
 Each package is installed only from the index its lock records, one pip run
 per index with `--isolated` and every `PIP_*` variable and pip config file
 ignored, so `PIP_INDEX_URL`, `pip.conf`, `--find-links` wheelhouses or another
