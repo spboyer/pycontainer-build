@@ -867,6 +867,111 @@ def test_docker_archive_unspecified_target_exposes_platform(tmp_path):
         open_local_image_source(reference, layers, tmp_path / "out", "linux", "amd64")
 
 
+# --- multi-platform image indexes (issue #29) ------------------------------
+
+
+def _multi_platform_builder(tmp_path, base_image):
+    context = tmp_path / "context"
+    context.mkdir(exist_ok=True)
+    (context / "app.py").write_text("print('hello')\n")
+    return ImageBuilder(BuildConfig(
+        tag="app:v1",
+        base_image=base_image,
+        context_dir=str(context),
+        output_dir=str(tmp_path / "out"),
+        platform="linux/amd64,linux/arm64",
+        use_cache=False,
+    ))
+
+
+def _two_platform_layout(tmp_path):
+    layout = Layout(tmp_path / "base")
+    layers = {}
+    descriptors = []
+    for arch in ("amd64", "arm64"):
+        descriptor, platform, layer = layout.image(arch.encode(), arch=arch)
+        descriptors.append({**descriptor, "platform": platform})
+        layers[arch] = layer
+    nested = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": descriptors,
+    }
+    layout.add(layout.blob(json.dumps(nested).encode(), nested["mediaType"]), ref="multi")
+    return layout, layers
+
+
+def test_oci_layout_index_base_builds_each_platform(tmp_path, offline):
+    layout, layers = _two_platform_layout(tmp_path)
+
+    builder = _multi_platform_builder(tmp_path, f"oci:{layout.root}:multi")
+    builder.build()
+
+    assert [image.platform["architecture"] for image in builder.platform_images] == ["amd64", "arm64"]
+    for image in builder.platform_images:
+        assert image.layers[0].to_descriptor() == layers[image.platform["architecture"]]
+    refs = tmp_path / "out" / "refs" / "tags" / "v1"
+    assert refs.read_text() == builder.index_digest
+
+
+def test_local_layout_annotation_never_verifies_base_tag(tmp_path, offline, monkeypatch):
+    layout, _ = _two_platform_layout(tmp_path)
+    layout.descriptors[0]["annotations"]["org.opencontainers.image.ref.name"] = "python:3.11-slim"
+    layout.write_index()
+    seen = []
+
+    def fake_deps_layer(self, layers_dir, **kwargs):
+        seen.append(self._base_image_tag_verified)
+
+    monkeypatch.setattr(ImageBuilder, "_create_deps_layer", fake_deps_layer)
+    builder = _multi_platform_builder(tmp_path, f"oci:{layout.root}:python:3.11-slim")
+    builder.config.include_deps = True
+    builder.build()
+
+    assert seen == [False, False]
+
+
+@pytest.mark.parametrize("change_after_read", [1, 2])
+def test_local_layout_change_during_index_build_fails_before_publication(
+    tmp_path, offline, change_after_read
+):
+    layout, _ = _two_platform_layout(tmp_path)
+    replacement, _, _ = layout.image(b"replacement")
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+    original = ImageBuilder._read_base_image
+    reads = []
+
+    def read_then_retag(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        reads.append(1)
+        if len(reads) == change_after_read:
+            layout.add(replacement, ref="other")
+        return result
+
+    builder = _multi_platform_builder(tmp_path, f"oci:{layout.root}:multi")
+    with patch.object(ImageBuilder, "_read_base_image", read_then_retag):
+        with pytest.raises(LocalImageError, match="changed during the multi-platform build"):
+            builder.build()
+
+    assert (out / "index.json").read_text() == "previous"
+    assert not (out / "refs" / "tags" / "v1").exists()
+
+
+def test_single_platform_docker_archive_cannot_satisfy_image_index(tmp_path, offline):
+    archive = tmp_path / "amd64.tar"
+    docker_archive(archive, [(["base:amd64"], "amd64", [layer_tar({"x": b"x"})])])
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+
+    with pytest.raises(LocalImageError, match="does not match requested linux/arm64"):
+        _multi_platform_builder(tmp_path, f"docker-archive:{archive}").build()
+    assert (out / "index.json").read_text() == "previous"
+    assert not (out / "refs" / "tags" / "v1").exists()
+
+
 @pytest.mark.parametrize("modern", [False, True])
 @pytest.mark.parametrize("size_delta", [-1, 0, 1])
 def test_docker_layer_size_checked_before_any_staging(tmp_path, monkeypatch, modern, size_delta):

@@ -57,6 +57,12 @@ real runtime evidence, unlike the synthetic benchmark above. The target
 platform must match the Docker daemon, so emulated runs fail instead of
 producing evidence.
 
+Add `--multi-platform-index` to build an amd64/arm64 index, import the native
+target, verify its config digest and run the staged dependency. The tests
+workflow runs this check on both native targets and uploads separate
+`index-runtime-evidence-*` artifacts. These records are not release evidence;
+each target is validated only when its index check actually succeeds.
+
 The `Runtime image check` workflow runs it natively for `linux/amd64` and
 `linux/arm64` on same-repository pull requests, pushes to main and release
 tags. Its gate runs `scripts/verify_runtime_evidence.py`, which passes only

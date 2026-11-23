@@ -400,10 +400,11 @@ class OCILayoutSource:
                 f"OCI layout {self.root} has unsupported imageLayoutVersion "
                 f"{layout.get('imageLayoutVersion')!r}; expected '1.0.0'."
             )
-        self.index = _load_json_object(
-            self._read_file(self.root / "index.json", "OCI layout index"),
-            f"OCI layout index in {self.root}",
-        )
+        index_bytes = self._read_file(self.root / "index.json", "OCI layout index")
+        # Everything below index.json is content-addressed and digest-verified,
+        # so its bytes identify the selectable snapshot of this layout.
+        self.snapshot_digest = f"sha256:{hashlib.sha256(index_bytes).hexdigest()}"
+        self.index = _load_json_object(index_bytes, f"OCI layout index in {self.root}")
 
     def __enter__(self):
         return self
