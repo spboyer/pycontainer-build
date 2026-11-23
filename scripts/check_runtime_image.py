@@ -180,6 +180,66 @@ def shell_command_check(args, docker, skopeo, image_ref, evidence):
     print("Shell-form command runtime check passed.")
 
 
+def cmd_only_check(args, docker, skopeo, image_ref, evidence):
+    """Start CMD-only imports under a base entrypoint that marks and forwards argv."""
+    from pycontainer.config_loader import config_from_file
+    from pycontainer.dockerfile_import import run_import
+
+    cases = {
+        "shell": ('printf \'shell=%s\\n\' "$MARKER"', "shell=expanded\n"),
+        "exec": (json.dumps(["printf", "exec=%s\\n", "$MARKER  literal"]), "exec=$MARKER  literal\n"),
+    }
+    with tempfile.TemporaryDirectory(prefix="pycontainer-cmd-check-") as temp_dir:
+        root = Path(temp_dir)
+        base_context = root / "base-context"
+        base_context.mkdir()
+        (base_context / "app.py").touch()
+        base_layout = root / "base-layout"
+        ImageBuilder(BuildConfig(
+            tag="runtime-check",
+            base_image=args.base_image,
+            context_dir=str(base_context),
+            output_dir=str(base_layout),
+            platform=args.platform,
+            entrypoint=["/bin/sh", "-c", 'echo inherited-entrypoint; exec "$@"', "entrypoint"],
+            use_cache=False,
+        )).build()
+        evidence["cases"] = {}
+        for form, (command, expected_command_output) in cases.items():
+            context = root / form
+            context.mkdir()
+            (context / "app.py").write_text("print('unexpected auto-detected entrypoint')\n")
+            dockerfile = context / "Dockerfile"
+            dockerfile.write_text(f"FROM {args.base_image}\nENV MARKER=expanded\nCMD {command}\n")
+            config_path = context / "pyproject.toml"
+            message, status = run_import(dockerfile, config_path)
+            if status:
+                raise RuntimeError(f"CMD-only {form}-form import failed: {message}")
+            layout = root / f"{form}-layout"
+            config = config_from_file(config_path, {
+                "tag": "runtime-check",
+                "base_image": f"oci:{base_layout}:runtime-check",
+                "context_dir": str(context),
+                "output_dir": str(layout),
+                "platform": args.platform,
+                "use_cache": False,
+            })
+            builder = ImageBuilder(config)
+            builder.build()
+            case_evidence = evidence["cases"][form] = {}
+            record_image(case_evidence, builder)
+            stdout = run_layout(
+                docker, skopeo, layout, f"{image_ref}-{form}", args.timeout, args.platform,
+                case_evidence,
+            )
+            expected = "inherited-entrypoint\n" + expected_command_output
+            if stdout != expected:
+                raise RuntimeError(
+                    f"CMD-only {form}-form output mismatch: expected {expected!r}, got {stdout!r}"
+                )
+            print(f"CMD-only {form}-form runtime output:\n{stdout}", end="")
+
+
 def command_output(command, timeout=30):
     return subprocess.run(
         command, check=True, capture_output=True, text=True, timeout=timeout
@@ -220,20 +280,26 @@ def main(argv=None):
         default=120,
         help="timeout in seconds for Docker and Skopeo commands",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--dependency-layer-only",
         action="store_true",
         help="Run the staged dependency layer in the target base image without Skopeo",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--multi-platform-index",
         action="store_true",
         help="Build an amd64/arm64 image index and import the native target",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--shell-command",
         action="store_true",
         help="Import a quoted shell-form ENTRYPOINT, build it and run it in the target base image",
+    )
+    modes.add_argument(
+        "--cmd-only",
+        action="store_true",
+        help="Import and run shell- and exec-form CMD under an inherited entrypoint",
     )
     parser.add_argument(
         "--shell",
@@ -243,20 +309,16 @@ def main(argv=None):
     if args.timeout < 1:
         parser.error("--timeout must be positive")
     if args.multi_platform_index:
-        if args.dependency_layer_only:
-            parser.error("--multi-platform-index cannot be combined with --dependency-layer-only")
-        if args.shell_command:
-            parser.error("--multi-platform-index cannot be combined with --shell-command")
         if args.platform not in INDEX_PLATFORMS:
             parser.error("index check supports linux/amd64 and linux/arm64 only")
 
     if args.shell is not None and not args.shell_command:
         parser.error("--shell requires --shell-command")
-    if args.shell_command and args.dependency_layer_only:
-        parser.error("--shell-command cannot be combined with --dependency-layer-only")
 
     if args.multi_platform_index:
         mode = "oci-index-import-startup"
+    elif args.cmd_only:
+        mode = "cmd-only"
     elif args.shell_command:
         mode = "shell-command"
     elif args.dependency_layer_only:
@@ -322,6 +384,9 @@ def run_check(args, evidence):
         evidence["skopeo_version"] = command_output([skopeo, "--version"])
 
     image_ref = f"pycontainer-runtime-check:{uuid.uuid4().hex[:12]}"
+    if args.cmd_only:
+        cmd_only_check(args, docker, skopeo, image_ref, evidence)
+        return
     if args.shell_command:
         shell_command_check(args, docker, skopeo, image_ref, evidence)
         return
