@@ -1376,6 +1376,81 @@ def test_auth_replay_failure_hides_initial_http_error_traceback(
         assert not (tmp_path / "blob").exists()
 
 
+class _SyntheticExchangeFailure(Exception):
+    pass
+
+
+@pytest.mark.parametrize("operation", ["manifest", "blob"])
+@pytest.mark.parametrize("failure", ["invalid-utf8", "unexpected"])
+def test_token_exchange_failure_hides_initial_http_error_traceback(
+    tmp_path, monkeypatch, operation, failure
+):
+    reason_token = "synthetic-401-reason-secret"
+    client = RegistryClient("registry.example", "team/app")
+    requests = []
+
+    def open_request(request, timeout):
+        requests.append(request.full_url)
+        if request.full_url.startswith("https://auth.example/"):
+            if failure == "unexpected":
+                raise _SyntheticExchangeFailure("synthetic exchange failure")
+            return _Response(b"\xff")
+        headers = Message()
+        headers["Www-Authenticate"] = 'Bearer realm="https://auth.example/token"'
+        raise urllib.error.HTTPError(
+            request.full_url, 401, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(client._opener, "open", open_request)
+    monkeypatch.setattr(client, "_get_blob_opener", lambda: client._opener)
+    expected = (
+        (RegistryAuthenticationError, "not valid JSON")
+        if failure == "invalid-utf8"
+        else (_SyntheticExchangeFailure, "synthetic exchange failure")
+    )
+    with pytest.raises(expected[0], match=expected[1]) as error:
+        if operation == "manifest":
+            client.pull_manifest("latest")
+        else:
+            digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    assert len(requests) == 2
+    assert client._bearer_token is None
+    rendered = "".join(traceback.format_exception(error.value))
+    assert reason_token not in str(error.value)
+    assert reason_token not in rendered
+    assert "HTTPError" not in rendered
+
+
+def test_blob_redirect_error_hides_redirect_http_error_traceback(
+    tmp_path, monkeypatch
+):
+    reason_token = "synthetic-redirect-reason-secret"
+    headers = Message()
+    headers["Location"] = "https://user:synthetic-password@storage.example/blob"
+
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 307, f"Redirect {reason_token}", headers,
+                io.BytesIO(b""),
+            )
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", lambda request, timeout: pytest.fail())
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+    with pytest.raises(RegistryRequestError, match="credentials") as error:
+        client.pull_blob(digest, tmp_path / "blob", 1)
+
+    rendered = "".join(traceback.format_exception(error.value))
+    for secret in (reason_token, "synthetic-password"):
+        assert secret not in str(error.value)
+        assert secret not in rendered
+    assert error.value.__context__ is None
+
+
 @pytest.mark.parametrize("rewind_fails", [False, True])
 def test_auth_upload_replay_preserves_nonzero_body_offset(monkeypatch, rewind_fails):
     reason_token = "synthetic-upload-challenge-secret"
