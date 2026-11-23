@@ -607,6 +607,19 @@ exclude-paths = ["src/generated", "fixtures/**"]
 exclude-defaults = true
 ```
 
+Context traversal never follows directory symlinks or Windows junctions. A
+linked include root (including auto-detected `src`, `app` or a virtualenv)
+fails the build; nested directory links are skipped. A selected file symlink
+must use a relative target that resolves to an existing file inside the
+context and that is itself selected (exclusions win); it is stored as a link
+with `/` separators. A target may climb with leading `..` components, but not
+above the context root, and may not use `..` after descending into a directory.
+Absolute, dangling, cyclic, out-of-context and unselected-target file links
+fail the build. A context directory that is itself a symlink is still
+supported. These checks are not a defense against the context changing during
+a build, and they do not cover explicitly named inputs such as requirements or
+manifest files.
+
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
