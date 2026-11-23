@@ -156,12 +156,17 @@ def test_project_manifest_detectors_reject_unsafe_links(tmp_path, target_kind, d
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))
-def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind):
+@pytest.mark.parametrize(
+    "environment",
+    [PY311, target_environment("linux", "arm", "3.11", "3.11.8", variant="v7")],
+    ids=["amd64", "arm-v7"],
+)
+def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind, environment):
     context = _copy(tmp_path, kind)
     lock_name = FORMATS[kind][0]
 
     assert detect_lockfile(context) == lock_name
-    selection = load_lockfile(context, Path(lock_name), PY311)
+    selection = load_lockfile(context, Path(lock_name), environment)
 
     # Host-only (win32), dev-group and older-Python packages are excluded.
     assert _selected(selection) == EXPECTED_311
@@ -169,7 +174,7 @@ def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind):
     assert selection.index_urls == ()
     rendered = selection.render_requirements()
     assert "iniconfig==2.0.0 --hash=sha256:" in rendered
-    assert rendered == load_lockfile(context, Path(lock_name), PY311).render_requirements()
+    assert rendered == load_lockfile(context, Path(lock_name), environment).render_requirements()
 
 
 @pytest.mark.parametrize("kind", ["uv", "pdm", "poetry"])
@@ -1289,15 +1294,17 @@ def _write_target_marker_uv_project(context):
         requires=[
             'marker-trans-amd; platform_machine == "x86_64"',
             'marker-trans-arm; platform_machine == "aarch64"',
+            'marker-trans-armv7; platform_machine == "armv7l"',
             'marker-trans-win; sys_platform == "win32"',
         ],
     )
     names = (
         "marker-root-amd", "marker-root-arm", "marker-trans-amd", "marker-trans-arm",
-        "marker-trans-win",
+        "marker-root-armv7", "marker-trans-armv7", "marker-trans-win",
     )
     for name in names:
-        _write_named_wheel(wheelhouse, name)
+        tag = "py3-none-manylinux2014_armv7l" if name == "marker-root-armv7" else "py3-none-any"
+        _write_named_wheel(wheelhouse, name, tag=tag)
     _write_uv_project(context, wheelhouse / "fixture_dep-1.0-py3-none-any.whl")
     manifest = context / "pyproject.toml"
     text = manifest.read_text(encoding="utf-8")
@@ -1305,7 +1312,8 @@ def _write_target_marker_uv_project(context):
         '"colorama>=0.4; sys_platform == \'win32\'"]',
         '"colorama>=0.4; sys_platform == \'win32\'", '
         '"marker-root-amd==1.0; platform_machine == \'x86_64\'", '
-        '"marker-root-arm==1.0; platform_machine == \'aarch64\'"]',
+        '"marker-root-arm==1.0; platform_machine == \'aarch64\'", '
+        '"marker-root-armv7==1.0; platform_machine == \'armv7l\'"]',
     )
     manifest.write_text(text, encoding="utf-8")
 
@@ -1314,13 +1322,15 @@ def _write_target_marker_uv_project(context):
         '    { name = "fixture-dep" },\n]',
         '    { name = "fixture-dep" },\n'
         '    { name = "marker-root-amd", marker = "platform_machine == \'x86_64\'" },\n'
-        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'" },\n]',
+        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'" },\n'
+        '    { name = "marker-root-armv7", marker = "platform_machine == \'armv7l\'" },\n]',
         1,
     ).replace(
         '    { name = "fixture-dep", specifier = "==1.0" },\n]',
         '    { name = "fixture-dep", specifier = "==1.0" },\n'
         '    { name = "marker-root-amd", marker = "platform_machine == \'x86_64\'", specifier = "==1.0" },\n'
-        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'", specifier = "==1.0" },\n]',
+        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'", specifier = "==1.0" },\n'
+        '    { name = "marker-root-armv7", marker = "platform_machine == \'armv7l\'", specifier = "==1.0" },\n]',
         1,
     )
     before, package = text.split('name = "fixture-dep"\nversion = "1.0"\n', 1)
@@ -1330,13 +1340,15 @@ def _write_target_marker_uv_project(context):
         'dependencies = [\n'
         '    { name = "marker-trans-amd", marker = "platform_machine == \'x86_64\'" },\n'
         '    { name = "marker-trans-arm", marker = "platform_machine == \'aarch64\'" },\n'
+        '    { name = "marker-trans-armv7", marker = "platform_machine == \'armv7l\'" },\n'
         '    { name = "marker-trans-win", marker = "sys_platform == \'win32\'" },\n'
         ']\n',
         1,
     )
     text = before + 'name = "fixture-dep"\nversion = "1.0"\n' + package
     for name in names:
-        wheel = wheelhouse / f"{name.replace('-', '_')}-1.0-py3-none-any.whl"
+        tag = "py3-none-manylinux2014_armv7l" if name == "marker-root-armv7" else "py3-none-any"
+        wheel = wheelhouse / f"{name.replace('-', '_')}-1.0-{tag}.whl"
         digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
         text += (
             f'\n[[package]]\nname = "{name}"\nversion = "1.0"\n'
@@ -1344,6 +1356,12 @@ def _write_target_marker_uv_project(context):
             f'wheels = [{{ url = "https://example.invalid/{wheel.name}", hash = "sha256:{digest}" }}]\n'
         )
     lock.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("variant", [None, "v6"])
+def test_locked_target_rejects_arm_without_v7(variant):
+    with pytest.raises(LockfileError, match="linux/arm"):
+        target_environment("linux", "arm", "3.11", "3.11.9", variant=variant)
 
 
 def test_locked_build_stages_root_and_transitive_markers_for_each_target(tmp_path, monkeypatch):
