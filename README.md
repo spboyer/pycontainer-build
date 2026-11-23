@@ -149,8 +149,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -330,7 +330,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
 - `--include-deps` — Stage importable dependencies from a venv or install a
   requirements file as target-compatible binary wheels. Requirements installs
   are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
@@ -387,6 +387,56 @@ pycontainer build \
   establish the Python ABI. These metadata checks apply to requirements and
   virtualenv staging alike.
 
+### Local base images
+
+`--base-image` (and `base_image` in `[build]`) can read a base image from disk
+without a registry, credentials, or a Docker daemon:
+
+```bash
+# OCI image layout (for example `skopeo copy docker://python:3.11-slim oci:base:3.11-slim`)
+pycontainer build --tag app:v1 --base-image oci:./base:3.11-slim
+pycontainer build --tag app:v1 --base-image oci:./base@sha256:<manifest-digest>
+
+# A previous pycontainer output is itself an OCI layout
+pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./dist/v2
+
+# Uncompressed `docker save` archive (legacy and Docker 25+ formats)
+pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). For a single-entry index,
+  either annotation on the index itself can also identify the entry. The
+  reference may be omitted when the layout holds one image, or a set of images
+  that all carry platform metadata. Nested image indexes use the same exact
+  OS/architecture/variant selection as registry pulls.
+- `docker-archive:<path>[:<repo-tag>]` selects a `manifest.json` entry by
+  `RepoTags`, normalized like registry references (`python:3.11-slim` matches
+  `docker.io/library/python:3.11-slim`). The tag may be omitted when the archive
+  holds one image.
+- The path ends at the first `:` after an optional Windows drive prefix, so
+  paths containing `:` are not supported. Relative paths resolve against the
+  current directory, and the source must not overlap `--output`.
+- Every blob is checked against its digest and size, and every base layer is
+  checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
+  more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+  Each OCI index, including nested indexes, is limited to 1,000 entries.
+  Layers are limited to 64 GiB (including decompressed content); Docker archive
+  member sizes are checked before any selected image blobs are staged.
+- Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
+  are not supported; extract or decompress them first.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
+
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
 - `--exclude PATH` — Exclude a context-root-relative path or glob; repeat to add exclusions
@@ -425,8 +475,34 @@ inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
-- Invalidates on file content changes (mtime + size checks)
+- Invalidates when file contents, relative paths, permission bits, the
+  workdir or reproducibility settings change (mtime is ignored for
+  reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Saving and restoring the cache (offline export/import):** the `--cache-dir`
+directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only
+relative source paths, so it can be archived or saved by CI (for example with
+`actions/cache`) and restored to a different absolute path and checkout
+location. A restored cache produces cache hits and an identical OCI manifest,
+config and layers. Partial restores are handled as follows:
+
+- Blobs without `index.json`: a clean miss; the layer is rebuilt and indexed.
+- `index.json` with missing or corrupt blobs: those entries are discarded and
+  rebuilt.
+- Malformed `index.json`: the build fails with `CacheIndexError`; delete the
+  reported `index.json` (cached layers are rebuilt) or rerun with `--no-cache`.
+- Concurrent builds may share a restored directory; index updates are locked.
+
+Caches are portable between machines of the same OS, not across operating
+systems: Windows reports source files as mode `0o666`, Linux checkouts as
+`0o644`/`0o755`, and the mode is recorded in the layer, so a cache saved on
+Windows misses on Linux (and vice versa) by design. Windows checkouts with
+`core.autocrlf` also change file content. Key saved caches on the OS. Blobs
+left without an index entry are not counted or evicted; delete the directory to
+reclaim them. See [GitHub Actions](docs/github-actions.md#caching-application-layers).
 
 ### Python API
 
@@ -479,8 +555,18 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -643,6 +729,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 
