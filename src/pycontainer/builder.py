@@ -353,6 +353,7 @@ def _verify_image_index(
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig):
+        config.validate_metadata()
         self._history = (
             BuildHistory(config.history_dir)
             if config.record_history and not config.dry_run
@@ -434,6 +435,7 @@ class ImageBuilder:
         return timing.phase(name) if timing else nullcontext()
 
     def build(self):
+        self.config.validate_metadata()
         self._conda_warning_emitted = False
         if self.config.scan and len(self.config.target_platforms()) > 1:
             raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
@@ -522,6 +524,7 @@ class ImageBuilder:
             image.platform["architecture"],
             image.platform["os"],
             variant=image.platform.get("variant"),
+            annotations=self.config.index_annotations,
             ref_names=ref_names,
         )
         _atomic_write_bytes(
@@ -573,7 +576,9 @@ class ImageBuilder:
             json.dumps(build_oci_layout(),separators=(',',':')).encode(),
         )
         ref_names=local_reference_names(self.config.tag, self.config.all_tags())
-        layout_index=build_layout_index_json(index_digest, index_size, ref_names)
+        layout_index=build_layout_index_json(
+            index_digest, index_size, ref_names, annotations=self.config.index_annotations
+        )
         _atomic_write_bytes(
             output/'index.json',
             json.dumps(layout_index,separators=(',',':')).encode(),
@@ -596,7 +601,10 @@ class ImageBuilder:
             OCIManifestDescriptor(OCI_MANIFEST_MEDIA_TYPE, image.manifest_digest, image.manifest_size, dict(image.platform))
             for image in images
         ]
-        index_bytes=json.dumps(build_image_index_json(descriptors),separators=(',',':')).encode()
+        index_bytes=json.dumps(
+            build_image_index_json(descriptors, annotations=self.config.index_annotations),
+            separators=(',',':'),
+        ).encode()
         index_digest="sha256:"+hashlib.sha256(index_bytes).hexdigest()
         _write_content_addressed_bytes(layers_dir/_digest_filename(index_digest), index_bytes, index_digest)
         return index_digest, len(index_bytes)
@@ -687,7 +695,10 @@ class ImageBuilder:
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
         _write_content_addressed_bytes(cfg_path, cfg_bytes, cfg_digest)
 
-        manifest=build_manifest_json(cfg_digest,len(cfg_bytes),all_layers)
+        manifest=build_manifest_json(
+            cfg_digest,len(cfg_bytes),all_layers,
+            annotations=self.config.manifest_annotations,
+        )
         manifest_bytes=json.dumps(manifest,separators=(',',':')).encode()
         manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
         manifest_path=layers_dir/manifest_digest.split(":",1)[1]
@@ -882,8 +893,12 @@ class ImageBuilder:
         client.pull_blob(config_digest, config_path, config_size)
         try:
             base_config=json.loads(config_path.read_bytes())
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise RegistryRequestError("Base image config is not valid JSON.") from error
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            invalid_base_config = True
+        else:
+            invalid_base_config = False
+        if invalid_base_config:
+            raise RegistryRequestError("Base image config is not valid JSON.")
         if not isinstance(base_config, dict):
             raise RegistryRequestError("Base image config is not a JSON object.")
 
@@ -1069,7 +1084,11 @@ class ImageBuilder:
         if self.config.env:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
-            print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+            print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
+        if self.config.manifest_annotations:
+            print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
+        if self.config.index_annotations:
+            print(f"  Index Annotations: {len(self.config.index_annotations)} configured (values hidden)")
         if self.config.stop_signal:
             print(f"  Stop Signal: {self.config.stop_signal}")
         if self.config.volumes:

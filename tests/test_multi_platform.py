@@ -378,6 +378,8 @@ def test_normalize_platforms_strips_and_dedupes():
         "linux/amd64",
         "linux/arm64",
     ]
+    with pytest.raises(ValueError):
+        normalize_platforms("linux/amd64,,linux/arm64")
 
 
 def test_scanning_multi_platform_config_is_rejected():
@@ -447,8 +449,6 @@ def test_platform_commands_inherit_and_clear_independently(
         assert config.get("Cmd") == (
             runtime[arch]["Cmd"] if expected_cmd == "inherited" else expected_cmd
         )
-    with pytest.raises(ValueError):
-        normalize_platforms("linux/amd64,,linux/arm64")
 
 
 @pytest.mark.parametrize(
@@ -506,6 +506,111 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
         ("3.11-slim", {"expected_digest": None}),
         (registry.index_digest, {"expected_digest": registry.index_digest}),
     ]
+
+
+def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
+    tmp_path, monkeypatch
+):
+    bases = {
+        arch: {
+            "Entrypoint": [f"{arch}-entrypoint"],
+            "StopSignal": signal,
+            "Volumes": {f"/{arch}": {}},
+            "Labels": {"base": arch},
+        }
+        for arch, signal in (("amd64", "SIGQUIT"), ("arm64", "SIGINT"), ("arm", "SIGTERM"))
+    }
+    builder = _builder(
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_runtime_by_arch=bases),
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+        tags=["stable"], cmd=["python", "app.py"],
+        labels={"example.label": "explicit"},
+        manifest_annotations={"example.manifest": "manifest-value"},
+        index_annotations={"example.index": "index-value"},
+    )
+    builder.build()
+    out = tmp_path / "out"
+    layout = json.loads((out / "index.json").read_bytes())
+    assert layout["annotations"] == {
+        "example.index": "index-value",
+        "org.opencontainers.image.ref.name": "registry.example/team/app:v1",
+    }
+    assert {
+        descriptor["annotations"]["org.opencontainers.image.ref.name"]
+        for descriptor in layout["manifests"]
+    } == {"registry.example/team/app:v1", "registry.example/team/app:stable"}
+    index_bytes = _blob(out, builder.index_digest)
+    assert _digest(index_bytes) == builder.index_digest
+    for descriptor in layout["manifests"]:
+        assert descriptor["digest"] == builder.index_digest
+        assert descriptor["size"] == len(index_bytes)
+    index = json.loads(index_bytes)
+    assert index["annotations"] == {"example.index": "index-value"}
+    for descriptor in index["manifests"]:
+        arch = descriptor["platform"]["architecture"]
+        manifest_bytes = _blob(out, descriptor["digest"])
+        assert _digest(manifest_bytes) == descriptor["digest"]
+        assert len(manifest_bytes) == descriptor["size"]
+        manifest = json.loads(manifest_bytes)
+        assert manifest["annotations"] == {"example.manifest": "manifest-value"}
+        config_descriptor = manifest["config"]
+        config_bytes = _blob(out, config_descriptor["digest"])
+        assert _digest(config_bytes) == config_descriptor["digest"]
+        assert len(config_bytes) == config_descriptor["size"]
+        image_config = json.loads(config_bytes)
+        if arch == "arm":
+            assert descriptor["platform"]["variant"] == image_config["variant"] == "v7"
+        config = image_config["config"]
+        assert config["Labels"] == {"base": arch, "example.label": "explicit"}
+        assert config["Entrypoint"] == [f"{arch}-entrypoint"]
+        assert config["Cmd"] == ["python", "app.py"]
+        assert config["StopSignal"] == bases[arch]["StopSignal"]
+        assert config["Volumes"] == bases[arch]["Volumes"]
+
+    client = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    builder.push(show_progress=False)
+    assert [call for call in client.calls if call[0] == "index"] == [
+        ("index", builder.index_digest, builder.index_digest),
+        ("index", "v1", builder.index_digest),
+        ("index", "stable", builder.index_digest),
+    ]
+
+
+def test_multi_platform_annotation_changes_recompute_only_dependent_digests(
+    tmp_path, monkeypatch
+):
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(),
+        manifest_annotations={"example.z": "two", "example.manifest": "one"},
+        index_annotations={"example.z": "two", "example.index": "one"},
+    )
+    builder.build()
+    original_index = builder.index_digest
+    original_manifests = [image.manifest_digest for image in builder.platform_images]
+    original_configs = [image.config_digest for image in builder.platform_images]
+
+    builder.config.manifest_annotations = dict(reversed(list(builder.config.manifest_annotations.items())))
+    builder.config.index_annotations = dict(reversed(list(builder.config.index_annotations.items())))
+    builder.build()
+    assert builder.index_digest == original_index
+    assert [image.manifest_digest for image in builder.platform_images] == original_manifests
+
+    builder.config.index_annotations["example.index"] = "two"
+    builder.build()
+    assert builder.index_digest != original_index
+    assert [image.manifest_digest for image in builder.platform_images] == original_manifests
+    index_with_new_annotation = builder.index_digest
+
+    builder.config.manifest_annotations["example.manifest"] = "two"
+    builder.build()
+    assert builder.index_digest != index_with_new_annotation
+    assert all(
+        image.manifest_digest != previous
+        for image, previous in zip(builder.platform_images, original_manifests)
+    )
+    assert [image.config_digest for image in builder.platform_images] == original_configs
 
 
 @pytest.mark.parametrize("override", [False, True])

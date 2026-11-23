@@ -286,7 +286,7 @@ def main(argv=None):
         action="store_true",
         help="Run the staged dependency layer in the target base image without Skopeo",
     )
-    modes.add_argument(
+    parser.add_argument(
         "--multi-platform-index",
         action="store_true",
         help="Build an amd64/arm64 image index and import the native target",
@@ -309,6 +309,13 @@ def main(argv=None):
     if args.timeout < 1:
         parser.error("--timeout must be positive")
     if args.multi_platform_index:
+        for option, selected in (
+            ("--dependency-layer-only", args.dependency_layer_only),
+            ("--shell-command", args.shell_command),
+            ("--cmd-only", args.cmd_only),
+        ):
+            if selected:
+                parser.error(f"--multi-platform-index cannot be combined with {option}")
         if args.platform not in INDEX_PLATFORMS:
             parser.error("index check supports linux/amd64 and linux/arm64 only")
 
