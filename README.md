@@ -53,7 +53,7 @@ pycontainer build --tag myapp:latest
 # Build with custom base image and dependencies
 pycontainer build \
   --tag myapp:v1 \
-  --base-image python:3.12-slim \
+  --base-image python:3.12-slim-bookworm \
   --include-deps
 
 # Build FastAPI app (auto-detected, entrypoint configured)
@@ -310,7 +310,7 @@ By default, `pycontainer` auto-detects:
 pycontainer build \
   --tag myapp:v1.2.3 \
   --context /my/project \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --include-deps \
   --workdir /app \
   --env KEY=value \
@@ -362,14 +362,23 @@ pycontainer build \
   [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
   These bounds may reject wheels that a newer image could actually run.
 
-  Codename-less glibc tags such as `python:3.11-slim`, and unmapped Debian
-  codenames, keep the conservative `manylinux2014` tag; a failed install then
-  suggests pinning a codename or setting `PYTHON_LIBC`. Codename-less Alpine
-  tags such as `python:3.11-alpine`, and unmapped Alpine releases, require
-  explicit `PYTHON_LIBC` before requirements or virtualenv staging. Their
-  names cannot establish a musl version: old official `python:3.8.0-alpine`
-  uses musl 1.1, so the previous `musllinux_1_2` fallback was unsafe.
-  Pin a mapped Alpine release or provide supported libc metadata.
+  Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`,
+  and unmapped releases, cannot establish a libc floor from their names: official
+  `python:3.8.0-alpine` uses musl 1.1 and `python:3.4-wheezy` uses glibc 2.13,
+  so the previous `musllinux_1_2` / `manylinux2014` fallbacks were unsafe.
+  For verified official tag-only pulls, the builder instead reads the effective
+  `libc6`/`musl` package record from digest-checked base layers. It applies
+  whiteouts and rejects missing, linked, ambiguous, unsupported or wrong-architecture
+  records. Inspection is bounded (8 MiB metadata, 2 GiB decoded bytes and 100,000
+  members per layer, 300 seconds overall) and never extracts base files.
+  Thus the CLI's automatic selection, `BuildConfig`'s `python:3.11-slim`
+  default, and Aspire's `python:3.12-slim --include-deps` invocation remain
+  supported when the pulled image supplies valid package evidence.
+  If evidence is unavailable, explicitly select a mapped release, for example
+  `--base-image python:3.11-slim-bookworm`, or provide supported libc metadata
+  in the base image config. Application `--env` values are not base metadata.
+  Inferred `PYTHON_LIBC` is confined to a staging config copy, not added to
+  the final image environment. No distribution is silently substituted.
   When both a codename and `PYTHON_LIBC` are present they must
   name the same family, and the lower version wins. All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:

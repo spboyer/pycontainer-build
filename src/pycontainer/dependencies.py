@@ -20,7 +20,7 @@ MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
 INSTALL_TIMEOUT_SECONDS = 300
 
-# Shared target table. Values are the conservative codename-less glibc floor;
+# Shared target table. Values are legacy aliases for validated glibc targets;
 # the suffix after "manylinux2014_" is the machine tag for every generated tag.
 _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
@@ -171,8 +171,8 @@ def _codename_libc(image_tag: str) -> Optional[Tuple[str, int]]:
 
 def _target_libc(
     base_image: str, base_config: Optional[dict], base_image_tag_verified: bool
-) -> Tuple[str, Optional[int]]:
-    """Return target libc; None keeps only the codename-less glibc floor."""
+) -> Tuple[str, int]:
+    """Return target libc only from explicit metadata or a mapped codename."""
     repository, image_tag = _base_image_parts(base_image)
     libc = _base_environment(base_config).get("PYTHON_LIBC")
     explicit = _parse_libc(libc) if libc is not None else None
@@ -204,14 +204,13 @@ def _target_libc(
     claims = [claim[1] for claim in (explicit, codename) if claim]
     if claims:
         return tag_family, min(claims)
-    if tag_family == "musl":
-        raise ValueError(
-            f"Cannot validate target musl version from base image tag {image_tag!r}; "
-            "pin a mapped Alpine codename tag or set PYTHON_LIBC=musl-1.N "
-            "(N 1-99) in the image config. Codename-less and unmapped Alpine "
-            "tags do not establish a compatible musllinux floor."
-        )
-    return tag_family, None
+    raise ValueError(
+        f"Cannot validate target {tag_family} version from base image tag "
+        f"{image_tag or 'latest'!r}; pin a mapped codename tag (for example "
+        "python:3.11-slim-bookworm or python:3.11-alpine3.20) or set "
+        f"PYTHON_LIBC ({_SUPPORTED_LIBC_TEXT}) in the image config. "
+        "Codename-less and unmapped tags do not establish a compatible libc floor."
+    )
 
 
 def target_wheel_platforms(
@@ -231,8 +230,6 @@ def target_wheel_platforms(
     floor = _PIP_PLATFORMS[(os_name, arch)]
     machine = floor[len(_FLOOR_GLIBC_PREFIX):]
     family, minor = _target_libc(base_image, base_config, base_image_tag_verified)
-    if minor is None:
-        return [floor]
     if family == "musl":
         return [
             f"musllinux_1_{value}_{machine}"
@@ -242,6 +239,34 @@ def target_wheel_platforms(
         f"manylinux_2_{value}_{machine}"
         for value in range(minor, _MIN_GLIBC_MINOR - 1, -1)
     ] + [floor]
+
+
+def target_libc_config(
+    os_name: str, arch: str, base_image: str, base_config: Optional[dict],
+    base_layers: Iterable, *, base_image_tag_verified: bool = False,
+) -> Optional[dict]:
+    """Add layer-derived libc only to staging config for verified official tag pulls."""
+    repository, image_tag = _base_image_parts(base_image)
+    if (
+        not base_image_tag_verified
+        or "@" in base_image
+        or not _is_official_python_image(repository)
+        or "PYTHON_LIBC" in _base_environment(base_config)
+        or _codename_libc(image_tag)
+    ):
+        return base_config
+    validate_target_platform(os_name, arch)
+    from .base_libc import infer_libc_from_layers
+
+    family = "musl" if _is_alpine_tag(image_tag) else "glibc"
+    machine = _PIP_PLATFORMS[(os_name, arch)][len(_FLOOR_GLIBC_PREFIX):]
+    libc = infer_libc_from_layers(base_layers, family, arch, machine)
+    _parse_libc(libc)
+    config = dict(base_config or {})
+    image_config = dict(config.get("config", {}))
+    image_config["Env"] = [*image_config.get("Env", []), f"PYTHON_LIBC={libc}"]
+    config["config"] = image_config
+    return config
 
 
 def target_wheel_platform(
@@ -257,12 +282,6 @@ def target_wheel_platform(
         os_name, arch, base_image, base_config,
         base_image_tag_verified=base_image_tag_verified,
     )[0]
-
-
-def _uses_conservative_libc_floor(
-    base_image: str, base_config: Optional[dict], base_image_tag_verified: bool
-) -> bool:
-    return _target_libc(base_image, base_config, base_image_tag_verified)[1] is None
 
 
 def _target_options(
@@ -311,6 +330,10 @@ def install_requirements(
     *,
     base_image_tag_verified: bool = False,
 ) -> None:
+    target_options = _target_options(
+        os_name, arch, python_version, base_image, base_config,
+        base_image_tag_verified=base_image_tag_verified,
+    )
     validate_requirements(requirements, context_dir)
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -325,10 +348,7 @@ def install_requirements(
         "--no-compile",
         "--target",
         str(destination),
-        *_target_options(
-            os_name, arch, python_version, base_image, base_config,
-            base_image_tag_verified=base_image_tag_verified,
-        ),
+        *target_options,
         "-r",
         str(requirements),
     ]
@@ -375,16 +395,6 @@ def install_requirements(
             "Target dependency installation failed. Only wheels compatible with "
             f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
             "are supported."
-            + (
-                " The base image tag names no mapped codename, so only the "
-                "conservative manylinux2014 floor was used; pin a "
-                "codename tag (for example python:3.11-slim-bookworm) "
-                "or set PYTHON_LIBC in the image config."
-                if _uses_conservative_libc_floor(
-                    base_image, base_config, base_image_tag_verified
-                )
-                else ""
-            )
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):

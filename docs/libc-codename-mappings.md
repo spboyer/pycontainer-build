@@ -2,8 +2,11 @@
 
 Dependency staging selects libc tags using explicit `PYTHON_LIBC` metadata
 or a mapped codename token in a tag-only registry pull of the official
-`python` image. Only glibc keeps the codename-less `manylinux2014` floor;
-unproven Alpine tags fail before staging. Mapped values are conservative
+`python` image. For codename-less/unmapped official tag-only pulls, the builder
+can instead establish libc from effective, digest-checked base package metadata.
+Unproven targets of either libc family fail before staging;
+the shared `manylinux2014` table values are aliases, not inferred floors.
+Mapped values are conservative
 bounds based on the source evidence below, not measurements of individual
 image digests. The evidence is pinned to content-addressed Debian snapshot
 files and commits in Alpine `aports` or `docker-library/python`. Mutable
@@ -102,12 +105,44 @@ values from `git ls-remote https://git.alpinelinux.org/aports`.
   tag proves even a musl 1.1 floor. This is an intentional compatibility
   change, not evidence that runtime package databases are inspected by the
   builder.
+- Additional safety amendment (2026-11-22, #143 / #191): the remaining
+  unchanged glibc fallback acceptance is also superseded. The coordinator
+  verified official `python:3.4-wheezy`, linux/amd64 manifest
+  `sha256:f998a1bcf27c446557d2a036bc8c794364ee2faf8af1ef2c5691ca197a3c2df4`.
+  Its config has `PYTHON_VERSION=3.4.10` and no `PYTHON_LIBC`; the latest
+  effective dpkg status reports `libc6` 2.13-38+deb7u12. Manifest/config
+  descriptors and layers from the top through that status file were
+  verified. A hermetic `cp34-abi3-manylinux2014_x86_64` wheel fixture
+  reproduces unsafe real-pip selection before the fix. All codename-less
+  or unmapped tags now require explicit libc metadata. Explicit glibc
+  below 2.17 remains unsupported. Neither check establishes runtime
+  importability; no container was run.
+- Compatibility reconciliation (2026-11-22): the proposed reject-all-unmapped
+  behavior above is superseded for verified official tag-only pulls that
+  provide usable layer evidence. `base_libc.py` reads the final effective
+  dpkg `libc6` or APK `musl` version, applying ordered layer deletions and
+  opaque whiteouts before each layer's additions. Digests/sizes, gzip
+  trailers, tar end blocks, regular-file/ancestor types, package status,
+  unique fields and native package architecture are checked. Invalid,
+  missing, linked, ambiguous or unsupported evidence fails closed.
+  Limits are 8 MiB per database/extended header, 2 GiB decoded bytes and
+  100,000 members per layer, and 300 seconds including verification.
+  Base files are never extracted. The reporting scanner in
+  `system_packages.py` is not used as libc evidence.
+- Defaults and the external Aspire invocation are preserved: `BuildConfig`
+  and the reusable workflow still use `python:3.11-slim`, CLI automatic
+  selection is unchanged, and `python:3.12-slim --include-deps` stages using
+  verified package evidence. A hermetic actual CLI/registry/builder regression
+  checks descriptor verification, wheel selection and unchanged base config;
+  it also selects musl 1.1 for the old Alpine case and rejects Wheezy's
+  unsupported glibc 2.13 before pip. Inferred metadata exists only in a
+  staging config copy. A mapped release or explicit base metadata is required
+  when layer evidence is unavailable.
 - Pinned commits cover the release point and one later branch commit, not
   every intermediate commit. Both points share the same musl minor, and
   Alpine stable branches only take patch updates.
-- New Debian codenames stay on the codename-less glibc floor until a row is
-  verified and added here and in the code table. New or unmapped Alpine
-  releases require explicit libc metadata until their row is verified.
+- New or unmapped releases require valid layer evidence or explicit libc
+  metadata until their row is verified and added here and in the code table.
 - Docker Hub tags are mutable. These source records do not verify the libc
   installed in every published Python image digest, or prove that no
   intermediate suite update ever contained an older version. These

@@ -86,7 +86,7 @@ success for unrun integration tests.
 
 An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
 and a running Docker daemon:
-`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim-bookworm`.
 It pulls the selected base image, imports the generated layout into Docker, and
 starts a container. To test only dependency importability in the real target
 base image, without Skopeo, add `--dependency-layer-only`. These checks are not
@@ -153,12 +153,18 @@ plus `manylinux2014`, or `musllinux_1_N`..`musllinux_1_1`). Official `python`
 tag-only registry pulls derive the libc family from the resolved tag (`alpine`
 means musl, otherwise glibc) and the version from mapped Debian/Alpine
 codename tokens (`docs/libc-codename-mappings.md` pins each row to immutable
-snapshot/commit sources; update it with the code table); codename-less or unmapped
-glibc tags keep exactly `manylinux2014`. Codename-less or unmapped Alpine tags
-require supported explicit `PYTHON_LIBC` before requirements or venv staging:
-the former `musllinux_1_2` fallback is unsafe for old musl 1.1 images.
-Pin a mapped Alpine release or provide libc metadata instead. The shared
-`_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` floor values that
+snapshot/commit sources; update it with the code table). Codename-less or unmapped
+official tag-only pulls instead use effective `libc6`/`musl` package metadata
+from digest-checked ordered layers. `base_libc.py` applies whiteouts and fails
+closed on links, absent/ambiguous records, unsupported versions or architecture
+mismatches; limits are 8 MiB metadata, 2 GiB decoded bytes and 100,000 members
+per layer, and 300 seconds overall. It never extracts base files.
+Core defaults, auto-detection and the Aspire unversioned-tag invocation remain
+supported with this evidence. Missing evidence requires a mapped release or
+explicit base config `PYTHON_LIBC`. Inference uses a staging-only config copy.
+The system-package reporting scanner is not libc proof. Application `--env`
+overrides do not establish base metadata. The shared
+`_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` legacy alias values that
 `target_wheel_platforms` expands. All digest references, including tag-plus-digest, need supported
 `PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
 Local image names/annotations are not provenance either. The shared
