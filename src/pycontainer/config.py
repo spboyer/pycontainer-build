@@ -64,6 +64,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    record_history: bool = False
+    history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
     security: Optional[dict] = None

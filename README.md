@@ -192,6 +192,7 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
+- ✅ **Opt-in local history** — Inspect private build outcomes and phase timings
 - ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
   configuration for an existing image without applying it
 
@@ -573,6 +574,22 @@ pycontainer build --tag myapp:ci --push \
   --cache-to type=registry,ref=ghcr.io/org/myapp-cache
 ```
 
+**Local Build History**:
+
+```bash
+pycontainer build --record-history
+pycontainer history list
+pycontainer history clear
+```
+
+History is disabled by default. It records only a random run ID, UTC start
+time, outcome, and timings, never build configuration or error text. Use
+`--history-dir PATH` to select a directory outside the build context and OCI
+output; specifying a directory alone does not enable recording. For a build
+configured with `record-history = true`, `--no-record-history` disables it.
+See the [build history guide](docs/build-history.md) for retention, privacy,
+error handling, and custom-directory inspection.
+
 **Production Features**:
 - `--config FILE` — Load settings from `pycontainer.toml`
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
@@ -865,6 +882,7 @@ This style is intentional for the experimental phase.
 ### Documentation
 
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
+- **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop

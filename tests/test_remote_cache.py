@@ -28,6 +28,7 @@ from pycontainer.auth import (
 )
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.history import BuildHistory
 from pycontainer.registry_client import (
     RegistryClient,
     RegistryRequestError,
@@ -635,6 +636,26 @@ def test_full_build_uses_remote_layer(tmp_path, registry, monkeypatch):
 
     assert [layer.digest for layer in reader.layers] == [cold.digest]
     assert (Path(reader.config.output_dir) / "index.json").is_file()
+
+
+@pytest.mark.parametrize("export_fails", [False, True])
+def test_remote_export_records_build_outcome(tmp_path, registry, export_fails):
+    history_dir = tmp_path / "history"
+    writer = _builder(
+        tmp_path, "writer", cache_to=CACHE_SPEC,
+        record_history=True, history_dir=str(history_dir),
+    )
+    if export_fails:
+        registry.fail[("POST", "blobs/uploads/")] = 500
+        with pytest.raises(RemoteCacheError, match="Failed to export"):
+            writer.build()
+    else:
+        writer.build()
+
+    records = BuildHistory(history_dir).list()
+    assert len(records) == 1
+    assert records[0]["status"] == ("failed" if export_fails else "success")
+    assert "application" in records[0]["phases_ns"]
 
 
 def test_no_cache_disables_remote_import(tmp_path):

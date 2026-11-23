@@ -494,11 +494,17 @@ def test_devloop_forwards_remote_cache_options(tmp_path, monkeypatch, recording,
         argv = [command, "--context", str(tmp_path)]
     cache = "type=registry,ref=cache.example/team/app"
 
-    run_cli(monkeypatch, *argv, "--cache-from", cache, "--cache-to", cache)
+    history_dir = tmp_path / "history"
+    run_cli(
+        monkeypatch, *argv, "--cache-from", cache, "--cache-to", cache,
+        "--record-history", "--history-dir", str(history_dir),
+    )
 
     (builder,) = recording
     assert builder.config.cache_from == cache
     assert builder.config.cache_to == cache
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(history_dir)
     assert builder.pushes
 
 
@@ -522,6 +528,23 @@ def test_devloop_remote_cache_failure_stops_push(tmp_path, monkeypatch, recordin
 
     assert error.value.code == 1
     assert recording[0].pushes == []
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_forwards_history_options(tmp_path, monkeypatch, recording, command):
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    history_dir = tmp_path / "history"
+    run_cli(monkeypatch, command, "--record-history", "--history-dir", str(history_dir))
+
+    (builder,) = recording
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(history_dir)
 
 
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
