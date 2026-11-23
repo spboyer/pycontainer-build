@@ -44,7 +44,7 @@ jobs:
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
 
   # Evidence for #148, not a gate: populate a --cache-dir on each OS, then
   # restore every OS's cache into another absolute path and checkout location.

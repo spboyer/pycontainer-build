@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import re
@@ -59,7 +60,7 @@ def write_records(directory, records):
         (subdir / "evidence.json").write_text(json.dumps(record))
 
 
-def run_verifier(tmp_path, records):
+def run_verifier(tmp_path, records, dependency_fixture="requirements"):
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     write_records(evidence, records)
@@ -71,9 +72,124 @@ def run_verifier(tmp_path, records):
         "--commit", COMMIT,
         "--run-id", RUN_ID,
         "--run-attempt", RUN_ATTEMPT,
+        "--dependency-fixture", dependency_fixture,
         "--summary", str(summary),
     ])
     return code, summary.read_text()
+
+
+def passing_lock_record(target):
+    record = passing_record(target)
+    digest, packages = verifier.expected_lock_fixture(target)
+    record.update(
+        dependency_fixture="lockfile",
+        fixture_path=verifier.LOCK_FIXTURE_PATH,
+        lock_digest=digest,
+        fixture_app_digest="sha256:" + hashlib.sha256(
+            (verifier.LOCK_FIXTURE / "app.py").read_bytes()
+        ).hexdigest(),
+        locked_packages=packages,
+        lock_archive_verification="passed",
+        lock_runtime_verification="passed",
+        container_stdout=verifier.LOCK_MARKER + "\n",
+    )
+    return record
+
+
+def test_lock_gate_requires_matching_committed_fixture_on_both_targets(tmp_path):
+    code, summary = run_verifier(
+        tmp_path, [passing_lock_record("linux/amd64"), passing_lock_record("linux/arm64")],
+        "lockfile",
+    )
+    assert code == 0
+    assert "| `linux/amd64` |" in summary
+    assert "| `linux/arm64` |" in summary
+    assert "archive hashes were separately verified" in summary
+    assert "Python only, not native binaries" in summary
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("dependency_fixture", "requirements", "dependency fixture"),
+        ("fixture_path", "other/fixture", "fixture path"),
+        ("lock_digest", "sha256:" + "0" * 64, "lock digest"),
+        ("fixture_app_digest", "sha256:" + "0" * 64, "fixture app digest"),
+        ("locked_packages", [], "locked packages"),
+        ("lock_archive_verification", "failed", "lock_archive_verification"),
+        ("lock_runtime_verification", "failed", "lock_runtime_verification"),
+        ("container_stdout", "pycontainer-runtime-dependency-ok\n", "runtime dependency marker"),
+        ("container_stdout", "noise\npycontainer-lockfile-runtime-ok\n", "runtime dependency marker"),
+        ("container_stdout", " pycontainer-lockfile-runtime-ok\n", "runtime dependency marker"),
+        ("commit", "b" * 40, "expected"),
+        ("run_id", "9", "run_id"),
+        ("run_attempt", "1", "run_attempt"),
+    ],
+)
+def test_lock_gate_rejects_mismatched_evidence(tmp_path, field, value, reason):
+    arm = passing_lock_record("linux/arm64")
+    arm[field] = value
+    code, summary = run_verifier(tmp_path, [passing_lock_record("linux/amd64"), arm], "lockfile")
+    assert code == 1
+    assert reason in summary.split("### Not validated")[1]
+
+
+def test_lock_gate_rejects_ordinary_requirements_evidence(tmp_path):
+    code, summary = run_verifier(
+        tmp_path, [passing_record("linux/amd64"), passing_record("linux/arm64")], "lockfile"
+    )
+    assert code == 1
+    assert summary.count("dependency fixture does not match lockfile") == 2
+
+
+@pytest.mark.parametrize("field", ["name", "version", "wheel_sha256", "module_sha256", "metadata_sha256"])
+def test_lock_gate_rejects_altered_locked_package_fields(field):
+    record = passing_lock_record("linux/amd64")
+    record["locked_packages"][0][field] = "altered"
+    assert "locked packages" in verifier.rejection_reason(
+        record, "linux/amd64", COMMIT, RUN_ID, RUN_ATTEMPT, "lockfile"
+    )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        [],
+        ["--commit", COMMIT],
+        ["--commit", "abc", "--run-id", RUN_ID, "--run-attempt", RUN_ATTEMPT],
+    ],
+)
+def test_lock_gate_requires_exact_run_identity(tmp_path, identity):
+    with pytest.raises(SystemExit):
+        verifier.main([
+            "--evidence-dir", str(tmp_path), "--require", "linux/amd64",
+            "--dependency-fixture", "lockfile", *identity,
+        ])
+
+
+def test_lock_gate_rejects_modified_fixture_wheel(tmp_path, monkeypatch):
+    import shutil
+    fixture = tmp_path / "fixture"
+    shutil.copytree(verifier.LOCK_FIXTURE, fixture)
+    record = passing_lock_record("linux/amd64")
+    wheel = fixture / "wheelhouse" / "runtime_pure-1.0-py3-none-any.whl"
+    wheel.write_bytes(wheel.read_bytes() + b"bad")
+    monkeypatch.setattr(verifier, "LOCK_FIXTURE", fixture)
+    assert "committed lock fixture is invalid" in verifier.rejection_reason(
+        record, "linux/amd64", COMMIT, RUN_ID, RUN_ATTEMPT, "lockfile"
+    )
+
+
+def test_lock_gate_rejects_modified_fixture_assertion_script(tmp_path, monkeypatch):
+    import shutil
+    fixture = tmp_path / "fixture"
+    shutil.copytree(verifier.LOCK_FIXTURE, fixture)
+    record = passing_lock_record("linux/amd64")
+    (fixture / "app.py").write_text('print("pycontainer-lockfile-runtime-ok")\n')
+    monkeypatch.setattr(verifier, "LOCK_FIXTURE", fixture)
+    assert "fixture app digest" in verifier.rejection_reason(
+        record, "linux/amd64", COMMIT, RUN_ID, RUN_ATTEMPT, "lockfile"
+    )
 
 
 def test_gate_passes_only_with_full_evidence_for_every_target(tmp_path):
@@ -393,6 +509,13 @@ def test_runtime_workflow_requires_native_evidence_for_each_target():
     assert "--commit ${{ github.sha }}" in gate
     assert "--run-id ${{ github.run_id }}" in gate
     assert "--run-attempt ${{ github.run_attempt }}" in gate
+    workflow = (WORKFLOWS / "runtime-check.yml").read_text()
+    assert "dependency_fixture:" in workflow
+    assert "default: requirements" in workflow
+    assert "DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}" in startup
+    assert "DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}" in gate
+    assert '--dependency-fixture "$DEPENDENCY_FIXTURE"' in startup
+    assert '--dependency-fixture "$DEPENDENCY_FIXTURE"' in gate
 
 
 def test_pull_request_ci_runs_the_real_runtime_check():

@@ -18,6 +18,7 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
 - `system_packages.py`: system package declaration, inference and base-image
   verification (warning only). `system_install.py`: fail-closed groundwork for
   #31; it executes no package manager and has no callers until the #22
@@ -91,6 +92,14 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 
+Real scanner checks are separately marked `scanner_integration` and excluded
+by default. They require an explicitly selected Grype executable and controlled
+database digest; see [vulnerability scanning](docs/vulnerability-scanning.md)
+for the opt-in command and coverage limits. Fake-executable tests do not prove
+real Grype compatibility or OS/Python whiteout handling. A real Grype 0.119.0
+`linux/amd64` acceptance run passed on 2026-11-22; native Windows is rejected
+and macOS/arm64 scanner hosts remain unvalidated.
+
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
 in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`
@@ -124,6 +133,15 @@ and is listed separately as not validated. Re-run all jobs, not just failed
 jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
+An opt-in `workflow_dispatch` choice `dependency_fixture=lockfile` (or
+`--dependency-fixture lockfile` on the script) instead stages the offline
+`tests/fixtures/runtime-lock` uv lock. It verifies wheel archive hashes against
+the lock before staging and checks imported distribution names, versions and
+installed module/METADATA hashes in the container. The platform-tagged wheels
+contain only Python; this is not native-binary evidence. Lock evidence records
+the fixture path, lock digest and assertion-script digest and is gated against
+the committed fixture and the exact commit/run/attempt for both native targets.
+Workflow calls and release gates continue to use the default requirements fixture.
 
 Runtime security fragments (`security.py`) are deployment artifacts written
 beside the layout, never image config. Verify them with the opt-in Linux

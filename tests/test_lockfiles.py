@@ -2490,6 +2490,22 @@ def test_dry_run_reports_dependency_source(tmp_path, capsys):
     assert "including uv marker freshness" in output
 
 
+def test_repeated_dry_run_redetects_new_lockfile(tmp_path, capsys):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n", encoding="utf-8")
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "out"), include_deps=True, dry_run=True
+    ))
+    builder.build()
+    assert "Dependency Source: requirements (requirements.txt)" in capsys.readouterr().out
+
+    _write_uv_project(context)
+    builder.build()
+
+    assert "Dependency Source: lock (uv.lock)" in capsys.readouterr().out
+
+
 def test_dry_run_can_preview_without_dependencies(tmp_path, capsys):
     builder = ImageBuilder(BuildConfig(context_dir=str(tmp_path), include_deps=True, dry_run=True))
 
