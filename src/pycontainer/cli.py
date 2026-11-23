@@ -24,7 +24,7 @@ def main():
     b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
     b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
     b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
-    b.add_argument("--base-image",help="Base image to layer on (auto-detected from requires-python if not specified)")
+    b.add_argument("--base-image",help="Base image to layer on: a registry reference, oci:<path>[:<ref>|@sha256:<digest>], or docker-archive:<path>[:<repo-tag>] (auto-detected from requires-python if not specified)")
     b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")

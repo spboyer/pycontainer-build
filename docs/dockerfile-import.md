@@ -19,6 +19,25 @@ pycontainer import Dockerfile --build-arg PY=3.12
 - With `--force`, only the `[tool.pycontainer]` tables (including
   `[tool.pycontainer.env]` and `[tool.pycontainer.labels]`) are replaced; the
   rest of the file is preserved and the result is validated as TOML.
+- `--force` refuses, leaving the file untouched, if it already defines a
+  top-level `[build]` table, because a config file must contain exactly one
+  pycontainer table.
+- Existing inline `tool.pycontainer` definitions cannot be merged; `--force`
+  fails without changing the file. Convert them to tables before retrying.
+
+## Building from the imported settings
+
+Pass the generated file to the build command; it reads `[tool.pycontainer]`
+with the same keys, validation and precedence as `[build]`:
+
+```powershell
+pycontainer import Dockerfile -o pyproject.toml
+pycontainer build --config pyproject.toml --tag myapp:latest
+```
+
+Explicit CLI options such as `--base-image` or `--platform` override the
+imported values; omitted options keep them. A file that defines both `[build]`
+and `[tool.pycontainer]` is rejected instead of silently picking one.
 
 ## Mapping
 
