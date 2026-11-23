@@ -21,6 +21,7 @@ from pycontainer.cache import CacheIndexError, LayerCache
 from pycontainer.config import BuildConfig
 from pycontainer.dependency_cache import (
     DependencyCacheMiss,
+    ambient_pip_settings,
     decode_inventory,
     dependency_cache_key,
     encode_inventory,
@@ -35,7 +36,9 @@ SECRET = "hunter2-secret"
 
 @pytest.fixture(autouse=True)
 def _no_ambient_pip(monkeypatch):
-    for name in [name for name in os.environ if name.upper().startswith("PIP_")]:
+    for name in [
+        name for name in os.environ if name.upper().startswith(("PIP_", "PYTHON"))
+    ]:
         monkeypatch.delenv(name)
     monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
     monkeypatch.setattr(dependency_cache, "ambient_pip_settings", lambda: [])
@@ -104,6 +107,7 @@ def _image(builder):
         config["rootfs"]["diff_ids"],
         builder.config_digest,
         [(package["name"], package["versionInfo"]) for package in sbom["packages"]],
+        builder.manifest_digest,
     )
 
 
@@ -131,6 +135,95 @@ def test_hash_pinned_requirements_hit_reuses_identical_layer_without_pip(
     assert _image(second) == _image(first)
     assert _image(second)[3] == [("fixture-dep", "1.0")]
     assert Path(second.layers[0].tar_path).read_bytes() == Path(first.layers[0].tar_path).read_bytes()
+
+
+def test_pythonpath_customization_cannot_reuse_an_existing_dependency_layer(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project(tmp_path)
+    original = _builder(tmp_path, monkeypatch, context, "original")
+    original.build()
+    existing_entries = _dependency_keys(tmp_path / "cache")
+    capsys.readouterr()
+
+    startup = tmp_path / SECRET
+    startup.mkdir()
+    (startup / "sitecustomize.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "if '--target' in sys.argv:\n"
+        "    target = Path(sys.argv[sys.argv.index('--target') + 1])\n"
+        "    (target / 'startup_payload.py').write_text('STARTUP = True\\n')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(startup))
+
+    uncached = _builder(tmp_path, monkeypatch, context, "uncached", use_cache=False)
+    uncached.build()
+    assert uncached.layers[0].digest != original.layers[0].digest
+    capsys.readouterr()
+
+    rebuilt = _builder(tmp_path, monkeypatch, context, "rebuilt")
+    rebuilt.build()
+    output = capsys.readouterr().out
+
+    assert "Dependency layer cache miss: the builder Python startup environment" in output
+    assert SECRET not in output
+    assert rebuilt.layers[0].digest == uncached.layers[0].digest
+    assert _dependency_keys(tmp_path / "cache") == existing_entries
+
+
+def _project_with_unlisted_transitive(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    wheelhouse = context / "wheelhouse"
+    root = _named_wheel(wheelhouse, "config-root", requires=["config-child==1.0"])
+    _named_wheel(wheelhouse, "config-child")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f"config-root==1.0 --hash=sha256:{_sha(root)}\n"
+    )
+    return context
+
+
+def test_relative_pip_config_cannot_cache_an_incomplete_dependency_closure(
+    tmp_path, monkeypatch, capsys
+):
+    context = _project_with_unlisted_transitive(tmp_path)
+    config = context / "local-pip.conf"
+    config.write_text("[install]\nno-deps = true\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", config.name)
+
+    incomplete = _builder(tmp_path, monkeypatch, context, "incomplete")
+    incomplete.build()
+    output = capsys.readouterr().out
+    config.unlink()
+
+    with pytest.raises(RuntimeError, match="Target dependency installation failed"):
+        _builder(tmp_path, monkeypatch, context, "complete").build()
+
+    assert "Dependency layer cache miss: a relative pip configuration path" in output
+    assert _image(incomplete)[3] == [("config-root", "1.0")]
+    assert not _dependency_keys(tmp_path / "cache")
+
+
+def test_context_pip_module_cannot_hide_ambient_pip_settings(tmp_path, monkeypatch, capsys):
+    context = _project_with_unlisted_transitive(tmp_path)
+    (context / "pip.py").write_text("")
+    monkeypatch.chdir(context)
+    monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
+    monkeypatch.setenv("PIP_NO_DEPS", "1")
+
+    incomplete = _builder(tmp_path, monkeypatch, context, "incomplete")
+    incomplete.build()
+    output = capsys.readouterr().out
+    monkeypatch.delenv("PIP_NO_DEPS")
+
+    with pytest.raises(RuntimeError, match="Target dependency installation failed"):
+        _builder(tmp_path, monkeypatch, context, "complete").build()
+
+    assert "Dependency layer cache miss: ambient pip setting no-deps" in output
+    assert _image(incomplete)[3] == [("config-root", "1.0")]
+    assert not _dependency_keys(tmp_path / "cache")
 
 
 def test_locked_build_hit_makes_no_index_requests(tmp_path, monkeypatch, indexes):  # noqa: F811
@@ -311,6 +404,27 @@ def _lock_key(url, text="fixture-dep==1.0 --hash=sha256:" + "a" * 64):
     ).layer
 
 
+@pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"])
+def test_locked_cache_misses_for_python_startup_overrides(monkeypatch, name):
+    monkeypatch.setenv(name, SECRET)
+    with pytest.raises(DependencyCacheMiss, match="builder Python startup environment") as error:
+        _lock_key("https://pypi.org/simple")
+    assert SECRET not in str(error.value)
+
+
+def test_relative_pip_config_does_not_affect_locked_cache_identity(monkeypatch):
+    expected = _lock_key("https://pypi.org/simple")
+    monkeypatch.setenv("PIP_CONFIG_FILE", "local-pip.conf")
+    assert _lock_key("https://pypi.org/simple") == expected
+
+
+def test_python_image_metadata_does_not_disable_locked_cache(monkeypatch):
+    expected = _lock_key("https://pypi.org/simple")
+    monkeypatch.setenv("PYTHON_VERSION", "3.11.9")
+    monkeypatch.setenv("PYTHON_GET_PIP_URL", f"https://u:{SECRET}@example.invalid/get-pip.py")
+    assert _lock_key("https://pypi.org/simple") == expected
+
+
 @pytest.mark.parametrize("source_kind", ["requirements", "lock"])
 def test_cache_key_tracks_the_installer_target_marker_environment(
     tmp_path, monkeypatch, source_kind
@@ -332,10 +446,11 @@ def test_cache_key_tracks_the_installer_target_marker_environment(
     assert key() != before
 
 
-def test_cache_does_not_reuse_the_pre_target_marker_backend(tmp_path, monkeypatch):
+@pytest.mark.parametrize("old_backend", ["pip-target-v1", "pip-target-v2"])
+def test_cache_does_not_reuse_previous_installer_backends(tmp_path, monkeypatch, old_backend):
     context = _project(tmp_path)
     current_backend = dependency_cache.INSTALLER_BACKEND
-    monkeypatch.setattr(dependency_cache, "INSTALLER_BACKEND", "pip-target-v1")
+    monkeypatch.setattr(dependency_cache, "INSTALLER_BACKEND", old_backend)
     legacy_key = _key(context)
     cache = LayerCache(tmp_path / "cache")
     cache.store_bytes(legacy_key, b"legacy dependency layer", ["requirements.txt"])

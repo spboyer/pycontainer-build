@@ -30,7 +30,7 @@ from .dependencies import (
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
 # Bump when the installer changes layer-affecting behavior such as marker evaluation.
-INSTALLER_BACKEND = "pip-target-v2"
+INSTALLER_BACKEND = "pip-target-v3"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -82,6 +82,13 @@ _AMBIENT_IGNORED = {
 }
 _FIND_LINKS = ("-f", "--find-links")
 _SETTING_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+_PYTHON_IMAGE_METADATA = {
+    "PYTHON_VERSION",
+    "PYTHON_PIP_VERSION",
+    "PYTHON_SETUPTOOLS_VERSION",
+    "PYTHON_GET_PIP_URL",
+    "PYTHON_GET_PIP_SHA256",
+}
 
 
 class DependencyCacheMiss(Exception):
@@ -121,6 +128,13 @@ def dependency_cache_key(
         raise DependencyCacheMiss("virtualenv dependencies are not provably hash-pinned")
     if not reproducible:
         raise DependencyCacheMiss("non-reproducible builds embed file timestamps")
+    if any(
+        name.upper().startswith("PYTHON")
+        and name.upper() not in _PYTHON_IMAGE_METADATA
+        and value
+        for name, value in os.environ.items()
+    ):
+        raise DependencyCacheMiss("the builder Python startup environment is not provably isolated")
 
     if source_kind == "lock":
         inputs = _lock_inputs(requirement_sets)
@@ -128,6 +142,13 @@ def dependency_cache_key(
         # Locked installs run pip with --isolated and no PIP_* settings.
         ambient: object = "isolated"
     elif source_kind == "requirements" and requirements is not None:
+        config_file = os.environ.get("PIP_CONFIG_FILE", "")
+        if (
+            config_file
+            and os.path.normcase(config_file) != os.path.normcase(os.devnull)
+            and not os.path.isabs(config_file)
+        ):
+            raise DependencyCacheMiss("a relative pip configuration path is not provably stable")
         inputs, source_files = _requirements_inputs(requirements, context_dir)
         ambient = (ambient_reader or ambient_pip_settings)()
     else:
@@ -297,8 +318,9 @@ def ambient_pip_settings() -> List[List[str]]:
     """Read the effective pip configuration for plain requirements and key only provable settings."""
     environment = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
+        # Match the installer's exclusion of context-local imports.
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "--disable-pip-version-check", "config", "list"],
+            [sys.executable, "-P", "-m", "pip", "--disable-pip-version-check", "config", "list"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",

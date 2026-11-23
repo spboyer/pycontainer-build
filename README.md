@@ -615,7 +615,12 @@ an explicit miss printed as
 requirements, `-e`, `--no-deps`, direct-URL constraints, `file:` find-links,
 virtualenv staging, `--no-reproducible`, unknown ambient pip settings, and any
 index or find-links URL with a query string (a query can select another
-tenant or feed). A hit reuses the artifacts selected when the entry was stored.
+tenant or feed). Nonempty `PYTHON*` environment variables such as `PYTHONPATH`,
+`PYTHONHOME` and `PYTHONUSERBASE` also cause a miss for both lockfiles and
+plain requirements, except informational Python-image version/bootstrap
+metadata; their values are never stored. Plain requirements also miss when
+`PIP_CONFIG_FILE` is relative because pip runs in the build context. A hit
+reuses the artifacts selected when the entry was stored.
 
 **Saving and restoring the cache (offline export/import):** the `--cache-dir`
 directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only

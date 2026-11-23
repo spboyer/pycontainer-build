@@ -53,11 +53,14 @@ everything unprovable is an explicit `DependencyCacheMiss` with a secret-free
 reason. Keys hold target tags, Python, workdir, pip version, sanitized index
 identity (no userinfo, placeholders or query values; query-bearing URLs miss),
 the installer's exact target marker environment, allowlisted ambient pip
-settings for plain requirements, and `INSTALLER_BACKEND`. A backend change that
-alters marker evaluation must bump `INSTALLER_BACKEND` and key its marker
-environment. The inventory entry is stored after the layer and must name its
-digest; a hit runs no pip install and makes no network requests. Plain
-requirements still read the local pip configuration before lookup.
+settings for plain requirements, and `INSTALLER_BACKEND`. Nonempty Python
+startup overrides (such as `PYTHONPATH`) are explicit misses even for locked
+installs; a relative `PIP_CONFIG_FILE` is a miss for plain requirements. A
+backend change that alters staged output must bump `INSTALLER_BACKEND`; marker
+changes must also key the marker environment. The inventory entry is stored
+after the layer and must name its digest; a hit runs no pip install and makes
+no network requests. Plain requirements still read the local pip configuration
+before lookup.
 
 ## Setup and verified checks
 
