@@ -271,11 +271,11 @@ def test_cache_spec_and_config_validation():
 
 
 def test_cache_key_covers_sources_and_toolchain(monkeypatch):
-    baseline = app_layer_cache_key("v3:sha256:" + "1" * 64)
-    assert app_layer_cache_key("v3:sha256:" + "2" * 64) != baseline
-    assert app_layer_cache_key("v2:sha256:" + "1" * 64) != baseline
-    monkeypatch.setattr(remote_cache.platform, "python_version", lambda: "0.0.0")
+    baseline = app_layer_cache_key("v4:sha256:" + "1" * 64)
+    assert app_layer_cache_key("v4:sha256:" + "2" * 64) != baseline
     assert app_layer_cache_key("v3:sha256:" + "1" * 64) != baseline
+    monkeypatch.setattr(remote_cache.platform, "python_version", lambda: "0.0.0")
+    assert app_layer_cache_key("v4:sha256:" + "1" * 64) != baseline
     assert len(cache_tag(baseline)) <= 128
 
 
@@ -494,6 +494,65 @@ def test_remote_export_accepts_symlinks(tmp_path, registry):
     assert warm.digest == cold.digest
     with tarfile.open(cold.tar_path) as archive:
         assert archive.getmember("app/link.py").linkname == "app.py"
+
+
+def test_remote_cache_reuses_nested_symlink_with_normalized_target(
+    tmp_path, registry, monkeypatch
+):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    context = Path(writer.config.context_dir)
+    (context / "nested").mkdir()
+    link = context / "nested" / "link.py"
+    try:
+        link.symlink_to(os.path.join("..", "app.py"))
+    except OSError as error:
+        pytest.skip(f"Symlinks are unavailable: {error}")
+    writer.context_include_paths.append("nested")
+
+    cold = _app_layer(writer, tmp_path, "writer")
+    reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC)
+    reader.context_include_paths.append("nested")
+    _forbid_tar_build(monkeypatch)
+    warm = _app_layer(reader, tmp_path, "reader")
+
+    assert warm.digest == cold.digest
+    with tarfile.open(cold.tar_path) as archive:
+        assert archive.getmember("app/nested/link.py").linkname == "../app.py"
+
+
+def test_remote_export_rechecks_symlink_target_selection(tmp_path, registry, monkeypatch):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    context = Path(writer.config.context_dir)
+    (context / "other.py").write_text("unselected")
+    link = context / "link.py"
+    try:
+        link.symlink_to("app.py")
+    except OSError as error:
+        pytest.skip(f"Symlinks are unavailable: {error}")
+    writer.context_include_paths.append("link.py")
+    collect_hardlinks = builder_module.emitted_hardlinks
+
+    def retarget_after_emission(ordered_files, members):
+        hardlinks = collect_hardlinks(ordered_files, members)
+        link.unlink()
+        link.symlink_to("other.py")
+        return hardlinks
+
+    monkeypatch.setattr(builder_module, "emitted_hardlinks", retarget_after_emission)
+    with pytest.raises(ValueError, match="another selected file"):
+        _app_layer(writer, tmp_path, "writer")
+
+    assert not registry.manifest_puts()
+
+
+def test_remote_export_rechecks_one_shot_include_paths(tmp_path, registry):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+
+    layer = writer._create_app_layer(layers, iter(writer.context_include_paths))
+
+    assert layer.digest in registry.blobs
 
 
 def test_remote_export_accepts_extended_tar_paths(tmp_path, registry):

@@ -1,4 +1,4 @@
-import hashlib, json, os, shutil, tarfile, tempfile, logging
+import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
 from dataclasses import dataclass
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -19,8 +19,8 @@ from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     context_exclude_paths,
     ensure_dir,
-    iter_files,
     output_directory_lock,
+    select_context_files,
 )
 
 
@@ -528,7 +528,7 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         platforms=self.config.target_platforms()
-        self._resolved_base_reference=None
+        self._registry_base_snapshot=None
         self._resolved_base_from_tag=False
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
@@ -844,37 +844,35 @@ class ImageBuilder:
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        # Later registry platforms re-select from the same verified base index as the first.
-        pinned = None if local else getattr(self, "_resolved_base_reference", None)
-        pull_reference = pinned or reference
+        # Every registry platform selects from the first verified base snapshot; the
+        # mutable tag is never requested again, so a moved tag cannot mix bases.
+        snapshot = None if local else getattr(self, "_registry_base_snapshot", None)
         if not local:
             print(f"Pulling base image {self.config.base_image} for {target}...")
-        manifest, resolved_digest = client.pull_manifest(
-            pull_reference,
-            expected_digest=(
-                pull_reference
-                if pull_reference and pull_reference.startswith("sha256:")
-                else None
-            ),
-        )
-        if (
-            not local
-            and pinned is None
-            and isinstance(resolved_digest, str)
-            and resolved_digest.startswith("sha256:")
-        ):
-            self._resolved_base_reference = resolved_digest
-            # Only a registry pull by tag can vouch for the tag; a user-supplied
-            # tag@digest or digest is pulled by digest and never proves its tag.
-            self._resolved_base_from_tag = not reference.startswith("sha256:")
+        if snapshot is None:
+            manifest, resolved_digest = client.pull_manifest(
+                reference,
+                expected_digest=(
+                    reference
+                    if reference and reference.startswith("sha256:")
+                    else None
+                ),
+            )
+        else:
+            manifest, resolved_digest = copy.deepcopy(snapshot[0]), snapshot[1]
         if local:
             self._base_image_tag_verified = False
-        elif pinned is None:
-            self._base_image_tag_verified = (
+        elif snapshot is None:
+            self._registry_base_snapshot = (copy.deepcopy(manifest), resolved_digest)
+            # Only a registry pull by tag can vouch for the tag; a user-supplied
+            # tag@digest or digest is pulled by digest and never proves its tag.
+            # RegistryClient verifies sha256 and sha512 digests against the bytes.
+            self._resolved_base_from_tag = (
                 not reference.startswith("sha256:")
                 and isinstance(resolved_digest, str)
-                and resolved_digest.startswith("sha256:")
+                and resolved_digest.startswith(("sha256:", "sha512:"))
             )
+            self._base_image_tag_verified = self._resolved_base_from_tag
         else:
             self._base_image_tag_verified = bool(
                 getattr(self, "_resolved_base_from_tag", False)
@@ -1247,8 +1245,8 @@ class ImageBuilder:
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
         # Local annotations/tags and any digest reference are identity claims, not
         # a resolved registry tag, so they cannot establish the Python ABI or libc.
-        # Later platforms are pulled by the pinned index digest; they inherit tag
-        # provenance only when that digest was resolved from the initial tag pull.
+        # Later platforms reuse the first pinned base snapshot; they inherit tag
+        # provenance only when that snapshot was resolved from the initial tag pull.
         base_image_tag_verified = (
             parse_local_image_reference(self.config.base_image) is None
             and "@" not in self.config.base_image
@@ -1353,14 +1351,7 @@ class ImageBuilder:
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
         include_paths=tuple(include_paths)
-        files=list(
-            iter_files(
-                ctx,
-                include_paths,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=self.config.exclude_defaults,
-            )
-        )
+        files=select_context_files(ctx, include_paths, self.context_excludes)
         configured_requirements = ctx / self.config.requirements_file
         reject_shipped_credentials(
             files,
@@ -1446,13 +1437,8 @@ class ImageBuilder:
         return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
 
     def _verify_app_identity(self, files, identity, include_paths, *, hardlinks=None):
-        current_files=list(
-            iter_files(
-                Path(self.config.context_dir),
-                include_paths,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=self.config.exclude_defaults,
-            )
+        current_files=select_context_files(
+            Path(self.config.context_dir), include_paths, self.context_excludes
         )
         expected_names=sorted(Path(relative).as_posix() for _, relative in files)
         current_names=sorted(Path(relative).as_posix() for _, relative in current_files)
@@ -1509,20 +1495,20 @@ class ImageBuilder:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
                     arc=app_layer_arcname(self.config.workdir, rel)
+                    tarinfo=tar.gettarinfo(abs_path, arcname=arc)
+                    if tarinfo.issym():
+                        tarinfo.linkname=tarinfo.linkname.replace(os.sep, "/")
                     if self.config.reproducible:
-                        tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
                         tarinfo.uid=0
                         tarinfo.gid=0
                         tarinfo.uname="root"
                         tarinfo.gname="root"
-                        if tarinfo.isfile():
-                            with open(abs_path, 'rb') as f:
-                                tar.addfile(tarinfo, f)
-                        else:
-                            tar.addfile(tarinfo)
+                    if tarinfo.isfile():
+                        with open(abs_path, 'rb') as f:
+                            tar.addfile(tarinfo, f)
                     else:
-                        tar.add(abs_path,arcname=arc)
+                        tar.addfile(tarinfo)
                 hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             if uses_remote_cache:
                 self._verify_app_identity(

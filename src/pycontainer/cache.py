@@ -20,7 +20,7 @@ from .fs_utils import file_lock
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
 _MAX_TAR_READ_BYTES = 1024 * 1024
-_CACHE_KEY_VERSION = 3
+_CACHE_KEY_VERSION = 4
 
 
 class _BoundedTarReader(io.BufferedReader):
@@ -184,7 +184,7 @@ class LayerCache:
             if stat.S_ISLNK(metadata.st_mode):
                 record["kind"] = "symlink"
                 record["content"] = hashlib.sha256(
-                    os.fsencode(os.readlink(abs_path))
+                    os.fsencode(os.readlink(abs_path).replace(os.sep, "/"))
                 ).hexdigest()
             elif stat.S_ISREG(metadata.st_mode):
                 record["kind"] = "file"
@@ -301,7 +301,7 @@ class LayerCache:
                     elif member.issym():
                         if not stat.S_ISLNK(metadata.st_mode):
                             raise ValueError("Application layer symlink type differs")
-                        # The v3 key uses lstat size, while tar stores symlinks with size zero.
+                        # The cache key uses lstat size, while tar stores symlinks with size zero.
                         record.update(
                             kind="symlink",
                             size=metadata.st_size,

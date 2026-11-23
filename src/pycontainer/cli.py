@@ -32,6 +32,26 @@ def _tolerate_unencodable_output():
         try: "\u2713".encode(encoding)
         except (UnicodeEncodeError, LookupError): reconfigure(errors="replace")
 
+def _run_registry(parser, args):
+    from .blob_store import BlobIntegrityError
+    from .registry_cleanup import RegistryConfirmationError, run_delete, run_prune
+    from .registry_client import RegistryRequestError
+    if args.username and not (args.password or os.getenv('REGISTRY_PASSWORD')):
+        parser.error("--username requires --password or REGISTRY_PASSWORD.")
+    if args.username and not args.password:
+        args.password=os.getenv('REGISTRY_PASSWORD')
+    if args.registry_cmd=="prune" and args.keep<1:
+        parser.error("--keep must be at least 1.")
+    if args.registry_cmd=="prune" and args.page_size is not None and args.page_size<1:
+        parser.error("--page-size must be at least 1.")
+    try:
+        return run_delete(args) if args.registry_cmd=="delete" else run_prune(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    except (RegistryRequestError, RegistryConfirmationError, BlobIntegrityError) as exc:
+        print(f"Error: {exc}",file=sys.stderr)
+        return 1
+
 def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
     if tagging:
@@ -122,6 +142,24 @@ def main():
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    reg=sub.add_parser("registry",help="Delete or prune images in a registry")
+    reg_sub=reg.add_subparsers(dest="registry_cmd",required=True)
+    rd=reg_sub.add_parser("delete",help="Delete one manifest digest (removes every tag pointing to it)")
+    rd.add_argument("reference",help="Image reference with an explicit tag or @sha256 digest")
+    rp=reg_sub.add_parser("prune",help="Delete older semantic-version tags; dry run unless --execute")
+    rp.add_argument("repository",help="Repository without a tag, e.g. ghcr.io/user/app")
+    rp.add_argument("--keep",type=int,required=True,help="Number of highest semantic versions to keep (>= 1)")
+    rp.add_argument("--match",default="*",help="Glob selecting tags to consider (default: *)")
+    rp.add_argument("--protect",action="append",help="Glob of tags never pruned (repeatable)")
+    rp.add_argument("--page-size",type=int,help="Tags requested per page (registry may cap it)")
+    mode=rp.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run",action="store_true",help="Only print the plan (default)")
+    mode.add_argument("--execute",action="store_true",help="Delete the planned digests after confirmation")
+    for command in (rd, rp):
+        command.add_argument("--yes",action="store_true",help="Confirm deletion without prompting")
+        command.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
+        command.add_argument("--password",help="Registry password/token (or use env vars)")
+    rd.add_argument("--dry-run",action="store_true",help="Resolve and print the digest without deleting")
     history=sub.add_parser("history",help="Inspect or delete local build history")
     history_actions=history.add_subparsers(dest="history_action",required=True)
     for action in ("list", "clear"):
@@ -140,6 +178,8 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="registry":
+        raise SystemExit(_run_registry(parser,args))
     if args.cmd=="history":
         try:
             store=BuildHistory(args.history_dir)
