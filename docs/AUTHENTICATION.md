@@ -235,7 +235,8 @@ separate.
   `requirements*.txt|.in`, `constraints*.txt|.in`, `pip.conf`, `pip.ini` and
   requirements-graph files are scanned the same way, and `.netrc` / `_netrc`
   files are rejected. A host `PIP_CONFIG_FILE` or `NETRC` that points inside
-  the context is treated the same way, whatever its file name. Exclude them
+  the context is treated the same way, whatever its file name. Files over
+  1 MiB are rejected rather than partially scanned. Exclude them
   from the context or use placeholders.
 - **Host pip settings cannot change target selection.** Only these `PIP_*`
   variables, and the matching pip config-file keys, reach pip:

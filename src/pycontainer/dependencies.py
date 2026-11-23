@@ -711,7 +711,14 @@ def reject_shipped_credentials(
         ):
             continue
         with open(source, "rb") as handle:
-            text = _decode_requirements(handle.read(MAX_REQUIREMENTS_BYTES), "replace")
+            data = handle.read(MAX_REQUIREMENTS_BYTES + 1)
+        if len(data) > MAX_REQUIREMENTS_BYTES:
+            raise ValueError(
+                f"{relative.as_posix()} is too large to scan for credentials "
+                f"(over {MAX_REQUIREMENTS_BYTES} bytes) and would be copied into the "
+                "image; shrink it or exclude it from the build context."
+            )
+        text = _decode_requirements(data, "replace")
         reject_literal_credentials(Path(source), text, context_root)
 
 

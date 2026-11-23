@@ -20,8 +20,10 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.credentials import redact, url_has_credentials
 from pycontainer.dependencies import (
+    MAX_REQUIREMENTS_BYTES,
     _pip_failure_message,
     reject_credentialed_direct_urls,
+    reject_shipped_credentials,
     install_requirements,
     staged_packages,
     validate_requirements,
@@ -342,6 +344,22 @@ def test_literal_credentials_in_included_constraints_are_rejected(tmp_path):
         validate_requirements(context / "requirements.txt", context)
 
     assert SECRET not in str(error.value)
+
+
+@pytest.mark.parametrize("name", ["pip.conf", "constraints-dev.txt"])
+def test_oversized_shipped_pip_input_fails_closed(tmp_path, name):
+    context = tmp_path / "context"
+    context.mkdir()
+    shipped = context / name
+    shipped.write_text(
+        "#" * (MAX_REQUIREMENTS_BYTES + 1)
+        + f"\nindex-url = https://{USER}:{SECRET}@example.invalid/simple\n"
+    )
+
+    with pytest.raises(ValueError, match="too large to scan") as error:
+        reject_shipped_credentials([(shipped, Path(name))], context)
+
+    assert SECRET not in str(error.value) and USER not in str(error.value)
 
 
 @pytest.fixture
