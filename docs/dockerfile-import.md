@@ -23,6 +23,8 @@ pycontainer import Dockerfile --shell '["/bin/bash", "-c"]'
 - `--force` refuses, leaving the file untouched, if it already defines a
   top-level `[build]` table, because a config file must contain exactly one
   pycontainer table.
+- Existing inline `tool.pycontainer` definitions cannot be merged; `--force`
+  fails without changing the file. Convert them to tables before retrying.
 
 ## Building from the imported settings
 
