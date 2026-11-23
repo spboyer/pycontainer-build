@@ -86,8 +86,12 @@ def test_no_path_validates_build_defaults_with_local_detection(offline, monkeypa
     assert cfg.base_image == "python:3.13-slim" and table is None
 
 
-def test_invalid_detected_project_metadata_is_a_diagnostic(offline, monkeypatch, capsys):
-    _write(offline / "pyproject.toml", '[project]\nname = "demo"\nrequires-python = 312\n')
+@pytest.mark.parametrize(
+    "content",
+    ['[project]\nname = "demo"\nrequires-python = 312\n', 'project = "invalid"\n'],
+)
+def test_invalid_detected_project_metadata_is_a_diagnostic(offline, monkeypatch, capsys, content):
+    _write(offline / "pyproject.toml", content)
 
     assert _run(monkeypatch, ["validate", "config"]) == 2
     assert "[project].requires-python: cannot detect the Python version" in capsys.readouterr().err
@@ -102,6 +106,22 @@ def test_cli_overrides_take_precedence_and_are_attributed(offline, monkeypatch, 
 
     _write(offline / "pycontainer.toml", '[build]\nplatform = "bad"\n')
     assert _run(monkeypatch, ["validate", "config", "-c", path, "--platform", "linux/amd64"]) == 0
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_overrides_invalid_file_types_before_validation(offline, monkeypatch, capsys, table):
+    path = _write(offline / "config.toml", f'[{table}]\nplatform = 123\ninclude-deps = "invalid"\n')
+
+    assert _run(monkeypatch, ["validate", "config", path]) == 2
+    assert f"Invalid value for [{table}].platform" in capsys.readouterr().err
+    assert _run(
+        monkeypatch, ["validate", "config", path, "--platform", "linux/arm64", "--include-deps"]
+    ) == 0
+
+
+def test_validate_build_table_with_unrelated_scalar_tool(offline, monkeypatch):
+    path = _write(offline / "config.toml", 'tool = "standalone"\n[build]\n')
+    assert _run(monkeypatch, ["validate", "config", path]) == 0
 
 
 @pytest.mark.parametrize(
@@ -182,6 +202,16 @@ def test_build_and_validate_share_checks(offline, monkeypatch, capsys, content, 
     assert message in capsys.readouterr().err
     assert _run(monkeypatch, ["build", "--config", path, *extra]) == 2
     assert message in capsys.readouterr().err
+
+
+def test_directory_config_path_reports_an_error_in_build_and_validate(offline, monkeypatch, capsys):
+    path = str(offline)
+
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, command) == 2
+        err = capsys.readouterr().err
+        assert path in err or repr(path) in err
+        assert "Traceback" not in err
 
 
 @pytest.mark.parametrize(

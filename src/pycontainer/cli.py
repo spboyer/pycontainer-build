@@ -189,7 +189,7 @@ def main():
 
     try:
         cfg,_=resolve_build_config(Path(args.config) if args.config else None, cli_overrides)
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
     if cfg.verbose:

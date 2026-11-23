@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from pycontainer import builder, cache, cli, init_config, registry_client
-from pycontainer.config_loader import load_validated_file_config
+from pycontainer.config_loader import load_explicit_file_config
 from pycontainer.effective_config import resolve_build_config
 
 
@@ -53,7 +53,7 @@ def test_template_round_trips_through_real_loader(offline, monkeypatch, template
 
     assert _run(monkeypatch, ["init", "--template", template]) == 0
 
-    table, settings = load_validated_file_config(offline / "pycontainer.toml")
+    table, settings = load_explicit_file_config(offline / "pycontainer.toml")
     cfg, _ = resolve_build_config(offline / "pycontainer.toml", {})
     assert table == "[build]"
     assert cfg.base_image == "python:3.12-slim"

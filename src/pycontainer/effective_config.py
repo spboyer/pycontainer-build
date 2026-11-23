@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
 from .config import BuildConfig
-from .config_loader import _validate_config, load_validated_file_config, merge_configs
+from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
 from .dependencies import validate_target_platform
 from .fs_utils import relative_context_path
 from .project import detect_python_version
@@ -133,7 +133,7 @@ def resolve_build_config(
     """
     table, file_config = None, {}
     if config_path is not None:
-        table, file_config = load_validated_file_config(config_path)
+        table, file_config = load_explicit_file_config(config_path)
     cfg = resolve_settings(file_config, overrides, table, detect_base_image=config_path is None)
     return cfg, table
 
@@ -147,7 +147,7 @@ def resolve_settings(
 ) -> BuildConfig:
     """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
-    _validate_config(merged)
+    _validate_config(merged, table or BUILD_TABLE)
     origin = lambda field: _origin(field, overrides, table, file_config)
     try:
         cfg = BuildConfig(**merged)
@@ -156,7 +156,7 @@ def resolve_settings(
     if detect_base_image and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
-        except (TypeError, ValueError) as exc:
+        except (AttributeError, TypeError, ValueError) as exc:
             pyproject = Path(cfg.context_dir) / "pyproject.toml"
             raise ConfigValidationError(
                 [f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}"]
