@@ -24,7 +24,7 @@ from .credentials import (
     redact,
     url_has_credentials,
 )
-from .venv_markers import declared_roots, host_environments, venv_layout_os
+from .venv_markers import declared_roots, host_facts, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
@@ -1033,7 +1033,7 @@ def _verify_target_closure(
     environment = _target_marker_environment(os_name, arch, python_version, base_config, variant)
     request = {
         "environment": environment,
-        "hosts": host_environments(environment, version_established, host_os_name),
+        "host": host_facts(environment, version_established, host_os_name),
         "distributions": distributions,
         "roots": roots,
         "constraints": constraint_lines,

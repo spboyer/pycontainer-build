@@ -1,10 +1,10 @@
-import hashlib, json, os, shutil, tarfile, tempfile, logging
+import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
 from dataclasses import dataclass
 from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -204,7 +204,8 @@ from .registry_client import (
     RegistryRequestError,
     parse_image_reference,
 )
-from .auth import get_registry_auth
+from .auth import get_mirror_auth, get_registry_auth
+from .registry_mirrors import MirroredPullClient
 from .local_image import (
     LocalImageError,
     check_local_image_bounds,
@@ -522,7 +523,7 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         platforms=self.config.target_platforms()
-        self._resolved_base_reference=None
+        self._registry_base_snapshot=None
         self._resolved_base_from_tag=False
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
@@ -768,6 +769,23 @@ class ImageBuilder:
             )
         return client
 
+    def _base_image_client(self, registry: str, repo: str):
+        """Return a pull client that tries configured mirrors before upstream."""
+        def upstream_client():
+            auth=get_registry_auth(registry, include_generic_environment=False)
+            return self._registry_client(registry, repo, auth)
+
+        mirrors=self.config.registry_mirrors.get(canonical_registry(registry), [])
+        if not mirrors:
+            return upstream_client()
+
+        def mirror_client(host):
+            return lambda: self._registry_client(host, repo, get_mirror_auth(host))
+
+        endpoints=[(host, mirror_client(host)) for host in mirrors]
+        endpoints.append((registry, upstream_client))
+        return MirroredPullClient(registry, endpoints)
+
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
         self._base_image_name=self.config.base_image
@@ -775,9 +793,7 @@ class ImageBuilder:
         local=parse_local_image_reference(self.config.base_image)
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
-            # Generic REGISTRY_* variables target the destination, not the base registry.
-            auth=get_registry_auth(registry, include_generic_environment=False)
-            client=self._registry_client(registry, repo, auth)
+            client=self._base_image_client(registry, repo)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 
         target = f"{os_name}/{arch}" + (
@@ -827,37 +843,35 @@ class ImageBuilder:
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        # Later registry platforms re-select from the same verified base index as the first.
-        pinned = None if local else getattr(self, "_resolved_base_reference", None)
-        pull_reference = pinned or reference
+        # Every registry platform selects from the first verified base snapshot; the
+        # mutable tag is never requested again, so a moved tag cannot mix bases.
+        snapshot = None if local else getattr(self, "_registry_base_snapshot", None)
         if not local:
             print(f"Pulling base image {self.config.base_image} for {target}...")
-        manifest, resolved_digest = client.pull_manifest(
-            pull_reference,
-            expected_digest=(
-                pull_reference
-                if pull_reference and pull_reference.startswith("sha256:")
-                else None
-            ),
-        )
-        if (
-            not local
-            and pinned is None
-            and isinstance(resolved_digest, str)
-            and resolved_digest.startswith("sha256:")
-        ):
-            self._resolved_base_reference = resolved_digest
-            # Only a registry pull by tag can vouch for the tag; a user-supplied
-            # tag@digest or digest is pulled by digest and never proves its tag.
-            self._resolved_base_from_tag = not reference.startswith("sha256:")
+        if snapshot is None:
+            manifest, resolved_digest = client.pull_manifest(
+                reference,
+                expected_digest=(
+                    reference
+                    if reference and reference.startswith("sha256:")
+                    else None
+                ),
+            )
+        else:
+            manifest, resolved_digest = copy.deepcopy(snapshot[0]), snapshot[1]
         if local:
             self._base_image_tag_verified = False
-        elif pinned is None:
-            self._base_image_tag_verified = (
+        elif snapshot is None:
+            self._registry_base_snapshot = (copy.deepcopy(manifest), resolved_digest)
+            # Only a registry pull by tag can vouch for the tag; a user-supplied
+            # tag@digest or digest is pulled by digest and never proves its tag.
+            # RegistryClient verifies sha256 and sha512 digests against the bytes.
+            self._resolved_base_from_tag = (
                 not reference.startswith("sha256:")
                 and isinstance(resolved_digest, str)
-                and resolved_digest.startswith("sha256:")
+                and resolved_digest.startswith(("sha256:", "sha512:"))
             )
+            self._base_image_tag_verified = self._resolved_base_from_tag
         else:
             self._base_image_tag_verified = bool(
                 getattr(self, "_resolved_base_from_tag", False)
@@ -977,6 +991,9 @@ class ImageBuilder:
             )
         
         print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
+        if self.verbose and isinstance(client, MirroredPullClient):
+            served=", ".join(client.serving_hosts) or "local blob store"
+            print(f"  Served by: {served}")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -1091,6 +1108,9 @@ class ImageBuilder:
         if len(self.config.all_tags())>1:
             print(f"  Tags: {', '.join(self.config.all_tags())}")
         print(f"  Base Image: {self.config.base_image}")
+        if self.config.registry_mirrors:
+            mirrors="; ".join(f"{k} -> {', '.join(v)}" for k,v in self.config.registry_mirrors.items())
+            print(f"  Base Image Mirrors: {mirrors}")
         platforms=self.config.target_platforms()
         if len(platforms)>1:
             print(f"  Platforms (image index): {', '.join(platforms)}")
@@ -1305,8 +1325,8 @@ class ImageBuilder:
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
         # Local annotations/tags and any digest reference are identity claims, not
         # a resolved registry tag, so they cannot establish the Python ABI or libc.
-        # Later platforms are pulled by the pinned index digest; they inherit tag
-        # provenance only when that digest was resolved from the initial tag pull.
+        # Later platforms reuse the first pinned base snapshot; they inherit tag
+        # provenance only when that snapshot was resolved from the initial tag pull.
         base_image_tag_verified = self._has_verified_base_image_tag()
         version = target_python_version(
             base_image_name, base_config,

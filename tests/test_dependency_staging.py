@@ -3379,7 +3379,7 @@ def test_virtualenv_optional_roots_fail_only_when_selection_is_unknown(tmp_path,
         '[project.optional-dependencies]\n'
         'speed = ["not-installed", "venv-linux; sys_platform == \'linux\'"]\n'
     )
-    # Every plausible host would have installed not-installed, so speed was not selected.
+    # Any venv host would have installed not-installed, so speed was not selected.
     assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
 
     pyproject.write_text(
@@ -3476,6 +3476,110 @@ def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
 
     if fails:
         with pytest.raises(ValueError, match=r"extra \[uvloop\] of venv-root"):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+_POSIX_VENV = {"pyvenv": "version = 3.11.7\nhome = /usr/bin\n", "lib": ("lib", "python3.11")}
+_WINDOWS_VENV = {"pyvenv": "version = 3.11.7\nhome = C:\\Python311\n", "lib": ("Lib",)}
+_UNPROVEN_SPEED = "Cannot determine whether extra [speed] of venv-root"
+
+
+@pytest.mark.parametrize("layout", [_POSIX_VENV, _WINDOWS_VENV], ids=["posix", "windows"])
+@pytest.mark.parametrize(
+    ("marker", "root", "error"),
+    [
+        # An armv7l creator could have selected [speed] without installing venv-fast (#142).
+        ('extra == "speed" and platform_machine != "armv7l"', "", _UNPROVEN_SPEED),
+        ('extra == "speed" and platform_machine != "riscv64"', "", _UNPROVEN_SPEED),
+        ('extra == "speed" and sys_platform != "freebsd14"', "", _UNPROVEN_SPEED),
+        # Inactive on the amd64 target, so its absence never matters.
+        ('extra == "speed" and platform_machine == "armv7l"', "", None),
+        ('extra == "speed"', "", None),
+        ('extra == "speed" and platform_machine == "x" or extra == "speed"', "", None),
+        (
+            'extra == "speed" and platform_machine != "armv7l"',
+            "venv-root[speed]\n",
+            "venv-root 1.0 [speed] requires 'venv-fast",
+        ),
+        ('extra == "speed"', "venv-root[speed]\n", "venv-root 1.0 [speed] requires 'venv-fast"),
+    ],
+)
+def test_virtualenv_extras_are_not_ruled_out_for_unknown_creator_hosts(
+    tmp_path, monkeypatch, layout, marker, root, error
+):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {"venv-root": ["Provides-Extra: speed", f"Requires-Dist: venv-fast; {marker}"]},
+        **layout,
+    )
+    (context / "requirements.txt").write_text(root)
+
+    if error is None:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+    else:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "table",
+    ['[project]\nname = "app"\n[project.optional-dependencies]\n', "[dependency-groups]\n"],
+    ids=["optional", "group"],
+)
+@pytest.mark.parametrize(
+    ("entry", "fails"),
+    [
+        ("venv-absent; platform_machine != 'armv7l'", True),
+        ("venv-absent; sys_platform != 'freebsd14'", True),
+        ("venv-absent", False),
+        ("venv-absent; platform_machine == 'armv7l'", False),
+        ("venv-root; platform_machine != 'armv7l'", False),
+    ],
+)
+def test_virtualenv_groups_are_not_ruled_out_for_unknown_creator_hosts(
+    tmp_path, monkeypatch, table, entry, fails
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"venv-root": []}, **_POSIX_VENV)
+    (context / "pyproject.toml").write_text(f'{table}speed = ["{entry}"]\n')
+
+    if fails:
+        with pytest.raises(
+            ValueError, match=r"Cannot determine whether pyproject .*'speed' was selected"
+        ):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+
+@pytest.mark.parametrize(
+    ("layout", "fails"), [(_WINDOWS_VENV, False), (_POSIX_VENV, True)], ids=["windows", "posix"]
+)
+def test_virtualenv_extras_are_not_ruled_out_by_enumerating_platforms(
+    tmp_path, monkeypatch, layout, fails
+):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {
+            "venv-root": [
+                "Provides-Extra: broker",
+                *(
+                    f'Requires-Dist: venv-broker; platform_system == "{system}"'
+                    ' and extra == "broker"'
+                    for system in ("Windows", "Darwin", "Linux")
+                ),
+            ]
+        },
+        **layout,
+    )
+    (context / "requirements.txt").write_text("venv-root\n")
+
+    # A POSIX creator need not be Darwin or Linux; a Windows layout implies Windows.
+    if fails:
+        with pytest.raises(ValueError, match=r"Cannot determine whether extra \[broker\]"):
             _stage_base_venv(tmp_path, monkeypatch, context)
     else:
         assert _stage_base_venv(tmp_path, monkeypatch, context) is not None

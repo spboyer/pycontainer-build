@@ -148,6 +148,29 @@ def offline():
         yield
 
 
+def test_local_base_bypasses_configured_mirrors(tmp_path, offline, monkeypatch):
+    layout = Layout(tmp_path / "base")
+    descriptor, platform, layer = layout.image(b"local")
+    layout.add(descriptor, platform=platform)
+    builder = ImageBuilder(BuildConfig(
+        base_image=f"oci:{layout.root}",
+        context_dir=str(tmp_path / "context"),
+        output_dir=str(tmp_path / "out"),
+        registry_mirrors={"docker.io": ["mirror.example"]},
+    ))
+    monkeypatch.setattr(
+        builder, "_base_image_client",
+        lambda *_args: pytest.fail("local base must not use a registry mirror"),
+    )
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+
+    layers, config = builder._pull_base_image(layers_dir, "linux", "amd64")
+
+    assert layers[0].digest == layer["digest"]
+    assert config["rootfs"]["diff_ids"] == [layer["digest"]]
+
+
 def build(tmp_path: Path, base_image: str, platform="linux/amd64"):
     context = tmp_path / "context"
     context.mkdir(exist_ok=True)
