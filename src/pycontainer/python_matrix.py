@@ -133,7 +133,6 @@ class PythonMatrixBuilder:
         self.operations: List[PublicationOperation] = []
         self.built = False
         explicit = resolve_tags(config.tag, config.tags)
-        self.version_tag_count = len(explicit)
         excludes = context_exclude_paths(
             config.context_dir, output_dir=config.output_dir,
             exclude_paths=config.exclude_paths, exclude_defaults=False,
@@ -218,8 +217,25 @@ class PythonMatrixBuilder:
             raise RuntimeError("Must successfully build and validate every Python version before push().")
         with self._locks():
             self._verify()
-            registry, repo, _ = parse_image_reference(registry_url or self.config.tag)
+            target = registry_url or self.config.tag
+            registry, repo, tag = parse_image_reference(target)
             repository = f"{registry}/{repo}"
+            explicit = resolve_tags(target, [
+                parse_image_reference(ref)[2]
+                for ref in resolve_tags(self.config.tag, self.config.tags)[1:]
+            ])
+            alias_refs = resolve_tags(target, [
+                parse_image_reference(ref)[2] for ref in self.config.all_tags()[1:]
+            ])
+            version_refs = {
+                version: [f"{ref}-py{version}" for ref in explicit]
+                for version in self.children
+            }
+            suffixed = {ref for refs in version_refs.values() for ref in refs}
+            for ref in suffixed:
+                resolve_tags(ref)
+            if suffixed & set(alias_refs):
+                raise ValueError("Python matrix aliases collide with generated version tags.")
             blobs, manifests, indexes, version_tags, aliases = [], [], [], [], []
             seen = set()
             for version, child in self.children.items():
@@ -236,10 +252,10 @@ class PythonMatrixBuilder:
                 path = layers / digest_filename(child.manifest_digest)
                 if child.index_digest:
                     indexes.append(PublicationOperation(kind, f"{repository}@{child.index_digest}", path))
-                for i, ref in enumerate(child.config.all_tags()):
-                    name = parse_image_reference(ref)[2]
-                    operation = PublicationOperation(kind, f"{repository}:{name}", path)
-                    (version_tags if i < self.version_tag_count else aliases).append(operation)
+                refs = version_refs[version] + (alias_refs if version == self.default else [])
+                for i, ref in enumerate(refs):
+                    operation = PublicationOperation(kind, ref, path)
+                    (version_tags if i < len(explicit) else aliases).append(operation)
             self.operations = blobs + manifests + indexes + version_tags + aliases
             try:
                 auth = get_registry_auth(registry, bearer_token=auth_token, username=username, password=password)
@@ -272,4 +288,4 @@ class PythonMatrixBuilder:
                 operation.outcome = "confirmed"
                 if show_progress:
                     print(f"Confirmed {operation.kind}: {operation.reference}")
-        return self.config.tag
+        return f"{repository}:{tag}"

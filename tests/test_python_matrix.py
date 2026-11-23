@@ -448,6 +448,96 @@ def test_all_content_before_tags_and_aliases_last(tmp_path, monkeypatch):
     assert all(op.outcome == "confirmed" for op in build.operations)
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+@pytest.mark.parametrize("primary", ["v9", "stable", "v1.2"])
+def test_matrix_push_override_replaces_primary_and_returns_destination(
+    tmp_path, monkeypatch, platform, primary
+):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, platform=platform, tags=["stable"],
+        default_python_version="3.12",
+    )
+    builder = ImageBuilder(build.config)
+    builder.build()
+    push = FakePushClient()
+    clients = []
+
+    def client(registry, repository, **kwargs):
+        clients.append((registry, repository))
+        return push
+
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    destination = f"mirror.example/other/app:{primary}"
+    assert builder.push(registry_url=destination, show_progress=False) == destination
+    assert clients == [("mirror.example", "other/app")]
+    publications = builder._python_matrix.operations
+    tag_operations = [op for op in publications if "@" not in op.reference]
+    explicit = list(dict.fromkeys([primary, "stable"]))
+    expected = [
+        f"mirror.example/other/app:{name}-py{version}"
+        for version in ("3.11", "3.12") for name in explicit
+    ] + [
+        f"mirror.example/other/app:{name}"
+        for name in dict.fromkeys([primary, "stable", "v1.2", "v1", "latest"])
+    ]
+    assert [op.reference for op in tag_operations] == expected
+    written_tags = [
+        call[1] for call in push.calls if call[0] != "blob" and not call[1].startswith("sha256:")
+    ]
+    assert written_tags == [ref.rsplit(":", 1)[1] for ref in expected]
+    assert len(written_tags) == len(set(written_tags))
+    assert all(op.outcome == "confirmed" for op in publications)
+    first_tag = next(i for i, op in enumerate(publications) if "@" not in op.reference)
+    assert all("@" in op.reference for op in publications[:first_tag])
+    for op in tag_operations:
+        version = "3.11" if op.reference.endswith("-py3.11") else "3.12"
+        assert op.path.name == builder._python_matrix.children[version].manifest_digest.split(":")[1]
+    assert build.config.tag == "registry.example/team/app:v1.2.3"
+
+
+def test_matrix_override_failure_reports_destination_without_retry(tmp_path, monkeypatch):
+    build, _, _ = matrix(tmp_path, monkeypatch)
+    build.build()
+    attempts = []
+
+    def fail(call):
+        attempts.append(call)
+        return call[0] == "manifest" and call[1] == "v9"
+
+    push = FakePushClient(fail_on=fail)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(MatrixPublicationError) as raised:
+        build.push(registry_url="mirror.example/other/app:v9", show_progress=False)
+    tags = [op for op in raised.value.operations if "@" not in op.reference]
+    assert [(op.reference, op.outcome) for op in tags] == [
+        ("mirror.example/other/app:v9-py3.11", "confirmed"),
+        ("mirror.example/other/app:v9-py3.12", "confirmed"),
+        ("mirror.example/other/app:v9", "unknown"),
+        ("mirror.example/other/app:v1.2", "unattempted"),
+        ("mirror.example/other/app:v1", "unattempted"),
+        ("mirror.example/other/app:latest", "unattempted"),
+    ]
+    assert "mirror.example/other/app:v9" in str(raised.value)
+    assert sum(call[1] == "v9" for call in attempts) == 1
+    assert not any(call[1] in ("v1.2", "v1", "latest") for call in push.calls)
+
+
+@pytest.mark.parametrize("destination", [
+    "mirror.example/other/app:" + "x" * 125,
+    "mirror.example/other/app@sha256:" + "a" * 64,
+    "mirror.example/other/app:stable-py3.11",
+])
+def test_matrix_invalid_override_starts_no_publication(tmp_path, monkeypatch, destination):
+    build, _, _ = matrix(tmp_path, monkeypatch, tags=["stable"])
+    build.build()
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(ValueError):
+        build.push(registry_url=destination, show_progress=False)
+    assert push.calls == []
+    assert build.operations == []
+
+
 @pytest.mark.parametrize("destination, insecure", [
     ("registry.example/team/app:v1", True),
     ("other.example/team/app:v1", False),

@@ -423,6 +423,15 @@ reporting, even with `--no-progress`. Remote tag updates are non-atomic:
 previous updates or untagged uploaded content may remain. Ambiguous writes
 are unknown, never assumed unchanged. There is no rollback, deletion or
 retry-overwrite, which could destroy a concurrent writer's update.
+
+For Python API callers, `ImageBuilder.push(registry_url="mirror.example/team/app:v9")`
+changes the destination repository and primary tag, returning that normalized
+reference. Matrix version tags use `v9-pyX.Y`; the unsuffixed `v9` belongs to
+the default version. Configured additional tags and generated aliases are
+retained at the destination, as in non-matrix pushes, without regenerating
+semver aliases from the override. Local layout tags remain unchanged. Invalid
+generated tags or version/alias collisions fail before any remote publication.
+
 Hermetic tests do not establish real per-version/per-architecture startup;
 the existing cross-target dependency-marker limitation (#142) still applies.
 
