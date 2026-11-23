@@ -454,28 +454,13 @@ def _read_requirements_text(path: Path) -> str:
     return data.decode("utf-8-sig")
 
 
-def validate_requirements(requirements: Path, context_dir: Path) -> bool:
-    """Validate includes and options; return whether every requirement is hash-pinned."""
-    return scan_requirements(requirements, context_dir)[0]
-
-
 RequirementsFile = Tuple[Path, bool, List[List[str]]]
 
 
-def scan_requirements(
-    requirements: Path, context_dir: Path
-) -> Tuple[bool, List[RequirementsFile]]:
-    """Validate a requirements tree; return hash-pinning and each file's tokenized lines.
-
-    Files are returned in visit order as ``(path, is_constraint, lines)``.
-    """
-    hash_pinned, scanned, _ = _scan_requirements(requirements, context_dir)
-    return hash_pinned, scanned
-
-
-def _scan_requirements(
+def _inspect_requirements(
     requirements: Path, context_dir: Path, check_overrides: bool = True
-) -> Tuple[bool, List[RequirementsFile], List[str]]:
+) -> Tuple[bool, List[str], List[RequirementsFile]]:
+    """Validate requirements and collect their pinning status, roots and tokenized files."""
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
@@ -568,7 +553,20 @@ def _scan_requirements(
                     )
                 included_path = (path.parent / include).resolve(strict=True)
                 pending.append((included_path, include_constraint))
-    return hash_pinned, scanned, roots
+    return hash_pinned, roots, scanned
+
+
+def validate_requirements(requirements: Path, context_dir: Path) -> bool:
+    """Validate includes and options; return whether every requirement is hash-pinned."""
+    return _inspect_requirements(requirements, context_dir)[0]
+
+
+def scan_requirements(
+    requirements: Path, context_dir: Path
+) -> Tuple[bool, List[RequirementsFile]]:
+    """Validate a requirements tree and return pinning and tokenized files."""
+    hash_pinned, _, scanned = _inspect_requirements(requirements, context_dir)
+    return hash_pinned, scanned
 
 
 def _is_hash_pinned(options: List[str]) -> bool:
@@ -658,7 +656,7 @@ def _verify_virtualenv_targets(
     host_os_name: Optional[str] = None,
 ) -> None:
     root_lines = (
-        _scan_requirements(requirements, context_dir, check_overrides=False)[2]
+        _inspect_requirements(requirements, context_dir, check_overrides=False)[1]
         if context_dir is not None and requirements is not None and requirements.is_file()
         else []
     )
