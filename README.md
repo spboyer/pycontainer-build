@@ -381,23 +381,28 @@ pycontainer build \
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  cannot be re-resolved, so it is verified instead: root requirements (the
-  requirements file and pyproject `[project]` dependencies, optional
-  dependencies and dependency groups) and every installed `Requires-Dist` are
-  re-evaluated for each target, and the build fails if a requirement the
-  target needs is missing, uses an unknown marker value, or belongs to an extra
-  or group whose request cannot be ruled out. An extra or group counts as not
-  requested only when it is missing a requirement that any Windows, Linux or
-  macOS CPython host of the venv's Python version would have installed; a
-  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
-  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
-  layout), and `Lib/site-packages` to Windows. Only
-  package presence is checked, not versions; extra host-only packages are
-  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
-  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
-  also fail the build, as do dynamic dependencies that cannot be read. Use a
-  requirements file, which pip resolves for the target, when verification
-  fails.
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
@@ -706,6 +711,8 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
 - **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.

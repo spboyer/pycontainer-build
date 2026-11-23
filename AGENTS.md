@@ -18,6 +18,10 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `system_packages.py`: system package declaration, inference and base-image
+  verification (warning only). `system_install.py`: fail-closed groundwork for
+  #31; it executes no package manager and has no callers until the #22
+  isolated executor exists.
 - `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
   config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
@@ -219,20 +223,25 @@ extras, transitive `Requires-Dist`) onto the target environment and fails
 closed on `platform_release`, `platform_version`, unknown variables, or
 `python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
 pip's vendored `packaging`; a self-test refuses to install if that changes.
-Virtualenv staging cannot re-resolve, so `venv_markers.py` verifies the copied
-closure instead: roots (requirements file, pyproject dependencies, optional
-dependencies, dependency groups) and installed `Requires-Dist`/egg-info
-`requires.txt` are re-evaluated for each target, failing on missing,
-unknown-marker, or possibly-requested extra/group requirements. An extra is
-ruled out only if every Windows/Linux/macOS CPython host of the venv minor
-(narrowed to posix by a `lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`,
-or to Windows by a `Lib` site-packages layout) would have installed one of its
-missing requirements; `python_version` is
-shared only when the venv minor is established (`python3.X` path or
-`pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
-root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic
-dependency files, Poetry/PDM/Hatch/setuptools/Flit tables) fail closed when they
-mention host markers, and unreadable dynamic dependencies always fail closed.
+Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
+with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
+target-active roots, transitive `Requires-Dist`, versions, extras, constraint
+files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
+collects project roots, plausible venv hosts and checks unparsed sources. The
+verifier never imports staged packages and fails closed on unknown markers, egg
+distributions, missing or unsupported `Metadata-Version`, invalid metadata,
+direct URLs, and patch-dependent `Requires-Python` without a full
+`PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
+can contain credentials. An unrecorded extra or optional group is ruled out
+only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
+`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
+`Lib` layout; `python_version` shared only when
+the venv minor is established) would have installed one of its missing
+requirements; otherwise unsatisfied target-active requirements fail closed.
+Loose modules without metadata remain unverified; host-only packages remain
+staged. Unparsed root sources with host markers and unreadable dynamic
+dependencies fail closed. Unmarked declarations in those unparsed sources are
+not verified.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
