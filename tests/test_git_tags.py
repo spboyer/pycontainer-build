@@ -371,15 +371,18 @@ def test_config_file_supports_the_sha_fallback(git_repo, tmp_path):
     assert config_from_file(config_path).tag == f"app:sha-{commit[:12]}"
 
 
-def test_config_file_cannot_silently_allow_dirty_worktrees(release_repo, tmp_path):
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("key", ["allow_dirty", "allow-dirty"])
+def test_config_file_cannot_silently_allow_dirty_worktrees(release_repo, tmp_path, table, key):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
-        f"[build]\ncontext_dir = {json.dumps(str(release_repo))}\n"
-        "tag_from_git = true\nallow_dirty = true\n",
+        f"[{table}]\ncontext_dir = {json.dumps(str(release_repo))}\n"
+        f"tag_from_git = true\n{key} = true\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="--allow-dirty"):
+    with pytest.raises(ValueError, match="--allow-dirty") as error:
         config_from_file(config_path)
+    assert f"[{table}].allow_dirty" in str(error.value)
 
 
 def test_cli_git_tag_options_render_the_effective_build_plan(release_repo, monkeypatch, capsys):
