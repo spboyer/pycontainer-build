@@ -187,8 +187,8 @@ def _measure_transfer_worker(spec):
     source = Path(spec["source"])
     destination = Path(spec["destination"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    client = RegistryClient("benchmark.invalid", "benchmark")
-    client.base_url = spec["registry_url"]
+    registry = urlsplit(spec["registry_url"])
+    client = RegistryClient(registry.netloc, "benchmark", insecure=True)
 
     tracemalloc.start()
     started = time.perf_counter()
@@ -516,9 +516,7 @@ def _registry_requests(registry_url, repository):
 
 
 def _network_client(registry_url, repository):
-    client = RegistryClient(NETWORK_REGISTRY_HOST, repository)
-    client.base_url = f"{registry_url}/v2"
-    return client
+    return RegistryClient(urlsplit(registry_url).netloc, repository, insecure=True)
 
 
 def _measure_network_build_worker(spec):
@@ -530,8 +528,8 @@ def _measure_network_build_worker(spec):
 
     class LoopbackRegistryClient(RegistryClient):
         def __init__(self, registry, repository, **kwargs):
-            super().__init__(registry, repository, **kwargs)
-            self.base_url = f"{registry_url}/v2"
+            kwargs["insecure"] = True
+            super().__init__(urlsplit(registry_url).netloc, repository, **kwargs)
 
     builder_module.RegistryClient = LoopbackRegistryClient
     builder_module.get_registry_auth = lambda *_args, **_kwargs: RegistryAuth()

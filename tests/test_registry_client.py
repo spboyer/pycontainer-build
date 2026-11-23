@@ -5,10 +5,12 @@ import io
 import json
 import logging
 import ssl
+import threading
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.message import Message
@@ -58,6 +60,69 @@ def _http_error(url, status, headers=None, body=b""):
         url, status, "HTTP error", response_headers, io.BytesIO(body)
     )
 
+
+def test_concurrent_initial_challenges_reuse_acquired_token(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    initial_requests = threading.Barrier(2)
+    replay_completed = threading.Event()
+    acquisitions = []
+
+    def acquire(_params):
+        acquisitions.append(True)
+        return "shared-token"
+
+    def open_request(request, timeout):
+        if request.get_header("Authorization") == "Bearer shared-token":
+            replay_completed.set()
+            return _Response(b"ok")
+        if initial_requests.wait(timeout=10) == 1:
+            assert replay_completed.wait(timeout=10)
+        raise _http_error(
+            request.full_url, 401,
+            {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", acquire)
+    monkeypatch.setattr(client._opener, "open", open_request)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(client._make_request, "GET", f"{client.base_url}/test")
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=15) for future in futures]
+    assert [result[0] for result in results] == [200, 200]
+    assert len(acquisitions) == 1
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+@pytest.mark.parametrize("existing_token", [None, "rejected-token"])
+@pytest.mark.parametrize("auth_token", [None, "rejected-token"])
+def test_rejected_bearer_token_does_not_loop_or_refresh(
+    monkeypatch, method, existing_token, auth_token
+):
+    client = RegistryClient("registry.example", "team/app", auth_token=auth_token)
+    client._bearer_token = existing_token
+    requests = []
+    acquisitions = []
+
+    def acquire(_params):
+        acquisitions.append(True)
+        return "rejected-token"
+
+    def reject(request, timeout):
+        requests.append(request)
+        raise _http_error(
+            request.full_url, 401,
+            {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", acquire)
+    monkeypatch.setattr(client._opener, "open", reject)
+    assert client._make_request(method, f"{client.base_url}/test")[0] == 401
+    assert len(requests) == (1 if existing_token else 2)
+    assert len(acquisitions) == (0 if existing_token else 1)
+
+
 def test_parse_image_reference():
     """Test parsing various image reference formats."""
     assert parse_image_reference("ghcr.io/user/app:v1")==("ghcr.io","user/app","v1")
@@ -103,8 +168,8 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
-        requests.append((method, url, headers))
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        requests.append((method, url, headers, max_response_bytes))
         return 200, body, {"Docker-Content-Digest": digest}
 
     monkeypatch.setattr(client, "_make_request", fake_request)
@@ -117,6 +182,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
         requests[0][2]["Accept"]
     )
+    assert requests[0][3] == len(body)
 
     with pytest.raises(BlobIntegrityError, match="size"):
         client.pull_manifest(digest, expected_size=len(body) + 1)
@@ -209,9 +275,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         )
         return Response(b'{"token":"exchanged-token"}')
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     status, body, _=client._make_request(
         "GET", f"{client.base_url}/{client.repository}/manifests/latest"
@@ -259,9 +323,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
             )
         raise _http_error(request.full_url, 403)
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     with pytest.raises(
         RegistryAuthenticationError, match="exchange failed with HTTP 403"
@@ -305,9 +367,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
             )
         return _Response(b'{"token":"access-token"}')
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )
@@ -336,12 +396,9 @@ def test_pull_blob_streams_and_atomically_publishes_verified_content(
             requests.append((request, timeout))
             return response
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     destination = tmp_path / "blobs" / digest.split(":", 1)[1]
     client = RegistryClient("registry.example", "team/app", auth_token="secret")
+    client._blob_opener = Opener()
 
     assert client.pull_blob(digest, destination, len(content))
     assert destination.read_bytes() == content
@@ -514,12 +571,9 @@ def test_pull_blob_rejects_digest_or_size_mismatch_without_publishing(
         def open(self, request, timeout):
             return response
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     destination = tmp_path / "blob"
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     digest = f"sha256:{hashlib.sha256(expected_content).hexdigest()}"
 
     with pytest.raises(BlobIntegrityError):
@@ -543,15 +597,12 @@ def test_pull_blob_cleans_only_owned_temp_after_interrupted_download(
         def open(self, request, timeout):
             return InterruptedResponse()
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _delay: None)
     destination = tmp_path / "blob"
     sentinel = tmp_path / ".blob-another-writer.tmp"
     sentinel.write_bytes(b"other writer")
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     content = b"complete"
     digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
 
@@ -593,17 +644,12 @@ def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
         )
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
-    monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )
     destination = tmp_path / "blob"
     client = RegistryClient("registry.example", "team/app", auth_token="registry-secret")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     assert client.pull_blob(digest, destination, len(content))
     assert destination.read_bytes() == content
@@ -648,9 +694,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
 
     client = RegistryClient("registry.example", "team/app", auth_token="token")
     monkeypatch.setattr(client, "initiate_blob_upload", lambda: location)
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     assert client.upload_blob_monolithic(digest, source)
     request, timeout = requests[0]
@@ -683,9 +727,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
         request.data.read()
         return _Response(status=201)
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
 
     client.upload_blob_monolithic(
         f"sha256:{hashlib.sha256(content).hexdigest()}", source
@@ -731,9 +773,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
         requests.append((request, timeout))
         raise TimeoutError("not included in public error")
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
-    )
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append
     )
@@ -756,12 +796,12 @@ def _patch_urlopen(monkeypatch, handler):
     requests = []
     delays = []
 
-    def fake_urlopen(request, timeout):
+    def fake_open(_opener, request, timeout):
         requests.append(request)
         return handler(request, len(requests))
 
     monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        "pycontainer.registry_client.urllib.request.OpenerDirector.open", fake_open
     )
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
     return requests, delays
@@ -1339,7 +1379,10 @@ def test_token_exchange_rate_limit_reports_reset_without_echoing_secrets(
     assert len(requests) == 2
 
 
-def test_token_exchange_redacts_url_credentials_and_http_error_traceback(monkeypatch):
+@pytest.mark.parametrize("userinfo", ["synthetic-user:synthetic-password@", ""])
+def test_token_exchange_redacts_url_credentials_and_http_error_traceback(
+    monkeypatch, userinfo
+):
     client = RegistryClient("registry.example", "team/app")
     reason_token = "synthetic-status-token"
     headers = Message()
@@ -1349,8 +1392,7 @@ def test_token_exchange_redacts_url_credentials_and_http_error_traceback(monkeyp
         if request.full_url.startswith(client.base_url):
             challenge = Message()
             challenge["Www-Authenticate"] = (
-                'Bearer realm="https://synthetic-user:synthetic-password'
-                '@auth.example/token"'
+                f'Bearer realm="https://{userinfo}auth.example/token"'
             )
             raise urllib.error.HTTPError(
                 request.full_url,
@@ -1367,8 +1409,9 @@ def test_token_exchange_redacts_url_credentials_and_http_error_traceback(monkeyp
             io.BytesIO(b""),
         )
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fake_urlopen)
-    with pytest.raises(RegistryRateLimitError) as error:
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    expected = RegistryAuthenticationError if userinfo else RegistryRateLimitError
+    with pytest.raises(expected) as error:
         client.pull_manifest("latest")
 
     rendered = "".join(traceback.format_exception(error.value))
@@ -1389,7 +1432,7 @@ def test_invalid_token_challenge_hides_http_error_traceback(monkeypatch):
             request.full_url, 401, f"Bearer {reason_token}", headers, io.BytesIO(b"")
         )
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     with pytest.raises(RegistryAuthenticationError, match="token realm") as error:
         client.pull_manifest("latest")
 
@@ -1399,10 +1442,7 @@ def test_invalid_token_challenge_hides_http_error_traceback(monkeypatch):
 def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
     tmp_path, monkeypatch, caplog
 ):
-    redirect = (
-        "https://synthetic-user:synthetic-password@storage.example/blob"
-        "?token=synthetic-query-token"
-    )
+    redirect = "https://storage.example/blob?token=synthetic-query-token"
     reason_token = "synthetic-status-token"
 
     class Opener:
@@ -1417,12 +1457,9 @@ def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
             request.full_url, 429, f"Bearer {reason_token}", headers, io.BytesIO(b"")
         )
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fake_urlopen)
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    monkeypatch.setattr(client._opener, "open", fake_urlopen)
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
@@ -1432,12 +1469,7 @@ def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
     rendered = "".join(traceback.format_exception(error.value))
     assert "storage.example" in str(error.value)
     assert "storage.example" in caplog.text
-    for secret in (
-        "synthetic-user",
-        "synthetic-password",
-        "synthetic-query-token",
-        reason_token,
-    ):
+    for secret in ("synthetic-query-token", reason_token):
         assert secret not in str(error.value)
         assert secret not in caplog.text
         assert secret not in rendered
@@ -1458,11 +1490,8 @@ def test_missing_blob_redirect_location_hides_http_error_traceback(
                 io.BytesIO(b""),
             )
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with pytest.raises(RegistryRequestError, match="did not include a Location") as error:
@@ -1488,7 +1517,7 @@ def test_network_error_traceback_does_not_expose_credentials(
     def fail(*_args, **_kwargs):
         raise urllib.error.URLError(f"Bearer {token}")
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fail)
+    monkeypatch.setattr(client._opener, "open", fail)
     monkeypatch.setattr(client, "_open_blob_response", fail)
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
     error_type = (
@@ -1527,7 +1556,7 @@ def test_url_encoded_credentials_are_redacted(monkeypatch, operation):
             request.full_url, 400, body=f"Failed at {url}".encode()
         )
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fail)
+    monkeypatch.setattr(client._opener, "open", fail)
     with pytest.raises(RegistryRequestError) as error:
         if operation == "network":
             client._make_request("PUT", url, data=b"")
@@ -1559,13 +1588,10 @@ def test_pull_blob_rate_limit_fails_fast_and_observes_redirect_headers(
                 _errors_body(("TOOMANYREQUESTS", "slow down")),
             )
 
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
     delays = []
     monkeypatch.setattr("pycontainer.registry_client.time.sleep", delays.append)
     client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
