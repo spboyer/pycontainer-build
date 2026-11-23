@@ -156,7 +156,7 @@ def test_required_trust_resolves_tag_once_and_verifies_before_base_blobs(
 ):
     client = _Registry(index=index)
     monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
 
     def verify(policy, repository, digest, manifest, manifest_bytes, source):
         assert source is client
@@ -200,7 +200,7 @@ def test_verified_digest_does_not_authenticate_tag_for_dependency_staging(
     client.registry = "registry-1.docker.io"
     client.repository = "library/python"
     monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
 
     def verify(policy, repository, digest, manifest, manifest_bytes, source):
         assert repository == "docker.io/library/python"
@@ -232,7 +232,7 @@ def test_verified_digest_does_not_authenticate_tag_for_dependency_staging(
 def test_failed_verification_never_reads_child_or_base_blobs(tmp_path, monkeypatch):
     client = _Registry(index=True)
     monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
 
     def reject(*args):
         raise RuntimeError("untrusted signature")
@@ -264,7 +264,7 @@ def test_verified_index_still_requires_exact_child_descriptor(
     client.root_bytes = _encoded(client.root)
     client.root_digest = _digest(client.root_bytes)
     monkeypatch.setattr(builder_module, "RegistryClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
 
     def verify(*args):
         client.verified = True

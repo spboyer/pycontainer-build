@@ -66,7 +66,7 @@ def _exercise_builder(tmp_path, monkeypatch, image, policy, *, reject=False):
         return output
 
     monkeypatch.setattr(base_trust, "_run_cosign", run_cosign)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "empty-docker"))
     monkeypatch.setenv("REGISTRY_AUTH_FILE", str(tmp_path / "empty-auth.json"))
     original_pull_blob = RegistryClient.pull_blob
@@ -155,7 +155,7 @@ def _exercise_notation_builder(tmp_path, monkeypatch, image, policy, *, reject=F
 
     monkeypatch.setattr(builder_module, "verify_base_image", verify)
     monkeypatch.setattr(RegistryClient, "pull_blob", stop_before_base_blob)
-    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_: RegistryAuth())
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *_, **__: RegistryAuth())
     config = BuildConfig(
         context_dir=str(tmp_path), output_dir=str(tmp_path / "output"),
         base_image=f"{image[0]}@{image[1]}", base_image_trust=policy,
@@ -299,7 +299,7 @@ def test_real_verifier_with_authenticated_private_registry(tmp_path, monkeypatch
     monkeypatch.setattr(module, name, run)
     monkeypatch.setattr(builder_module, "RegistryClient", LoopbackClient)
     monkeypatch.setattr(builder_module, "get_registry_auth",
-                        lambda *_: RegistryAuth(username=USERNAME, password=PASSWORD))
+                        lambda *_, **__: RegistryAuth(username=USERNAME, password=PASSWORD))
     monkeypatch.setenv("REGISTRY_PASSWORD", PASSWORD)
     monkeypatch.setenv("REGISTRY_TOKEN", TOKEN)
     config = BuildConfig(

@@ -117,9 +117,11 @@ exercised; other versions are not guaranteed compatible.
 
 ## Registry authentication
 
-The normal registry client may use existing credentials. In required-trust
-mode, it does not send credentials to a different token-realm URL unless that
-exact HTTPS URL is explicitly pinned:
+Base pulls use registry-scoped credentials; generic `REGISTRY_TOKEN`,
+`REGISTRY_USERNAME` and `REGISTRY_PASSWORD` are reserved for the destination.
+See [registry authentication](AUTHENTICATION.md) for credential sources. In
+required-trust mode, the client does not send credentials to a different
+token-realm URL unless that exact HTTPS URL is explicitly pinned:
 
 ```toml
 auth_realm = "https://auth.example.com/token"
@@ -148,7 +150,8 @@ Bearer authentication (see below). No hosted private registry (for example
 ACR, ECR, GAR or GHCR with private access) has been exercised.
 Hermetic tests also exercise both discovery paths through a TLS loopback registry
 with a scoped Bearer challenge and synthetic credentials; verifier results in
-those tests are simulated.
+those tests are simulated. Multi-platform tests also check destination-credential
+isolation and credential-free cross-origin redirects.
 
 ## Opt-in real-provider checks
 

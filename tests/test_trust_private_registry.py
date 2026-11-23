@@ -14,6 +14,7 @@ import trustme
 
 from pycontainer import base_trust
 from pycontainer import builder as builder_module
+from pycontainer import auth as auth_module
 from pycontainer import trust_notation as notation
 from pycontainer.auth import RegistryAuth
 from pycontainer.base_trust import TrustVerificationError, verify_base_image
@@ -178,7 +179,8 @@ def _serve_cosign(server):
 
 def _serve_notation(server, cert=CERT):
     envelope = _cose(cert)
-    subject = {"mediaType": MANIFEST, "digest": server.subject_digest, "size": len(server.subject)}
+    subject = {"mediaType": getattr(server, "subject_media_type", MANIFEST),
+               "digest": server.subject_digest, "size": len(server.subject)}
     signature = _encoded({
         "schemaVersion": 2, "mediaType": MANIFEST, "artifactType": notation._SIGNATURE,
         "config": {"mediaType": "application/vnd.oci.empty.v1+json",
@@ -366,7 +368,7 @@ def test_builder_verifies_private_tag_once_before_any_base_blob(
 
     monkeypatch.setattr(builder_module, "RegistryClient", LoopbackClient)
     monkeypatch.setattr(builder_module, "get_registry_auth",
-                        lambda *_: RegistryAuth(username=USERNAME, password=PASSWORD))
+                        lambda *_, **__: RegistryAuth(username=USERNAME, password=PASSWORD))
     config = BuildConfig(context_dir=str(tmp_path), output_dir=str(tmp_path / "output"),
                          base_image="registry.example/team/base:latest",
                          base_image_trust=policy, use_cache=False)
@@ -432,7 +434,7 @@ def test_builder_discovers_signatures_with_scoped_bearer_challenge(
         monkeypatch.setenv("REGISTRY_TOKEN", TOKEN)
         monkeypatch.setattr(
             builder_module, "get_registry_auth",
-            lambda *_: RegistryAuth(
+            lambda *_, **__: RegistryAuth(
                 username=USERNAME,
                 password="wrong-password" if failure == "credentials" else PASSWORD,
             ),
@@ -490,4 +492,104 @@ def test_builder_discovers_signatures_with_scoped_bearer_challenge(
     finally:
         if untrusted:
             untrusted.close()
+        server.close()
+
+
+@pytest.mark.parametrize("provider", ["cosign", "notation"])
+def test_multi_platform_trust_uses_scoped_base_credentials(
+        tmp_path, monkeypatch, provider):
+    from test_multi_platform import FakeBaseRegistry
+
+    server = _Server(bearer=True)
+    storage = _Server(credentials=None, ca=server.ca)
+    try:
+        base = FakeBaseRegistry()
+        server.subject_digest = base.index_digest
+        server.subject = base.manifests[base.index_digest]
+        server.subject_media_type = INDEX
+        server.base_blobs = set(base.blobs)
+        for reference, body in base.manifests.items():
+            server.manifest(reference, body, json.loads(body)["mediaType"])
+        for body in base.blobs.values():
+            server.blob(body)
+
+        repository = f"127.0.0.1:{server.httpd.server_address[1]}/team/base"
+        authority = repository.split("/", 1)[0]
+        destination_secret = "synthetic-destination-secret"
+        monkeypatch.setenv("REGISTRY_USERNAME", "synthetic-destination-user")
+        monkeypatch.setenv("REGISTRY_PASSWORD", destination_secret)
+        monkeypatch.setenv("REGISTRY_TOKEN", destination_secret)
+        monkeypatch.setattr(auth_module.DockerConfigAuthProvider, "_load_config", lambda self: {
+            "auths": {authority: {"username": USERNAME, "password": PASSWORD}}
+        })
+
+        if provider == "cosign":
+            signature_blobs = _serve_cosign(server)
+            policy = _cosign_policy()
+
+            def run(args, environment):
+                check_verifier(args, environment)
+                return _encoded([{"critical": {
+                    "identity": {"docker-reference": repository},
+                    "image": {"docker-manifest-digest": server.subject_digest},
+                    "type": "cosign container image signature"}}])
+
+            monkeypatch.setattr(base_trust, "_run_cosign", run)
+        else:
+            signature_blobs = {_digest(_serve_notation(server))}
+            policy = _notation_policy(tmp_path)
+
+            def run(args, environment):
+                check_verifier(args, environment)
+                return ("Successfully verified signature for " + args[-1] + "\n").encode()
+
+            monkeypatch.setattr(notation, "_run", run)
+        policy["repository"] = repository
+        verification_requests = []
+
+        def check_verifier(args, environment):
+            _assert_no_secret([*args, *environment.values()])
+            assert all(destination_secret not in value and TOKEN not in value
+                       for value in [*args, *environment.values()])
+            verification_requests.append(len(server.requests))
+            server.manifest("3.11-slim", b'{"retargeted":true}', INDEX)
+
+        for digest in signature_blobs:
+            path = f"/v2/team/base/blobs/{digest}"
+            storage.routes[f"/storage/{digest}"] = server.routes[path]
+            server.routes[path] = (307, b"", {"Location": f"{storage.url}/storage/{digest}"})
+
+        context = tmp_path / "context"
+        context.mkdir()
+        (context / "app.py").write_text("print('hello')\n")
+        config = BuildConfig(
+            context_dir=str(context), output_dir=str(tmp_path / "output"),
+            base_image=f"{repository}:3.11-slim", base_image_trust=policy,
+            registry_ca_file=server.ca_file, platform="linux/amd64,linux/arm64",
+            use_cache=False,
+        )
+        ImageBuilder(config).build()
+
+        assert len(verification_requests) == 2
+        paths = [path for path, _ in server.requests]
+        tag_path = "/v2/team/base/manifests/3.11-slim"
+        index_path = f"/v2/team/base/manifests/{server.subject_digest}"
+        assert paths.count(tag_path) == 2
+        assert paths.count(index_path) == 2
+        for position, descriptor in enumerate(json.loads(server.subject)["manifests"]):
+            child_path = f"/v2/team/base/manifests/{descriptor['digest']}"
+            child_request = paths.index(child_path)
+            assert child_request >= verification_requests[position]
+            manifest = json.loads(base.manifests[descriptor["digest"]])
+            blobs = [manifest["config"], *manifest["layers"]]
+            assert all(paths.index(f"/v2/team/base/blobs/{blob['digest']}") > child_request
+                       for blob in blobs)
+        assert server.token_queries == [
+            {"service": ["synthetic-registry"], "scope": ["repository:team/base:pull"]}
+        ] * 2
+        assert all(auth in (BASIC, f"Bearer {TOKEN}") for _, auth in server.requests)
+        assert len(storage.requests) == 2 * len(signature_blobs)
+        assert all(auth is None for _, auth in storage.requests)
+    finally:
+        storage.close()
         server.close()
