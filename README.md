@@ -390,9 +390,10 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   current directory, and the source must not overlap `--output`.
 - Every blob is checked against its digest and size, and every base layer is
   checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
-  needs Python 3.14+). Unknown layer media types, unsafe or duplicate archive
-  members, sparse members, symlinked OCI layout blobs, archive links that
-  escape the archive, and
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
   more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
   Each OCI index, including nested indexes, is limited to 1,000 entries.
   Layers are limited to 64 GiB (including decompressed content); Docker archive

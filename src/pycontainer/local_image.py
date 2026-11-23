@@ -190,6 +190,7 @@ def verify_layer_diff_ids(layers, config: Dict) -> None:
                 f"Local base image DiffID {index} is not a sha256 digest."
             ) from error
         if layer.media_type in TAR_LAYER_MEDIA_TYPES:
+            _require_plain_tar(Path(layer.tar_path), index)
             actual = layer.digest
         elif layer.media_type in GZIP_LAYER_MEDIA_TYPES:
             actual = _decompressed_digest(Path(layer.tar_path), gzip.open, "gzip")
@@ -212,6 +213,35 @@ def verify_layer_diff_ids(layers, config: Dict) -> None:
                 f"Local base image layer {index} has DiffID {actual}, but its "
                 f"config declares {expected}."
             )
+
+
+def _require_plain_tar(path: Path, index: int) -> None:
+    """Reject plain-tar layers whose bytes are compressed or not a tar stream."""
+    invalid = f"Local base image layer {index} is not a valid uncompressed tar stream."
+    try:
+        with path.open("rb") as source:
+            magic = source.read(len(XZ_MAGIC))
+            if not magic:
+                return
+            if magic.startswith((GZIP_MAGIC, ZSTD_MAGIC, BZIP2_MAGIC, XZ_MAGIC)):
+                raise BlobIntegrityError(
+                    f"Local base image layer {index} is compressed, but its media "
+                    "type declares an uncompressed tar."
+                )
+            source.seek(0)
+            with tarfile.open(fileobj=source, mode="r:", tarinfo=_BoundedTarInfo) as tar:
+                while tar.next() is not None:
+                    tar.members.clear()
+                end = tar.offset
+            # tarfile stops silently at an invalid later header; require a real end.
+            source.seek(end)
+            trailer = source.read(tarfile.BLOCKSIZE)
+    except BlobIntegrityError:
+        raise
+    except (tarfile.TarError, OSError) as error:
+        raise BlobIntegrityError(invalid) from error
+    if trailer.strip(b"\0"):
+        raise BlobIntegrityError(invalid)
 
 
 def _decompressed_digest(path: Path, opener, name: str) -> str:
