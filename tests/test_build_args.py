@@ -335,6 +335,23 @@ def test_direct_build_redacts_system_package_logs(tmp_path, monkeypatch, caplog)
     assert value not in caplog.text
 
 
+def test_direct_build_redacts_conda_warning_paths(tmp_path, caplog):
+    value = "private-requirements"
+    (tmp_path / "environment.yml").write_text("name: example\n")
+    (tmp_path / f"{value}.txt").write_text("")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_deps=True, dry_run=True,
+        requirements_file="${NAME}.txt", build_args={"NAME": value},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(config).build()
+
+    assert "Conda inputs ignored" in caplog.text
+    assert "<redacted>.txt" in caplog.text
+    assert value not in caplog.text
+
+
 def test_unreadable_base_layer_diagnostic_redacts_build_arguments(tmp_path, caplog):
     value = "private-path"
     config = BuildConfig(

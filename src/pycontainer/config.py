@@ -1,4 +1,6 @@
+import posixpath
 import re
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -30,6 +32,49 @@ def validate_insecure_registries(registries: List[str]) -> List[str]:
         if entry.lower() not in normalized:
             normalized.append(entry.lower())
     return normalized
+
+# Linux signal names in the OCI "SIGNAME" format, matching Docker's Linux table.
+STOP_SIGNALS = frozenset(
+    [
+        "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE",
+        "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGKILL", "SIGPIPE",
+        "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV", "SIGSTKFLT",
+        "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN",
+        "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2", "SIGVTALRM", "SIGWINCH",
+        "SIGXCPU", "SIGXFSZ", "SIGRTMIN", "SIGRTMAX",
+    ]
+    + [f"SIGRTMIN+{n}" for n in range(1, 16)]
+    + [f"SIGRTMAX-{n}" for n in range(1, 15)]
+)
+
+
+def validate_stop_signal(value: str) -> str:
+    """Return value if it is a supported OCI SIGNAME, else raise ValueError."""
+    if not isinstance(value, str) or value not in STOP_SIGNALS:
+        raise ValueError(
+            f"stop_signal must be a Linux signal name such as SIGTERM, SIGINT or "
+            f"SIGRTMIN+3; got {value!r}."
+        )
+    return value
+
+
+def validate_volume(path: str) -> str:
+    """Return path if it is a normalized absolute container path, else raise ValueError."""
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or path == "/"
+        or path.startswith("//")
+        or "\\" in path
+        or any(unicodedata.category(ch).startswith("C") for ch in path)
+        or posixpath.normpath(path) != path
+    ):
+        raise ValueError(
+            "volumes entries must be normalized absolute container paths other "
+            f"than '/', without '.', '..', empty segments, backslashes or control "
+            f"characters; got {path!r}."
+        )
+    return path
 
 
 @dataclass
@@ -68,6 +113,8 @@ class BuildConfig:
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
     security: Optional[dict] = None
+    stop_signal: Optional[str] = None
+    volumes: List[str] = field(default_factory=list)
     build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -98,6 +145,11 @@ class BuildConfig:
             from .security import validate_security
 
             self.security = validate_security(self.security, self.platform)
+        if self.stop_signal is not None:
+            validate_stop_signal(self.stop_signal)
+        if not isinstance(self.volumes, list):
+            raise ValueError("volumes must be a list of absolute container paths.")
+        self.volumes = list(dict.fromkeys(validate_volume(p) for p in self.volumes))
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
