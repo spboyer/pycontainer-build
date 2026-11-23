@@ -13,7 +13,7 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, m
     pip_config.write_text("[install]\nno-deps = true\n", encoding="utf-8")
     monkeypatch.setenv("PIP_CONFIG_FILE", str(pip_config))
     monkeypatch.setenv("PIP_NO_DEPS", "1")
-    monkeypatch.setenv("PYTHONPATH", str(ROOT / "src"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "python-user-base"))
     output = tmp_path / "benchmark.json"
     subprocess.run(
         [

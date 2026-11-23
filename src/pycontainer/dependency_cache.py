@@ -30,7 +30,7 @@ from .dependencies import (
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
 # Bump when the installer changes layer-affecting behavior such as marker evaluation.
-INSTALLER_BACKEND = "pip-target-v3"
+INSTALLER_BACKEND = "pip-target-v4"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -89,6 +89,12 @@ _PYTHON_IMAGE_METADATA = {
     "PYTHON_GET_PIP_URL",
     "PYTHON_GET_PIP_SHA256",
 }
+_LOCK_MANIFESTS = {
+    "pipenv": "Pipfile",
+    "pdm": "pyproject.toml",
+    "poetry": "pyproject.toml",
+    "uv": "pyproject.toml",
+}
 
 
 class DependencyCacheMiss(Exception):
@@ -121,6 +127,9 @@ def dependency_cache_key(
     requirements: Optional[Path] = None,
     requirement_sets: Sequence[Tuple[str, str]] = (),
     lock_name: Optional[str] = None,
+    lock_kind: Optional[str] = None,
+    lock_roots: Optional[Sequence[str]] = None,
+    lock_verifier: Optional[str] = None,
     ambient_reader: Optional[AmbientReader] = None,
 ) -> DependencyCacheKey:
     """Return the cache key for a provably reusable dependency layer or raise ``DependencyCacheMiss``."""
@@ -137,8 +146,21 @@ def dependency_cache_key(
         raise DependencyCacheMiss("the builder Python startup environment is not provably isolated")
 
     if source_kind == "lock":
-        inputs = _lock_inputs(requirement_sets)
-        source_files: Tuple[str, ...] = (lock_name,) if lock_name else ()
+        manifest_name = _LOCK_MANIFESTS.get(lock_kind or "")
+        if manifest_name is None or lock_roots is None or not lock_verifier:
+            raise DependencyCacheMiss("the locked verification inputs are unavailable")
+        if any("://" in root or "$" in root for root in lock_roots):
+            raise DependencyCacheMiss("a locked manifest requirement cannot be keyed safely")
+        inputs = {
+            "kind": lock_kind,
+            "requirements": _lock_inputs(requirement_sets),
+            "roots": sorted(lock_roots),
+            "verifier": lock_verifier,
+        }
+        source_files: Tuple[str, ...] = (
+            (lock_name, (Path(lock_name).parent / manifest_name).as_posix())
+            if lock_name else ()
+        )
         # Locked installs run pip with --isolated and no PIP_* settings.
         ambient: object = "isolated"
     elif source_kind == "requirements" and requirements is not None:
@@ -316,19 +338,21 @@ def _file_digest(path: Path) -> str:
 
 def ambient_pip_settings() -> List[List[str]]:
     """Read the effective pip configuration for plain requirements and key only provable settings."""
-    environment = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
         # Match the installer's exclusion of context-local imports.
         result = subprocess.run(
-            [sys.executable, "-P", "-m", "pip", "--disable-pip-version-check", "config", "list"],
+            [
+                sys.executable, "-E", "-P", "-X", "utf8", "-m", "pip",
+                "--disable-pip-version-check", "config", "list",
+            ],
             capture_output=True,
             encoding="utf-8",
-            errors="replace",
-            env=environment,
+            errors="strict",
+            env=dict(os.environ),
             stdin=subprocess.DEVNULL,
             timeout=PIP_CONFIG_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
         raise DependencyCacheMiss("the ambient pip configuration could not be read") from error
     if result.returncode:
         raise DependencyCacheMiss("the ambient pip configuration could not be read")

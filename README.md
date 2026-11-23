@@ -106,6 +106,10 @@ skopeo copy oci:dist/image docker-daemon:myapp:latest
 docker run -p 8000:8000 myapp:latest
 ```
 
+With several tags, select one explicitly, for example
+`skopeo copy oci:dist/image:myapp:stable docker-daemon:myapp:stable`; see
+[Multiple tags](docs/multiple-tags.md#output).
+
 #### Option 2: Use Podman (Native OCI Support)
 
 ```bash
@@ -285,6 +289,27 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Skaffold and Tilt
+
+Use pycontainer as a custom builder for the Kubernetes inner loop. It builds
+without a Docker daemon and pushes to a registry the cluster pulls from:
+
+```yaml
+# skaffold.yaml (build.local.push: true is required)
+custom:
+  buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+```
+
+```python
+# Tiltfile
+custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
+             deps=['app'], skips_local_docker=True)
+```
+
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
+registries and multi-platform requests are rejected.
+[See full documentation →](docs/skaffold-tilt.md)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:
@@ -335,15 +360,21 @@ pycontainer build \
 
 **Base Image & Dependencies**:
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
-- `--include-deps` — Stage importable dependencies from a lockfile, a
-  requirements file, or a venv as target-compatible binary wheels. Requirements installs
-  are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
+- `--include-deps` — Stage importable dependencies from a lockfile or
+  requirements file as target-compatible binary wheels, or copy a verified
+  pure-Python venv. Requirements files, including generated lock selections,
+  are limited to 1 MiB; staging is limited to 300 seconds, 512 MiB, and 100,000 files;
   supported targets are `linux/amd64` and `linux/arm64` with CPython. A venv
   must match the target Python minor version and contain only pure-Python
   packages. Dependencies are placed under `<workdir>/.python`, added to
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
   distributions and cross-compilation are not supported.
+  Pip runs without the host's `PYTHONPATH`, and pip configuration cannot disable
+  target `Requires-Python` checks.
+  Generated Linux console scripts use UTF-8 and LF line endings on every host,
+  including Windows, and retain executable mode in the dependency layer.
+  Copied application files are not normalized.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
@@ -351,25 +382,30 @@ pycontainer build \
   `Requires-Dist` metadata are evaluated for the target (`linux`, the target
   machine, CPython and the base image's Python version), not the build host.
   Markers on `platform_release` or `platform_version`, and on
-  `python_full_version` when the base image does not declare a full
+  `python_full_version` or `implementation_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  cannot be re-resolved, so it is verified instead: root requirements (the
-  requirements file and pyproject `[project]` dependencies, optional
-  dependencies and dependency groups) and every installed `Requires-Dist` are
-  re-evaluated for each target, and the build fails if a requirement the
-  target needs is missing, uses an unknown marker value, or belongs to an extra
-  or group whose request cannot be ruled out. An extra or group counts as not
-  requested only when it is missing a requirement that any Windows, Linux or
-  macOS CPython host of the venv's Python version would have installed; a
-  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
-  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
-  layout), and `Lib/site-packages` to Windows. Only
-  package presence is checked, not versions; extra host-only packages are
-  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
-  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
-  also fail the build, as do dynamic dependencies that cannot be read. Use a
-  requirements file, which pip resolves for the target, when verification
-  fails.
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
@@ -377,7 +413,7 @@ pycontainer build \
   Local image names/annotations also cannot establish libc. Adding a tag to a
   digest does not make it safe; use an image config with supported metadata
   or a tag-only registry pull. Unsupported metadata always fails, as does
-  metadata conflicting with a verified tag-only pull.
+  Python or libc metadata conflicting with a verified tag-only pull.
   Digest and unverified local sources also require explicit
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
   establish the Python ABI. These metadata checks apply to lockfile,
@@ -393,19 +429,26 @@ pycontainer build \
 
 **Lockfiles**: With `--include-deps`, the dependency source is chosen in this
 order: `--lockfile`, then `--requirements`, then a single lockfile at the
-context root, then a venv, then `requirements.txt`. More than one root lockfile
-is an error until you choose one. No locking tool is needed at build time, and
-none is added as a dependency:
+context root, then a venv, then `requirements.txt`. Explicit `--lockfile` and
+`--requirements` are mutually exclusive. More than one root lockfile is an
+error until you choose one. No locking tool is needed at build time, and none
+is added as a dependency:
 
 1. The lock is checked against its manifest (`pyproject.toml` or `Pipfile`):
    Poetry and PDM content hashes, the Pipfile hash, or uv's recorded
    requirements. A stale lock fails; run `poetry lock`, `pipenv lock`,
    `pdm lock`, or `uv lock` and rebuild.
-2. Environment markers are evaluated for the target image, not the build host,
-   so a Windows-only or `python_version` fork resolves for the container's
-   Linux CPython. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
+2. Root and recorded transitive markers are evaluated for each target image,
+   not the build host, so platform and Python forks select the container's
+   dependencies. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
 3. The exact locked versions and their recorded hashes are installed with
    `pip --no-deps --require-hashes` as target wheels and included in the SBOM.
+   Pip does not resolve transitive dependencies in this mode: the lock must
+   record the complete target graph and a matching wheel hash for each target.
+
+The build context must be writable: temporary `.pycontainer-lockfile-*`
+directories hold generated requirements, are excluded from images, and are
+removed after staging.
 
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
@@ -418,14 +461,20 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+PDM and uv projects with dynamic dependencies are unsupported. Poetry dynamic
+dependencies must be declared in `tool.poetry.dependencies`.
 Poetry's Python and dependency ranges support PEP 440 constraints, exact
 versions, wildcards, and single caret or tilde constraints; other
 Poetry-specific combinations are rejected. Applicable Poetry root and
 recorded transitive dependencies, including requested extras, must be present
-at compatible locked versions. Poetry and uv graph checks rely on the lock's
-recorded dependency metadata and cannot reconstruct dependencies omitted
-from the lock itself. uv extras without recorded dependencies are treated
-as empty, consistent with uv.
+at compatible locked versions. uv extras without recorded dependencies are
+treated as empty, consistent with uv.
+Pipenv roots and PDM roots and recorded edges must be present at compatible
+locked versions. For all four formats, staged wheel dependency metadata is
+checked for target-compatible transitive versions, markers and requested
+extras before creating a layer. Each wheel needs valid metadata in its matching
+`.dist-info` directory, limited to 1 MiB. This cannot detect dependencies
+omitted from the wheels' own metadata.
 uv registry URLs must match the current `[[tool.uv.index]]` declarations
 or the implicit PyPI index; settings from `uv.toml` and legacy index options
 are not supported. Limited-resolution uv locks are accepted only when their
@@ -553,7 +602,8 @@ requirements (including nested `-r`/`-c` files) where every requirement is
 `==`-pinned with `--hash`. A hit runs no pip install and makes no index requests,
 and yields the same layer digest, DiffID and SBOM inventory as a fresh build.
 The key covers requirement/constraint/find-links content, target platform,
-pip target/ABI/libc tags, the installer's target marker environment, Python
+pip target/ABI/libc tags, the installer's target marker environment, locked
+manifest roots and extras and the backend used for closure verification, Python
 version and implementation, workdir, pip version, the installer backend and
 sanitized index and find-links identities, including their exact paths. Plain
 requirements also key allowlisted ambient pip settings, read locally with
@@ -758,6 +808,9 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
+- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
@@ -825,6 +878,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References

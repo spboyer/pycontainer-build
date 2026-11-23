@@ -201,8 +201,10 @@ from .dependency_cache import (
     encode_inventory,
 )
 from .sbom import generate_sbom
+from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
+    _LOCKFILE_STAGING_PREFIX,
     create_console_entrypoints,
     install_locked_requirements,
     install_requirements,
@@ -213,7 +215,12 @@ from .dependencies import (
     target_wheel_platform,
     validate_target_platform,
 )
-from .lockfiles import detect_lockfile, load_lockfile, preflight_lockfile, target_environment
+from .lockfiles import (
+    _locked_verification_backend,
+    _locked_verification_roots,
+    detect_lockfile, load_lockfile, preflight_lockfile, target_environment,
+    verify_locked_installation,
+)
 
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
@@ -228,12 +235,15 @@ class ImageBuilder:
             if config.cache_dir
             else default_cache_dir
         )
-        self.context_excludes=context_exclude_paths(
-            context_dir,
-            output_dir=config.output_dir,
-            cache_dir=cache_dir,
-            exclude_paths=config.exclude_paths,
-            exclude_defaults=config.exclude_defaults,
+        self.context_excludes=(
+            *context_exclude_paths(
+                context_dir,
+                output_dir=config.output_dir,
+                cache_dir=cache_dir,
+                exclude_paths=config.exclude_paths,
+                exclude_defaults=config.exclude_defaults,
+            ),
+            f"{_LOCKFILE_STAGING_PREFIX}*",
         )
         self.context_include_paths=(
             config.include_paths
@@ -278,7 +288,7 @@ class ImageBuilder:
 
     def _build_image(self):
         self._dependency_source_cache = None
-        self._lock_selection_cache = None
+        self._lock_selection_cache = {}
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -295,10 +305,7 @@ class ImageBuilder:
                 package.name
                 for package in self._lock_selection(
                     base_config, os_name, arch,
-                    base_image_tag_verified=(
-                        parse_local_image_reference(self.config.base_image) is None
-                        and "@" not in self.config.base_image
-                    ),
+                    base_image_tag_verified=self._base_image_tag_verified(),
                 ).packages
             )
         report_system_packages(self.config, base_layers, locked_names)
@@ -365,13 +372,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -657,6 +666,13 @@ class ImageBuilder:
             return False
         return detect_lockfile(Path(self.config.context_dir)) is not None
 
+    def _base_image_tag_verified(self) -> bool:
+        # Local annotations and digest references do not establish registry identity.
+        return (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
+
     def _dependency_source(self):
         """Choose the dependency source: lock, requirements file, or virtualenv."""
         cached = getattr(self, "_dependency_source_cache", None)
@@ -688,7 +704,8 @@ class ImageBuilder:
                     source = ("requirements", Path(DEFAULT_REQUIREMENTS_FILE))
                 else:
                     source = ("venv", deps_paths)
-        self._dependency_source_cache = source
+        if source[0] != "venv":
+            self._dependency_source_cache = source
         return source
 
     def _lock_selection(self, base_config, os_name, arch, *, base_image_tag_verified=False):
@@ -702,12 +719,13 @@ class ImageBuilder:
             ),
             target_python_full_version(base_config),
         )
-        cached = getattr(self, "_lock_selection_cache", None)
-        if cached is not None and cached[0] == environment:
-            return cached[1]
-        selection = load_lockfile(Path(self.config.context_dir), relative, environment)
-        self._lock_selection_cache = (environment, selection)
-        return selection
+        key = tuple(sorted(environment.items()))
+        cache = getattr(self, "_lock_selection_cache", None)
+        if cache is None:
+            cache = self._lock_selection_cache = {}
+        if key not in cache:
+            cache[key] = load_lockfile(Path(self.config.context_dir), relative, environment)
+        return cache[key]
 
     def _create_deps_layer(
         self,
@@ -742,12 +760,7 @@ class ImageBuilder:
                 f"target {os_name}/{arch}."
             )
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
-        # Local annotations/tags and any digest reference are identity claims, not
-        # a resolved registry tag, so they cannot establish the Python ABI or libc.
-        base_image_tag_verified = (
-            parse_local_image_reference(self.config.base_image) is None
-            and "@" not in self.config.base_image
-        )
+        base_image_tag_verified = self._base_image_tag_verified()
         version = target_python_version(
             base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
@@ -758,9 +771,10 @@ class ImageBuilder:
         )
         layers_dir=Path(layers_dir)
         cache_key = None
+        verification_roots = None
         if self.cache:
             try:
-                cache_key = self._dependency_cache_key(
+                cache_key, verification_roots = self._dependency_cache_key(
                     source_kind, source_value, base_config, os_name, arch, version,
                     base_image_name, base_image_tag_verified,
                 )
@@ -793,6 +807,15 @@ class ImageBuilder:
                     base_image_name,
                     base_config,
                     base_image_tag_verified=base_image_tag_verified,
+                )
+                verify_locked_installation(
+                    selection,
+                    ctx,
+                    site_packages,
+                    target_environment(
+                        os_name, arch, version, target_python_full_version(base_config)
+                    ),
+                    verification_roots=verification_roots,
                 )
             elif source_kind == "requirements":
                 install_requirements(
@@ -874,6 +897,7 @@ class ImageBuilder:
         self, source_kind, source_value, base_config, os_name, arch, version,
         base_image_name, base_image_tag_verified,
     ):
+        """Return the cache key and the manifest roots it must verify."""
         ctx = Path(self.config.context_dir)
         common = dict(
             source_kind=source_kind,
@@ -893,14 +917,24 @@ class ImageBuilder:
                 base_config, os_name, arch,
                 base_image_tag_verified=base_image_tag_verified,
             )
+            verification_roots = _locked_verification_roots(
+                selection,
+                ctx,
+                target_environment(
+                    os_name, arch, version, target_python_full_version(base_config)
+                ),
+            )
             return dependency_cache_key(
                 requirement_sets=selection.requirement_sets(),
                 lock_name=selection.path.as_posix(),
+                lock_kind=selection.kind,
+                lock_roots=tuple(str(root) for root in verification_roots[0]),
+                lock_verifier=_locked_verification_backend(),
                 **common,
-            )
+            ), verification_roots
         if source_kind == "requirements":
-            return dependency_cache_key(requirements=ctx / source_value, **common)
-        return dependency_cache_key(**common)
+            return dependency_cache_key(requirements=ctx / source_value, **common), None
+        return dependency_cache_key(**common), None
 
     def _cached_dependency_layer(self, layers_dir, cache_key):
         cached = self.cache.get_entry(cache_key.layer)
