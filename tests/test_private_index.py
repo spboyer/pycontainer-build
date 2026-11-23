@@ -28,7 +28,9 @@ from pycontainer.dependencies import (
     staged_packages,
     validate_requirements,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
+from test_dependency_staging import (
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _write_named_wheel, _write_wheel,
+)
 
 
 USER = "synthetic-user"
@@ -779,10 +781,15 @@ def test_cached_build_keeps_index_credentials_out_of_cache(
     tmp_path, monkeypatch, capfd, home, index
 ):
     monkeypatch.setenv("PIP_INDEX_URL", index.url_with(f"{USER}:{SECRET}"))
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    base_config = {
+        **BASE_CONFIG,
+        "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
+    }
     monkeypatch.setattr(
         ImageBuilder,
         "_pull_base_image",
-        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
+        lambda self, layers_dir, os_name, arch: ([layer], base_config),
     )
     cache = tmp_path / "cache"
     context = _context(tmp_path)
