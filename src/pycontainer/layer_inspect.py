@@ -6,12 +6,10 @@ while member metadata and regular-file content digests are recorded. Nothing
 is extracted. Whiteouts follow the OCI image-spec layer rules, so the reported
 filesystem is the one a runtime would assemble.
 """
-import contextlib
 import gzip
 import hashlib
 import heapq
 import json
-import sys
 import tarfile
 import tempfile
 import zlib
@@ -52,6 +50,11 @@ from .registry_client import RegistryRequestError
 
 MAX_IMAGE_MEMBERS = 1_000_000
 MAX_PATH_BYTES = 4096
+MAX_LAYER_PATH_BYTES = 16 * 1024 * 1024
+MAX_IMAGE_NODES = 1_000_000
+MAX_IMAGE_PATH_BYTES = 64 * 1024 * 1024
+MAX_EXTENDED_HEADERS = 100
+MAX_LAYER_EXTENDED_HEADER_BYTES = 16 * 1024 * 1024
 TOP_ITEMS = 10
 
 WHITEOUT_PREFIX = ".wh."
@@ -71,8 +74,42 @@ INSPECTION_ERRORS = (
 )
 
 
+class _InspectionTarInfo(_BoundedTarInfo):
+    """Bound chained extended headers before tarfile recursively processes them."""
+
+    def _proc_member(self, tarfile_obj):
+        extended = self.type in (
+            tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+            tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK,
+        )
+        if extended:
+            count = getattr(tarfile_obj, "_inspection_extended_header_count", 0) + 1
+            size = getattr(tarfile_obj, "_inspection_extended_header_bytes", 0) + self.size
+            if count > MAX_EXTENDED_HEADERS:
+                raise LayerInspectionError(
+                    f"Layer has more than {MAX_EXTENDED_HEADERS} consecutive extended headers."
+                )
+            if size > MAX_LAYER_EXTENDED_HEADER_BYTES:
+                raise LayerInspectionError(
+                    f"Layer extended headers exceed {MAX_LAYER_EXTENDED_HEADER_BYTES} bytes."
+                )
+            tarfile_obj._inspection_extended_header_count = count
+            tarfile_obj._inspection_extended_header_bytes = size
+        else:
+            tarfile_obj._inspection_extended_header_count = 0
+        return super()._proc_member(tarfile_obj)
+
+
 class LayerInspectionError(RuntimeError):
     """Raised when an image or layer cannot be inspected completely and safely."""
+
+
+@dataclass(slots=True)
+class _Inode:
+    size: int
+    digest: str
+    layer: int
+    links: int = 0
 
 
 @dataclass(slots=True)
@@ -82,17 +119,25 @@ class Entry:
     mode: Optional[int] = None
     uid: int = 0
     gid: int = 0
+    mtime: float = 0.0
+    xattrs: Tuple[Tuple[str, str], ...] = ()
     size: int = 0
     digest: Optional[str] = None
     link: Optional[str] = None
+    inode: Optional[_Inode] = None
 
     def key(self):
-        return (self.kind, self.mode, self.uid, self.gid, self.size, self.digest, self.link)
+        return (
+            self.kind, self.mode, self.uid, self.gid, self.mtime, self.xattrs,
+            self.size, self.digest, self.link,
+        )
 
     def to_dict(self) -> Dict:
         data = {"type": self.kind, "size": self.size, "layer": self.layer}
         if self.mode is not None:
-            data.update(mode=f"{self.mode:04o}", uid=self.uid, gid=self.gid)
+            data.update(mode=f"{self.mode:04o}", uid=self.uid, gid=self.gid, mtime=self.mtime)
+        if self.xattrs:
+            data["xattrs"] = dict(self.xattrs)
         if self.digest:
             data["digest"] = self.digest
         if self.link is not None:
@@ -255,7 +300,14 @@ def _corruption_errors() -> Tuple[type, ...]:
 
 
 def _member_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, layer: int) -> Entry:
-    common = {"layer": layer, "mode": member.mode & 0o7777, "uid": member.uid, "gid": member.gid}
+    xattrs = tuple(sorted(
+        (key, value) for key, value in member.pax_headers.items()
+        if key.startswith(("SCHILY.xattr.", "LIBARCHIVE.xattr."))
+    ))
+    common = {
+        "layer": layer, "mode": member.mode & 0o7777, "uid": member.uid, "gid": member.gid,
+        "mtime": member.mtime, "xattrs": xattrs,
+    }
     if member.issparse():
         raise LayerInspectionError(f"Layer {layer} contains unsupported sparse file {display(member.name)!r}.")
     if member.isdir():
@@ -282,7 +334,9 @@ def _member_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, layer: int) -> 
                 raise LayerInspectionError(f"Layer {layer} ends inside the content of {display(member.name)!r}.")
             hasher.update(chunk)
             remaining -= len(chunk)
-        return Entry("file", size=member.size, digest=f"sha256:{hasher.hexdigest()}", **common)
+        digest = f"sha256:{hasher.hexdigest()}"
+        return Entry("file", size=member.size, digest=digest,
+                     inode=_Inode(member.size, digest, layer), **common)
     raise LayerInspectionError(
         f"Layer {layer} contains unsupported tar entry type {member.type!r} at {display(member.name)!r}."
     )
@@ -292,10 +346,12 @@ def read_layer(path: Path, report: LayerReport, budget: List[int]):
     """Stream one layer blob and return its (path, entry, whiteout-kind) records."""
     index = report.index
     records: List[Tuple[str, Optional[Entry], Optional[str]]] = []
+    path_bytes = 0
+    archive_end = 0
     try:
         with _open_decompressed(path, report.media_type, index) as raw:
             reader = _CountingReader(raw, index)
-            with tarfile.open(fileobj=reader, mode="r|", tarinfo=_BoundedTarInfo,
+            with tarfile.open(fileobj=reader, mode="r|", tarinfo=_InspectionTarInfo,
                               encoding="utf-8", errors="surrogateescape") as tar:
                 while (member := tar.next()) is not None:
                     tar.members.clear()
@@ -305,7 +361,18 @@ def read_layer(path: Path, report: LayerReport, budget: List[int]):
                         raise LayerInspectionError(f"Layer {index} has more than {MAX_ARCHIVE_MEMBERS} entries.")
                     if budget[0] > MAX_IMAGE_MEMBERS:
                         raise LayerInspectionError(f"Image has more than {MAX_IMAGE_MEMBERS} layer entries.")
-                    records.append(_record(tar, member, index, report))
+                    record = _record(tar, member, index, report)
+                    path_bytes += len(record[0].encode("utf-8", "surrogateescape"))
+                    if record[1] is not None and record[1].link is not None:
+                        path_bytes += len(record[1].link.encode("utf-8", "surrogateescape"))
+                    if path_bytes > MAX_LAYER_PATH_BYTES:
+                        raise LayerInspectionError(
+                            f"Layer {index} exceeds {MAX_LAYER_PATH_BYTES} bytes of member paths."
+                        )
+                    records.append(record)
+                archive_end = tar.offset
+                if tar.fileobj.buf.strip(b"\0"):
+                    reader.trailing_nonzero = True
             reader.drain()
     except LayerInspectionError:
         raise
@@ -313,10 +380,16 @@ def read_layer(path: Path, report: LayerReport, budget: List[int]):
         raise LayerInspectionError(f"Layer {index} ({report.digest}) is malformed: {error}") from error
     except _corruption_errors() as error:
         raise LayerInspectionError(f"Layer {index} ({report.digest}) is corrupt: {error}") from error
+    except RecursionError as error:
+        raise LayerInspectionError(
+            f"Layer {index} ({report.digest}) has too many chained extended headers."
+        ) from error
     except OSError as error:
         raise LayerInspectionError(f"Layer {index} ({report.digest}) could not be read: {error}") from error
     if reader.trailing_nonzero:
         raise LayerInspectionError(f"Layer {index} ({report.digest}) has data after the end of its tar archive.")
+    if reader.count < archive_end + 2 * tarfile.BLOCKSIZE:
+        raise LayerInspectionError(f"Layer {index} ({report.digest}) is truncated before the end of its tar archive.")
     report.uncompressed_size = reader.count
     actual = f"sha256:{reader.hasher.hexdigest()}"
     if actual != report.diff_id:
@@ -330,10 +403,14 @@ def _record(tar, member, index: int, report: LayerReport):
     path = normalize_member_path(member.name, index)
     parent, name = _split(path)
     if name == OPAQUE_WHITEOUT:
+        if not member.isreg() or member.size:
+            raise LayerInspectionError(f"Layer {index} contains invalid whiteout {display(member.name)!r}.")
         return parent, None, "opaque"
     if name.startswith(WHITEOUT_PREFIX):
         target = name[len(WHITEOUT_PREFIX):]
         if target in ("", ".", "..") or target.startswith(WHITEOUT_PREFIX):
+            raise LayerInspectionError(f"Layer {index} contains invalid whiteout {display(member.name)!r}.")
+        if not member.isreg() or member.size:
             raise LayerInspectionError(f"Layer {index} contains invalid whiteout {display(member.name)!r}.")
         return f"{parent}/{target}" if parent else target, None, "whiteout"
     if not path:
@@ -353,6 +430,43 @@ class Filesystem:
         self.shadowed_total = 0
         self.shadowed: List[Tuple[int, str, int, int]] = []
         self.before: Optional[Dict[str, Optional[Entry]]] = None
+        self.node_count = 1
+        self.path_bytes = 0
+        self.before_path_bytes = 0
+        self.reported_path_bytes = 0
+
+    def _add_node(self, path: str) -> None:
+        path_size = len(path.encode("utf-8", "surrogateescape"))
+        if self.node_count >= MAX_IMAGE_NODES:
+            raise LayerInspectionError(
+                f"Image has more than {MAX_IMAGE_NODES} filesystem nodes."
+            )
+        if self.path_bytes + path_size > MAX_IMAGE_PATH_BYTES:
+            raise LayerInspectionError(
+                f"Image exceeds {MAX_IMAGE_PATH_BYTES} bytes of retained filesystem paths."
+            )
+        self.node_count += 1
+        self.path_bytes += path_size
+
+    def _report_path(self, path: str) -> None:
+        self.reported_path_bytes += len(path.encode("utf-8", "surrogateescape"))
+        if self.reported_path_bytes > MAX_IMAGE_PATH_BYTES:
+            raise LayerInspectionError(
+                f"Inspection report exceeds {MAX_IMAGE_PATH_BYTES} bytes of file paths."
+            )
+
+    @staticmethod
+    def _retain_entry(entry: Entry) -> None:
+        if entry.inode is not None:
+            entry.inode.links += 1
+
+    def _release_entry(self, entry: Entry, path: str, layer: int) -> None:
+        inode = entry.inode
+        if inode is None:
+            return
+        inode.links -= 1
+        if inode.links == 0 and inode.size:
+            self._shadow(inode.size, path, inode.layer, layer)
 
     def lookup(self, path: str) -> Optional[_Node]:
         node = self.root
@@ -374,21 +488,49 @@ class Filesystem:
 
     def _touch(self, path: str, before: Optional[Entry]) -> None:
         if self.before is not None and path not in self.before:
+            self.before_path_bytes += len(path.encode("utf-8", "surrogateescape"))
+            if self.before_path_bytes > MAX_IMAGE_PATH_BYTES:
+                raise LayerInspectionError(
+                    f"Image diff exceeds {MAX_IMAGE_PATH_BYTES} bytes of file paths."
+                )
             self.before[path] = before
 
     def _remove(self, parent: _Node, name: str, path: str, layer: int) -> List[Tuple[str, Entry]]:
         node = parent.children.pop(name)
         removed = [(path, node.entry), *self.walk(node, path)]
+        self.node_count -= len(removed)
+        self.path_bytes -= sum(
+            len(removed_path.encode("utf-8", "surrogateescape"))
+            for removed_path, _ in removed
+        )
         for removed_path, entry in removed:
             self._touch(removed_path, entry)
-            if entry.kind == "file" and entry.size:
-                self._shadow(entry.size, removed_path, entry.layer, layer)
+            self._release_entry(entry, removed_path, layer)
         return removed
 
     def _shadow(self, size: int, path: str, origin: int, layer: int) -> None:
         self.shadowed_total += size
         item = (size, path, origin, layer)
         (heapq.heappush if len(self.shadowed) < TOP_ITEMS else heapq.heappushpop)(self.shadowed, item)
+
+    def _validate_whiteout_parent(self, path: str, layer: int) -> None:
+        node = self.root
+        walked = []
+        for part in path.split("/") if path else ():
+            walked.append(part)
+            child = node.children.get(part)
+            if child is None:
+                return
+            parent_path = "/".join(walked)
+            if child.entry.kind == "symlink":
+                raise LayerInspectionError(
+                    f"Layer {layer} places a whiteout beneath symlink {display(parent_path)!r}."
+                )
+            if child.children is None:
+                raise LayerInspectionError(
+                    f"Layer {layer} places a whiteout beneath non-directory {display(parent_path)!r}."
+                )
+            node = child
 
     def _parent(self, path: str, layer: int, created: List[Tuple[str, str, Entry]]) -> Tuple[_Node, str]:
         """Return the parent node, creating implicit directories for missing parents."""
@@ -408,6 +550,7 @@ class Filesystem:
                     self._remove(node, part, parent_path, layer)
                 else:
                     self._touch(parent_path, None)
+                self._add_node(parent_path)
                 child = _Node(Entry("dir", layer), {})
                 node.children[part] = child
                 created.append((change, parent_path, child.entry))
@@ -422,7 +565,13 @@ class Filesystem:
             )
         if target.entry.kind == "dir":
             raise LayerInspectionError(f"Layer {layer} hardlink {display(path)!r} targets a directory.")
-        entry.digest = target.entry.digest
+        if target.entry.kind not in ("file", "hardlink") or target.entry.inode is None:
+            raise LayerInspectionError(
+                f"Layer {layer} hardlink {display(path)!r} does not target a regular file."
+            )
+        entry.inode = target.entry.inode
+        entry.size = entry.inode.size
+        entry.digest = entry.inode.digest
 
     def apply(self, report: LayerReport, records, keep_changes: bool) -> None:
         layer = report.index
@@ -432,12 +581,16 @@ class Filesystem:
         def deleted(removed: List[Tuple[str, Entry]]) -> None:
             report.deleted += len(removed)
             if changes is not None:
-                changes.extend((DELETED, removed_path, entry) for removed_path, entry in removed)
+                for removed_path, entry in removed:
+                    self._report_path(removed_path)
+                    changes.append((DELETED, removed_path, entry))
 
         # Whiteouts hide lower-layer content only, so they apply before this layer's additions.
         for path, _, kind in records:
             if kind not in ("whiteout", "opaque"):
                 continue
+            parent_path = path if kind == "opaque" else _split(path)[0]
+            self._validate_whiteout_parent(parent_path, layer)
             node = self.lookup(path)
             if kind == "opaque":
                 if node is None or node.children is None:
@@ -457,6 +610,7 @@ class Filesystem:
                 layer_changes[path] = change
                 setattr(report, change, getattr(report, change) + 1)
             if changes is not None:
+                self._report_path(path)
                 changes.append((layer_changes[path], path, entry))
 
         for path, entry, kind in records:
@@ -472,6 +626,8 @@ class Filesystem:
             if existing is None:
                 change = ADDED
                 self._touch(path, None)
+                self._add_node(path)
+                self._retain_entry(entry)
                 parent.children[name] = _Node(entry, {} if entry.kind == "dir" else None)
             elif existing.entry.kind == "dir" and entry.kind == "dir":
                 if existing.entry.mode is None:
@@ -487,11 +643,11 @@ class Filesystem:
                 if old.kind == "dir":
                     for child in sorted(existing.children):
                         deleted(self._remove(existing, child, f"{path}/{child}", layer))
-                elif old.kind == "file" and old.size:
-                    self._shadow(old.size, path, old.layer, layer)
+                self._release_entry(old, path, layer)
                 change = MODIFIED if old.key() != entry.key() else UNCHANGED
                 existing.entry = entry
                 existing.children = {} if entry.kind == "dir" else None
+                self._retain_entry(entry)
             record(change, path, entry)
         report.shadowed_bytes = self.shadowed_total - shadowed_before
         report.changes = changes
@@ -519,17 +675,22 @@ def _observations(fs: Filesystem) -> Tuple[Dict, List[Dict]]:
     totals = {"files": 0, "directories": 0, "symlinks": 0, "other": 0, "bytes": 0}
     largest: List[Tuple[int, str]] = []
     by_digest: Dict[str, List] = {}
+    counted_inodes = set()
     bloat = {key: [0, 0, []] for key, _ in BLOAT_PATTERNS}
     for path, entry in fs.walk():
-        kind = {"file": "files", "dir": "directories", "symlink": "symlinks"}.get(entry.kind, "other")
+        kind = {"file": "files", "hardlink": "files",
+                "dir": "directories", "symlink": "symlinks"}.get(entry.kind, "other")
         totals[kind] += 1
-        if entry.kind != "file":
+        if entry.kind not in ("file", "hardlink"):
             continue
-        totals["bytes"] += entry.size
+        inode = id(entry.inode) if entry.inode is not None else id(entry)
+        if inode not in counted_inodes:
+            totals["bytes"] += entry.size
+            counted_inodes.add(inode)
         (heapq.heappush if len(largest) < TOP_ITEMS else heapq.heappushpop)(largest, (entry.size, path))
-        if entry.size:
-            group = by_digest.setdefault(entry.digest, [entry.size, 0, []])
-            group[1] += 1
+        if entry.size and entry.digest:
+            group = by_digest.setdefault(entry.digest, [entry.size, set(), []])
+            group[1].add(inode)
             if len(group[2]) < 3:
                 group[2].append(path)
         category = _bloat_category(path)
@@ -551,7 +712,8 @@ def _observations(fs: Filesystem) -> Tuple[Dict, List[Dict]]:
                       for s, p, o, r in sorted(fs.shadowed, reverse=True)],
         })
     duplicates = sorted(
-        ((size * (count - 1), size, count, paths) for size, count, paths in by_digest.values() if count > 1),
+        ((size * (len(inodes) - 1), size, len(inodes), paths)
+         for size, inodes, paths in by_digest.values() if len(inodes) > 1),
         reverse=True,
     )
     if duplicates:
@@ -611,6 +773,20 @@ def _index_platforms(index: Dict) -> List[Dict]:
     descriptors = index.get("manifests")
     if not isinstance(descriptors, list) or not descriptors:
         raise LayerInspectionError("Image index does not list any manifests.")
+    for position, descriptor in enumerate(descriptors, 1):
+        if not isinstance(descriptor, dict):
+            raise LayerInspectionError(f"Image index descriptor {position} is not an object.")
+        platform = descriptor.get("platform")
+        if platform is None:
+            continue
+        if not isinstance(platform, dict):
+            raise LayerInspectionError(f"Image index descriptor {position} has invalid platform metadata.")
+        if any(not isinstance(platform.get(key), str) or not platform[key]
+               for key in ("os", "architecture")):
+            raise LayerInspectionError(f"Image index descriptor {position} has invalid platform metadata.")
+        variant = platform.get("variant")
+        if variant is not None and (not isinstance(variant, str) or not variant):
+            raise LayerInspectionError(f"Image index descriptor {position} has an invalid platform variant.")
     return descriptors
 
 
@@ -670,8 +846,16 @@ def _load_config(source, manifest: Dict, blobs: Path, platform: Optional[str], v
         raise LayerInspectionError("Image config is not valid JSON.") from error
     if not isinstance(config, dict):
         raise LayerInspectionError("Image config is not a JSON object.")
+    config_variant = config.get("variant")
+    if config_variant is not None and (not isinstance(config_variant, str) or not config_variant):
+        raise LayerInspectionError("Image config has an invalid platform variant.")
+    if variant is not None and config_variant is not None and variant != config_variant:
+        raise LayerInspectionError(
+            f"Selected index platform variant {variant!r} does not match image config variant "
+            f"{config_variant!r}."
+        )
     actual = {"os": config.get("os"), "architecture": config.get("architecture"),
-              "variant": variant or config.get("variant")}
+              "variant": variant or config_variant}
     if not all(isinstance(actual[k], str) and actual[k] for k in ("os", "architecture")):
         raise LayerInspectionError("Image config does not declare its os and architecture.")
     if platform:
@@ -718,8 +902,8 @@ def inspect_image(
     variant = parse_platform_variant(platform) if platform else None
     with tempfile.TemporaryDirectory(prefix="pycontainer-inspect-") as temporary:
         blobs = Path(temporary)
-        with contextlib.redirect_stdout(sys.stderr), open_local_image_source(
-            reference, blobs, blobs / "output", os_name, arch, variant
+        with open_local_image_source(
+            reference, blobs, blobs / "output", os_name, arch, variant, quiet=True
         ) as source:
             manifest, manifest_digest, selected_variant = _select_manifest(source, platform)
             config_ref, _, resolved_platform, descriptors, diff_ids, created_by = _load_config(

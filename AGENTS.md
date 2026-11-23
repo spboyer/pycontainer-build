@@ -38,8 +38,13 @@ Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
 content, normalized relative paths, workdir, and reproducibility settings.
 Index updates are locked and atomically replaced; cache blobs are verified
-before reuse. A malformed index raises an explicit `CacheIndexError`; missing
-or corrupt blobs are discarded and rebuilt.
+before reuse. A malformed index raises an explicit `CacheIndexError` with a
+remediation message; missing or corrupt blobs are discarded and rebuilt. A
+saved `--cache-dir` can be restored to another absolute path and checkout on
+the same OS (`tests/test_cache_portability.py`); source modes are part of the
+key, so Windows and Linux caches are not interchangeable. The non-gating
+`cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
+cross-OS restore outcomes.
 
 ## Setup and verified checks
 
@@ -138,7 +143,6 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- CLI defaults can overwrite TOML settings.
 - PyPI installation of this project returned HTTP 404 during the 2026-11-19
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
@@ -165,6 +169,26 @@ unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
 `PYTHON_VERSION`. Both helpers validate before requirements or venv staging.
 Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
+`dependencies.install_requirements` runs pip through `_pip_target.py`, which
+forces every `pip._vendor.packaging` marker evaluation (requirement-file roots,
+extras, transitive `Requires-Dist`) onto the target environment and fails
+closed on `platform_release`, `platform_version`, unknown variables, or
+`python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
+pip's vendored `packaging`; a self-test refuses to install if that changes.
+Virtualenv staging cannot re-resolve, so `venv_markers.py` verifies the copied
+closure instead: roots (requirements file, pyproject dependencies, optional
+dependencies, dependency groups) and installed `Requires-Dist`/egg-info
+`requires.txt` are re-evaluated for each target, failing on missing,
+unknown-marker, or possibly-requested extra/group requirements. An extra is
+ruled out only if every Windows/Linux/macOS CPython host of the venv minor
+(narrowed to posix by a `lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`,
+or to Windows by a `Lib` site-packages layout) would have installed one of its
+missing requirements; `python_version` is
+shared only when the venv minor is established (`python3.X` path or
+`pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
+root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic
+dependency files, Poetry/PDM/Hatch/setuptools/Flit tables) fail closed when they
+mention host markers, and unreadable dynamic dependencies always fail closed.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
@@ -172,3 +196,22 @@ Roadmap: `spboyer/pycontainer-build#66`. Reuse existing issues before opening
 another; do not close duplicate candidates without preserving their scope.
 Keep fixes separate from the documentation audit. Commit on a feature branch
 using conventional commit messages; never put credentials in code or issues.
+
+
+<!-- github-knowledge-base-start -->
+## Knowledge Base
+
+### Purpose
+
+This repository uses the Knowledge Base at [https://github.com/spboyer/pycontainer-build](https://github.com/spboyer/pycontainer-build) on branch `main`.
+
+### Required behavior
+
+1. Before changing code, read `docs/index.md` from that branch.
+2. Use the index to open only the knowledge files relevant to the task.
+3. If the index is unavailable, stop and report that the Knowledge Base could not be loaded.
+
+### Source of truth
+
+Generated knowledge tracks the code. When the knowledge and code disagree, trust the code.
+<!-- github-knowledge-base-end -->

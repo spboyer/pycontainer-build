@@ -204,10 +204,6 @@ def file_lock(path, *, blocking=True):
         if os.name == "nt":
             import msvcrt
 
-            lock.seek(0, os.SEEK_END)
-            if lock.tell() == 0:
-                lock.write(b"\0")
-                lock.flush()
             lock.seek(0)
             while True:
                 try:
@@ -223,6 +219,11 @@ def file_lock(path, *, blocking=True):
                     time.sleep(0.05)
 
             try:
+                # Windows can lock beyond EOF, so initialize only after locking.
+                lock.seek(0, os.SEEK_END)
+                if lock.tell() == 0:
+                    lock.write(b"\0")
+                    lock.flush()
                 yield
             finally:
                 lock.seek(0)

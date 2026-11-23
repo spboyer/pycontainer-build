@@ -135,12 +135,14 @@ def open_local_image_source(
     os_name: Optional[str],
     arch: Optional[str],
     variant: Optional[str] = None,
+    quiet: bool = False,
 ):
     """Open a local base image source after rejecting overlap with the output.
 
     ``os_name=None`` and ``arch=None`` skip the Docker archive's early platform
     check for inspection; Docker archive callers must validate the returned
-    ``DockerArchiveSource.platform`` themselves.
+    ``DockerArchiveSource.platform`` themselves. ``quiet=True`` suppresses
+    Docker archive layer progress output.
     """
     if _paths_overlap(reference.path, Path(output_dir)):
         raise LocalImageError(
@@ -149,7 +151,7 @@ def open_local_image_source(
         )
     if reference.transport == OCI_TRANSPORT:
         return OCILayoutSource(reference)
-    return DockerArchiveSource(reference, Path(layers_dir), os_name, arch, variant)
+    return DockerArchiveSource(reference, Path(layers_dir), os_name, arch, variant, quiet)
 
 
 def check_local_image_bounds(config_size: int, layer_sizes: List[int]) -> None:
@@ -188,6 +190,7 @@ def verify_layer_diff_ids(layers, config: Dict) -> None:
                 f"Local base image DiffID {index} is not a sha256 digest."
             ) from error
         if layer.media_type in TAR_LAYER_MEDIA_TYPES:
+            _require_plain_tar(Path(layer.tar_path), index)
             actual = layer.digest
         elif layer.media_type in GZIP_LAYER_MEDIA_TYPES:
             actual = _decompressed_digest(Path(layer.tar_path), gzip.open, "gzip")
@@ -210,6 +213,35 @@ def verify_layer_diff_ids(layers, config: Dict) -> None:
                 f"Local base image layer {index} has DiffID {actual}, but its "
                 f"config declares {expected}."
             )
+
+
+def _require_plain_tar(path: Path, index: int) -> None:
+    """Reject plain-tar layers whose bytes are compressed or not a tar stream."""
+    invalid = f"Local base image layer {index} is not a valid uncompressed tar stream."
+    try:
+        with path.open("rb") as source:
+            magic = source.read(len(XZ_MAGIC))
+            if not magic:
+                return
+            if magic.startswith((GZIP_MAGIC, ZSTD_MAGIC, BZIP2_MAGIC, XZ_MAGIC)):
+                raise BlobIntegrityError(
+                    f"Local base image layer {index} is compressed, but its media "
+                    "type declares an uncompressed tar."
+                )
+            source.seek(0)
+            with tarfile.open(fileobj=source, mode="r:", tarinfo=_BoundedTarInfo) as tar:
+                while tar.next() is not None:
+                    tar.members.clear()
+                end = tar.offset
+            # tarfile stops silently at an invalid later header; require a real end.
+            source.seek(end)
+            trailer = source.read(tarfile.BLOCKSIZE)
+    except BlobIntegrityError:
+        raise
+    except (tarfile.TarError, OSError) as error:
+        raise BlobIntegrityError(invalid) from error
+    if trailer.strip(b"\0"):
+        raise BlobIntegrityError(invalid)
 
 
 def _decompressed_digest(path: Path, opener, name: str) -> str:
@@ -438,7 +470,9 @@ class OCILayoutSource:
     def _select(self) -> List[Dict]:
         descriptors = self._descriptors()
         if self.reference.digest:
-            return [d for d in descriptors if d["digest"] == self.reference.digest]
+            return self._unique(
+                [d for d in descriptors if d["digest"] == self.reference.digest]
+            )
         if self.reference.reference:
             wanted = self.reference.reference
             matches = [d for d in descriptors if wanted in _descriptor_aliases(d)]
@@ -448,8 +482,34 @@ class OCILayoutSource:
                 and wanted in _descriptor_aliases(self.index)
             ):
                 matches = descriptors
-            return matches
+            return self._unique(matches)
         return descriptors
+
+    def _unique(self, matches: List[Dict]) -> List[Dict]:
+        """Collapse selected descriptors that repeat one manifest under several names."""
+        unique: Dict[Tuple[str, Optional[str]], Dict] = {}
+        for descriptor in matches:
+            platform = descriptor.get("platform")
+            key = (
+                descriptor["digest"],
+                json.dumps(platform, sort_keys=True) if platform is not None else None,
+            )
+            existing = unique.get(key)
+            if existing is None:
+                unique[key] = descriptor
+                continue
+            if (existing["size"], existing["mediaType"]) != (
+                descriptor["size"], descriptor["mediaType"]
+            ):
+                raise LocalImageError(
+                    f"OCI layout {self.root} has conflicting descriptors for "
+                    f"{descriptor['digest']}."
+                )
+            if _image_name(existing.get("annotations")) != _image_name(
+                descriptor.get("annotations")
+            ):
+                unique[key] = {k: v for k, v in existing.items() if k != "annotations"}
+        return list(unique.values())
 
     def _available(self) -> str:
         names = sorted(
@@ -633,10 +693,12 @@ class DockerArchiveSource:
         os_name: Optional[str],
         arch: Optional[str],
         variant: Optional[str] = None,
+        quiet: bool = False,
     ):
         self.path = reference.path
         self.reference = reference
         self.layers_dir = layers_dir
+        self.quiet = quiet
         self.source_name = str(reference.path)
         self.platform: Optional[Dict[str, str]] = None
         self._published: Dict[str, int] = {}
@@ -836,7 +898,8 @@ class DockerArchiveSource:
         for position, (layer_path, member) in enumerate(zip(layer_paths, layer_members), 1):
             description = f"layer {position}"
             path_digest = self._path_digest(layer_path)
-            print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
+            if not self.quiet:
+                print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
             try:
                 digest, size = _stage_stream(
                     self._open_member(member), self.layers_dir, path_digest,

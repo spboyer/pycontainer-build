@@ -1,8 +1,10 @@
 """Local OCI-layout and Docker-save base images (issue #20)."""
+import bz2
 import gzip
 import hashlib
 import io
 import json
+import lzma
 import tarfile
 from pathlib import Path
 from unittest.mock import patch
@@ -262,6 +264,44 @@ def test_oci_layout_selects_each_tag_for_shared_manifest(tmp_path, offline):
         build(tmp_path, f"oci:{layout.root}")
 
 
+@pytest.mark.parametrize("with_platform", [False, True])
+def test_oci_layout_digest_selects_manifest_shared_by_tags(tmp_path, offline, with_platform):
+    layout = Layout(tmp_path / "base")
+    descriptor, platform, layer = layout.image(b"shared")
+    for tag in ("app:v1", "app:latest"):
+        layout.add(descriptor, ref=tag, platform=platform if with_platform else None)
+
+    builder, manifest, _ = build(tmp_path, f"oci:{layout.root}@{descriptor['digest']}")
+    assert manifest["layers"][0] == layer
+    assert builder._base_image_name not in ("app:v1", "app:latest")
+
+
+def test_oci_layout_ref_selects_manifest_shared_by_aliases(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, layer = layout.image(b"shared")
+    layout.descriptors.append(
+        {**descriptor, "annotations": {"org.opencontainers.image.ref.name": "app:v1"}}
+    )
+    layout.descriptors.append(
+        {**descriptor, "annotations": {"io.containerd.image.name": "app:v1"}}
+    )
+    layout.write_index()
+
+    builder, manifest, _ = build(tmp_path, f"oci:{layout.root}:app:v1")
+    assert manifest["layers"][0] == layer
+    assert builder._base_image_name == "app:v1"
+
+
+def test_oci_layout_rejects_conflicting_duplicate_digest_descriptors(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, _, _ = layout.image(b"shared")
+    layout.add(descriptor, ref="one")
+    layout.add({**descriptor, "size": descriptor["size"] + 1}, ref="two")
+
+    with pytest.raises(LocalImageError, match="conflicting descriptors"):
+        build(tmp_path, f"oci:{layout.root}@{descriptor['digest']}")
+
+
 def test_oci_layout_selects_by_containerd_image_name_alias(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     tagged, _, tagged_layer = layout.image(b"tagged")
@@ -417,6 +457,54 @@ def test_oci_layout_rejects_wrong_diff_id(tmp_path, offline):
     layout.add(layout.blob(json.dumps(manifest).encode(), manifest["mediaType"]))
     with pytest.raises(BlobIntegrityError, match="DiffID"):
         build(tmp_path, f"oci:{layout.root}")
+
+
+NOT_PLAIN_TAR = {
+    "gzip": lambda data: gzip.compress(data, mtime=0),
+    "zstd": lambda data: b"\x28\xb5\x2f\xfd" + data,
+    "bzip2": bz2.compress,
+    "xz": lzma.compress,
+    "garbage": lambda data: b"not a tar header".ljust(1024, b"\x01"),
+    "truncated": lambda data: data[:600],
+    "corrupt-later-header": lambda data: data[:1024] + b"\x01" * 512 + data[1536:],
+}
+
+
+@pytest.mark.parametrize("encoding", sorted(NOT_PLAIN_TAR))
+def test_oci_plain_tar_layer_rejects_non_tar_bytes_matching_diff_id(
+    tmp_path, offline, encoding
+):
+    layout = Layout(tmp_path / "base")
+    data = NOT_PLAIN_TAR[encoding](layer_tar({"a": b"a"}))
+    layer = layout.blob(data, OCI_TAR_LAYER)
+    config = layout.blob(image_config([sha(data)]), "application/vnd.oci.image.config.v1+json")
+    manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": config, "layers": [layer]}
+    layout.add(layout.blob(json.dumps(manifest).encode(), manifest["mediaType"]))
+    with pytest.raises(BlobIntegrityError, match="uncompressed tar"):
+        build(tmp_path, f"oci:{layout.root}")
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+@pytest.mark.parametrize("encoding", ["bzip2", "xz"])
+def test_docker_archive_rejects_unsupported_compressed_layer(tmp_path, offline, encoding):
+    archive = tmp_path / "base.tar"
+    data = NOT_PLAIN_TAR[encoding](layer_tar({"a": b"a"}))
+    docker_archive(archive, [(["base:v1"], "amd64", [data])], modern=True)
+    with pytest.raises(BlobIntegrityError, match="uncompressed tar"):
+        build(tmp_path, f"docker-archive:{archive}")
+
+
+def test_oci_plain_tar_layer_accepts_empty_tar(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    empty = layer_tar({})
+    layer = layout.blob(empty, OCI_TAR_LAYER)
+    config = layout.blob(image_config([sha(empty)]), "application/vnd.oci.image.config.v1+json")
+    manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": config, "layers": [layer]}
+    layout.add(layout.blob(json.dumps(manifest).encode(), manifest["mediaType"]))
+    build(tmp_path, f"oci:{layout.root}")
+    assert (tmp_path / "out" / "index.json").exists()
 
 
 def test_oci_layout_rejects_bad_layout_marker_and_corrupt_manifest(tmp_path, offline):
