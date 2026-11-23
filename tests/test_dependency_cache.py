@@ -104,6 +104,7 @@ def _image(builder):
         config["rootfs"]["diff_ids"],
         builder.config_digest,
         [(package["name"], package["versionInfo"]) for package in sbom["packages"]],
+        builder.manifest_digest,
     )
 
 
