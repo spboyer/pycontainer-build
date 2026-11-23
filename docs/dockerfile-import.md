@@ -96,10 +96,10 @@ Compatibility boundary:
   do not record it, so pass `--shell` when the base image changed its shell.
 - The shell must exist in the target image. A distroless base produces a
   warning because it typically has no shell; prefer exec form there.
-- A `CMD`-only import is combined with the entrypoint auto-detected at build
-  time, so a shell-form `CMD` becomes arguments to that entrypoint. Use
-  `ENTRYPOINT` (or set `entrypoint`) when the command must run on its own
-  (tracked in #206).
+- A `CMD`-only import does not get an auto-detected or framework entrypoint:
+  like Docker, the image keeps the base image's `Entrypoint` (if any) and runs
+  the imported `CMD` under it. Set `entrypoint` to run `cmd` as its arguments.
+  Exec-form `ENTRYPOINT []` / `CMD []` clear the base image's value.
 
 To check a converted shell-form command in a real runtime (Linux/WSL with
 Skopeo and a running Docker daemon; not part of the default tests or CI):
@@ -113,6 +113,19 @@ It imports a quoted shell-form `ENTRYPOINT`, builds the image, imports it into
 Docker, runs it and compares the exact output. The requested `--platform` must
 match the Docker daemon. An optional `--evidence` record is tagged
 `shell-command` and does not satisfy the separate full-startup release gate.
+
+For `CMD`-only imports, use the separate verifier on a disposable Docker host
+with Skopeo:
+
+```bash
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --cmd-only --evidence cmd-only-evidence.json
+```
+
+It builds a base with a known entrypoint, imports shell- and exec-form
+`CMD` Dockerfiles with no `ENTRYPOINT`, and checks the exact output of each
+container. The same-repository PR runtime workflow runs this check on the
+exact PR head on Linux/amd64 and uploads a separate `cmd-only-runtime-evidence`
+artifact. It does not substitute for the full-startup release evidence.
 
 ## Parsing
 
