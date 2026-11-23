@@ -149,6 +149,24 @@ def test_gate_retains_report_on_findings(tmp_path, monkeypatch, scanner, severit
     assert report["matches"][0]["vulnerability"]["severity"] == severity
 
 
+def test_blocked_scan_records_failed_build_history(tmp_path, monkeypatch, scanner):
+    from pycontainer.history import BuildHistory
+    from pycontainer.scanning import VulnerabilityFoundError
+
+    scanner[1].write_text(json.dumps({"severities": ["high"]}))
+    history_dir = tmp_path / "history"
+    builder = make_builder(
+        tmp_path, monkeypatch, scanner,
+        record_history=True, history_dir=str(history_dir),
+    )
+
+    with pytest.raises(VulnerabilityFoundError):
+        builder.build()
+
+    records = BuildHistory(history_dir).list()
+    assert [record["status"] for record in records] == ["failed"]
+
+
 @pytest.mark.parametrize("policy", [
     {"scan_threshold": "critical"}, {"scan_unknown": "ignore"},
     {"scan_threshold": "low"},
