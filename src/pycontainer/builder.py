@@ -207,6 +207,7 @@ from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app
 from .sbom import generate_sbom
 from .squash import SquashError, squash_layers
 from .layer_analysis import analyze_platform, shared_blobs
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -412,7 +413,15 @@ class ImageBuilder:
             return self.config.tag
 
         with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+            security_fragments=render_security_fragments(
+                self.config.security, self.config.context_dir
+            )
+            result=self._build_image()
+            for fragment_path in write_security_fragments(
+                Path(self.config.output_dir), security_fragments
+            ):
+                logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
+            return result
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -1002,6 +1011,8 @@ class ImageBuilder:
             print("  Layer Analysis: layer-analysis.json in the output directory")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(

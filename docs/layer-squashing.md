@@ -154,11 +154,13 @@ Use `--skopeo-image quay.io/skopeo/stable:latest` to run Skopeo from a
 container when no `skopeo` binary is installed. It is not part of the default
 test suite or CI.
 
-Run the check from a Linux builder. On a Windows host, staged console scripts
-currently get CRLF shebangs, so the dependency's entrypoint fails in Linux
-containers whether or not you squash. That is a staging limitation, not a
-squash one; see [#225](https://github.com/spboyer/pycontainer-build/issues/225).
-One way to run the check from Windows with Docker Desktop:
+Historically, Windows staging produced CRLF console-script shebangs that failed
+in Linux containers, with or without squashing
+([#225](https://github.com/spboyer/pycontainer-build/issues/225)). The fix
+from [#228](https://github.com/spboyer/pycontainer-build/pull/228) is included,
+but Windows-built plain-versus-squashed runtime equivalence still needs
+validation. The prior Linux-builder workaround remains an option when using
+Docker Desktop on Windows:
 
 ```powershell
 docker run --rm -v //var/run/docker.sock:/var/run/docker.sock -v "${PWD}:/src:ro" -w /src docker:cli `

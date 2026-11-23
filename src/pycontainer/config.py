@@ -58,11 +58,17 @@ class BuildConfig:
     latest_tag: bool = False
     squash: bool = False
     analyze_layers: bool = False
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

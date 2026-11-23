@@ -17,6 +17,8 @@ daemon without discussing the trade-off first.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `squash.py`, `layer_analysis.py`: opt-in builder-layer squashing with OCI
   whiteout/opaque semantics, and the `layer-analysis.json` report.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -120,6 +122,13 @@ The tests workflow also runs the multi-platform index check on both native
 targets and uploads separate `index-runtime-evidence-*` artifacts; the release
 workflow continues to use only the single-platform release evidence.
 
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
+
 `.github/workflows/execution-backend-probe.yml` records isolated-execution host
 prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
 runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
@@ -129,9 +138,11 @@ gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
 squashed. Unrepresentable overlay cases raise `SquashError` rather than being
 approximated. `scripts/check_squash_equivalence.py` is the opt-in Docker
 equivalence check for plain versus squashed images (`--skopeo-image` runs
-Skopeo from a container). Run it from a Linux builder: dependency staging on a
-Windows host writes CRLF console-script shebangs that fail in Linux containers
-([#225](https://github.com/spboyer/pycontainer-build/issues/225)).
+Skopeo from a container). The historical Linux-builder workaround for Windows
+CRLF console-script shebangs is tracked in
+[#225](https://github.com/spboyer/pycontainer-build/issues/225); its fix is
+included via [#228](https://github.com/spboyer/pycontainer-build/pull/228).
+Windows-built plain-versus-squashed runtime equivalence still needs validation.
 See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 There is no configured root formatter, linter, type checker, or timing gate.

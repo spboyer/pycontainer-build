@@ -623,6 +623,28 @@ def test_squash_flattens_builder_layers_and_keeps_base(tmp_path, monkeypatch):
         ]
 
 
+def test_squash_and_security_fragments_can_be_combined(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    plain = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx,
+        squash=True,
+    )
+    plain.build()
+    secured = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx,
+        output_dir=str(tmp_path / "secured"), squash=True, analyze_layers=True,
+        security={"kubernetes": {"capabilities": {"drop": ["ALL"]}}},
+    )
+    secured.build()
+
+    assert secured.index_digest == plain.index_digest
+    assert all(len(image.layers) == 2 for image in secured.platform_images)
+    assert (tmp_path / "secured" / "layer-analysis.json").is_file()
+    fragment = tmp_path / "secured" / "security" / "kubernetes-security-context.json"
+    assert json.loads(fragment.read_text()) == {"capabilities": {"drop": ["ALL"]}}
+
+
 def test_repeated_squashed_builds_are_reproducible(tmp_path, monkeypatch):
     _install_fake_deps(monkeypatch)
     first = _builder(
