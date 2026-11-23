@@ -111,12 +111,19 @@ def build_index_json(
     architecture="amd64",
     os_name="linux",
     variant=None,
+    *,
+    ref_names=None,
 ):
     platform = {"architecture": architecture, "os": os_name}
     if variant:
         platform["variant"] = variant
     annot={"org.opencontainers.image.ref.name":tag} if tag else None
-    # The image-layout spec resolves ref.name on the manifest descriptor; the
-    # index-level copy is kept for existing consumers.
-    desc=OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,platform,annot)
-    return OCIIndex(2,[desc],annot).to_json()
+    # The image-layout spec resolves ref.name on the manifest descriptor, one
+    # descriptor per reference; the index-level copy is kept for existing consumers.
+    names=list(dict.fromkeys(ref_names or ([tag] if tag else [])))
+    descriptors=[
+        OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,
+                              dict(platform),{"org.opencontainers.image.ref.name":name})
+        for name in names
+    ] or [OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,platform)]
+    return OCIIndex(2,descriptors,annot).to_json()

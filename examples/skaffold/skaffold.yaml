@@ -1,0 +1,25 @@
+# Skaffold custom builder that builds and pushes with pycontainer-build.
+# Skaffold passes IMAGE, BUILD_CONTEXT, PUSH_IMAGE and PLATFORMS in the
+# environment; pycontainer reads them directly, so no values are templated
+# into the shell command.
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: pycontainer-skaffold-demo
+build:
+  local:
+    # pycontainer has no Docker daemon handoff; images must go to a registry.
+    push: true
+  artifacts:
+    - image: pycontainer-demo
+      custom:
+        buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+        dependencies:
+          paths:
+            - app/**
+            - pyproject.toml
+manifests:
+  rawYaml:
+    - k8s/deployment.yaml
+deploy:
+  kubectl: {}

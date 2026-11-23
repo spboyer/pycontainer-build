@@ -1,6 +1,8 @@
 """Declared build inputs and non-recursive configuration interpolation."""
+import json
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
+from urllib.parse import quote
 
 BuildArgument = Union[str, Dict[str, str]]
 ARGUMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -9,6 +11,20 @@ EXPANDABLE_FIELDS = (
     "cmd", "env", "labels", "user", "include_paths", "exclude_paths",
     "output_dir", "cache_dir", "requirements_file", "platform",
 )
+
+
+def redact_values(message: str, values: Iterable[str]) -> str:
+    representations = set()
+    for value in values:
+        if value:
+            representations.update((
+                value, repr(value)[1:-1],
+                json.dumps(value, ensure_ascii=False)[1:-1],
+                json.dumps(value)[1:-1], quote(value, safe=""),
+            ))
+    for value in sorted(representations, key=len, reverse=True):
+        message = message.replace(value, "<redacted>")
+    return message
 
 
 def _check_text(value: str, description: str) -> None:
