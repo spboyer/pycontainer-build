@@ -34,7 +34,22 @@ _VENV_HOSTS = (
     ("darwin", "Darwin", "posix", ("x86_64", "arm64")),
 )
 
+_POSIX_LIB_DIR = re.compile(r"python\d+\.\d+t?")
+
 RootGroup = Tuple[str, bool, List[str]]
+
+
+def venv_layout_os(site_root: Tuple[str, ...]) -> Optional[str]:
+    """Infer the creating host's os_name from the site-packages layout, if recognizable."""
+    if (
+        len(site_root) >= 3
+        and _POSIX_LIB_DIR.fullmatch(site_root[-2])
+        and site_root[-3] in ("lib", "lib64")
+    ):
+        return "posix"
+    if len(site_root) >= 2 and site_root[-2] == "Lib":
+        return "nt"
+    return None
 
 
 def _normalize(name: str) -> str:
@@ -253,6 +268,7 @@ def verify_virtualenv_markers(
     environment: dict,
     roots: List[RootGroup],
     shared_python_version: bool = True,
+    host_os_name: Optional[str] = None,
 ) -> List[str]:
     """Return why the staged virtualenv cannot be shown complete for the target."""
     dists = _installed(site_packages)
@@ -271,6 +287,7 @@ def verify_virtualenv_markers(
             "platform_machine": machine,
         }
         for sys_platform, system, os_name, machines in _VENV_HOSTS
+        if host_os_name in (None, os_name)
         for machine in machines
     ]
 
