@@ -46,24 +46,38 @@ class _FakeRegistries:
 
     def __init__(self):
         self.requests = []
+        self.paths = []
+        self.responses = {}
 
     def urlopen(self, request, timeout=None):
         url = urllib.parse.urlsplit(request.full_url)
         authorization = request.get_header("Authorization")
         self.requests.append((url.hostname, request.get_method(), authorization))
+        self.paths.append(url.path)
         if url.hostname.startswith("auth."):
-            registry = url.hostname.removeprefix("auth.")
+            registry = (
+                "registry-1.docker.io"
+                if url.hostname == "auth.docker.io"
+                else url.hostname.removeprefix("auth.")
+            )
             return _Response(200, json.dumps({"token": f"issued-{registry}"}).encode())
         if authorization != f"Bearer issued-{url.hostname}":
             headers = email.message.Message()
+            realm_host = (
+                "auth.docker.io"
+                if url.hostname == "registry-1.docker.io"
+                else f"auth.{url.hostname}"
+            )
             headers["Www-Authenticate"] = (
-                f'Bearer realm="https://auth.{url.hostname}/token",'
+                f'Bearer realm="https://{realm_host}/token",'
                 f'service="{url.hostname}",scope="repository:team/image:pull,push"'
             )
             raise urllib.error.HTTPError(
                 request.full_url, 401, "Unauthorized", headers, io.BytesIO(b"")
             )
         method = request.get_method()
+        if method == "GET" and url.path in self.responses:
+            return _Response(200, self.responses[url.path])
         if "/manifests/" in url.path and method == "GET":
             manifest = {
                 "schemaVersion": 2,
@@ -159,14 +173,15 @@ def test_base_pull_does_not_send_generic_destination_credentials(
 
     assert layers == []
     assert config == {"architecture": "amd64", "os": "linux"}
+    realm_host = "auth.docker.io" if host == "registry-1.docker.io" else f"auth.{host}"
     assert [request_host for request_host, _, _ in fake.requests] == [
         host,
-        f"auth.{host}",
+        realm_host,
         host,
         host,
     ]
-    assert fake.headers_for(f"auth.{host}") == [None]
-    _assert_no_destination_secret(fake.headers_for(host, f"auth.{host}"))
+    assert fake.headers_for(realm_host) == [None]
+    _assert_no_destination_secret(fake.headers_for(host, realm_host))
 
 
 def test_base_pull_uses_registry_scoped_docker_config(
@@ -195,6 +210,86 @@ def test_base_pull_uses_registry_scoped_docker_config(
     assert fake.headers_for("auth.base.example") == [
         _basic("base-user", "base-password")
     ]
+    _assert_no_destination_secret(
+        fake.headers_for("base.example", "auth.base.example")
+    )
+
+
+@pytest.mark.parametrize("kind", ["basic", "bearer"])
+@pytest.mark.parametrize("scoped", [False, True])
+def test_multi_platform_build_scopes_auth_for_each_base_pull(
+    tmp_path, monkeypatch, registries, kind, scoped
+):
+    fake, home = registries
+    _set_destination_credentials(monkeypatch, kind)
+    if scoped:
+        docker_config = home / ".docker" / "config.json"
+        docker_config.parent.mkdir()
+        docker_config.write_text(json.dumps({"auths": {"base.example": {
+            "username": "base-user", "password": "base-password",
+        }}}))
+
+    descriptors = []
+    config_paths = []
+    for arch in ("amd64", "arm64"):
+        config = json.dumps({
+            "os": "linux",
+            "architecture": arch,
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }).encode()
+        config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+        config_path = f"/v2/team/image/blobs/{config_digest}"
+        fake.responses[config_path] = config
+        config_paths.append(config_path)
+        manifest = json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": len(config),
+            },
+            "layers": [],
+        }).encode()
+        digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+        fake.responses[f"/v2/team/image/manifests/{digest}"] = manifest
+        descriptors.append({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest,
+            "size": len(manifest),
+            "platform": {"os": "linux", "architecture": arch},
+        })
+    index = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": descriptors,
+    }).encode()
+    index_digest = "sha256:" + hashlib.sha256(index).hexdigest()
+    fake.responses["/v2/team/image/manifests/latest"] = index
+    fake.responses[f"/v2/team/image/manifests/{index_digest}"] = index
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    builder = ImageBuilder(BuildConfig(
+        base_image="base.example/team/image:latest",
+        tag="push.example/team/image:v1",
+        context_dir=str(context),
+        output_dir=str(tmp_path / "layout"),
+        platform="linux/amd64,linux/arm64",
+        include_deps=False,
+        use_cache=False,
+    ))
+
+    builder.build()
+
+    assert [image.platform["architecture"] for image in builder.platform_images] == [
+        "amd64", "arm64",
+    ]
+    assert all(path in fake.paths for path in config_paths)
+    assert f"/v2/team/image/manifests/{index_digest}" in fake.paths
+    expected = _basic("base-user", "base-password") if scoped else None
+    assert fake.headers_for("auth.base.example") == [expected, expected]
     _assert_no_destination_secret(
         fake.headers_for("base.example", "auth.base.example")
     )

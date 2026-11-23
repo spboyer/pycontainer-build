@@ -211,7 +211,8 @@ pycontainer build --tag registry.example.com/app:v1 --push
 Base-image pulls use only registry-scoped credentials. Generic
 `REGISTRY_TOKEN`, `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` values, and the
 `--username`/`--password` flags, are reserved for the destination push and are
-never sent to the base registry or its token endpoint. Authenticate a private
+never sent to the base registry or its token endpoint. This applies to every
+target in a multi-platform image-index build. Authenticate a private
 base independently of the destination with an inline `auths` entry for the base
 registry host in `~/.docker/config.json` (credential helpers and `credsStore`
 are not read). The host-scoped `GITHUB_TOKEN` (ghcr.io) and Azure CLI

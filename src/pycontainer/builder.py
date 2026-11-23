@@ -1,9 +1,10 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
+from dataclasses import dataclass
 from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -178,7 +179,17 @@ def _select_index_descriptor(
         f"Base image has multiple manifests matching {target}; specify an exact "
         f"variant. Available platforms: {available_text}."
     )
-from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
+from .oci import (
+    OCI_MANIFEST_MEDIA_TYPE,
+    OCILayer,
+    OCIManifestDescriptor,
+    build_config_json,
+    build_image_index_json,
+    build_index_json,
+    build_layout_index_json,
+    build_manifest_json,
+    build_oci_layout,
+)
 from .project import (
     CONDA_FILES, detect_conda_inputs, detect_entrypoint,
     default_include_paths, find_dependencies,
@@ -193,6 +204,7 @@ from .registry_client import (
 )
 from .auth import get_registry_auth
 from .local_image import (
+    LocalImageError,
     check_local_image_bounds,
     open_local_image_source,
     parse_local_image_reference,
@@ -217,6 +229,128 @@ from .dependencies import (
 )
 
 logger=logging.getLogger(__name__)
+
+UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
+
+
+@dataclass
+class PlatformImage:
+    """One platform-specific image manifest built for an image index."""
+
+    platform: Dict[str, str]
+    manifest_digest: str
+    manifest_size: int
+    config_digest: str
+    config_size: int
+    layers: List[OCILayer]
+    app_layer_count: int
+
+
+def _read_verified_blob(layers_dir: Path, digest: str, size: int, description: str) -> bytes:
+    path = layers_dir / _digest_filename(digest)
+    if path.is_symlink() or not path.is_file():
+        raise LayerIntegrityError(f"{description} blob {digest} is missing.")
+    content = path.read_bytes()
+    actual = "sha256:" + hashlib.sha256(content).hexdigest()
+    if actual != digest or len(content) != size:
+        raise LayerIntegrityError(
+            f"{description} blob {digest} does not match its descriptor."
+        )
+    return content
+
+
+def _verify_platform_image(
+    layers_dir: Path, image: PlatformImage, check_diff_ids: bool = False
+) -> None:
+    """Check manifest, config, platform, layer and DiffID agreement for one image."""
+    target = "/".join(
+        image.platform[key]
+        for key in ("os", "architecture", "variant")
+        if key in image.platform
+    )
+    manifest = json.loads(
+        _read_verified_blob(
+            layers_dir, image.manifest_digest, image.manifest_size, f"{target} manifest"
+        )
+    )
+    if manifest.get("mediaType") != OCI_MANIFEST_MEDIA_TYPE:
+        raise LayerIntegrityError(f"{target} manifest has an unexpected media type.")
+    expected_config = {
+        "mediaType": "application/vnd.oci.image.config.v1+json",
+        "digest": image.config_digest,
+        "size": image.config_size,
+    }
+    if manifest.get("config") != expected_config:
+        raise LayerIntegrityError(f"{target} manifest config descriptor does not match.")
+    if manifest.get("layers") != [layer.to_descriptor() for layer in image.layers]:
+        raise LayerIntegrityError(f"{target} manifest layers do not match the build.")
+    config = json.loads(
+        _read_verified_blob(
+            layers_dir, image.config_digest, image.config_size, f"{target} config"
+        )
+    )
+    if (
+        config.get("os") != image.platform.get("os")
+        or config.get("architecture") != image.platform.get("architecture")
+        or config.get("variant") != image.platform.get("variant")
+    ):
+        raise LayerIntegrityError(
+            f"{target} config platform does not match its index descriptor."
+        )
+    diff_ids = config.get("rootfs", {}).get("diff_ids")
+    if not isinstance(diff_ids, list) or len(diff_ids) != len(image.layers):
+        raise LayerIntegrityError(
+            f"{target} config has {len(diff_ids or [])} DiffIDs for "
+            f"{len(image.layers)} layers."
+        )
+    for position, (layer, diff_id) in enumerate(zip(image.layers, diff_ids), 1):
+        if layer.media_type == UNCOMPRESSED_LAYER_MEDIA_TYPE and diff_id != layer.digest:
+            raise LayerIntegrityError(
+                f"{target} layer {position} DiffID does not match its uncompressed digest."
+            )
+        if not _blob_matches(
+            layers_dir / _digest_filename(layer.digest), layer.digest, layer.size
+        ):
+            raise LayerIntegrityError(
+                f"{target} layer {position} blob {layer.digest} is missing or corrupt."
+            )
+    if check_diff_ids:
+        # Compressed base layers need decompression; done once, before publication.
+        try:
+            verify_layer_diff_ids(image.layers, config)
+        except (BlobIntegrityError, LocalImageError) as error:
+            raise LayerIntegrityError(
+                f"{target} layer DiffIDs their content: {error}"
+            ) from error
+
+
+def _verify_image_index(
+    layers_dir: Path,
+    index_digest: str,
+    index_size: int,
+    images: List[PlatformImage],
+    check_diff_ids: bool = False,
+) -> None:
+    """Check that an index blob references exactly the verified platform images."""
+    index = json.loads(
+        _read_verified_blob(layers_dir, index_digest, index_size, "Image index")
+    )
+    expected = [
+        {
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "digest": image.manifest_digest,
+            "size": image.manifest_size,
+            "platform": image.platform,
+        }
+        for image in images
+    ]
+    if index.get("manifests") != expected:
+        raise LayerIntegrityError("Image index descriptors do not match the built images.")
+    platforms = [tuple(sorted(image.platform.items())) for image in images]
+    if len(set(platforms)) != len(platforms):
+        raise LayerIntegrityError("Image index contains duplicate platforms.")
+    for image in images:
+        _verify_platform_image(layers_dir, image, check_diff_ids)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig):
@@ -309,6 +443,8 @@ class ImageBuilder:
     def build(self):
         self.config.validate_metadata()
         self._conda_warning_emitted = False
+        if self.config.scan and len(self.config.target_platforms()) > 1:
+            raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
         if conda_prefix(self.config.context_dir, ".") is not None:
             raise ValueError(
                 "The build context is inside a host Conda environment; use a "
@@ -333,6 +469,9 @@ class ImageBuilder:
                         self.config.context_dir, self.config.output_dir
                     )
                 with output_directory_lock(self.config.output_dir):
+                    security_fragments=render_security_fragments(
+                        self.config.security, self.config.context_dir
+                    )
                     result = self._build_image()
                     if self.config.scan:
                         from .scanning import scanned_image
@@ -341,6 +480,10 @@ class ImageBuilder:
                             Path(self.config.output_dir), self.manifest_digest, self.config
                         ):
                             logger.info("Vulnerability gate passed for %s", self.manifest_digest)
+                    for fragment_path in write_security_fragments(
+                        Path(self.config.output_dir), security_fragments
+                    ):
+                        logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
             except BaseException:
                 if timing:
                     self._record_failed_history(timing, self.config)
@@ -362,16 +505,129 @@ class ImageBuilder:
         layers_dir=ensure_dir(blobs/'sha256')
         refs_dir=ensure_dir(output/'refs'/'tags')
 
-        os_name, arch = parse_platform(self.config.platform)
-        security_fragments=render_security_fragments(
-            self.config.security, self.config.context_dir
+        platforms=self.config.target_platforms()
+        self._resolved_base_reference=None
+        self._resolved_base_from_tag=False
+        self._base_image_tag_verified=False
+        self._local_base_snapshot=None
+        self._app_layer=None
+        self._requirement_files=[]
+        if len(platforms)>1:
+            return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
+
+        image=self._build_platform_image(layers_dir, platforms[0])
+
+        oci_layout=build_oci_layout()
+        _atomic_write_bytes(
+            output/'oci-layout',
+            json.dumps(oci_layout,separators=(',',':')).encode(),
         )
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
+        index=build_index_json(
+            image.manifest_digest,
+            image.manifest_size,
+            ref_names[0],
+            image.platform["architecture"],
+            image.platform["os"],
+            variant=image.platform.get("variant"),
+            annotations=self.config.index_annotations,
+            ref_names=ref_names,
+        )
+        _atomic_write_bytes(
+            output/'index.json',
+            json.dumps(index,separators=(',',':')).encode(),
+        )
+
+        for tag_ref in self.config.all_tags():
+            _, _, tag_name=parse_image_reference(tag_ref)
+            _atomic_write_bytes(refs_dir/tag_name, image.manifest_digest.encode())
+
+        self.manifest_digest=image.manifest_digest
+        self.config_digest=image.config_digest
+        self.layers=image.layers
+        self.index_digest=None
+        self.platform_images=[image]
+        
+        if getattr(self.config, 'generate_sbom', False):
+            sbom_path=output/'sbom.json'
+            logger.info("Generating SBOM...")
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
+            logger.info(f"✓ SBOM saved to {sbom_path}")
+        
+        return self.config.tag
+
+    def _build_multi_platform(self, output: Path, layers_dir: Path, refs_dir: Path, platforms: List[str]):
+        """Build every platform in isolation, then publish one index only if all succeed."""
+        images=[]
+        for platform in platforms:
+            print(f"Building platform {platform}...")
+            images.append(self._build_platform_image(layers_dir, platform))
+
+        index_digest, index_size=self._write_image_index(layers_dir, images)
+        _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
+        self._verify_local_base_unchanged(layers_dir)
+
+        _atomic_write_bytes(
+            output/'oci-layout',
+            json.dumps(build_oci_layout(),separators=(',',':')).encode(),
+        )
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
+        layout_index=build_layout_index_json(
+            index_digest, index_size, ref_names, annotations=self.config.index_annotations
+        )
+        _atomic_write_bytes(
+            output/'index.json',
+            json.dumps(layout_index,separators=(',',':')).encode(),
+        )
+        for tag_ref in self.config.all_tags():
+            _, _, tag_name=parse_image_reference(tag_ref)
+            _atomic_write_bytes(refs_dir/tag_name, index_digest.encode())
+
+        self.index_digest=index_digest
+        self.index_size=index_size
+        self.manifest_digest=index_digest
+        self.config_digest=None
+        self.platform_images=images
+        self.layers=list({layer.digest: layer for image in images for layer in image.layers}.values())
+        print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
+        return self.config.tag
+
+    def _write_image_index(self, layers_dir: Path, images: List["PlatformImage"]) -> Tuple[str, int]:
+        descriptors=[
+            OCIManifestDescriptor(OCI_MANIFEST_MEDIA_TYPE, image.manifest_digest, image.manifest_size, dict(image.platform))
+            for image in images
+        ]
+        index_bytes=json.dumps(
+            build_image_index_json(descriptors, annotations=self.config.index_annotations),
+            separators=(',',':'),
+        ).encode()
+        index_digest="sha256:"+hashlib.sha256(index_bytes).hexdigest()
+        _write_content_addressed_bytes(layers_dir/_digest_filename(index_digest), index_bytes, index_digest)
+        return index_digest, len(index_bytes)
+
+    def _build_platform_image(self, layers_dir: Path, platform: str) -> "PlatformImage":
+        """Build config and manifest blobs for one platform without touching tags."""
+        self._target_platform=platform
+        self._staged_packages=[]
+        self._dependency_site_packages=False
+        self._base_image_tag_verified=False
+        os_name, arch = parse_platform(platform)
         with self._time_history_phase("base_image"):
             base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
-        ) or parse_platform_variant(self.config.platform)
+        ) or parse_platform_variant(platform)
         
         # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
         if self.config.entrypoint is not None:
@@ -390,6 +646,7 @@ class ImageBuilder:
                     base_image_tag_verified=(
                         parse_local_image_reference(self.config.base_image) is None
                         and "@" not in self.config.base_image
+                        and getattr(self, "_base_image_tag_verified", False)
                     ),
                 )
                 deps_layer=self._create_deps_layer(
@@ -397,9 +654,11 @@ class ImageBuilder:
                 )
             if deps_layer: app_layers.append(deps_layer)
         
-        with self._time_history_phase("application"):
-            app_layer=self._create_app_layer(layers_dir, include)
-        app_layers.append(app_layer)
+        # The application tar is byte-identical for every target, so build it once.
+        if self._app_layer is None:
+            with self._time_history_phase("application"):
+                self._app_layer=self._create_app_layer(layers_dir, include)
+        app_layers.append(self._app_layer)
         
         all_layers=base_layers+app_layers
 
@@ -446,57 +705,22 @@ class ImageBuilder:
         manifest_path=layers_dir/manifest_digest.split(":",1)[1]
         _write_content_addressed_bytes(manifest_path, manifest_bytes, manifest_digest)
 
-        oci_layout=build_oci_layout()
-        _atomic_write_bytes(
-            output/'oci-layout',
-            json.dumps(oci_layout,separators=(',',':')).encode(),
+        platform_descriptor={"architecture": arch, "os": os_name}
+        if variant:
+            platform_descriptor["variant"]=variant
+        return PlatformImage(
+            platform=platform_descriptor,
+            manifest_digest=manifest_digest,
+            manifest_size=len(manifest_bytes),
+            config_digest=cfg_digest,
+            config_size=len(cfg_bytes),
+            layers=all_layers,
+            app_layer_count=len(app_layers),
         )
-
-        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
-        index=build_index_json(
-            manifest_digest,
-            len(manifest_bytes),
-            ref_names[0],
-            arch,
-            os_name,
-            variant=variant,
-            annotations=self.config.index_annotations,
-            ref_names=ref_names,
-        )
-        _atomic_write_bytes(
-            output/'index.json',
-            json.dumps(index,separators=(',',':')).encode(),
-        )
-
-        for tag_ref in self.config.all_tags():
-            _, _, tag_name=parse_image_reference(tag_ref)
-            _atomic_write_bytes(refs_dir/tag_name, manifest_digest.encode())
-
-        self.manifest_digest=manifest_digest
-        self.config_digest=cfg_digest
-        self.layers=all_layers
-        
-        if getattr(self.config, 'generate_sbom', False):
-            sbom_path=output/'sbom.json'
-            logger.info("Generating SBOM...")
-            with self._time_history_phase("sbom"):
-                generate_sbom(
-                    Path(self.config.context_dir),
-                    sbom_path,
-                    format=(
-                        self.config.generate_sbom
-                        if isinstance(self.config.generate_sbom, str)
-                        else "spdx"
-                    ),
-                    package_inventory=getattr(self, "_staged_packages", []),
-                )
-            logger.info(f"✓ SBOM saved to {sbom_path}")
-
-        for fragment_path in write_security_fragments(output, security_fragments):
-            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
-        
-        return self.config.tag
     
+    def _requested_platform(self) -> str:
+        return getattr(self, "_target_platform", None) or self.config.platform
+
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
@@ -521,7 +745,7 @@ class ImageBuilder:
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
         self._base_image_name=self.config.base_image
-        requested_variant = parse_platform_variant(self.config.platform)
+        requested_variant = parse_platform_variant(self._requested_platform())
         local=parse_local_image_reference(self.config.base_image)
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
@@ -537,6 +761,7 @@ class ImageBuilder:
         with open_local_image_source(
             local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
         ) as source:
+            self._pin_local_base_snapshot(getattr(source, "snapshot_digest", None))
             base_layers, base_config = self._read_base_image(
                 source, None, layers_dir, os_name, arch
             )
@@ -544,22 +769,73 @@ class ImageBuilder:
             self._base_image_name=source.source_name
         return base_layers, base_config
 
+    def _pin_local_base_snapshot(self, snapshot: Optional[str]) -> None:
+        """Require every platform to select from the same local layout index."""
+        if snapshot is None:
+            return
+        pinned=getattr(self, "_local_base_snapshot", None)
+        if pinned is None:
+            self._local_base_snapshot=snapshot
+        elif snapshot != pinned:
+            raise LocalImageError(
+                f"Local base image {self.config.base_image} changed during the "
+                f"multi-platform build (index {pinned[:19]}... became {snapshot[:19]}...); "
+                "rebuild once the layout is stable."
+            )
+
+    def _verify_local_base_unchanged(self, layers_dir: Path) -> None:
+        """Re-read a pinned local layout index before publishing the image index."""
+        if getattr(self, "_local_base_snapshot", None) is None:
+            return
+        local=parse_local_image_reference(self.config.base_image)
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), None, None
+        ) as source:
+            self._pin_local_base_snapshot(getattr(source, "snapshot_digest", None))
+
     def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Resolve and validate a base image through a registry or local source."""
         local = reference is None
-        platform = self.config.platform
+        platform = self._requested_platform()
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
+        # Later registry platforms re-select from the same verified base index as the first.
+        pinned = None if local else getattr(self, "_resolved_base_reference", None)
+        pull_reference = pinned or reference
         if not local:
             print(f"Pulling base image {self.config.base_image} for {target}...")
-        manifest, _ = client.pull_manifest(
-            reference,
+        manifest, resolved_digest = client.pull_manifest(
+            pull_reference,
             expected_digest=(
-                reference if reference and reference.startswith("sha256:") else None
+                pull_reference
+                if pull_reference and pull_reference.startswith("sha256:")
+                else None
             ),
         )
+        if (
+            not local
+            and pinned is None
+            and isinstance(resolved_digest, str)
+            and resolved_digest.startswith("sha256:")
+        ):
+            self._resolved_base_reference = resolved_digest
+            # Only a registry pull by tag can vouch for the tag; a user-supplied
+            # tag@digest or digest is pulled by digest and never proves its tag.
+            self._resolved_base_from_tag = not reference.startswith("sha256:")
+        if local:
+            self._base_image_tag_verified = False
+        elif pinned is None:
+            self._base_image_tag_verified = (
+                not reference.startswith("sha256:")
+                and isinstance(resolved_digest, str)
+                and resolved_digest.startswith("sha256:")
+            )
+        else:
+            self._base_image_tag_verified = bool(
+                getattr(self, "_resolved_base_from_tag", False)
+            )
 
         selected_variant = None
         selected_from_index = False
@@ -682,6 +958,8 @@ class ImageBuilder:
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
         if self.config.scan:
+            if getattr(self, "index_digest", None):
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
             from .scanning import scanned_image
 
             with output_directory_lock(self.config.output_dir):
@@ -710,6 +988,9 @@ class ImageBuilder:
         for tag_ref in self.config.all_tags()[1:]:
             extra_tag=parse_image_reference(tag_ref)[2]
             if extra_tag not in push_tags: push_tags.append(extra_tag)
+
+        if getattr(self, "index_digest", None):
+            self.pushed_refs=[]
         
         auth=get_registry_auth(
             registry,
@@ -720,6 +1001,10 @@ class ImageBuilder:
         client=self._registry_client(registry, repo, auth)
         
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
+
+        if getattr(self, "index_digest", None):
+            self._push_image_index(client, layers_dir, push_tags, f"{registry}/{repo}", show_progress)
+            return f"{registry}/{repo}:{tag}"
         
         for i, layer in enumerate(layers, 1):
             digest=layer["digest"]
@@ -739,6 +1024,40 @@ class ImageBuilder:
         self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
 
         return f"{registry}/{repo}:{tag}"
+
+    def _push_image_index(self, client, layers_dir: Path, push_tags: List[str], repository: str, show_progress: bool) -> None:
+        """Push blobs, then platform manifests by digest, then the index; tags go last."""
+        _verify_image_index(layers_dir, self.index_digest, self.index_size, self.platform_images)
+        blobs={}
+        for image in self.platform_images:
+            for layer in image.layers: blobs.setdefault(layer.digest, None)
+            blobs.setdefault(image.config_digest, None)
+        for i, digest in enumerate(blobs, 1):
+            if show_progress: print(f"  Pushing blob {i}/{len(blobs)} ({digest[:19]}...)")
+            skipped=not client.push_blob(digest, layers_dir/_digest_filename(digest), check_exists=True)
+            if show_progress and skipped: print(f"    Blob exists, skipped")
+        for image in self.platform_images:
+            target="/".join(image.platform[k] for k in ("os","architecture","variant") if k in image.platform)
+            if show_progress: print(f"  Pushing {target} manifest ({image.manifest_digest[:19]}...)")
+            manifest_data=(layers_dir/_digest_filename(image.manifest_digest)).read_bytes()
+            client.push_manifest(image.manifest_digest, manifest_data)
+        index_data=(layers_dir/_digest_filename(self.index_digest)).read_bytes()
+        if show_progress: print(f"  Pushing image index ({self.index_digest[:19]}...)")
+        client.push_index(self.index_digest, index_data)
+        for i, push_tag in enumerate(push_tags):
+            ref=f"{repository}:{push_tag}"
+            try:
+                client.push_index(push_tag, index_data)
+            except (RegistryRequestError, OSError) as error:
+                confirmed=", ".join(self.pushed_refs) or "(none)"
+                remaining=", ".join(f"{repository}:{tag}" for tag in push_tags[i+1:]) or "(none)"
+                raise RegistryRequestError(
+                    f"Image index tag publication failed. Confirmed pushed: {confirmed}. "
+                    f"Failed tag write (outcome unknown): {ref}. Not attempted: {remaining}. "
+                    f"Previously pushed tags were not rolled back. Cause: {error}"
+                ) from error
+            self.pushed_refs.append(ref)
+            if show_progress: print(f"✓ Pushed index tag {push_tag}")
     
     def _show_build_plan(self):
         """Display build plan for dry-run mode."""
@@ -746,6 +1065,11 @@ class ImageBuilder:
         if len(self.config.all_tags())>1:
             print(f"  Tags: {', '.join(self.config.all_tags())}")
         print(f"  Base Image: {self.config.base_image}")
+        platforms=self.config.target_platforms()
+        if len(platforms)>1:
+            print(f"  Platforms (image index): {', '.join(platforms)}")
+        else:
+            print(f"  Platform: {platforms[0]}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
         if self.config.entrypoint is not None:
@@ -866,9 +1190,12 @@ class ImageBuilder:
         base_image_name = getattr(self, "_base_image_name", self.config.base_image)
         # Local annotations/tags and any digest reference are identity claims, not
         # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        # Later platforms are pulled by the pinned index digest; they inherit tag
+        # provenance only when that digest was resolved from the initial tag pull.
         base_image_tag_verified = (
             parse_local_image_reference(self.config.base_image) is None
             and "@" not in self.config.base_image
+            and getattr(self, "_base_image_tag_verified", False)
         )
         version = target_python_version(
             base_image_name, base_config,
