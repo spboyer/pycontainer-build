@@ -289,7 +289,7 @@ def test_direct_build_redacts_system_package_logs(tmp_path, monkeypatch, caplog)
     with caplog.at_level(logging.WARNING):
         ImageBuilder(config).build()
 
-    assert "system packages cannot be verified" in caplog.text
+    assert "Could not verify system packages" in caplog.text
     assert value not in caplog.text
 
 
@@ -304,7 +304,7 @@ def test_unreadable_base_layer_diagnostic_redacts_build_arguments(tmp_path, capl
     with caplog.at_level(logging.DEBUG):
         report_system_packages(config, [layer], redact=config.redact)
 
-    assert "Could not inspect base layer" in caplog.text
+    assert "could not read base layer" in caplog.text
     assert value not in caplog.text
 
 

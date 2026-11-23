@@ -368,3 +368,280 @@ def test_cache_miss_reason_is_available_in_debug_logs(tmp_path, caplog):
         assert cache.get_layer([(source, Path("source.py"))]) is None
 
     assert "Layer cache miss: no entry" in caplog.text
+
+
+_FIXED_NS = 1_700_000_000_000_000_000
+
+
+def _link_or_skip(source, link):
+    try:
+        os.link(source, link)
+    except (AttributeError, NotImplementedError, OSError) as error:
+        pytest.skip(f"Hardlinks are unavailable here: {error}")
+
+
+def _write_topology(context, linked, names=("a.txt", "b.txt")):
+    first = context / names[0]
+    for name in names:
+        (context / name).unlink(missing_ok=True)
+    first.write_text("same content")
+    for name in names[1:]:
+        if linked:
+            _link_or_skip(first, context / name)
+        else:
+            (context / name).write_text("same content")
+    for name in names:
+        os.chmod(context / name, 0o644)
+        os.utime(context / name, ns=(_FIXED_NS, _FIXED_NS))
+
+
+def _build_app_layer(context, output, *, reproducible, cache_dir=None, workdir="/app"):
+    builder = ImageBuilder(
+        BuildConfig(
+            context_dir=str(context),
+            output_dir=str(output),
+            workdir=workdir,
+            reproducible=reproducible,
+            use_cache=cache_dir is not None,
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
+        )
+    )
+    layers_dir = output / "layers"
+    layers_dir.mkdir(parents=True, exist_ok=True)
+    layer = builder._create_app_layer(layers_dir, builder.context_include_paths)
+    with tarfile.open(layer.tar_path) as archive:
+        entries = [(member.name, member.type, member.linkname) for member in archive.getmembers()]
+    return layer.digest, entries
+
+
+@pytest.mark.parametrize("reproducible", [True, False])
+@pytest.mark.parametrize("first_linked", [False, True])
+def test_cache_invalidates_when_hardlink_topology_changes(tmp_path, reproducible, first_linked):
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    _write_topology(context, first_linked)
+    first_digest, first_entries = _build_app_layer(
+        context, tmp_path / "first", reproducible=reproducible, cache_dir=cache_dir
+    )
+
+    _write_topology(context, not first_linked)
+    cached_digest, cached_entries = _build_app_layer(
+        context, tmp_path / "cached", reproducible=reproducible, cache_dir=cache_dir
+    )
+    fresh_digest, fresh_entries = _build_app_layer(
+        context, tmp_path / "fresh", reproducible=reproducible
+    )
+
+    linked_entries = [
+        ("app/a.txt", tarfile.REGTYPE, ""),
+        ("app/b.txt", tarfile.LNKTYPE, "app/a.txt"),
+    ]
+    independent_entries = [("app/a.txt", tarfile.REGTYPE, ""), ("app/b.txt", tarfile.REGTYPE, "")]
+    assert first_entries == (linked_entries if first_linked else independent_entries)
+    assert fresh_entries == (independent_entries if first_linked else linked_entries)
+    assert cached_entries == fresh_entries
+    assert cached_digest == fresh_digest
+    assert cached_digest != first_digest
+
+    repeated_digest, repeated_entries = _build_app_layer(
+        context, tmp_path / "repeated", reproducible=reproducible, cache_dir=cache_dir
+    )
+    assert (repeated_digest, repeated_entries) == (fresh_digest, fresh_entries)
+
+
+def test_cache_combines_build_arguments_and_hardlink_topology(tmp_path):
+    import json
+
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    hits = []
+
+    def build(version, name):
+        output = tmp_path / name
+        config = BuildConfig(
+            context_dir=str(context), output_dir=str(output),
+            include_paths=["a.txt", "b.txt"], cache_dir=str(cache_dir),
+            build_args={"VERSION": version}, workdir="/srv/${VERSION}",
+        )
+        builder = ImageBuilder(config)
+        get_layer = builder.cache.get_layer
+
+        def record_lookup(*args, **kwargs):
+            cached = get_layer(*args, **kwargs)
+            hits.append(cached is not None)
+            return cached
+
+        builder.cache.get_layer = record_lookup
+        layers_dir = output / "layers"
+        layers_dir.mkdir(parents=True)
+        layer = builder._create_app_layer(layers_dir, builder.context_include_paths)
+        with tarfile.open(layer.tar_path) as archive:
+            types = [member.type for member in archive.getmembers()]
+        return layer.digest, types
+
+    _write_topology(context, True)
+    linked = build("release-one", "linked")
+    assert build("release-one", "repeat") == linked
+    _write_topology(context, False)
+    independent = build("release-one", "independent")
+    build("release-two", "other-version")
+
+    assert hits == [False, True, False, False]
+    assert linked[1] == [tarfile.REGTYPE, tarfile.LNKTYPE]
+    assert independent[1] == [tarfile.REGTYPE, tarfile.REGTYPE]
+    assert independent[0] != linked[0]
+    metadata = json.loads((cache_dir / "index.json").read_text())
+    assert len(metadata) == 3
+    assert all(entry["source_files"] == [] for entry in metadata.values())
+    assert "release-one" not in json.dumps(metadata)
+    assert "release-two" not in json.dumps(metadata)
+
+
+def test_cache_identity_for_equivalent_hardlink_topology_is_portable(tmp_path):
+    cache = LayerCache(tmp_path / "cache")
+    keys = []
+    for name in ("one", "two"):
+        context = tmp_path / name
+        context.mkdir()
+        _write_topology(context, True)
+        files = [(context / "a.txt", Path("a.txt")), (context / "b.txt", Path("b.txt"))]
+        keys.append(cache._compute_files_digest(files))
+    assert keys[0] == keys[1]
+    assert keys[0].startswith("v3:")
+
+
+@pytest.mark.parametrize("workdir", ["/app", "/srv/app", "/"])
+def test_cache_hardlink_probe_matches_emitted_tar_order(tmp_path, workdir):
+    import pycontainer.cache as cache_module
+
+    context = tmp_path / "context"
+    context.mkdir()
+    _write_topology(context, True, names=("a.txt", "b.txt", "c.txt"))
+    cache = LayerCache(tmp_path / "cache")
+    keys = set()
+    for order in (("c.txt", "a.txt", "b.txt"), ("a.txt", "b.txt", "c.txt")):
+        files = [(context / name, Path(name)) for name in order]
+        with tarfile.open(tmp_path / "layer.tar", "w") as archive:
+            for path, relative in files:
+                archive.add(path, arcname=cache_module.app_layer_arcname(workdir, relative))
+            emitted = cache_module.emitted_hardlinks(files, archive.getmembers())
+        assert emitted == {name: order[0] for name in order[1:]}
+        assert LayerCache._probe_hardlinks(files, workdir) == emitted
+        keys.add(cache._compute_files_digest(files, workdir, reproducible=False))
+    assert len(keys) == 2
+
+
+@pytest.mark.parametrize("reproducible", [True, False])
+def test_cache_ignores_hardlinks_to_unselected_files(tmp_path, reproducible):
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    _write_topology(context, False, names=("a.txt",))
+    first = _build_app_layer(context, tmp_path / "first", reproducible=reproducible, cache_dir=cache_dir)
+
+    _link_or_skip(context / "a.txt", tmp_path / "outside.txt")
+    cached = _build_app_layer(context, tmp_path / "cached", reproducible=reproducible, cache_dir=cache_dir)
+    fresh = _build_app_layer(context, tmp_path / "fresh", reproducible=reproducible)
+
+    assert cached == fresh == first
+    assert fresh[1] == [("app/a.txt", tarfile.REGTYPE, "")]
+
+
+def test_cache_matches_tar_when_platform_reports_no_inodes(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    _write_topology(context, False)
+    _build_app_layer(context, tmp_path / "first", reproducible=True, cache_dir=cache_dir)
+    _write_topology(context, True)
+
+    real_lstat = os.lstat
+    context_prefix = str(context)
+
+    class _NoInode:
+        def __init__(self, result):
+            self._result = result
+
+        def __getattr__(self, name):
+            return 0 if name == "st_ino" else getattr(self._result, name)
+
+    def lstat_without_inodes(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        return _NoInode(result) if os.fspath(path).startswith(context_prefix) else result
+
+    monkeypatch.setattr(os, "lstat", lstat_without_inodes)
+    cached = _build_app_layer(context, tmp_path / "cached", reproducible=True, cache_dir=cache_dir)
+    fresh = _build_app_layer(context, tmp_path / "fresh", reproducible=True)
+
+    assert cached == fresh
+    assert [entry[1] for entry in fresh[1]] == [tarfile.REGTYPE, tarfile.REGTYPE]
+
+
+def test_cache_keeps_symlinks_beside_hardlinks(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    _write_topology(context, True)
+    try:
+        os.symlink("a.txt", context / "s.txt")
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"Symlinks are unavailable here: {error}")
+
+    first = _build_app_layer(context, tmp_path / "first", reproducible=True, cache_dir=cache_dir)
+    cached = _build_app_layer(context, tmp_path / "cached", reproducible=True, cache_dir=cache_dir)
+    fresh = _build_app_layer(context, tmp_path / "fresh", reproducible=True)
+
+    assert first == cached == fresh
+    assert fresh[1] == [
+        ("app/a.txt", tarfile.REGTYPE, ""),
+        ("app/b.txt", tarfile.LNKTYPE, "app/a.txt"),
+        ("app/s.txt", tarfile.SYMTYPE, "a.txt"),
+    ]
+
+
+def test_hardlinked_build_layers_match_rootfs_diff_ids(tmp_path, monkeypatch):
+    import json
+
+    context = tmp_path / "context"
+    context.mkdir()
+    _write_topology(context, False)
+    base_config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {"Env": [], "WorkingDir": "/"},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image", lambda self, layers_dir, os_name, arch: ([], base_config)
+    )
+
+    def build(name):
+        output = tmp_path / name
+        ImageBuilder(
+            BuildConfig(
+                tag="test:links",
+                context_dir=str(context),
+                output_dir=str(output),
+                cache_dir=str(tmp_path / "cache"),
+            )
+        ).build()
+        blobs = output / "blobs" / "sha256"
+        index = json.loads((output / "index.json").read_text())
+        manifest = json.loads((blobs / index["manifests"][0]["digest"].split(":")[1]).read_text())
+        config = json.loads((blobs / manifest["config"]["digest"].split(":")[1]).read_text())
+        layers = manifest["layers"]
+        assert [layer["digest"] for layer in layers] == config["rootfs"]["diff_ids"]
+        for layer in layers:
+            blob = blobs / layer["digest"].split(":")[1]
+            assert blob.stat().st_size == layer["size"]
+            assert _digest(blob.read_bytes()) == layer["digest"]
+        with tarfile.open(blobs / layers[-1]["digest"].split(":")[1]) as archive:
+            return layers[-1]["digest"], [(m.name, m.type) for m in archive.getmembers()]
+
+    independent = build("independent")
+    _write_topology(context, True)
+    linked = build("linked")
+    assert linked[0] != independent[0]
+    assert linked[1] == [("app/a.txt", tarfile.REGTYPE), ("app/b.txt", tarfile.LNKTYPE)]
