@@ -319,6 +319,40 @@ def test_reference_selection_and_non_local_reference(tmp_path):
     assert "local images only" in error_of(str(tmp_path))
 
 
+@pytest.mark.parametrize("with_platform", [False, True])
+def test_digest_selects_manifest_shared_by_tags(tmp_path, with_platform):
+    image = Image(tmp_path / "img")
+    layer = tar(("v", b"shared"))
+    image.image([layer], ref="one", platform=with_platform)
+    descriptor = image.descriptors[0]
+    image.descriptors.append({
+        **descriptor, "annotations": {"org.opencontainers.image.ref.name": "two"}
+    })
+    (image.root / "index.json").write_text(json.dumps({
+        "schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": image.descriptors,
+    }))
+
+    result = inspect_image(f"oci:{image.root}@{descriptor['digest']}")
+
+    assert result["manifest"]["digest"] == descriptor["digest"]
+    assert result["layers"][0]["diffId"] == sha(layer)
+
+
+def test_digest_rejects_conflicting_shared_manifest_descriptors(tmp_path):
+    image = Image(tmp_path / "img")
+    image.image([tar(("v", b"shared"))], ref="one")
+    descriptor = image.descriptors[0]
+    image.descriptors.append({
+        **descriptor, "size": descriptor["size"] + 1,
+        "annotations": {"org.opencontainers.image.ref.name": "two"},
+    })
+    (image.root / "index.json").write_text(json.dumps({
+        "schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": image.descriptors,
+    }))
+
+    assert "conflicting descriptors" in error_of(f"oci:{image.root}@{descriptor['digest']}")
+
+
 def test_docker_archive_inspection_reports_platform_and_keeps_json_clean(tmp_path, capsys):
     image = docker_archive(tmp_path / "app.tar", [tar(("a", b"1")), tar((".wh.a", b""), ("b", b"22"))])
     output, code = run_inspect(image, as_json=True)
