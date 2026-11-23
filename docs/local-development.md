@@ -651,7 +651,7 @@ except Exception as e:
 pycontainer build --tag myapp:latest --base-image python:3.11-slim --include-deps
 
 # 2. Use smaller base images
-pycontainer build --tag myapp:latest --base-image python:3.11-alpine --include-deps
+pycontainer build --tag myapp:latest --base-image python:3.11-alpine3.20 --include-deps
 
 # 3. Include only necessary files
 pycontainer build \

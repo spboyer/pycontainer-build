@@ -362,10 +362,15 @@ pycontainer build \
   [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
   These bounds may reject wheels that a newer image could actually run.
 
-  Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`, and
-  unmapped codenames, keep the conservative `manylinux2014` or `musllinux_1_2`
-  tag; a failed install then suggests pinning a codename or setting
-  `PYTHON_LIBC`. When both a codename and `PYTHON_LIBC` are present they must
+  Codename-less glibc tags such as `python:3.11-slim`, and unmapped Debian
+  codenames, keep the conservative `manylinux2014` tag; a failed install then
+  suggests pinning a codename or setting `PYTHON_LIBC`. Codename-less Alpine
+  tags such as `python:3.11-alpine`, and unmapped Alpine releases, require
+  explicit `PYTHON_LIBC` before requirements or virtualenv staging. Their
+  names cannot establish a musl version: old official `python:3.8.0-alpine`
+  uses musl 1.1, so the previous `musllinux_1_2` fallback was unsafe.
+  Pin a mapped Alpine release or provide supported libc metadata.
+  When both a codename and `PYTHON_LIBC` are present they must
   name the same family, and the lower version wins. All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
   the digest is fetched without verifying that it matches any supplied tag.

@@ -1,8 +1,9 @@
 # Codename-to-libc mappings for official `python` tags
 
-Dependency staging raises the target libc above the conservative
-`manylinux2014`/`musllinux_1_2` floor only for a codename token in a tag-only
-registry pull of the official `python` image. Mapped values are conservative
+Dependency staging selects libc tags using explicit `PYTHON_LIBC` metadata
+or a mapped codename token in a tag-only registry pull of the official
+`python` image. Only glibc keeps the codename-less `manylinux2014` floor;
+unproven Alpine tags fail before staging. Mapped values are conservative
 bounds based on the source evidence below, not measurements of individual
 image digests. The evidence is pinned to content-addressed Debian snapshot
 files and commits in Alpine `aports` or `docker-library/python`. Mutable
@@ -85,11 +86,28 @@ values from `git ls-remote https://git.alpinelinux.org/aports`.
 
 ## Limitations
 
+- Safety amendment (2026-11-22, #143 / #191): the original unchanged
+  codename-less Alpine acceptance is superseded. The coordinator's verified
+  Docker Hub pull of `python:3.8.0-alpine`, linux/amd64 manifest
+  `sha256:3996a4b86240b6d41b57055cd7f626cbb15e2baef149b4fd841e04fec7308290`,
+  has Alpine 3.10.3 and final musl `1.1.22-r3` in `/lib/apk/db/installed`.
+  The manifest, config and all five layer digests and sizes were verified;
+  package-database updates were applied in layer order. The verified config
+  has `PYTHON_VERSION=3.8.0` and no `PYTHON_LIBC`. No container was run.
+  The previous `musllinux_1_2` fallback permitted a newer-musl wheel.
+  A hermetic CPython 3.8 wheel fixture reproduces that pip selection before
+  the fix. Codename-less and unmapped Alpine tags now require explicit
+  supported `PYTHON_LIBC`, or a mapped release tag, before requirements or
+  virtualenv staging. Neither the Python version nor an unspecified Alpine
+  tag proves even a musl 1.1 floor. This is an intentional compatibility
+  change, not evidence that runtime package databases are inspected by the
+  builder.
 - Pinned commits cover the release point and one later branch commit, not
   every intermediate commit. Both points share the same musl minor, and
   Alpine stable branches only take patch updates.
-- New codenames and Alpine releases stay on the codename-less floor until a
-  row is verified and added here and in the code table.
+- New Debian codenames stay on the codename-less glibc floor until a row is
+  verified and added here and in the code table. New or unmapped Alpine
+  releases require explicit libc metadata until their row is verified.
 - Docker Hub tags are mutable. These source records do not verify the libc
   installed in every published Python image digest, or prove that no
   intermediate suite update ever contained an older version. These

@@ -341,7 +341,7 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
     with pytest.raises(ValueError, match="does not support target platform"):
         _target_options("windows", "amd64", "3.11")
     assert _target_options(
-        "linux", "amd64", "3.11", "python:3.11-alpine",
+        "linux", "amd64", "3.11", "python:3.11-alpine3.20",
         base_image_tag_verified=True,
     )[1] == "musllinux_1_2_x86_64"
     with pytest.raises(ValueError, match="custom base image"):
@@ -384,6 +384,48 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
 
 def _libc_config(*env):
     return {"config": {"Env": ["PYTHON_VERSION=3.11.8", *env]}}
+
+
+def test_old_codename_less_alpine_cannot_select_musl_1_2_wheel(tmp_path):
+    _write_wheel(tmp_path / "wheelhouse", tag="cp38-cp38-musllinux_1_2_x86_64")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    with pytest.raises(ValueError, match="Cannot validate target musl"):
+        install_requirements(
+            requirements, tmp_path / "staged", tmp_path,
+            "linux", "amd64", "3.8", "python:3.8.0-alpine",
+            {"config": {"Env": ["PYTHON_VERSION=3.8.0"]}},
+            base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize("source", ["requirements", "venv"])
+def test_unproven_alpine_rejects_before_dependency_staging(
+    tmp_path, monkeypatch, source
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    if source == "requirements":
+        (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    else:
+        site_packages = context / "venv" / "Lib" / "site-packages"
+        site_packages.mkdir(parents=True)
+        (site_packages / "fixture_dep.py").write_text("value = 1\n")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        base_image="python:3.11-alpine",
+    )
+
+    def unexpected_staging(*args, **kwargs):
+        pytest.fail("dependencies must not be staged without validated target libc")
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", unexpected_staging)
+    monkeypatch.setattr("pycontainer.builder.stage_virtualenv", unexpected_staging)
+    with pytest.raises(ValueError, match="Cannot validate target musl"):
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -573,7 +615,8 @@ def _glibc_tags(newest, machine):
     [
         ("amd64", "python:3.11-slim", (), True, ["manylinux2014_x86_64"]),
         ("arm64", "python:3.11", (), True, ["manylinux2014_aarch64"]),
-        ("amd64", "python:3.11-alpine", (), True, ["musllinux_1_2_x86_64"]),
+        ("amd64", "python:3.11-alpine", ("PYTHON_LIBC=musl-1.1",), True,
+         ["musllinux_1_1_x86_64"]),
         ("arm64", "python:3.11-slim-bookworm", (), True, _glibc_tags(31, "aarch64")),
         ("amd64", "docker.io/library/python:3.11-bullseye", (), True,
          _glibc_tags(28, "x86_64")),
@@ -599,8 +642,10 @@ def _glibc_tags(newest, machine):
         ("amd64", "python:3.11-Alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
         ("amd64", "python:3.11-alpine3.24", (), True,
          ["musllinux_1_2_x86_64", "musllinux_1_1_x86_64"]),
-        ("amd64", "python:3.11-alpine3.25", (), True, ["musllinux_1_2_x86_64"]),
-        ("amd64", "python:3.11-alpine3.99", (), True, ["musllinux_1_2_x86_64"]),
+        ("amd64", "python:3.11-alpine3.25", ("PYTHON_LIBC=musl-1.2",), True,
+         ["musllinux_1_2_x86_64", "musllinux_1_1_x86_64"]),
+        ("arm64", "python:3.11-alpine3.99", ("PYTHON_LIBC=musl-1.1",), True,
+         ["musllinux_1_1_aarch64"]),
     ],
 )
 def test_compatible_wheel_platforms_follow_verified_libc(
@@ -637,6 +682,10 @@ def test_compatible_wheel_platforms_follow_verified_libc(
         ("python:3.11-alpine3.20", ("PYTHON_LIBC=glibc-2.36",), True, "conflicts"),
         ("python:3.11-alpine-bookworm", (), True, "glibc codename"),
         ("python:3.11-alpine3.20-bookworm", (), True, "more than one"),
+        ("python:3.8.0-alpine", (), True, "Cannot validate target musl"),
+        ("python:3.11-alpine", (), True, "Cannot validate target musl"),
+        ("python:3.11-alpine3.25", (), True, "Cannot validate target musl"),
+        ("python:3.11-Alpine3.99", (), True, "Cannot validate target musl"),
         ("python:3.11-slim-bookworm", (), False, "unverified"),
         (f"python:3.11-slim-bookworm@{DIGEST}", (), True, "unverified"),
         ("example/python:3.11-slim-bookworm", (), True, "unverified"),
@@ -684,6 +733,10 @@ def _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env=()):
          ("PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=glibc-2.28")),
         ("manylinux_2_36_x86_64", "amd64", "python:3.11-slim-trixie", ()),
         ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine3.20", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine3.10", ()),
+        ("musllinux_1_2_aarch64", "arm64", "python:3.11-alpine3.20", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine",
+         ("PYTHON_LIBC=musl-1.1",)),
         ("musllinux_1_1_aarch64", "arm64", f"python@{DIGEST}",
          ("PYTHON_LIBC=musl-1.2",)),
     ],
@@ -705,7 +758,8 @@ def test_real_pip_selects_compatible_newer_or_older_libc_wheels(
         ("manylinux_2_32_aarch64", "arm64", "python:3.11-slim-bookworm", (), False),
         ("manylinux_2_29_x86_64", "amd64", "python:3.11-bullseye", (), False),
         ("manylinux_2_37_x86_64", "amd64", "python:3.11-slim-trixie", (), False),
-        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine", (), True),
+        ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine",
+         ("PYTHON_LIBC=musl-1.1",), False),
         ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine3.12", (), False),
         ("musllinux_1_1_x86_64", "amd64", "python:3.11-slim-bookworm", (), False),
         ("manylinux2014_x86_64", "amd64", "python:3.11-alpine3.20", (), False),

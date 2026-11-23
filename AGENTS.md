@@ -154,7 +154,10 @@ tag-only registry pulls derive the libc family from the resolved tag (`alpine`
 means musl, otherwise glibc) and the version from mapped Debian/Alpine
 codename tokens (`docs/libc-codename-mappings.md` pins each row to immutable
 snapshot/commit sources; update it with the code table); codename-less or unmapped
-tags keep exactly `manylinux2014`/`musllinux_1_2`. The shared
+glibc tags keep exactly `manylinux2014`. Codename-less or unmapped Alpine tags
+require supported explicit `PYTHON_LIBC` before requirements or venv staging:
+the former `musllinux_1_2` fallback is unsafe for old musl 1.1 images.
+Pin a mapped Alpine release or provide libc metadata instead. The shared
 `_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` floor values that
 `target_wheel_platforms` expands. All digest references, including tag-plus-digest, need supported
 `PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.

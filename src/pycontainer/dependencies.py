@@ -29,7 +29,6 @@ _PIP_PLATFORMS = {
 _FLOOR_GLIBC_PREFIX = "manylinux2014_"
 _MIN_GLIBC_MINOR = 17
 _MIN_MUSL_MINOR = 1
-_FLOOR_MUSL_MINOR = 2
 # Two-digit minors keep the generated --platform list bounded.
 _LIBC_PATTERN = re.compile(r"(glibc)-2\.([1-9]\d?)|(musl)-1\.([1-9]\d?)")
 _ALPINE_TOKEN = re.compile(r"alpine3\.\d+")
@@ -173,7 +172,7 @@ def _codename_libc(image_tag: str) -> Optional[Tuple[str, int]]:
 def _target_libc(
     base_image: str, base_config: Optional[dict], base_image_tag_verified: bool
 ) -> Tuple[str, Optional[int]]:
-    """Return the target libc family and minor; None keeps the codename-less floor."""
+    """Return target libc; None keeps only the codename-less glibc floor."""
     repository, image_tag = _base_image_parts(base_image)
     libc = _base_environment(base_config).get("PYTHON_LIBC")
     explicit = _parse_libc(libc) if libc is not None else None
@@ -205,6 +204,13 @@ def _target_libc(
     claims = [claim[1] for claim in (explicit, codename) if claim]
     if claims:
         return tag_family, min(claims)
+    if tag_family == "musl":
+        raise ValueError(
+            f"Cannot validate target musl version from base image tag {image_tag!r}; "
+            "pin a mapped Alpine codename tag or set PYTHON_LIBC=musl-1.N "
+            "(N 1-99) in the image config. Codename-less and unmapped Alpine "
+            "tags do not establish a compatible musllinux floor."
+        )
     return tag_family, None
 
 
@@ -226,8 +232,6 @@ def target_wheel_platforms(
     machine = floor[len(_FLOOR_GLIBC_PREFIX):]
     family, minor = _target_libc(base_image, base_config, base_image_tag_verified)
     if minor is None:
-        if family == "musl":
-            return [f"musllinux_1_{_FLOOR_MUSL_MINOR}_{machine}"]
         return [floor]
     if family == "musl":
         return [
@@ -373,9 +377,9 @@ def install_requirements(
             "are supported."
             + (
                 " The base image tag names no mapped codename, so only the "
-                "conservative manylinux2014/musllinux_1_2 floor was used; pin a "
-                "codename tag (for example python:3.11-slim-bookworm or "
-                "python:3.11-alpine3.20) or set PYTHON_LIBC in the image config."
+                "conservative manylinux2014 floor was used; pin a "
+                "codename tag (for example python:3.11-slim-bookworm) "
+                "or set PYTHON_LIBC in the image config."
                 if _uses_conservative_libc_floor(
                     base_image, base_config, base_image_tag_verified
                 )
