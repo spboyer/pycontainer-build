@@ -332,7 +332,7 @@ def test_conda_prefix_cannot_be_staged_when_signal_is_excluded(tmp_path, monkeyp
         tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
         exclude_paths=[".venv/conda-meta"],
     )
-    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+    with pytest.raises(FileNotFoundError, match="no supported .*virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 
@@ -2155,7 +2155,7 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
     context.mkdir()
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
 
-    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+    with pytest.raises(FileNotFoundError, match="no supported lockfile, virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 ARM_V7_CONFIG = {**BASE_CONFIG, "architecture": "arm", "variant": "v7"}
@@ -2178,18 +2178,21 @@ def _arm_v7_builder(tmp_path, monkeypatch, context):
     )
 
 
-def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> None:
+def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=(), requires_python=None,
+                       tag="py3-none-any") -> None:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     module = name.replace("-", "_")
     dist_info = f"{module}-1.0.dist-info"
     metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    if requires_python:
+        metadata += f"Requires-Python: {requires_python}\n"
     metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
     metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
     files = {
         f"{module}/__init__.py": b"",
         f"{dist_info}/METADATA": (metadata + "\n").encode(),
         f"{dist_info}/WHEEL": (
-            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
         ).encode(),
     }
     record = io.StringIO()
@@ -2199,9 +2202,81 @@ def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> N
         writer.writerow((path, f"sha256={digest.rstrip('=')}", len(content)))
     writer.writerow((f"{dist_info}/RECORD", "", ""))
     files[f"{dist_info}/RECORD"] = record.getvalue().encode()
-    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-py3-none-any.whl", "w") as wheel:
+    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-{tag}.whl", "w") as wheel:
         for path, content in files.items():
             wheel.writestr(path, content)
+
+
+@pytest.mark.parametrize(("image", "version"), [
+    ("python:3.11-slim", "3.12.4"),
+    ("python:3.11.8-slim", "3.11.9"),
+])
+def test_verified_python_tag_rejects_conflicting_python_version(image, version):
+    base_config = {"config": {"Env": [f"PYTHON_VERSION={version}"]}}
+    with pytest.raises(ValueError, match="conflicts.*PYTHON_VERSION"):
+        target_python_version(image, base_config, base_image_tag_verified=True)
+
+
+def test_unverified_python_tag_does_not_override_python_version():
+    base_config = {"config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.12.4"]}}
+    assert target_python_version(
+        "python:3.11-slim@sha256:" + "a" * 64, base_config, base_image_tag_verified=True
+    ) == "3.12"
+
+
+def test_locked_pip_ignores_pythonpath_shadowing(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root")
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    requirements = context / "requirements.txt"
+    requirements.write_text(
+        f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
+    )
+    poison = tmp_path / "pythonpath"
+    poison.mkdir()
+    (poison / "pip.py").write_text("raise RuntimeError('shadowed pip')\n", encoding="utf-8")
+    marker = tmp_path / "sitecustomize-ran"
+    (poison / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+
+    install_requirements(
+        requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
+        "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+    )
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("source", ["environment", "config"])
+def test_locked_pip_cannot_ignore_target_requires_python(tmp_path, monkeypatch, source):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires_python=">=3.12")
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    requirements = context / "requirements.txt"
+    requirements.write_text(f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    if source == "environment":
+        monkeypatch.setenv("PIP_IGNORE_REQUIRES_PYTHON", "1")
+    else:
+        monkeypatch.delenv("PIP_IGNORE_REQUIRES_PYTHON", raising=False)
+        config = tmp_path / "pip.conf"
+        config.write_text("[install]\nignore-requires-python = true\n", encoding="utf-8")
+        monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+
+    with pytest.raises(RuntimeError, match="Target dependency installation failed"):
+        install_requirements(
+            requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
+            "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+        )
 
 
 def _install_marker_fixture(

@@ -160,6 +160,16 @@ and is listed separately as not validated. Re-run all jobs, not just failed
 jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
+An opt-in `workflow_dispatch` choice `dependency_fixture=lockfile` (or
+`--dependency-fixture lockfile` on the script) instead stages the offline
+`tests/fixtures/runtime-lock` uv lock. It verifies wheel archive hashes against
+the lock before staging and checks imported distribution names, versions and
+installed module/METADATA hashes in the container. The platform-tagged wheels
+contain only Python; this is not native-binary evidence. Lock evidence records
+the fixture path, lock digest and assertion-script digest and is gated against
+the committed fixture and the exact commit/run/attempt for both native targets.
+Workflow calls and release gates continue to use the default requirements fixture.
+
 The tests workflow also runs the multi-platform index check on both native
 targets and uploads separate `index-runtime-evidence-*` artifacts; the release
 workflow continues to use only the single-platform release evidence.
@@ -280,15 +290,18 @@ pulls. Local sources must leave it false. Unsupported metadata and metadata
 conflicting with a verified tag-only pull fail before pip runs.
 `target_python_version` uses the same default-false keyword; digest and
 unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
-`PYTHON_VERSION`. Both helpers validate before requirements or venv staging.
-Staged packages are importable under `<workdir>/.python`;
-source distributions, lockfiles and cross-compilation are not supported.
+`PYTHON_VERSION`. Both helpers validate before lockfile, requirements or venv
+staging. Staged packages are importable under `<workdir>/.python`; source
+distributions and cross-compilation are not supported.
+
 `dependencies.install_requirements` runs pip through `_pip_target.py`, which
 forces every `pip._vendor.packaging` marker evaluation (requirement-file roots,
 extras, transitive `Requires-Dist`) onto the target environment and fails
 closed on `platform_release`, `platform_version`, unknown variables, or
-`python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
-pip's vendored `packaging`; a self-test refuses to install if that changes.
+`python_full_version` or `implementation_version` without a full base-image
+`PYTHON_VERSION`. It relies on pip's vendored `packaging`; a self-test refuses
+to install if that changes. Lock selections resolve recorded transitive markers
+before pip runs because locked installs use `--no-deps`.
 Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
 target-active roots, transitive `Requires-Dist`, versions, extras, constraint
@@ -322,8 +335,9 @@ in `dependencies.py` (keep #143 libc changes in that table), and never falls
 back to source builds; each platform gets its own
 base selection and dependency layer, including its own virtualenv closure check.
 Tags move only after the whole index verifies. A local `oci:` base must keep the
-same layout `index.json` across platforms. Detected virtualenvs take precedence;
-exclude them to select the requirements file. Multi-tag registry pushes are not
+same layout `index.json` across platforms. Explicit dependency sources and
+detected lockfiles take precedence over virtualenvs; otherwise exclude a
+virtualenv to select `requirements.txt`. Multi-tag registry pushes are not
 atomic: a later tag failure can leave earlier tags moved. Hermetic index tests do
 not prove per-architecture runtime startup.
 
@@ -337,6 +351,34 @@ errors are redacted. See
 `docs/AUTHENTICATION.md#private-package-indexes` and
 `tests/test_private_index.py`, which uses a loopback index and synthetic
 secrets only.
+
+Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
+without their tools, rejects stale locks against the manifest, evaluates
+markers for the target (never the host) and installs the selection through
+`install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+For `linux/arm/v7`, lock selection and staged-wheel closure use the
+`platform_machine=armv7l` marker and the same variant-specific wheel tags as
+ordinary requirements.
+Generated requirements live temporarily inside the writable build context;
+`.pycontainer-lockfile-*` staging directories are always excluded from images.
+Manifest paths are rechecked before lock reads and installation verification;
+in-context links are allowed, while external or dangling links fail. Resolution
+does not protect against concurrent filesystem changes.
+Poetry checks locked and legacy Python ranges and recorded applicable root,
+transitive and extra dependencies. uv limited environments must match the
+recorded supported markers and include the target; unverifiable marker
+normalization and unknown target values fail closed. Pipenv roots and PDM
+roots and recorded edges must match the selection. After installation, all
+four formats' wheel metadata is checked for target-compatible transitive
+versions, markers and requested extras. Metadata must match its `.dist-info`
+directory and is limited to 1 MiB; this cannot recover dependencies missing
+from the wheels' own metadata.
+Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
+venv, `requirements.txt`; explicit `lockfile` and `requirements_file` are
+mutually exclusive. Non-registry sources fail; never add an
+unconstrained fallback. Real lock fixtures live in `tests/fixtures/lockfiles`
+and are validated with `poetry check --lock`, `pipenv verify`,
+`pdm lock --check` and `uv lock --check`.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
