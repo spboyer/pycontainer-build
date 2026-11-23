@@ -210,6 +210,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_libc_config,
     target_wheel_platform,
     validate_target_platform,
 )
@@ -365,8 +366,15 @@ class ImageBuilder:
         app_layers=[]
         if self.config.include_deps:
             with self._time_history_phase("dependencies"):
+                staging_config = target_libc_config(
+                    os_name, arch, self.config.base_image, base_config, base_layers,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                    ),
+                )
                 deps_layer=self._create_deps_layer(
-                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                    layers_dir, base_config=staging_config, os_name=os_name, arch=arch
                 )
             if deps_layer: app_layers.append(deps_layer)
         
