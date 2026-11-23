@@ -33,7 +33,7 @@ _PIP_PLATFORMS = {
 _MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
 _PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
 _VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
-_CLOSURE_HEADERS = ("Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
+_CLOSURE_HEADERS = ("Metadata-Version", "Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
 _MARKER_ERROR_EXIT = 86
 _PATCH_ERROR_EXIT = 87
 _MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
@@ -332,9 +332,15 @@ def _read_requirements_text(path: Path) -> str:
 
 
 def validate_requirements(
-    requirements: Path, context_dir: Path, check_overrides: bool = True
+    requirements: Path,
+    context_dir: Path,
+    check_overrides: bool = True,
+    constraints: Optional[List[str]] = None,
 ) -> List[str]:
-    """Validate requirements files and return their root requirement lines."""
+    """Validate requirements files and return their root requirement lines.
+
+    Constraint-file requirement lines are appended to ``constraints`` when given.
+    """
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
@@ -402,9 +408,13 @@ def validate_requirements(
             elif option.startswith("-c") and not option.startswith("--") and len(option) > 2:
                 include = option[2:]
                 include_constraint = True
-            elif not option.startswith("-") and not constraint:
+            elif not option.startswith("-"):
                 requirement = re.sub(r"(^|\s)#.*$", "", line)
-                roots.append(re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip())
+                requirement = re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip()
+                if not constraint:
+                    roots.append(requirement)
+                elif constraints is not None:
+                    constraints.append(requirement)
 
             if include is not None:
                 if include.startswith(("http://", "https://", "file://")):
@@ -482,8 +492,11 @@ def _verify_target_closure(
     requirements: Optional[Path],
 ) -> None:
     """Reject staged packages whose target-active requirements are not installed."""
+    constraint_lines: List[str] = []
     root_lines = (
-        validate_requirements(requirements, context_dir, check_overrides=False)
+        validate_requirements(
+            requirements, context_dir, check_overrides=False, constraints=constraint_lines
+        )
         if context_dir is not None and requirements is not None and requirements.is_file()
         else []
     )
@@ -535,6 +548,7 @@ def _verify_target_closure(
         ),
         "distributions": distributions,
         "roots": roots,
+        "constraints": constraint_lines,
     }
     try:
         result = subprocess.run(

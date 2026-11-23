@@ -60,21 +60,21 @@ def main():
             variables, extras = set(), set()
             if marker is not None:
                 _walk(marker._markers, variables, extras)
-            return variables, {canonicalize_name(extra) for extra in extras}
+            return variables, {canonicalize_name(extra) for extra in extras}, extras
 
         machine = environment["platform_machine"]
         other = "aarch64" if machine == "x86_64" else "x86_64"
         probe = dict(environment, extra="")
         matching = Marker(f'platform_machine == "{machine}" and sys_platform == "linux"')
         opposite = Marker(f'platform_machine == "{other}"')
-        unknown_variables, _ = marker_info(Marker('platform_release >= "1"'))
+        unknown_variables = marker_info(Marker('platform_release >= "1"'))[0]
         if (
             not matching.evaluate(probe)
             or opposite.evaluate(probe)
             or unknown_variables != {"platform_release"}
-            or marker_info(Marker('extra == "Foo_Bar"'))[1] != {"foo-bar"}
-            or not Marker('extra == "Foo_Bar"').evaluate(dict(probe, extra="foo-bar"))
-            or Marker('extra != "Foo_Bar"').evaluate(dict(probe, extra="foo-bar"))
+            or marker_info(Marker('extra == "Foo_Bar"'))[1:] != ({"foo-bar"}, {"Foo_Bar"})
+            or not Marker('extra == "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
+            or Marker('extra != "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
         ):
             raise ClosureError("target marker self-test failed")
     except Exception as exc:
@@ -90,6 +90,18 @@ def main():
     def active(requirement, extra, label):
         if requirement.parsed.marker is None:
             return extra == ""
+        if extra:
+            # Older vendored packaging compares extra spellings literally, so
+            # evaluate with the marker's own spelling of the canonical extra.
+            spellings = {
+                raw for raw in requirement.info[2] if canonicalize_name(raw) == extra
+            }
+            if len(spellings) > 1:
+                raise ClosureError(
+                    f"{label} requires {requirement.text!r}, whose marker spells "
+                    f"extra [{extra}] inconsistently"
+                )
+            extra = next(iter(spellings), extra)
         return requirement.parsed.marker.evaluate(dict(environment, extra=extra))
 
     def unsatisfied(requirement, label):
@@ -153,9 +165,15 @@ def main():
     try:
         for record in request["distributions"]:
             label = record["path"]
-            for header in ("Name", "Version"):
+            for header in ("Metadata-Version", "Name", "Version"):
                 if len(record["headers"].get(header, [])) != 1:
                     raise ClosureError(f"{label} must declare exactly one {header}")
+            try:
+                metadata_version = Version(record["headers"]["Metadata-Version"][0].strip())
+            except InvalidVersion:
+                metadata_version = None
+            if metadata_version is None or metadata_version.release[0] not in {1, 2}:
+                raise ClosureError(f"{label} has an unsupported Metadata-Version")
             name = record["headers"]["Name"][0].strip()
             try:
                 version = Version(record["headers"]["Version"][0].strip())
@@ -210,6 +228,16 @@ def main():
                 "requirements": requirements,
                 "extras": extras,
             }
+
+        for text in request.get("constraints", []):
+            label = "requirements constraints"
+            constraint = Parsed(text, label)
+            if constraint.parsed.name and active(constraint, "", label):
+                installed = dists.get(canonicalize_name(constraint.parsed.name))
+                if installed is not None:
+                    message = unsatisfied(constraint, label)
+                    if message:
+                        problem(message)
 
         selected = set()
         pending = [(key, "") for key in sorted(dists)]

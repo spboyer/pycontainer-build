@@ -1147,6 +1147,41 @@ def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
         _stage_base_venv(tmp_path, monkeypatch, context)
 
 
+def test_virtualenv_installed_versions_must_satisfy_target_constraints(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text("venv-root\n-c constraints.txt\n")
+    constraints = context / "constraints.txt"
+    constraints.write_text(
+        "venv-root<1; sys_platform == 'linux'\n"
+        "venv-root>=9; sys_platform == 'win32'\n"
+        "venv-absent==2\n"
+    )
+    with pytest.raises(
+        ValueError, match=r"requirements constraints requires 'venv-root<1.*1.0 is installed"
+    ):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+    constraints.write_text("venv-root<2\nvenv-absent==2\n")
+    assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["", "Metadata-Version: 3.0\n", "Metadata-Version: 2.1\nMetadata-Version: 2.1\n"],
+)
+def test_virtualenv_requires_one_supported_metadata_version(tmp_path, monkeypatch, header):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"venv-root": []})
+    metadata = context / ".venv" / "Lib" / "site-packages" / "venv_root-1.0.dist-info" / "METADATA"
+    metadata.write_text(f"{header}Name: venv-root\nVersion: 1.0\n\n")
+
+    with pytest.raises(ValueError, match="Metadata-Version"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
 def test_virtualenv_root_versions_and_extras_are_enforced(tmp_path, monkeypatch):
     context = tmp_path / "context"
     _write_base_venv(context, {"venv-root": [
