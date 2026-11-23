@@ -193,6 +193,8 @@ from .local_image import (
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .tags import local_reference_names
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -270,6 +272,9 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
@@ -342,13 +347,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -377,6 +384,9 @@ class ImageBuilder:
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
@@ -608,6 +618,8 @@ class ImageBuilder:
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
