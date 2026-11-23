@@ -5,8 +5,10 @@ target image environment, and rendered as ``name==version --hash=...`` lines
 that the target-aware, wheel-only pip staging installs with ``--no-deps``.
 """
 import hashlib
+import io
 import json
 import re
+import tokenize
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,14 +19,16 @@ try:
     from packaging.markers import InvalidMarker, Marker
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion
 except ImportError:  # pragma: no cover - exercised when only pip is installed
     try:
         from pip._vendor.packaging.markers import InvalidMarker, Marker
         from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
         from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from pip._vendor.packaging.version import InvalidVersion
     except ImportError:
         Marker = Requirement = SpecifierSet = None
-        InvalidMarker = InvalidRequirement = InvalidSpecifier = ValueError
+        InvalidMarker = InvalidRequirement = InvalidSpecifier = InvalidVersion = ValueError
 
 
 LOCKFILE_KINDS = {
@@ -111,9 +115,14 @@ def load_lockfile(
 ) -> LockSelection:
     """Validate a lock against its manifest and select the target's packages."""
     path, kind, reader = _lock_reader(context_dir, relative)
-    if environment.get("python_full_version") is None:
+    full_version = environment.get("python_full_version")
+    if (
+        full_version is None
+        or not re.fullmatch(r"\d+\.\d+\.\d+", full_version)
+        or full_version.rsplit(".", 1)[0] != environment.get("python_version")
+    ):
         raise LockfileError(
-            "Lockfile staging needs the full target Python version; use a base image "
+            "Lockfile staging needs a consistent, final full target Python version; use a base image "
             "with PYTHON_VERSION=<major>.<minor>.<patch> metadata."
         )
     packages, indexes = reader(path, environment)
@@ -183,6 +192,13 @@ def _stale(lock_name: str, command: str) -> LockfileError:
     )
 
 
+def _marker_tokens(marker: str, source: str):
+    try:
+        return list(tokenize.generate_tokens(io.StringIO(marker).readline))
+    except (tokenize.TokenError, IndentationError) as exc:
+        raise LockfileError(f"Cannot parse environment marker in {source}: {marker!r}") from exc
+
+
 def _marker_applies(
     marker: Optional[str], environment: Dict[str, Optional[str]], source: str, extra: str = ""
 ) -> bool:
@@ -192,8 +208,9 @@ def _marker_applies(
         parsed = Marker(str(marker))
     except InvalidMarker as exc:
         raise LockfileError(f"Invalid environment marker in {source}: {marker!r}") from exc
+    names = {token.string for token in _marker_tokens(str(parsed), source) if token.type == tokenize.NAME}
     for variable, value in environment.items():
-        if value is None and re.search(rf"\b{variable}\b", str(parsed)):
+        if value is None and variable in names:
             raise LockfileError(
                 f"Cannot evaluate marker {str(parsed)!r} in {source} for the target "
                 f"image because {variable} is unknown."
@@ -294,6 +311,160 @@ def poetry_content_hash(pyproject: dict, *, with_dependency_groups: bool = True)
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
 
 
+def _poetry_specifier(value, kind: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise LockfileError(f"poetry.lock has no valid {kind} constraint; relock with Poetry.")
+    specifier = value.strip()
+    if specifier == "*":
+        return ""
+    match = re.fullmatch(r"([\^~])\s*(\d+(?:\.\d+){0,2})", specifier)
+    if match:
+        try:
+            parts = [int(part) for part in match.group(2).split(".")]
+        except ValueError as exc:
+            raise LockfileError(f"Invalid Poetry {kind} constraint {value!r}.") from exc
+        if match.group(1) == "^":
+            pivot = next((index for index, part in enumerate(parts) if part), len(parts) - 1)
+        else:
+            pivot = min(1, len(parts) - 1)
+        upper = parts[:pivot] + [parts[pivot] + 1]
+        specifier = f">={match.group(2)},<{'.'.join(str(part) for part in upper)}"
+    elif re.fullmatch(r"[0-9][A-Za-z0-9.!+_-]*(?:\.\*)?", specifier):
+        specifier = "==" + specifier
+    try:
+        SpecifierSet(specifier)
+    except InvalidSpecifier as exc:
+        raise LockfileError(
+            f"Unsupported Poetry {kind} constraint {value!r}; use a PEP 440 range, "
+            "exact or wildcard version, or a single caret or tilde constraint and relock."
+        ) from exc
+    return specifier
+
+
+def _poetry_dependency_options(value, source: str):
+    options = value if isinstance(value, list) else [value]
+    if not options:
+        raise LockfileError(f"Invalid Poetry dependency in {source}.")
+    for option in options:
+        if isinstance(option, str):
+            yield {"version": option}
+        elif isinstance(option, dict):
+            yield option
+        else:
+            raise LockfileError(f"Invalid Poetry dependency in {source}.")
+
+
+def _check_poetry_complete(pyproject: dict, entries: List[dict], environment) -> None:
+    by_name: Dict[str, List[Tuple[int, dict]]] = {}
+    for index, entry in enumerate(entries):
+        by_name.setdefault(canonical_name(entry["name"]), []).append((index, entry))
+    pending = [(index, "") for index in range(len(entries))]
+    visited = set()
+
+    def require(name, specifier, extras, source):
+        name = canonical_name(name)
+        try:
+            candidates = [
+                (index, entry) for index, entry in by_name.get(name, [])
+                if specifier.contains(entry["version"], prereleases=True)
+            ]
+        except InvalidVersion as exc:
+            raise LockfileError(f"poetry.lock package {name} has an invalid version.") from exc
+        if not candidates:
+            raise LockfileError(
+                f"poetry.lock does not lock {name}{specifier} for the target required by {source}; "
+                "run `poetry lock`."
+            )
+        for extra in extras:
+            if not isinstance(extra, str) or not extra:
+                raise LockfileError(f"Invalid Poetry dependency extra in {source}.")
+            pending.extend((index, canonical_name(extra)) for index, _ in candidates)
+
+    def require_pep508(text, source, extra=""):
+        if not isinstance(text, str):
+            raise LockfileError(f"Invalid requirement in {source}: {text!r}")
+        try:
+            requirement = Requirement(text)
+        except InvalidRequirement as exc:
+            raise LockfileError(f"Invalid requirement in {source}: {text!r}") from exc
+        marker = str(requirement.marker) if requirement.marker else None
+        if not _marker_applies(marker, environment, source, extra):
+            return
+        if requirement.url:
+            raise LockfileError(f"Direct URL requirement {requirement.name} in {source} is unsupported.")
+        require(requirement.name, requirement.specifier, requirement.extras, source)
+
+    def require_poetry(name, option, source, extra=""):
+        marker = option.get("markers")
+        if option.get("optional") and (not extra or not marker):
+            return
+        if not _marker_applies(marker, environment, source, extra):
+            return
+        if option.get("optional"):
+            names = {
+                token.string for token in _marker_tokens(str(Marker(str(marker))), source)
+                if token.type == tokenize.NAME
+            }
+            if "extra" not in names:
+                return
+        python = option.get("python")
+        if python is not None and not SpecifierSet(_poetry_specifier(python, "Python")).contains(
+            environment["python_full_version"], prereleases=True
+        ):
+            return
+        platform = option.get("platform")
+        if platform is not None:
+            if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", platform):
+                raise LockfileError(f"Unsupported Poetry platform constraint in {source}: {platform!r}.")
+            if platform != environment["sys_platform"]:
+                return
+        unsupported = set(option) - {
+            "version", "markers", "python", "platform", "optional", "extras", "source", "allow-prereleases"
+        }
+        if unsupported:
+            raise LockfileError(f"Unsupported Poetry dependency option {sorted(unsupported)[0]!r} in {source}.")
+        extras = option.get("extras", [])
+        if not isinstance(extras, list):
+            raise LockfileError(f"Invalid Poetry dependency extras in {source}.")
+        specifier = SpecifierSet(_poetry_specifier(option.get("version", "*"), f"dependency {name}"))
+        require(name, specifier, extras, source)
+
+    for text in pyproject.get("project", {}).get("dependencies", []):
+        require_pep508(text, "pyproject.toml")
+    legacy = pyproject.get("tool", {}).get("poetry", {}).get("dependencies", {})
+    if not isinstance(legacy, dict):
+        raise LockfileError("Invalid Poetry dependencies in pyproject.toml.")
+    for name, definition in legacy.items():
+        if name.lower() == "python":
+            continue
+        for option in _poetry_dependency_options(definition, "pyproject.toml"):
+            require_poetry(name, option, "pyproject.toml")
+
+    while pending:
+        index, extra = pending.pop()
+        if (index, extra) in visited:
+            continue
+        visited.add((index, extra))
+        entry = entries[index]
+        source = f"poetry.lock package {entry['name']}"
+        dependencies = entry.get("dependencies", {})
+        if not isinstance(dependencies, dict):
+            raise LockfileError(f"Invalid Poetry dependencies in {source}.")
+        for name, definition in dependencies.items():
+            for option in _poetry_dependency_options(definition, source):
+                require_poetry(name, option, source, extra)
+        if extra:
+            extra_table = entry.get("extras", {})
+            if not isinstance(extra_table, dict):
+                raise LockfileError(f"Invalid Poetry extras in {source}.")
+            for name, requirements in extra_table.items():
+                if canonical_name(name) == extra:
+                    if not isinstance(requirements, list):
+                        raise LockfileError(f"Invalid Poetry extra {name!r} in {source}.")
+                    for text in requirements:
+                        require_pep508(text, source, extra)
+
+
 def _load_poetry(path: Path, environment):
     lock = _read_toml(path)
     pyproject = _read_toml(_manifest(path, "pyproject.toml"))
@@ -314,11 +485,20 @@ def _load_poetry(path: Path, environment):
             fresh = expected == poetry_content_hash(pyproject, with_dependency_groups=False)
     if not fresh:
         raise _stale("poetry.lock", "poetry lock")
+    constraints = [_poetry_specifier(metadata.get("python-versions"), "Python")]
+    legacy = pyproject.get("tool", {}).get("poetry", {}).get("dependencies", {})
+    if not isinstance(legacy, dict):
+        raise LockfileError("Invalid Poetry dependencies in pyproject.toml.")
+    legacy_python = legacy.get("python")
+    if legacy_python is not None:
+        constraints.append(_poetry_specifier(legacy_python, "Python"))
     if environment is None:
         return [], []
     _require_python(pyproject.get("project", {}).get("requires-python"), environment, "pyproject.toml")
+    for constraint in constraints:
+        _require_python(constraint, environment, "poetry.lock")
 
-    packages, indexes = [], []
+    packages, indexes, selected_entries = [], [], []
     for entry in lock.get("package", []):
         name = entry.get("name", "<unnamed>")
         if "main" not in entry.get("groups", []):
@@ -327,6 +507,12 @@ def _load_poetry(path: Path, environment):
         marker = markers.get("main") if isinstance(markers, dict) else markers
         if not _marker_applies(marker, environment, f"poetry.lock package {name}"):
             continue
+        if not isinstance(entry.get("name"), str) or not entry["name"]:
+            raise LockfileError("poetry.lock has a package without a valid name.")
+        _require_python(
+            _poetry_specifier(entry.get("python-versions"), "Python"),
+            environment, f"poetry.lock package {name}",
+        )
         source = entry.get("source")
         if source:
             if source.get("type") != "legacy":
@@ -338,6 +524,8 @@ def _load_poetry(path: Path, environment):
         packages.append(
             _package(name, entry.get("version"), [item.get("hash") for item in entry.get("files", [])], "poetry.lock")
         )
+        selected_entries.append(entry)
+    _check_poetry_complete(pyproject, selected_entries, environment)
     return packages, _ordered_unique(indexes)
 
 
@@ -384,7 +572,10 @@ def _load_pipenv(path: Path, environment):
             f"Pipfile.lock requires Python {requires['python_full_version']}, but the target "
             f"image provides {environment['python_full_version']}."
         )
-    sources = {source.get("name"): source.get("url") for source in meta.get("sources", [])}
+    source_entries = meta.get("sources", [])
+    if not isinstance(source_entries, list) or any(not isinstance(source, dict) for source in source_entries):
+        raise LockfileError("Pipfile.lock has invalid package sources.")
+    sources = {source.get("name"): source.get("url") for source in source_entries}
 
     packages, indexes = [], []
     for name, entry in sorted(lock.get("default", {}).items()):
@@ -405,7 +596,12 @@ def _load_pipenv(path: Path, environment):
         if index:
             if index not in sources:
                 raise LockfileError(f"Pipfile.lock package {name} references unknown index {index!r}.")
-            indexes.append(_index_url(sources[index], f"Pipfile.lock index {index}"))
+            url = sources[index]
+        else:
+            if not source_entries:
+                raise LockfileError(f"Pipfile.lock package {name} has no default source.")
+            url = source_entries[0].get("url")
+        indexes.append(_index_url(url, f"Pipfile.lock package {name}"))
         packages.append(_package(name, version[2:], entry.get("hashes", []), "Pipfile.lock"))
     return packages, _ordered_unique(indexes)
 
@@ -531,8 +727,16 @@ def _lock_requirement_key(entry: dict, environment, scenarios, source: str) -> T
 
 def _check_uv_fresh(lock: dict, root: dict, pyproject: dict, environment) -> None:
     project = pyproject.get("project", {})
-    if project.get("requires-python") and lock.get("requires-python") != project["requires-python"]:
-        raise _stale("uv.lock", "uv lock")
+    if project.get("requires-python"):
+        try:
+            matches = (
+                bool(lock.get("requires-python"))
+                and SpecifierSet(lock["requires-python"]) == SpecifierSet(project["requires-python"])
+            )
+        except InvalidSpecifier as exc:
+            raise LockfileError("Invalid requires-python in pyproject.toml or uv.lock.") from exc
+        if not matches:
+            raise _stale("uv.lock", "uv lock")
     optional = project.get("optional-dependencies", {})
     scenarios = ("", *sorted(canonical_name(extra) for extra in optional))
     expected = sorted(
@@ -592,10 +796,64 @@ def _check_uv_complete(pyproject: dict, environment, selected, visited) -> None:
             if state_name == name and state_version in matches
             for extra in state_extras
         }
-        if not matches or not extras <= covered:
+        nonempty_extras = {
+            canonical_name(extra)
+            for (entry_name, entry_version), entry in selected.items()
+            if entry_name == name and entry_version in matches
+            for extra, dependencies in entry.get("optional-dependencies", {}).items()
+            if dependencies
+        }
+        if not matches or not (extras & nonempty_extras) <= covered:
             raise LockfileError(
                 f"uv.lock does not lock {requirement} for the target environment; run `uv lock`."
             )
+
+
+def _uv_environment_markers(values, source: str) -> set[str]:
+    if values is None:
+        return set()
+    if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise LockfileError(f"Invalid supported environments in {source}.")
+    markers = set()
+    for value in values:
+        try:
+            marker = str(Marker(value))
+        except InvalidMarker as exc:
+            raise LockfileError(f"Invalid environment marker in {source}: {value!r}") from exc
+        tokens = _marker_tokens(marker, source)
+        # These bounds are equivalent for final CPython releases; do not rewrite quoted values.
+        for index in range(len(tokens) - 3, -1, -1):
+            variable, operator, version = tokens[index:index + 3]
+            if (
+                variable.type == tokenize.NAME
+                and variable.string == "python_version"
+                and operator.type == tokenize.OP
+                and operator.string in {">=", "<"}
+                and version.type == tokenize.STRING
+                and re.fullmatch(r"""(['"])\d+\.\d+\1""", version.string)
+            ):
+                if variable.start[0] != 1:
+                    raise LockfileError(f"Cannot normalize environment marker in {source}: {value!r}")
+                start, end = variable.start[1], variable.end[1]
+                marker = marker[:start] + "python_full_version" + marker[end:]
+        markers.add(marker)
+    return markers
+
+
+def _check_uv_environments(lock: dict, settings: dict, environment) -> None:
+    configured = _uv_environment_markers(settings.get("environments"), "tool.uv.environments")
+    locked = _uv_environment_markers(lock.get("supported-markers"), "uv.lock")
+    if configured != locked:
+        raise LockfileError(
+            "Cannot verify uv.lock supported environments match tool.uv.environments; "
+            "run `uv lock` or use unrestricted environments."
+        )
+    if environment is not None and locked:
+        applies = [
+            _marker_applies(marker, environment, "uv.lock supported environments") for marker in sorted(locked)
+        ]
+        if not any(applies):
+            raise LockfileError("uv.lock does not support the target environment; update the environments and relock.")
 
 
 def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
@@ -627,6 +885,7 @@ def _load_uv(path: Path, environment):
     )
     if unsupported:
         raise LockfileError(f"uv tool.uv.{unsupported[0]} is unsupported for lockfile staging.")
+    _check_uv_environments(lock, uv_settings, environment)
     _check_uv_indexes(path, lock, uv_settings)
 
     by_name: Dict[str, List[dict]] = {}
@@ -661,15 +920,14 @@ def _load_uv(path: Path, environment):
             if dependency.get("version") in (None, entry.get("version"))
             and dependency.get("source") in (None, entry.get("source"))
         ]
-        if len(candidates) > 1:
-            candidates = [
-                entry
-                for entry in candidates
-                if any(
-                    _marker_applies(marker, environment, f"uv.lock package {name}")
-                    for marker in entry.get("resolution-markers", [None])
-                )
-            ]
+        candidates = [
+            entry
+            for entry in candidates
+            if any(
+                _marker_applies(marker, environment, f"uv.lock package {name}")
+                for marker in entry.get("resolution-markers", [None])
+            )
+        ]
         if len(candidates) != 1:
             raise LockfileError(f"uv.lock dependency {name} of {parent} does not identify one locked package.")
         entry = candidates[0]
@@ -682,9 +940,7 @@ def _load_uv(path: Path, environment):
         pending.extend((child, name) for child in entry.get("dependencies", []))
         optional = entry.get("optional-dependencies", {})
         for extra in extras:
-            if extra not in optional:
-                raise LockfileError(f"uv.lock package {name} has no locked extra {extra!r}.")
-            pending.extend((child, name) for child in optional[extra])
+            pending.extend((child, name) for child in optional.get(extra, ()))
     _check_uv_complete(pyproject, environment, selected, visited)
 
     packages, indexes = [], []

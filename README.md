@@ -379,9 +379,22 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+Poetry's Python and dependency ranges support PEP 440 constraints, exact
+versions, wildcards, and single caret or tilde constraints; other
+Poetry-specific combinations are rejected. Applicable Poetry root and
+recorded transitive dependencies, including requested extras, must be present
+at compatible locked versions. Poetry and uv graph checks rely on the lock's
+recorded dependency metadata and cannot reconstruct dependencies omitted
+from the lock itself. uv extras without recorded dependencies are treated
+as empty, consistent with uv.
 uv registry URLs must match the current `[[tool.uv.index]]` declarations
 or the implicit PyPI index; settings from `uv.toml` and legacy index options
-are not supported.
+are not supported. Limited-resolution uv locks are accepted only when their
+recorded supported markers match the configured environments after supported
+normalization and include the target; unverifiable marker equivalence and
+unknown target marker values fail explicitly. Normalization supports
+`python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
+unrecognized equivalences are rejected even if they are logically equal.
 Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
 PyPI itself is left to your pip configuration so mirrors keep working, and
 pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
