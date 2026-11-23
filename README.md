@@ -361,8 +361,9 @@ pycontainer build \
   Windows, Linux or macOS CPython host of the venv's Python version would have
   installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
   is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if its target
-  requirements are not satisfied, verification fails rather than guessing.
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
@@ -370,6 +371,18 @@ pycontainer build \
   setuptools or Flit tables mentioning host markers fail, as do unreadable
   dynamic dependencies. Unmarked declarations in those unparsed sources are
   not verified. Use a requirements file when a virtualenv cannot be verified.
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to requirements and
+  virtualenv staging alike.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
