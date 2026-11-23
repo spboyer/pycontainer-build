@@ -154,6 +154,11 @@ Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
 markers for the target (never the host) and installs the selection through
 `install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+Poetry checks locked and legacy Python ranges and recorded applicable root,
+transitive and extra dependencies; Poetry and uv cannot reconstruct dependency
+metadata omitted from a lock. uv limited environments must match the recorded
+supported markers and include the target; unverifiable marker normalization
+and unknown target values fail closed.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`. Non-registry sources fail; never add an
 unconstrained fallback. Real lock fixtures live in `tests/fixtures/lockfiles`
