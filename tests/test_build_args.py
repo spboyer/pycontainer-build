@@ -169,6 +169,39 @@ def test_cli_override_order_and_empty_value(tmp_path, monkeypatch):
     assert configs[0].labels == {"version": "last=with=equals"}
 
 
+@pytest.mark.parametrize("operation", ["build", "push"])
+@pytest.mark.parametrize(("category", "exit_code"), [("findings", 3), ("scanner", 4)])
+def test_scan_errors_redact_arguments_and_preserve_exit_code(
+    tmp_path, monkeypatch, capsys, operation, category, exit_code,
+):
+    from pycontainer.scanning import ScanError
+
+    value = "private-scan-value"
+    path = tmp_path / "config.toml"
+    path.write_text(f'[build.build-args]\nVALUE = "{value}"\n')
+
+    class FailingBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            if operation == "build":
+                raise ScanError(category, f"failure: {value}")
+            return "layout"
+
+        def push(self, **kwargs):
+            raise ScanError(category, f"failure: {value}")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FailingBuilder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--config", str(path), "--push"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    output = capsys.readouterr()
+    assert error.value.code == exit_code
+    assert value not in output.out + output.err
+    assert "<redacted>" in output.err
+
+
 def test_semantic_validation_redacts_escaped_argument_values(tmp_path, monkeypatch, capsys):
     path = tmp_path / "config.toml"
     path.write_text(
@@ -280,6 +313,9 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
     builder.manifest_digest = "sha256:" + "a" * 64
     builder.config_digest = "sha256:" + "b" * 64
     builder.layers = []
+    manifest = tmp_path / "out" / "blobs" / "sha256" / ("a" * 64)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"{}")
 
     with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError, match="stopped"):
         if operation == "pull":

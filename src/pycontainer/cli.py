@@ -1,6 +1,6 @@
 import argparse, json, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import config_from_file, load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
@@ -86,6 +86,15 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
+    b.add_argument("--scan-executable",help="Grype executable path or name")
+    b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
+    b.add_argument("--scan-unknown",choices=("fail","ignore"),help="Unknown severity policy (default: fail)")
+    b.add_argument("--scan-report-format",choices=("json","sarif"),help="Report format (default: json)")
+    b.add_argument("--scan-report",help="Report destination (default: output directory)")
+    b.add_argument("--scan-offline",action="store_true",default=None,help="Use an imported database without updates; freshness still enforced")
+    b.add_argument("--scan-db-dir",help="Grype database cache (default: ~/.pycontainer/grype-db)")
+    b.add_argument("--scan-db-max-age-hours",type=int,help="Maximum database build age (default: 120 hours)")
     b.add_argument("--stop-signal",help="OCI StopSignal, e.g. SIGTERM or SIGRTMIN+3 (overrides the base image value)")
     b.add_argument("--volume",dest="volumes",action="append",help="Declare an absolute container path as an OCI volume (repeatable; merged with base volumes; metadata only, no mount is created)")
 
@@ -197,6 +206,15 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'scan': args.scan,
+        'scan_executable': args.scan_executable,
+        'scan_threshold': args.scan_threshold,
+        'scan_unknown': args.scan_unknown,
+        'scan_report_format': args.scan_report_format,
+        'scan_report': args.scan_report,
+        'scan_offline': args.scan_offline,
+        'scan_db_dir': args.scan_db_dir,
+        'scan_db_max_age_hours': args.scan_db_max_age_hours,
         'stop_signal': args.stop_signal,
         'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
@@ -254,6 +272,7 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+    from .scanning import ScanError
     log_filter = _BuildArgumentLogFilter(cfg)
     handlers = list(logging.getLogger().handlers) if cfg.build_args else []
     for handler in handlers:
@@ -280,6 +299,8 @@ def main():
             if getattr(args,"output_ref",None):
                 write_reference(Path(args.output_ref),pushed)
                 print("Wrote image reference to", cfg.redact(str(args.output_ref)))
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
     except (OSError, ValueError, RuntimeError) as exc:
         if not cfg.build_args:
             raise
