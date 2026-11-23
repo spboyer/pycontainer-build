@@ -254,8 +254,8 @@ separate.
 - **Only installed packages ship.** The dependency layer contains the staged
   `site-packages` and generated console scripts. pip's stderr and debug log are
   kept in host temporary files outside the staged tree. Installed
-  `direct_url.json` metadata with URL credentials fails the build, for both
-  pip-staged and virtualenv-staged dependencies.
+  `direct_url.json` metadata with URL credentials fails pip-staged builds;
+  virtualenv staging rejects all `direct_url.json` metadata.
 - **Errors are classified and redacted.** HTTP 401/403 failures name the
   supported credential sources, HTTP 407 points at proxy credentials, and
   connection or TLS failures say so. Excerpts are limited to a few pip lines

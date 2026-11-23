@@ -756,10 +756,11 @@ def test_virtualenv_direct_url_credentials_are_rejected(tmp_path, monkeypatch):
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
     (tmp_path / "layers").mkdir()
 
-    with pytest.raises(ValueError, match="records a URL with credentials") as error:
+    with pytest.raises(ValueError, match="direct URL metadata is unsupported") as error:
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
     assert SECRET not in str(error.value)
+    assert USER not in str(error.value)
 
 
 def test_context_local_pip_config_file_is_scanned(tmp_path, monkeypatch, home):
