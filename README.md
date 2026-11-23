@@ -165,6 +165,10 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
+- ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
+  OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
+  read-only root; applied by your runtime, not enforced by the image
+  ([guide](docs/security-fragments.md))
 - ✅ **Reproducible builds** — Deterministic layer creation with fixed timestamps
 - ✅ **Cross-platform builds** — Build linux/amd64 from ARM, linux/arm64 from x86, etc.
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
@@ -559,6 +563,13 @@ The same keys, validation and CLI precedence apply. A file that defines both
 one. Poetry-only keys such as `push` are reported as unknown by
 `pycontainer build`; use `--push` instead. See
 [Dockerfile import](docs/dockerfile-import.md).
+
+Optional `[build.security.kubernetes]` and `[build.security.oci]` tables
+(`[tool.pycontainer.security.*]` in `pyproject.toml`) write deployment
+fragments to `<output_dir>/security/` without changing the image. They are
+not enforced by the image; see [runtime security
+fragments](docs/security-fragments.md) for the schema, supported versions and
+how to apply them.
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
