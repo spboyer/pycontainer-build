@@ -113,6 +113,29 @@ reproducible = true
     assert config.reproducible is False
 
 
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_overrides_invalid_file_values_before_validation(tmp_path, monkeypatch, table):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[{table}]\nplatform = 123\ninclude-deps = "invalid"\n')
+
+    config = _capture_config(
+        monkeypatch,
+        ["build", "--config", str(config_path), "--platform", "linux/arm64", "--include-deps"],
+    )
+
+    assert config.platform == "linux/arm64"
+    assert config.include_deps is True
+
+
+def test_cli_build_config_ignores_unrelated_scalar_tool_key(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('tool = "standalone"\n[build]\nbase_image = "python:3.12"\n')
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+
+    assert config.base_image == "python:3.12"
+
+
 def test_cli_context_include_and_exclude_options_override_config(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
