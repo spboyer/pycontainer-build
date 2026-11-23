@@ -367,7 +367,13 @@ class ImageBuilder:
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
         
-        entry = self.config.entrypoint or detect_entrypoint(self.config.context_dir)
+        # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
+        if self.config.entrypoint is not None:
+            entry = self.config.entrypoint
+        elif self.config.cmd is not None:
+            entry = None
+        else:
+            entry = detect_entrypoint(self.config.context_dir)
         include = self.context_include_paths
 
         app_layers=[]
@@ -734,7 +740,15 @@ class ImageBuilder:
         print(f"  Base Image: {self.config.base_image}")
         print(f"  Context: {self.config.context_dir}")
         print(f"  Working Dir: {self.config.workdir}")
-        print(f"  Entrypoint: {' '.join(self.config.entrypoint or ['<auto-detect>'])}")
+        if self.config.entrypoint is not None:
+            entrypoint = ' '.join(self.config.entrypoint) or '<none>'
+        elif self.config.cmd is not None:
+            entrypoint = '<inherited from base image>'
+        else:
+            entrypoint = '<auto-detect>'
+        print(f"  Entrypoint: {entrypoint}")
+        if self.config.cmd is not None:
+            print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
         if self.config.exposed_ports:
             print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:

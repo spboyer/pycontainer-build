@@ -376,6 +376,9 @@ By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
 - **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
+  (skipped when `cmd` is configured without `entrypoint`: the image then keeps
+  the base image's `Entrypoint` and runs `cmd`, as Docker does; an explicit
+  `entrypoint = []` / `cmd = []` clear the base image's value)
 - **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`
