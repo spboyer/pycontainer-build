@@ -196,6 +196,7 @@ from .project import (
 )
 from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
+from .release_notes import release_notes_labels
 from .registry_client import (
     RegistryClient,
     RegistryRequestError,
@@ -408,6 +409,8 @@ class ImageBuilder:
                 and exclude not in config.exclude_paths
             )
         )
+        self.release_notes_labels=release_notes_labels(config)
+        framework_label_explicit="framework" in (config.labels or {})
         self.config=apply_framework_defaults(
             config,
             context_dir,
@@ -415,6 +418,9 @@ class ImageBuilder:
             self.context_excludes,
             exclude_defaults=False,
         )
+        if "framework" in self.release_notes_labels and not framework_label_explicit and self.config.labels:
+            # The configured release-notes key takes precedence over the framework default.
+            self.config.labels.pop("framework", None)
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
         if config.use_cache and not self.dry_run:
@@ -683,7 +689,8 @@ class ImageBuilder:
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers],
-                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes,
+                                generated_labels=self.release_notes_labels)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -1079,6 +1086,8 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
+        for key, notes in self.release_notes_labels.items():
+            print(f"  Release Notes: label {key}, {len(notes.encode('utf-8'))} bytes (contents hidden)")
         if self.config.manifest_annotations:
             print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
         if self.config.index_annotations:
