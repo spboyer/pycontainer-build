@@ -5,6 +5,7 @@ import os
 import stat
 import time
 from contextlib import contextmanager
+from itertools import dropwhile
 from pathlib import Path, PureWindowsPath
 
 
@@ -169,17 +170,17 @@ def context_exclude_paths(
 
 
 def _is_directory_link(path):
-    """Detect directory links, including Windows junctions on Python 3.11."""
+    """Detect directory symlinks and Windows junctions (mount points)."""
     if not path.is_dir():
         return False
-    attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    return path.is_symlink() or bool(
-        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    reparse_tag = getattr(path.lstat(), "st_reparse_tag", 0)
+    return path.is_symlink() or reparse_tag == getattr(
+        stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003
     )
 
 
 def _check_root_links(base, relative):
-    """Reject include roots reached through a directory link."""
+    """Reject context paths reached through, or naming, a directory link."""
     current = Path(base)
     for index, part in enumerate(relative.parts):
         current = current / part
@@ -187,7 +188,7 @@ def _check_root_links(base, relative):
             current.is_symlink() and index < len(relative.parts) - 1
         ):
             raise ValueError(
-                f"Include path {relative.as_posix()!r} traverses a symlink or "
+                f"Context path {relative.as_posix()!r} traverses a symlink or "
                 "junction directory; directory links are never followed."
             )
 
@@ -243,8 +244,10 @@ def iter_files(
 ):
     """Yield unique context files, pruning excluded directories during traversal.
 
-    With ``match_patterns`` only matching files are yielded and selected
-    symlinks must resolve to files inside the context.
+    Directory symlinks and junctions are never followed: an include path that
+    names or traverses one is rejected and nested ones are pruned. Selected
+    file symlinks must use a relative target resolving to a file inside the
+    context. With ``match_patterns`` only matching files are yielded.
     """
     base = Path(base)
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
@@ -312,7 +315,9 @@ def select_context_files(base, include_paths, excludes, conditional_includes=())
 
     Ordinary include paths keep their existing order; files added only by
     active conditional include globs follow in POSIX path order. Every exclude
-    pattern wins over both.
+    pattern wins over both. ``excludes`` must already contain any default
+    patterns. A selected file symlink must target another selected file, so
+    exclusions win over links.
     """
     files = list(
         iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
@@ -332,12 +337,33 @@ def select_context_files(base, include_paths, excludes, conditional_includes=())
             if relative.as_posix() not in seen
         ]
         files.extend(sorted(added, key=lambda item: item[1].as_posix()))
-    selected_paths = {os.path.abspath(path) for path, _ in files}
+    # Lexical membership keeps the link valid inside the image. A ``..`` after
+    # a descending component could climb out of a pruned directory link that
+    # the image lacks, so targets may only climb first and then descend, and
+    # never above the context root, which the image root mirrors. The lexical
+    # check is case-exact so a link valid on Windows cannot dangle on Linux.
+    lexical_paths = {os.path.abspath(path) for path, _ in files}
+    resolved_paths = {
+        os.path.normcase(os.path.realpath(path))
+        for path, _ in files
+        if not path.is_symlink()
+    }
     for path, relative in files:
         if path.is_symlink():
-            _check_selected_link(base, path, relative)
-            target = os.path.abspath(path.parent / os.readlink(path))
-            if target not in selected_paths:
+            text = os.readlink(path)
+            parts = [
+                part
+                for part in text.replace(os.altsep or os.sep, os.sep).split(os.sep)
+                if part not in ("", ".")
+            ]
+            climbs = len(parts) - len(list(dropwhile(lambda part: part == "..", parts)))
+            target = path.parent / text
+            if (
+                ".." in parts[climbs:]
+                or climbs >= len(relative.parts)
+                or os.path.abspath(target) not in lexical_paths
+                or os.path.normcase(os.path.realpath(target)) not in resolved_paths
+            ):
                 raise ValueError(
                     f"Selected symlink {relative.as_posix()!r} must target "
                     "another selected file."

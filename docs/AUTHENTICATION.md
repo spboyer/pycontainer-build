@@ -62,6 +62,11 @@ Reads credentials from environment variables:
 - `GITHUB_TOKEN` (only for the `ghcr.io` registry)
 - `REGISTRY_TOKEN` (generic)
 
+The generic `REGISTRY_*` variables are not scoped to a registry. Pass
+`include_generic_environment=False` to `EnvironmentAuthProvider`,
+`get_default_auth_provider` or `get_registry_auth` to ignore them while keeping
+`GITHUB_TOKEN` for ghcr.io; base-image pulls do this.
+
 #### Registry host scoping
 Provider-specific credentials are selected only when the registry is a bare
 `host` authority, optionally with a numeric HTTPS port of 443 (including
@@ -202,6 +207,28 @@ export REGISTRY_PASSWORD="mypass"
 pycontainer build --tag registry.example.com/app:v1 --push
 ```
 
+### Private Base Images
+Base-image pulls use only registry-scoped credentials. Generic
+`REGISTRY_TOKEN`, `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` values, and the
+`--username`/`--password` flags, are reserved for the destination push and are
+never sent to the base registry or its token endpoint. This applies to every
+target in a multi-platform image-index build. Authenticate a private
+base independently of the destination with an inline `auths` entry for the base
+registry host in `~/.docker/config.json` (credential helpers and `credsStore`
+are not read). The host-scoped `GITHUB_TOKEN` (ghcr.io) and Azure CLI
+(`*.azurecr.io`) providers remain enabled for base pulls, with the same behavior
+as for pushes.
+
+```bash
+# ~/.docker/config.json contains an inline auths entry for base.example.com
+export REGISTRY_USERNAME="push-user"
+export REGISTRY_PASSWORD="push-password"
+pycontainer build \
+  --base-image base.example.com/team/python:3.11 \
+  --tag registry.example.com/app:v1 \
+  --push
+```
+
 ## Private Package Indexes
 
 With `--include-deps` and a requirements file, the builder runs the host
@@ -326,6 +353,12 @@ separate.
 - Concurrent initial bearer challenges share token acquisition and replay once;
   rejection of the current token is reported without indefinite refresh. See
   [REGISTRY_PUSH.md](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
+- Base-image mirrors (`--registry-mirror`) resolve credentials with
+  `get_mirror_auth`, which uses only host-scoped sources (the mirror's own
+  Docker config entry, Azure CLI for `*.azurecr.io`, `GITHUB_TOKEN` for
+  `ghcr.io`). Generic `REGISTRY_*` variables, explicit flags, and upstream
+  credentials are never sent to a mirror. See
+  [REGISTRY_PUSH.md](REGISTRY_PUSH.md#base-image-registry-mirrors).
 
 ### Token Scopes
 - **GitHub**: Require minimum scope (`write:packages`)

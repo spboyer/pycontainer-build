@@ -147,3 +147,49 @@ def test_run_layout_refuses_wrong_image_platform_before_start(script, monkeypatc
     assert evidence["image_platform"] == "linux/arm64"
     assert not any(command[:2] == ["docker", "run"] for command in calls)
     assert calls[-1] == ["docker", "image", "rm", "--force", "img:tag"]
+
+
+@pytest.mark.parametrize("matches", [False, True])
+def test_index_layout_selects_platform_and_verifies_config_before_start(
+    script, monkeypatch, matches
+):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout="container output\n", stderr="", returncode=0)
+
+    def inspect(command):
+        return "linux/arm64" if command[-2] == "{{.Os}}/{{.Architecture}}" else (
+            "sha256:expected" if matches else "sha256:wrong"
+        )
+
+    monkeypatch.setattr(script.subprocess, "run", run)
+    monkeypatch.setattr(script, "command_output", inspect)
+    evidence = {}
+    kwargs = {
+        "source_reference": "runtime.example/check:v1",
+        "expected_config_digest": "sha256:expected",
+    }
+    if matches:
+        assert script.run_layout(
+            "docker", "skopeo", Path("layout"), "img:tag", 5, "linux/arm64",
+            evidence, **kwargs,
+        ) == "container output\n"
+    else:
+        with pytest.raises(RuntimeError, match="config digest"):
+            script.run_layout(
+                "docker", "skopeo", Path("layout"), "img:tag", 5, "linux/arm64",
+                evidence, **kwargs,
+            )
+    assert calls[0][:6] == ["skopeo", "--override-os", "linux", "--override-arch", "arm64", "copy"]
+    assert calls[0][6].endswith(":runtime.example/check:v1")
+    assert any(command[:2] == ["docker", "run"] for command in calls) is matches
+    assert calls[-1] == ["docker", "image", "rm", "--force", "img:tag"]
+
+
+@pytest.mark.parametrize("other_mode", ["--shell-command", "--cmd-only", "--dependency-layer-only"])
+def test_index_mode_cannot_be_combined_with_other_modes(script, other_mode):
+    with pytest.raises(SystemExit) as exc:
+        script.main([other_mode, "--multi-platform-index"])
+    assert exc.value.code == 2

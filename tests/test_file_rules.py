@@ -245,6 +245,35 @@ def test_cli_overrides_resolve_before_rules_in_every_entry_point(
         ]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cli_multi_platform_with_per_target_rules_fails_before_building(
+    tmp_path, monkeypatch, capsys, dry_run
+):
+    context = _context(tmp_path)
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        f'[build]\ncontext-dir = {str(context)!r}\n'
+        f'output-dir = {str(tmp_path / "out")!r}\n'
+        'include-paths = ["app.py"]\n'
+        '[[build.file-rules]]\nwhen = \'target.arch == "amd64"\'\n'
+        'include = "native/amd64.so"\n'
+        '[[build.file-rules]]\nwhen = \'target.arch == "arm64"\'\n'
+        'include = "native/arm64.so"\n'
+    )
+    constructed = []
+    monkeypatch.setattr(cli, "ImageBuilder", lambda config: constructed.append(config))
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", "build", "--config", str(path),
+        "--platform", "linux/amd64,linux/arm64", *(["--dry-run"] if dry_run else []),
+    ])
+    with pytest.raises((SystemExit, ValueError)) as raised:
+        cli.main()
+    captured = capsys.readouterr()
+    assert "single target platform" in str(raised.value) + captured.out + captured.err
+    assert constructed == []
+    assert not (tmp_path / "out").exists()
+
+
 def test_excludes_win_over_overlapping_includes(tmp_path):
     context = _context(tmp_path)
     rules = [
@@ -746,12 +775,15 @@ def test_in_context_file_symlink_is_kept_as_link(tmp_path, reproducible):
         assert "\\" not in link.linkname
 
 
-@pytest.mark.parametrize("kind", ["absolute", "excluded", "different-case"])
+@pytest.mark.parametrize(
+    "kind", ["absolute", "excluded", "different-case", "climbs-past-root"]
+)
 def test_selected_link_must_target_selected_image_file(tmp_path, kind):
     context = _context(tmp_path)
     target = context / "app.py"
     link_target = (
         target if kind == "absolute"
+        else Path("..", "..", "context", "app.py") if kind == "climbs-past-root"
         else Path("..") / ("APP.py" if kind == "different-case" else "app.py")
     )
     _symlink(context / "debug_tools" / "alias.py", link_target)

@@ -17,8 +17,13 @@ daemon without discussing the trade-off first.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
+- `registry_cleanup.py`: `registry delete`/`prune` planning and confirmation.
+  Deletion is by manifest digest and removes every aliased tag; never select a
+  digest shared with a retained tag, and never retry `DELETE`. Tests use the
+  in-process fake registry in `tests/test_registry_cleanup.py`, never a real one.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
+  Multi-platform index scanning is rejected; build and scan each target separately.
 - `system_packages.py`: system package declaration, inference and base-image
   verification (warning only). `system_install.py`: fail-closed groundwork for
   #31; it executes no package manager and has no callers until the #22
@@ -44,7 +49,8 @@ Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
 content, normalized relative paths, workdir, and reproducibility settings, plus
 the context-relative hardlink targets `tarfile` emits (never inode numbers or
-absolute paths); key version 3 invalidated earlier keys that lacked them.
+absolute paths); key version 3 invalidated earlier keys that lacked them, and
+version 4 invalidated Windows entries whose symlink text kept backslashes.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -117,9 +123,12 @@ starts a container. `--platform` must match the daemon; emulated runs fail
 rather than count as evidence. `--evidence` writes a passed or failed JSON
 record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+Add `--multi-platform-index` to build both targets, select the native image
+from the index, verify its imported config digest and start it. Index evidence
+is separate from single-platform release evidence.
 To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
 (optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
-Neither mode is part of default pytest.
+These modes are not part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
@@ -133,6 +142,9 @@ and is listed separately as not validated. Re-run all jobs, not just failed
 jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
+The tests workflow also runs the multi-platform index check on both native
+targets and uploads separate `index-runtime-evidence-*` artifacts; the release
+workflow continues to use only the single-platform release evidence.
 
 Runtime security fragments (`security.py`) are deployment artifacts written
 beside the layout, never image config. Verify them with the opt-in Linux
@@ -157,8 +169,10 @@ There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
 and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
-multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
-does not measure external registry throughput. Do not describe suggested tools
+multiple blob sizes with per-sample peak RSS and Python allocation metrics, and
+`registry-network-*` cases that time the real sequential pull/build/push against
+a loopback registry with injected latency and bandwidth (see `docs/TESTING.md`);
+it does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
 
 ## Change discipline
@@ -187,7 +201,10 @@ size before publication; only safe reads use bounded retries and explicit
 request timeouts. Registry HTTP(S) requests go through the client's openers:
 keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
 explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
-credentials over HTTP to non-loopback hosts.
+credentials over HTTP to non-loopback hosts. Base-image mirrors
+(`registry_mirrors.py`) apply only to pulls; each mirror uses only its own
+host-scoped credentials, integrity and rate-limit failures never fall back,
+and pushes bypass mirrors.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
@@ -202,13 +219,13 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
-- The registry client is HTTPS-only and does not read Docker `credsStore`,
-  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
-  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
-  (#29) are rejected, not emulated.
+- The registry client does not read Docker `credsStore`, `credHelpers` or
+  `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff (`PUSH_IMAGE=false`,
+  `custom_build(tag=...)`) and multi-platform dev-loop requests are rejected,
+  not emulated.
 
-Dependency staging installs wheel-only requirements for `linux/amd64` and
-`linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
+Dependency staging installs wheel-only requirements for `linux/amd64`,
+`linux/arm64` and `linux/arm/v7` CPython targets (1 MiB requirements file, 300-second timeout,
 512 MiB staged size and 100,000 files); the builder interpreter must provide
 `pip`. Existing virtualenv staging accepts
 pure-Python packages only and rejects native binaries; its Python minor version
@@ -258,17 +275,20 @@ Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
 target-active roots, transitive `Requires-Dist`, versions, extras, constraint
 files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
-collects project roots, plausible venv hosts and checks unparsed sources. The
+collects project roots, established venv host facts and checks unparsed sources. The
 verifier never imports staged packages and fails closed on unknown markers, egg
 distributions, missing or unsupported `Metadata-Version`, invalid metadata,
 direct URLs, and patch-dependent `Requires-Python` without a full
 `PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
 can contain credentials. An unrecorded extra or optional group is ruled out
-only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
-`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
-`Lib` layout; `python_version` shared only when
-the venv minor is established) would have installed one of its missing
-requirements; otherwise unsatisfied target-active requirements fail closed.
+only if one of its missing requirements is provably active on the creator host
+using three-valued (Kleene) marker evaluation over established facts only:
+CPython, `os_name` from the layout (`posix` for `lib/pythonX.Y` with a POSIX
+`pyvenv.cfg` `home`, `nt` for `Lib`, which also implies the Windows
+`sys_platform`/`platform_system` values), and `python_version` when the venv
+minor is established. Every other host marker (for example `platform_machine`,
+or a non-Windows `sys_platform`) is unknown, never sampled from a finite host
+list (#142); otherwise unsatisfied target-active requirements fail closed.
 Extra markers compare canonical names on any vendored `packaging` version;
 `in`/`not in` keep PEP 508 substring semantics (not list membership), never
 name candidate extras or rule one out, and fail closed without
@@ -277,6 +297,18 @@ Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
 not verified.
+Comma-separated `platform` values build an OCI image index for a subset of
+`linux/amd64`, `linux/arm64` and `linux/arm/v7`. arm/v7 requires the exact
+`v7` variant, uses `armv7l` wheel tags from the shared `_PIP_PLATFORMS` table
+in `dependencies.py` (keep #143 libc changes in that table), and never falls
+back to source builds; each platform gets its own
+base selection and dependency layer, including its own virtualenv closure check.
+Tags move only after the whole index verifies. A local `oci:` base must keep the
+same layout `index.json` across platforms. Detected virtualenvs take precedence;
+exclude them to select the requirements file. Multi-tag registry pushes are not
+atomic: a later tag failure can leave earlier tags moved. Hermetic index tests do
+not prove per-architecture runtime startup.
+
 The `_pip_target.py` bootstrap also filters host pip environment variables and config-file keys
 to index, authentication, TLS, proxy and timeout settings (see
 `dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if

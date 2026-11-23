@@ -10,10 +10,59 @@ from .file_rules import evaluate_file_rules
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
+MULTI_PLATFORM_SCAN_ERROR = (
+    "Vulnerability scanning is not supported for multi-platform images; "
+    "build and scan each platform separately."
+)
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
+
+
+DOCKER_HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
+
+
+def _normalize_registry_host(entry, kind: str) -> str:
+    """Validate a ``host[:port]`` registry name and return it lowercased."""
+    if not isinstance(entry, str) or not _REGISTRY_HOST.fullmatch(entry):
+        raise ValueError(
+            f"Invalid {kind} {entry!r}: expected host[:port] without "
+            "a scheme, path, or credentials."
+        )
+    try:
+        port = urllib.parse.urlsplit(f"//{entry}").port
+    except ValueError:
+        port = 0
+    if port == 0:
+        raise ValueError(f"Invalid {kind} port in {entry!r}.")
+    return entry.lower()
+
+
+def canonical_registry(host: str) -> str:
+    """Return the lookup key for a registry host, folding Docker Hub aliases."""
+    host = host.lower()
+    return "docker.io" if host in DOCKER_HUB_HOSTS else host
+
+
+def normalize_platforms(value: str) -> List[str]:
+    """Split a comma-separated platform list, validating and de-duplicating it."""
+    from .builder import parse_platform
+
+    if not isinstance(value, str):
+        raise ValueError("platform must be a string such as 'linux/amd64'.")
+    platforms: List[str] = []
+    for entry in value.split(","):
+        platform = entry.strip()
+        if not platform:
+            raise ValueError(
+                f"Invalid platform list {value!r}: entries must not be empty."
+            )
+        parse_platform(platform)
+        if platform not in platforms:
+            platforms.append(platform)
+    return platforms
 
 
 def validate_insecure_registries(registries: List[str]) -> List[str]:
@@ -22,19 +71,38 @@ def validate_insecure_registries(registries: List[str]) -> List[str]:
         raise ValueError("insecure_registries must be a list of host[:port] strings.")
     normalized = []
     for entry in registries:
-        if not isinstance(entry, str) or not _REGISTRY_HOST.fullmatch(entry):
+        host = _normalize_registry_host(entry, "insecure registry")
+        if host not in normalized:
+            normalized.append(host)
+    return normalized
+
+
+def validate_registry_mirrors(mirrors: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Normalize ``{upstream: [mirror, ...]}`` pull-through mirror settings."""
+    if not isinstance(mirrors, dict):
+        raise ValueError(
+            "registry_mirrors must map an upstream host[:port] to a list of mirror hosts."
+        )
+    normalized: Dict[str, List[str]] = {}
+    for upstream, hosts in mirrors.items():
+        key = canonical_registry(_normalize_registry_host(upstream, "mirrored registry"))
+        if key in normalized:
+            raise ValueError(f"Registry {upstream!r} has more than one mirror list.")
+        if not isinstance(hosts, list) or not hosts:
             raise ValueError(
-                f"Invalid insecure registry {entry!r}: expected host[:port] without "
-                "a scheme, path, or credentials."
+                f"Registry mirrors for {upstream!r} must be a non-empty list of "
+                "host[:port] strings."
             )
-        try:
-            port = urllib.parse.urlsplit(f"//{entry}").port
-        except ValueError:
-            port = 0
-        if port == 0:
-            raise ValueError(f"Invalid insecure registry port in {entry!r}.")
-        if entry.lower() not in normalized:
-            normalized.append(entry.lower())
+        ordered: List[str] = []
+        for entry in hosts:
+            host = _normalize_registry_host(entry, "registry mirror")
+            if canonical_registry(host) == key:
+                raise ValueError(
+                    f"Registry mirror {entry!r} is the upstream registry {upstream!r}."
+                )
+            if host not in ordered:
+                ordered.append(host)
+        normalized[key] = ordered
     return normalized
 
 # Linux signal names in the OCI "SIGNAME" format, matching Docker's Linux table.
@@ -127,6 +195,7 @@ class BuildConfig:
     history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
+    registry_mirrors: Dict[str, List[str]] = field(default_factory=dict)
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
@@ -172,6 +241,7 @@ class BuildConfig:
         self.insecure_registries = validate_insecure_registries(
             self.insecure_registries
         )
+        self.registry_mirrors = validate_registry_mirrors(self.registry_mirrors)
         if self.registry_ca_file is not None:
             from .registry_client import create_registry_ssl_context
 
@@ -181,7 +251,8 @@ class BuildConfig:
         if self.security is not None:
             from .security import validate_security
 
-            self.security = validate_security(self.security, self.platform)
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if self.stop_signal is not None:
             validate_stop_signal(self.stop_signal)
         if not isinstance(self.volumes, list):
@@ -199,6 +270,26 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+        platforms = normalize_platforms(self.platform)
+        if len(platforms) > 1:
+            unsupported = [p for p in platforms if p not in MULTI_PLATFORM_TARGETS]
+            if unsupported:
+                raise ValueError(
+                    "Multi-platform builds support only "
+                    f"{', '.join(MULTI_PLATFORM_TARGETS)}; unsupported target(s): "
+                    f"{', '.join(unsupported)}."
+                )
+            if self.generate_sbom:
+                raise ValueError(
+                    "SBOM generation is not supported for multi-platform builds; "
+                    "build each platform separately to generate its SBOM."
+                )
+            if self.scan:
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+
+    def target_platforms(self) -> List[str]:
+        """Return the normalized, de-duplicated target platforms in request order."""
+        return normalize_platforms(self.platform)
 
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""

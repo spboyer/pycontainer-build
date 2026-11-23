@@ -6,14 +6,16 @@ Labels and annotations are separate string-to-string maps:
 |---|---|---|
 | `labels` | Image config `config.Labels` | Yes |
 | `manifest_annotations` | Image manifest `annotations` | No |
-| `index_annotations` | Local layout `index.json` `annotations` | No |
+| `index_annotations` | Local layout `index.json` and multi-platform image index `annotations` | No |
 
 Annotations describe the newly built object, so base manifest, index, and
 descriptor annotations are not copied. The builder retains its own
 `org.opencontainers.image.ref.name` in the local index independently of user
 annotations. On the existing single-image path, a registry push sends the image
 manifest and config, not the local layout index. Manifest annotations therefore
-travel with that push; index annotations remain in the local layout.
+travel with that push; index annotations remain in the local layout. A
+multi-platform push sends the annotated image index as well as each annotated
+platform manifest; the layout wrapper keeps the same user index annotations.
 
 ## Configuration and precedence
 
@@ -115,12 +117,9 @@ digests. On the single-image path, changing only an index annotation changes
   generated keys that collide with explicit CLI or file labels; do not silently
   resolve those collisions by precedence. Reuse this guard for other generated
   labels.
-- [#150](https://github.com/spboyer/pycontainer-build/pull/150) creates both a
-  content-addressed image index for registry pushes and a layout-index wrapper.
-  Apply manifest annotations to each platform manifest and index annotations to
-  both index objects. Serialize the annotated image index before calculating its
-  digest and size for the wrapper descriptors and push. Preserve each platform
-  descriptor and the existing verification and publication ordering.
+- Multi-platform builds serialize the annotated image index before calculating
+  its digest and size for the layout descriptors and push. Each platform
+  manifest carries the configured manifest annotations independently.
 - [#185](https://github.com/spboyer/pycontainer-build/pull/185) adds one layout
   descriptor per tag. Keep user index annotations on the index, preserve each
   descriptor's independent internal reference annotation, and use the final
