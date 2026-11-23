@@ -554,8 +554,7 @@ def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys
     assert [rel.as_posix() for _, rel in find_dependencies(context)] == ["requirements.txt"]
 
     explicit = [{"when": 'BUILD_MODE == "dev"', "include": "conda_env/lib/**"}]
-    with pytest.raises(ValueError, match="Conda environment"):
-        _selected(_config(context, tmp_path, [], include_paths=["conda_env"]))
+    assert _selected(_config(context, tmp_path, [], include_paths=["conda_env"])) == []
     with pytest.raises(ValueError, match="Conda environment"):
         _selected(_config(context, tmp_path, explicit,
                           build_args={"BUILD_MODE": "dev"}))
@@ -569,6 +568,41 @@ def test_exclusion_precedes_conda_root_validation(tmp_path):
         {"when": 'BUILD_MODE == "production"', "exclude": "conda_env"},
     ]
     assert _selected(_config(context, tmp_path, rules)) == ["app.py"]
+
+
+@pytest.mark.parametrize("exclude_marker", [False, True])
+def test_conditional_selection_prunes_links_into_conda_prefix(tmp_path, exclude_marker):
+    context = _context(tmp_path)
+    prefix = tmp_path / "host-env"
+    (prefix / "conda-meta").mkdir(parents=True)
+    binary = prefix / "host.pyd"
+    binary.write_bytes(b"host binary")
+    _symlink(context / "debug_tools" / "alias.pyd", binary)
+    rules = [DEV_TOOLS]
+    if exclude_marker:
+        rules.append({"when": 'BUILD_MODE == "dev"', "exclude": "**/conda-meta"})
+    builder = ImageBuilder(_config(context, tmp_path, rules,
+                                   build_args={"BUILD_MODE": "dev"}))
+    selected = [relative.as_posix() for _, relative in builder.context_files]
+    assert selected == ["app.py", "debug_tools/inspect.py", "debug_tools/nested/trace.py"]
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    with tarfile.open(builder._create_app_layer(layers).tar_path) as archive:
+        assert archive.getnames() == [f"app/{name}" for name in selected]
+
+
+def test_conda_preflight_failure_preserves_build_history(tmp_path):
+    from pycontainer.history import BuildHistory
+
+    context = _context(tmp_path)
+    (context / "conda-meta").mkdir()
+    config = _config(context, tmp_path, [], record_history=True,
+                     history_dir=str(tmp_path / "history"))
+    builder = ImageBuilder(config)
+    with pytest.raises(ValueError, match="source-only build context"):
+        builder.build()
+    assert not Path(config.output_dir).exists()
+    assert BuildHistory(config.history_dir).list()[0]["status"] == "failed"
 
 
 def test_same_size_same_time_edit_changes_cached_layer(tmp_path):
@@ -733,6 +767,22 @@ def test_ordinary_include_rejects_dangling_symlink(tmp_path):
     _symlink(context / "broken.py", Path("missing.py"))
     with pytest.raises(ValueError, match="symlink.*dangling"):
         _selected(_config(context, tmp_path, [], include_paths=["broken.py"]))
+
+
+def test_conda_prefix_check_reports_legacy_symlink_loop_error(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    link = context / "debug_tools" / "loop.py"
+    _symlink(link, Path("loop.py"))
+    resolve = Path.resolve
+
+    def legacy_resolve(path, strict=False):
+        if path == link and not strict:
+            raise RuntimeError("Symlink loop")
+        return resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", legacy_resolve)
+    with pytest.raises(ValueError, match="symlink.*cyclic"):
+        _selected(_config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"}))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions only")

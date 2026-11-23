@@ -10,6 +10,7 @@ EXPANDABLE_FIELDS = (
     "tag", "tags", "base_image", "context_dir", "workdir", "entrypoint",
     "cmd", "env", "labels", "user", "include_paths", "exclude_paths",
     "output_dir", "cache_dir", "requirements_file", "platform",
+    "stop_signal", "volumes",
 )
 
 

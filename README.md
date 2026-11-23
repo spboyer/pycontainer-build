@@ -446,6 +446,16 @@ pycontainer build \
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
   establish the Python ABI. These metadata checks apply to requirements and
   virtualenv staging alike.
+- **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
+  `conda-lock.yml`, and `conda-meta/` directories in the context. With
+  `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
+  selected pip requirements file takes precedence over a venv, with a warning
+  that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
+  ordinary Conda projects still build application-only images. Host Conda
+  prefixes are never copied, even with explicit includes or
+  `--no-default-excludes`; a context inside a Conda prefix requires a source-only
+  context instead. See the [export workaround](docs/local-development.md#conda-projects).
+  Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
 
 ### Local base images
 
@@ -539,6 +549,9 @@ error handling, and custom-directory inspection.
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
   `linux/arm64` or `linux/arm/v7`)
+- `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
+  as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
+- `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
@@ -648,6 +661,31 @@ in `[build]` may use hyphens or underscores. After overrides are applied,
 unknown settings and values with the wrong TOML type are reported as
 configuration errors.
 
+#### Stop signal and volumes
+
+`stop_signal` (`--stop-signal`) and `volumes` (`--volume`, repeatable) set the
+OCI image config `StopSignal` and `Volumes` fields:
+
+```toml
+[build]
+stop_signal = "SIGINT"
+volumes = ["/data", "/var/cache/app"]
+```
+
+- When unset, the base image's `StopSignal` and `Volumes` are inherited
+  unchanged. A configured `stop_signal` replaces the base value.
+- Configured volumes are merged with the base volumes as a sorted,
+  de-duplicated set, so the config digest is deterministic. Base volumes
+  cannot be removed. `--volume` values replace (not extend) the file's list.
+- Signals must be canonical Linux names (`SIGTERM`, not `term`, `15` or
+  `sigterm`). Volume paths must be absolute, normalized Linux paths; `/`,
+  relative paths, `.`/`..` segments, backslashes, trailing slashes and control
+  characters are rejected.
+- Volumes are image metadata only: pycontainer does not create mounts, and the
+  container runtime decides how to back them. The stop signal is honored only by
+  runtimes that read it, such as `docker stop`.
+- These are config fields, not OCI labels; `labels` are unaffected.
+
 `--config` also accepts a `pyproject.toml` whose settings live under
 `[tool.pycontainer]` (with `[tool.pycontainer.env]` and
 `[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
@@ -706,7 +744,8 @@ in dry-run mode. Defaults are checked even when overridden.
 
 `${NAME}` expands **once**, only in `tag`, `tags`, `base_image`, `context_dir`,
 `workdir`, `entrypoint`, `cmd`, `user`, `include_paths`, `exclude_paths`,
-`output_dir`, `cache_dir`, `requirements_file`, `platform`, and the **values**
+`output_dir`, `cache_dir`, `requirements_file`, `platform`, `stop_signal`,
+`volumes`, and the **values**
 of `env` and `labels`. Hyphenated setting aliases work too. Dictionary keys,
 SBOM formats, system-package declarations and other settings do not expand.
 `$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
@@ -772,8 +811,9 @@ Active includes add to `include-paths`; **every exclusion wins** over every
 include. That covers active exclude rules, `exclude-paths`, the default
 exclusions (so a `tests/**` rule needs `--no-default-excludes`), and the output
 and cache directories, which are always excluded. Conda environment prefixes
-(directories containing `conda-meta/`) are also always pruned, and an include
-path or rule rooted inside one fails unless that root is already excluded; host
+(directories containing `conda-meta/`) are also always pruned, including symlink
+aliases to them. Ordinary includes skip these prefixes; a conditional rule
+rooted inside one fails unless that root is already excluded. Host
 Conda environments are never copied into the image. The selection is refreshed
 once per build and shared by framework detection, `--dry-run` (which reports the count and,
 with `-v`, each path), the app layer and the cache key; active rule sets are part

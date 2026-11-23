@@ -106,6 +106,39 @@ def _raise_walk_error(error):
     raise error
 
 
+def _conda_prefix_in_context(base, relative):
+    """Check context-relative ancestors and resolved link targets."""
+    for parent in (relative, *relative.parents):
+        candidate = base / parent
+        if (candidate / "conda-meta").is_dir():
+            return candidate.absolute()
+    absolute = (base / relative).absolute()
+    try:
+        resolved = absolute.resolve()
+    except RuntimeError:
+        raise ValueError(
+            f"Context symlink {relative.as_posix()!r} is cyclic."
+        ) from None
+    if resolved != absolute:
+        for parent in (resolved, *resolved.parents):
+            if (parent / "conda-meta").is_dir():
+                return parent
+    return None
+
+
+def conda_prefix(base, relative):
+    """Find a Conda prefix containing a context path without reading metadata."""
+    base = Path(base)
+    relative = relative_context_path(relative)
+    prefix = _conda_prefix_in_context(base, relative)
+    if prefix is not None:
+        return prefix
+    for parent in base.absolute().parents:
+        if (parent / "conda-meta").is_dir():
+            return parent
+    return None
+
+
 def context_exclude_paths(
     context_dir,
     *,
@@ -180,22 +213,14 @@ def _check_selected_link(base, path, relative):
         )
 
 
-def is_conda_prefix(path):
-    """Return whether a directory is a Conda environment prefix."""
-    return (Path(path) / "conda-meta").is_dir()
-
-
 def _check_conda_root(base, relative):
     """Reject an include path at or inside a Conda environment prefix."""
-    current = Path(base)
-    for part in ("", *relative.parts):
-        current = current / part
-        if is_conda_prefix(current):
-            raise ValueError(
-                f"Include path {relative.as_posix()!r} is inside a Conda "
-                "environment; host Conda environments are never copied into "
-                "the image."
-            )
+    if conda_prefix(base, relative) is not None:
+        raise ValueError(
+            f"Include path {relative.as_posix()!r} is inside a Conda "
+            "environment; host Conda environments are never copied into "
+            "the image."
+        )
 
 
 def glob_root(pattern):
@@ -230,17 +255,22 @@ def iter_files(
         if match_patterns is not None and not path_is_excluded(relative, match_patterns):
             return False
         if path.is_symlink():
+            if _conda_prefix_in_context(base, relative) is not None:
+                return False
             _check_selected_link(base, path, relative)
         return path.is_file()
 
     seen = set()
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
-        absolute = base / relative
         if path_is_excluded(relative, excludes):
             continue
+        if match_patterns is not None:
+            _check_conda_root(base, relative)
+        if conda_prefix(base, relative) is not None:
+            continue
+        absolute = base / relative
         _check_root_links(base, relative)
-        _check_conda_root(base, relative)
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
                 absolute, topdown=True, onerror=_raise_walk_error
@@ -252,7 +282,7 @@ def iter_files(
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
                     and not _is_directory_link(root_path / directory)
-                    and not is_conda_prefix(root_path / directory)
+                    and _conda_prefix_in_context(base, root_relative / directory) is None
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename
