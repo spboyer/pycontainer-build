@@ -1,6 +1,7 @@
 """Fake-registry regressions for registry delete and prune (no real registry)."""
 import io
 import json
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -51,7 +52,8 @@ def _errors(code, message):
 class FakeRegistry:
     """In-memory Registry v2 subset: manifests, tags/list pagination, DELETE."""
 
-    def __init__(self, page_size=2, require_token=False):
+    def __init__(self, page_size=2, require_token=False, host=HOST):
+        self.host = host
         self.manifests = {}
         self.media_types = {}
         self.tags = {}
@@ -106,7 +108,7 @@ class FakeRegistry:
             scope = dict(urllib.parse.parse_qsl(parsed.query)).get("scope", "")
             action = scope.rsplit(":", 1)[-1]
             return _Response(json.dumps({"token": f"token-{action}"}).encode())
-        assert parsed.netloc == HOST
+        assert parsed.netloc == self.host
 
         for fault in self.faults:
             f_method, fragment, status, body, headers, times = fault
@@ -123,7 +125,7 @@ class FakeRegistry:
                 raise _error(url, 401, {
                     "Www-Authenticate": (
                         'Bearer realm="https://auth.example/token",'
-                        f'service="{HOST}",scope="repository:{REPO}:{action}"'
+                        f'service="{self.host}",scope="repository:{REPO}:{action}"'
                     )
                 })
 
@@ -170,14 +172,14 @@ def registry(monkeypatch):
     return fake
 
 
-def _run(monkeypatch, *argv, tty=False, answer=None):
+def _run(monkeypatch, *argv, tty=False, answer=None, credentials=True):
     stdin = io.StringIO()
     stdin.isatty = lambda: tty
     monkeypatch.setattr(sys, "stdin", stdin)
     if answer is not None:
         monkeypatch.setattr("builtins.input", lambda _prompt: answer)
-    monkeypatch.setattr(sys, "argv", ["pycontainer", "registry", *argv,
-                                      "--username", USER, "--password", PASSWORD])
+    auth_args = ("--username", USER, "--password", PASSWORD) if credentials else ()
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "registry", *argv, *auth_args])
     with pytest.raises(SystemExit) as exit_info:
         cli.main()
     return exit_info.value.code
@@ -359,6 +361,52 @@ def _repo_tags(registry, *tags):
         digests[tag] = registry.add_manifest(tag)
         registry.tag(digests[tag], tag)
     return digests
+
+
+@pytest.mark.parametrize("command", ["delete", "prune"])
+@pytest.mark.parametrize("host, expected_auth, uses_azure_cli", [
+    ("ghcr.io", "Bearer synthetic-github-token", False),
+    ("ghcr.io.example.com", None, False),
+    ("myregistry.azurecr.io", "Bearer synthetic-acr-token", True),
+    ("myregistry.azurecr.io.example.com", None, False),
+])
+def test_cleanup_commands_scope_provider_credentials(
+    monkeypatch, command, host, expected_auth, uses_azure_cli
+):
+    registry = FakeRegistry(host=host)
+    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", registry)
+    monkeypatch.setattr(
+        "pycontainer.auth.DockerConfigAuthProvider._load_config", lambda self: None
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-github-token")
+    for name in ("REGISTRY_TOKEN", "REGISTRY_USERNAME", "REGISTRY_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+    azure_calls = []
+
+    def fake_azure_cli(args, **kwargs):
+        azure_calls.append(args)
+        return subprocess.CompletedProcess(
+            args, 0,
+            stdout=json.dumps({
+                "loginServer": host,
+                "accessToken": "synthetic-acr-token",
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr("pycontainer.auth.subprocess.run", fake_azure_cli)
+    digests = _repo_tags(registry, "v1.0.0", "v2.0.0")
+    if command == "delete":
+        args = ("delete", f"{host}/{REPO}:v1.0.0", "--yes")
+    else:
+        args = ("prune", f"{host}/{REPO}", "--keep", "1", "--execute", "--yes")
+
+    assert _run(monkeypatch, *args, credentials=False) == 0
+    assert len(registry.methods("DELETE")) == 1
+    assert registry.tags == {"v2.0.0": digests["v2.0.0"]}
+    assert all(auth == expected_auth for _, _, auth in registry.requests)
+    assert bool(azure_calls) == uses_azure_cli
 
 
 def test_semver_precedence_and_rejections():
