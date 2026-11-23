@@ -18,8 +18,8 @@ from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     context_exclude_paths,
     ensure_dir,
-    iter_files,
     output_directory_lock,
+    select_context_files,
 )
 
 
@@ -964,14 +964,7 @@ class ImageBuilder:
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
-        files=list(
-            iter_files(
-                ctx,
-                include_paths,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=self.config.exclude_defaults,
-            )
-        )
+        files=select_context_files(ctx, include_paths, self.context_excludes)
         configured_requirements = ctx / self.config.requirements_file
         reject_shipped_credentials(
             files,
