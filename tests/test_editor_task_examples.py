@@ -517,5 +517,6 @@ def test_example_config_runs_real_cli_dry_run_without_writes(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "APP_MODE=example" in result.stdout
-    assert "example.project=synthetic" in result.stdout
+    assert "Labels: 1 configured (values hidden)" in result.stdout
+    assert "synthetic" not in result.stdout
     assert snapshot() == before
