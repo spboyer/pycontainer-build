@@ -1,3 +1,5 @@
+import json
+import math
 import tomllib
 
 import pytest
@@ -101,6 +103,96 @@ def test_merge_replaces_only_pycontainer_tables():
     assert data["tool"]["pycontainer"] == {"workdir": "/w"}
 
 
+def test_force_preserves_unrelated_multiline_text_with_table_like_lines(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pyproject.toml"
+    existing = (
+        '[project]\nname = "keep"\ndescription = """\n'
+        'before\u2028same line\n[tool.pycontainer]\nimportant description\n[tool.ruff]\nafter\n"""\n'
+        '\n[tool.ruff]\nline-length = 99\n'
+    )
+    out.write_text(existing, encoding="utf-8")
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    data = tomllib.loads(out.read_text(encoding="utf-8"))
+    assert data["project"] == tomllib.loads(existing)["project"]
+    assert data["tool"]["ruff"] == {"line-length": 99}
+    assert data["tool"]["pycontainer"] == {"base_image": "python:3.12"}
+
+
+def test_force_preserves_unrelated_quoted_dotted_table(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pyproject.toml"
+    out.write_text('[tool."pycontainer.backup"]\nnote = "keep"\nratio = nan\n')
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    data = tomllib.loads(out.read_text())
+    assert data["tool"]["pycontainer.backup"]["note"] == "keep"
+    assert math.isnan(data["tool"]["pycontainer.backup"]["ratio"])
+    assert data["tool"]["pycontainer"] == {"base_image": "python:3.12"}
+
+
+def test_force_preserves_unrelated_array_table_context(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pyproject.toml"
+    existing = (
+        '[[fruit]]\nname = "one"\n'
+        '[tool.pycontainer]\nbase_image = "old"\n'
+        '[fruit.physical]\ncolor = "red"\n'
+        '[[fruit]]\nname = "two"\n'
+        '[tool.pycontainer.env]\nMODE = "old"\n'
+    )
+    out.write_text(existing)
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    data = tomllib.loads(out.read_text())
+    assert data["fruit"] == tomllib.loads(existing)["fruit"]
+    assert data["tool"]["pycontainer"] == {"base_image": "python:3.12"}
+
+
+def test_force_replaces_single_quoted_pycontainer_tables(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pyproject.toml"
+    out.write_text(
+        "[tool.'pycontainer']\nbase_image = \"old\"\n"
+        "[tool.'pycontainer'.env]\nMODE = \"old\"\n"
+        "# Ruff compatibility settings\n"
+        '[tool.ruff]\nline-length = 99\n'
+    )
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    data = tomllib.loads(out.read_text())
+    assert "# Ruff compatibility settings" in out.read_text()
+    assert data["tool"]["ruff"] == {"line-length": 99}
+    assert data["tool"]["pycontainer"] == {"base_image": "python:3.12"}
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        '[tool]\npycontainer = {base_image = "old"}\nother = "keep"\n',
+        'tool.pycontainer = {base_image = "old"}\n',
+    ],
+)
+def test_force_refuses_inline_config_without_changing_file(tmp_path, monkeypatch, capsys, existing):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pyproject.toml"
+    out.write_text(existing)
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 2
+    assert out.read_text() == existing
+    assert "Cannot safely merge [tool.pycontainer]" in capsys.readouterr().err
+
+
 def test_cli_refuses_overwrite_then_merges_with_force(tmp_path, monkeypatch, capsys):
     dockerfile = tmp_path / "Dockerfile"
     dockerfile.write_text("FROM python:3.12\nWORKDIR /w\nRUN echo hi\n")
@@ -131,3 +223,102 @@ def test_cli_prints_snippet_without_output(tmp_path, monkeypatch, capsys):
         cli.main()
     assert exc.value.code == 0
     assert "[tool.pycontainer]" in capsys.readouterr().out
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr("sys.argv", ["pycontainer", *argv])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    return exc.value.code
+
+
+def test_imported_config_is_consumed_by_build_cli(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12-alpine\nWORKDIR /srv\nENV MODE=production\n"
+        'LABEL org.opencontainers.image.title="demo"\nEXPOSE 8080\n'
+        'CMD ["python", "app.py"]\n'
+    )
+    out = tmp_path / "pyproject.toml"
+    out.write_text('[project]\nname = "keep"\n\n[tool.ruff]\nline-length = 99\n')
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 0
+
+    configs = []
+
+    class FakeImageBuilder:
+        def __init__(self, config):
+            configs.append(config)
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    monkeypatch.setattr("sys.argv", ["pycontainer", "build", "--config", str(out), "--dry-run"])
+    cli.main()
+
+    config = configs[0]
+    assert config.base_image == "python:3.12-alpine"
+    assert config.workdir == "/srv"
+    assert config.env == {"MODE": "production"}
+    assert config.labels == {"org.opencontainers.image.title": "demo"}
+    assert config.exposed_ports == [8080]
+    assert config.cmd == ["python", "app.py"]
+    assert tomllib.loads(out.read_text())["tool"]["ruff"]["line-length"] == 99
+
+
+def test_imported_config_drives_real_build(tmp_path, monkeypatch):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        'FROM python:3.12-alpine\nWORKDIR /srv\nENV MODE=production\nLABEL owner=team\n'
+        'EXPOSE 8080\nCMD ["python", "app.py"]\n'
+    )
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    out = tmp_path / "pyproject.toml"
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out)]) == 0
+
+    base_images = []
+
+    def pull_base_image(builder, layers_dir, os_name, arch):
+        base_images.append((builder.config.base_image, os_name, arch))
+        return [], {
+            "architecture": arch,
+            "os": os_name,
+            "config": {"Env": ["BASE=kept"], "Labels": {"base": "kept"}},
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+
+    monkeypatch.setattr(cli.ImageBuilder, "_pull_base_image", pull_base_image)
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setattr("sys.argv", [
+        "pycontainer", "build", "--config", str(out), "--context", str(tmp_path),
+        "--tag", "app:latest", "--no-cache",
+    ])
+    cli.main()
+
+    blobs = tmp_path / "dist" / "image" / "blobs" / "sha256"
+    index = json.loads((tmp_path / "dist" / "image" / "index.json").read_text())
+    manifest_digest = index["manifests"][0]["digest"].split(":", 1)[1]
+    manifest = json.loads((blobs / manifest_digest).read_text())
+    config_digest = manifest["config"]["digest"].split(":", 1)[1]
+    config = json.loads((blobs / config_digest).read_text())
+
+    assert base_images == [("python:3.12-alpine", "linux", "amd64")]
+    assert config["config"]["WorkingDir"] == "/srv"
+    assert config["config"]["Env"] == ["BASE=kept", "MODE=production"]
+    assert config["config"]["Labels"] == {"base": "kept", "owner": "team"}
+    assert config["config"]["ExposedPorts"] == {"8080/tcp": {}}
+    assert config["config"]["Cmd"] == ["python", "app.py"]
+    assert config["rootfs"]["diff_ids"] == [layer["digest"] for layer in manifest["layers"]]
+
+
+@pytest.mark.parametrize("existing", ['[build]\ntag = "a:1"\n', 'build = { tag = "a:1" }\n'])
+def test_force_refuses_to_add_tool_table_beside_build(tmp_path, monkeypatch, capsys, existing):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\n")
+    out = tmp_path / "pycontainer.toml"
+    out.write_text(existing)
+
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 2
+    assert out.read_text() == existing
+    assert "already defines [build]" in capsys.readouterr().err
