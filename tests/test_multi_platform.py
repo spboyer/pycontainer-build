@@ -41,7 +41,7 @@ class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
     def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None,
-                 base_env_by_arch=None):
+                 base_env_by_arch=None, base_runtime_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
@@ -55,10 +55,13 @@ class FakeBaseRegistry:
                     "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
                     "PYTHON_LIBC=glibc-2.17",
                 ]
+            runtime = {"Env": env, "WorkingDir": "/"}
+            if base_runtime_by_arch is not None:
+                runtime.update(base_runtime_by_arch[arch])
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
-                "config": {"Env": env, "WorkingDir": "/"},
+                "config": runtime,
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -330,6 +333,40 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
         ("3.11-slim", {"expected_digest": None}),
         (registry.index_digest, {"expected_digest": registry.index_digest}),
     ]
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
+    tmp_path, monkeypatch, override
+):
+    bases = {
+        "amd64": {"StopSignal": "SIGQUIT", "Volumes": {"/amd64": {}}},
+        "arm64": {"StopSignal": "SIGINT", "Volumes": {"/arm64": {}}},
+    }
+    options = {"stop_signal": "SIGTERM", "volumes": ["/shared"]} if override else {}
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), **options
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+
+    for descriptor in index["manifests"]:
+        arch = descriptor["platform"]["architecture"]
+        manifest_bytes = _blob(out, descriptor["digest"])
+        assert _digest(manifest_bytes) == descriptor["digest"]
+        assert len(manifest_bytes) == descriptor["size"]
+        manifest = json.loads(manifest_bytes)
+        config_descriptor = manifest["config"]
+        config_bytes = _blob(out, config_descriptor["digest"])
+        assert _digest(config_bytes) == config_descriptor["digest"]
+        assert len(config_bytes) == config_descriptor["size"]
+        config = json.loads(config_bytes)["config"]
+        assert config["StopSignal"] == ("SIGTERM" if override else bases[arch]["StopSignal"])
+        volumes = {f"/{arch}": {}}
+        if override:
+            volumes["/shared"] = {}
+        assert config["Volumes"] == volumes
 
 
 def test_repeated_reproducible_builds_have_same_index_digest(tmp_path, monkeypatch):

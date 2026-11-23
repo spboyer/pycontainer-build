@@ -650,7 +650,8 @@ class ImageBuilder:
 
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
-                                layer_diff_ids=[layer.digest for layer in app_layers])
+                                layer_diff_ids=[layer.digest for layer in app_layers],
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -1010,6 +1011,10 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        if self.config.stop_signal:
+            print(f"  Stop Signal: {self.config.stop_signal}")
+        if self.config.volumes:
+            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
