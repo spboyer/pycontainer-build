@@ -129,6 +129,7 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    security: Optional[dict] = None
     _framework_default_env: Dict[str, str] = field(default_factory=dict, repr=False, compare=False)
     _framework_generated_state: Optional[Union[Dict[str, object], _FrameworkState]] = field(
         default=None, repr=False, compare=False
@@ -211,6 +212,10 @@ class BuildConfig:
             ports.specified = configured
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

@@ -552,6 +552,24 @@ def test_build_config_serialization_preserves_default_and_explicit_empty_ports()
     assert BuildConfig(**asdict(default)).has_exposed_ports()
 
 
+@pytest.mark.parametrize("ports", [None, []])
+def test_security_settings_and_framework_ports_survive_config_roundtrip(tmp_path, ports):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = BuildConfig(
+        security={"kubernetes": {"read_only_root_filesystem": True}},
+        exposed_ports=ports,
+    )
+    apply_framework_defaults(config, tmp_path)
+
+    restored = BuildConfig(**json.loads(json.dumps(asdict(config))))
+    apply_framework_defaults(restored, tmp_path)
+    assert restored.security == config.security
+    assert restored.labels["framework"] == "streamlit"
+    assert restored.entrypoint[0] == "streamlit"
+    assert restored.exposed_ports == ([8501] if ports is None else [])
+
+
 def test_dataclass_replace_preserves_explicit_empty_port_override(tmp_path):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
     write_file(tmp_path, "app.py", "import streamlit\n")
