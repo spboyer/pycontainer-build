@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
+from .tags import GitTagError
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -19,6 +20,7 @@ from .fs_utils import (
     ensure_dir,
     iter_files,
     output_directory_lock,
+    output_directory_lock_path,
 )
 
 
@@ -341,6 +343,7 @@ def _verify_image_index(
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
+        self._base_config_blobs=set()
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -409,11 +412,13 @@ class ImageBuilder:
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
         self._app_layer=None
+        self._base_config_blobs.clear()
         if len(platforms)>1:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
 
         image=self._build_platform_image(layers_dir, platforms[0])
         self.config.validate_git_tag_reference(check_head=True)
+        self._validate_git_worktree(layers_dir, [image])
 
         oci_layout=build_oci_layout()
         _atomic_write_bytes(
@@ -472,6 +477,7 @@ class ImageBuilder:
         _verify_image_index(layers_dir, index_digest, index_size, images, check_diff_ids=True)
         self._verify_local_base_unchanged(layers_dir)
         self.config.validate_git_tag_reference(check_head=True)
+        self._validate_git_worktree(layers_dir, images, index_digest)
 
         _atomic_write_bytes(
             output/'oci-layout',
@@ -494,6 +500,23 @@ class ImageBuilder:
         self.layers=list({layer.digest: layer for image in images for layer in image.layers}.values())
         print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
         return self.config.tag
+
+    def _validate_git_worktree(self, layers_dir: Path, images, index_digest=None) -> None:
+        if not self.config.tag_from_git:
+            return
+        digests = {image.manifest_digest for image in images}
+        digests.update(image.config_digest for image in images)
+        digests.update(layer.digest for image in images for layer in image.layers)
+        digests.update(self._base_config_blobs)
+        if index_digest:
+            digests.add(index_digest)
+        generated = [layers_dir / _digest_filename(digest) for digest in digests]
+        generated.append(output_directory_lock_path(self.config.output_dir))
+        if self.cache:
+            generated.extend((self.cache.index_file, self.cache.lock_file))
+            if self._app_layer:
+                generated.append(self.cache.blobs_dir / _digest_filename(self._app_layer.digest))
+        self.config.validate_git_worktree(generated)
 
     def _write_image_index(self, layers_dir: Path, images: List["PlatformImage"]) -> Tuple[str, int]:
         descriptors=[
@@ -744,6 +767,7 @@ class ImageBuilder:
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
+        self._base_config_blobs.add(config_digest)
         try:
             base_config=json.loads(config_path.read_bytes())
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -804,13 +828,12 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
-        if getattr(self, "index_digest", None):
-            self.pushed_refs=[]
+        self.pushed_refs=[]
         self.config.validate_git_tag_reference(check_head=False)
         
         target=registry_url or self.config.tag
         if registry_url and self.config.tag_from_git:
-            from .tags import GitTagError, replace_primary_tag
+            from .tags import replace_primary_tag
 
             version=parse_image_reference(self.config.tag)[2]
             if "@" in registry_url:
@@ -864,10 +887,20 @@ class ImageBuilder:
         if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
         manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
         manifest_data=manifest_path.read_bytes()
-        for push_tag in push_tags:
+        for i, push_tag in enumerate(push_tags):
+            try:
+                self.config.validate_git_tag_reference(check_head=False)
+            except GitTagError as error:
+                confirmed=", ".join(f"{registry}/{repo}:{tag}" for tag in push_tags[:i]) or "(none)"
+                remaining=", ".join(f"{registry}/{repo}:{tag}" for tag in push_tags[i:])
+                raise GitTagError(
+                    f"Git tag validation failed before manifest tag publication. "
+                    f"Confirmed pushed: {confirmed}. Not attempted: {remaining}. "
+                    f"Previously pushed tags were not rolled back. Cause: {error}"
+                ) from error
             client.push_manifest(push_tag, manifest_data)
+            self.pushed_refs.append(f"{registry}/{repo}:{push_tag}")
             if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
-        self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
 
         return f"{registry}/{repo}:{tag}"
 
@@ -892,6 +925,16 @@ class ImageBuilder:
         client.push_index(self.index_digest, index_data)
         for i, push_tag in enumerate(push_tags):
             ref=f"{repository}:{push_tag}"
+            try:
+                self.config.validate_git_tag_reference(check_head=False)
+            except GitTagError as error:
+                confirmed=", ".join(self.pushed_refs) or "(none)"
+                remaining=", ".join(f"{repository}:{tag}" for tag in push_tags[i:])
+                raise GitTagError(
+                    f"Git tag validation failed before image index tag publication. "
+                    f"Confirmed pushed: {confirmed}. Not attempted: {remaining}. "
+                    f"Previously pushed tags were not rolled back. Cause: {error}"
+                ) from error
             try:
                 client.push_index(push_tag, index_data)
             except (RegistryRequestError, OSError) as error:

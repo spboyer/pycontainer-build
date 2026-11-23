@@ -23,6 +23,38 @@ class GitTagError(ValueError):
     """Git state cannot safely supply an image tag."""
 
 
+def _validate_worktree_status(context: Path, allow_dirty: bool, generated_paths=()) -> None:
+    status = _git(
+        context, "status", "--porcelain", "-z", "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    if status.stderr.strip():
+        raise GitTagError(f"Git status could not fully inspect the worktree: {status.stderr.strip()}")
+    if allow_dirty or not status.stdout:
+        return
+    records = status.stdout.split("\0")
+    if generated_paths:
+        root_result = _git(context, "rev-parse", "--show-toplevel")
+        root = root_result.stdout.rstrip("\r\n")
+        if root_result.stderr.strip() or not root:
+            raise GitTagError(
+                f"Git could not determine the worktree root: {root_result.stderr.strip() or 'empty result'}"
+            )
+        generated = tuple(Path(path).parent.resolve() / Path(path).name for path in generated_paths)
+        for record in records:
+            if not record:
+                continue
+            if record.startswith("?? "):
+                path = Path(root) / record[3:]
+                path = path.parent.resolve() / path.name
+                if path in generated:
+                    continue
+            break
+        else:
+            return
+    raise GitTagError("Git worktree is dirty; commit or remove changes, or pass --allow-dirty.")
+
+
 def _git(context: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     for key in _GIT_REPOSITORY_ENV:
@@ -79,16 +111,7 @@ def git_tag_snapshot(
             f"{': ' + detail if detail else '.'}"
         )
 
-    status = _git(
-        path, "status", "--porcelain", "--untracked-files=normal",
-        "--ignore-submodules=none",
-    )
-    if status.stderr.strip():
-        raise GitTagError(f"Git status could not fully inspect the worktree: {status.stderr.strip()}")
-    if status.stdout and not allow_dirty:
-        raise GitTagError(
-            "Git worktree is dirty; commit or remove changes, or pass --allow-dirty."
-        )
+    _validate_worktree_status(path, allow_dirty)
 
     description = _git(path, "describe", "--tags", "--exact-match", commit, check=False)
     if description.returncode:

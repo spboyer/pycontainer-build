@@ -145,3 +145,12 @@ class BuildConfig:
         if snapshot is None or parse_image_reference(self.tag)[2] != snapshot[2]:
             raise GitTagError("The Git-derived primary image tag changed after configuration.")
         validate_git_tag_reference(snapshot, check_head=check_head)
+
+    def validate_git_worktree(self, generated_paths) -> None:
+        """Check for source changes while allowing untracked build artifacts."""
+        if not self.tag_from_git:
+            return
+        from pathlib import Path
+        from .tags import _validate_worktree_status
+
+        _validate_worktree_status(Path(self.context_dir), self.allow_dirty, generated_paths)

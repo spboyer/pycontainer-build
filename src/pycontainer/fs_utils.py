@@ -226,12 +226,16 @@ def file_lock(path, *, blocking=True):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def output_directory_lock_path(output_dir):
+    output_path = Path(output_dir).resolve()
+    output_key = hashlib.sha256(os.fsencode(str(output_path))).hexdigest()
+    return output_path.parent / f".pycontainer-build-{output_key}.lock"
+
+
 @contextmanager
 def output_directory_lock(output_dir):
-    output_path = Path(output_dir).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_key = hashlib.sha256(os.fsencode(str(output_path))).hexdigest()
-    lock_path = output_path.parent / f".pycontainer-build-{output_key}.lock"
+    lock_path = output_directory_lock_path(output_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock = file_lock(lock_path, blocking=False)
     try:

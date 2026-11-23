@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -492,6 +493,204 @@ def test_head_change_during_build_does_not_replace_published_refs(
 
 
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+@pytest.mark.parametrize("change", ["tracked", "untracked"])
+def test_worktree_changed_during_build_does_not_replace_published_refs(
+    release_repo, tmp_path, monkeypatch, platform, change
+):
+    output = tmp_path / "out"
+    refs = output / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (output / "index.json").write_text("previous index", encoding="utf-8")
+    (refs / "v0.1.0").write_text("previous digest", encoding="utf-8")
+    config = _config(
+        release_repo, output_dir=str(output), use_cache=False, platform=platform
+    )
+    builder = ImageBuilder(config)
+
+    def modify_source(layers_dir, os_name, arch):
+        path = release_repo / ("README.md" if change == "tracked" else "new.py")
+        path.write_text("changed\n", encoding="utf-8")
+        return [], None
+
+    monkeypatch.setattr(builder, "_pull_base_image", modify_source)
+    with pytest.raises(ValueError, match="(?i)dirty"):
+        builder.build()
+    assert (output / "index.json").read_text() == "previous index"
+    assert (refs / "v0.1.0").read_text() == "previous digest"
+
+
+def test_generated_output_and_cache_do_not_make_a_clean_build_fail(
+    release_repo, monkeypatch
+):
+    config = _config(
+        release_repo,
+        output_dir=str(release_repo / "generated" / "image"),
+        cache_dir=str(release_repo / "generated-cache"),
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
+    )
+    assert builder.build() == config.tag
+
+
+def test_pulled_base_config_blob_does_not_make_build_dirty(release_repo, monkeypatch):
+    base_config = json.dumps({
+        "architecture": "amd64", "os": "linux", "config": {},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }).encode()
+    digest = "sha256:" + hashlib.sha256(base_config).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": digest,
+            "size": len(base_config),
+        },
+        "layers": [],
+    }
+
+    class FakeSource:
+        def pull_manifest(self, reference, **kwargs):
+            return manifest, None
+
+        def pull_blob(self, blob_digest, path, size):
+            assert blob_digest == digest and size == len(base_config)
+            path.write_bytes(base_config)
+
+    config = _config(
+        release_repo, output_dir=str(release_repo / "generated" / "image"), use_cache=False
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image",
+        lambda layers_dir, os_name, arch: builder._read_base_image(
+            FakeSource(), "latest", layers_dir, os_name, arch
+        ),
+    )
+    assert builder.build() == config.tag
+
+
+def test_unrelated_untracked_file_in_output_blobs_is_not_ignored(release_repo, monkeypatch):
+    output = release_repo / "generated" / "image"
+    config = _config(release_repo, output_dir=str(output), use_cache=False)
+    builder = ImageBuilder(config)
+
+    def create_untracked(layers_dir, os_name, arch):
+        (layers_dir / "unrelated.txt").write_text("new\n", encoding="utf-8")
+        return [], None
+
+    monkeypatch.setattr(builder, "_pull_base_image", create_untracked)
+    with pytest.raises(ValueError, match="(?i)dirty"):
+        builder.build()
+    assert not (output / "index.json").exists()
+
+
+def test_generated_output_through_symlink_does_not_make_build_dirty(
+    release_repo, tmp_path, monkeypatch
+):
+    alias = tmp_path / "repo-alias"
+    try:
+        alias.symlink_to(release_repo, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Cannot create directory symlink: {error}")
+    config = _config(
+        release_repo, output_dir=str(alias / "generated" / "image"),
+        cache_dir=str(alias / "generated-cache"),
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
+    )
+    assert builder.build() == config.tag
+
+
+@pytest.mark.parametrize("change", ["tracked", "untracked"])
+def test_generated_output_does_not_hide_source_changes(release_repo, monkeypatch, change):
+    config = _config(
+        release_repo,
+        output_dir=str(release_repo / "generated" / "image"),
+        cache_dir=str(release_repo / "generated-cache"),
+    )
+    builder = ImageBuilder(config)
+
+    def modify_source(layers_dir, os_name, arch):
+        path = release_repo / ("README.md" if change == "tracked" else "new.py")
+        path.write_text("changed\n", encoding="utf-8")
+        return [], None
+
+    monkeypatch.setattr(builder, "_pull_base_image", modify_source)
+    with pytest.raises(ValueError, match="(?i)dirty"):
+        builder.build()
+    assert not (release_repo / "generated" / "image" / "index.json").exists()
+
+
+def test_allow_dirty_permits_source_changes_during_build(release_repo, tmp_path, monkeypatch):
+    config = _config(
+        release_repo, output_dir=str(tmp_path / "out"), use_cache=False, allow_dirty=True
+    )
+    builder = ImageBuilder(config)
+
+    def modify_source(layers_dir, os_name, arch):
+        (release_repo / "README.md").write_text("changed\n", encoding="utf-8")
+        return [], None
+
+    monkeypatch.setattr(builder, "_pull_base_image", modify_source)
+    assert builder.build() == config.tag
+
+
+def test_tracked_changes_inside_output_blobs_are_not_ignored(git_repo, monkeypatch):
+    tracked = git_repo / "blobs" / "sha256" / "tracked.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("before\n", encoding="utf-8")
+    _git(git_repo, "add", "blobs")
+    _git(git_repo, "commit", "-m", "track output file")
+    config = _config(
+        git_repo, git_fallback="sha", output_dir=str(git_repo), use_cache=False
+    )
+    builder = ImageBuilder(config)
+
+    def modify_tracked(layers_dir, os_name, arch):
+        tracked.write_text("changed\n", encoding="utf-8")
+        return [], None
+
+    monkeypatch.setattr(builder, "_pull_base_image", modify_tracked)
+    with pytest.raises(ValueError, match="(?i)dirty"):
+        builder.build()
+    assert not (git_repo / "index.json").exists()
+
+
+@pytest.mark.parametrize("allow_dirty", [False, True])
+def test_worktree_inspection_failure_before_publication_is_an_error(
+    release_repo, tmp_path, monkeypatch, allow_dirty
+):
+    config = _config(
+        release_repo, output_dir=str(tmp_path / "out"), use_cache=False,
+        allow_dirty=allow_dirty,
+    )
+    builder = ImageBuilder(config)
+    during_build = False
+    real_git = tags_module._git
+
+    def status_failure(context, *args, **kwargs):
+        if during_build and args[0] == "status":
+            return subprocess.CompletedProcess(args, 0, "", "status warning")
+        return real_git(context, *args, **kwargs)
+
+    def pull(layers_dir, os_name, arch):
+        nonlocal during_build
+        during_build = True
+        return [], None
+
+    monkeypatch.setattr(tags_module, "_git", status_failure)
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
+    with pytest.raises(ValueError, match="(?i)status"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_changed_git_tag_during_build_does_not_replace_published_refs(
     release_repo, tmp_path, monkeypatch, platform
 ):
@@ -547,6 +746,135 @@ def test_changed_git_tag_reference_prevents_push_before_registry_access(
     monkeypatch.setattr(builder_module, "RegistryClient", unexpected_registry)
     with pytest.raises(ValueError, match="no longer identifies"):
         builder.push(show_progress=False)
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_tag_changed_during_blob_upload_prevents_tag_publication(
+    release_repo, tmp_path, monkeypatch, platform
+):
+    from pycontainer import builder as builder_module
+    from pycontainer.auth import RegistryAuth
+
+    config = _config(release_repo, output_dir=str(tmp_path / "out"),
+                     use_cache=False, platform=platform)
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
+    )
+    builder.build()
+    uploaded = False
+    published = []
+    real_git = tags_module._git
+
+    def changed_tag(context, *args, **kwargs):
+        if uploaded and any(arg.startswith("refs/tags/") for arg in args):
+            return subprocess.CompletedProcess(args, 0, "0" * 40 + "\n", "")
+        return real_git(context, *args, **kwargs)
+
+    class FakeClient:
+        def push_blob(self, digest, path, check_exists=True):
+            nonlocal uploaded
+            uploaded = True
+            return True
+
+        def push_manifest(self, reference, data):
+            published.append(reference)
+
+        def push_index(self, reference, data):
+            published.append(reference)
+
+    monkeypatch.setattr(tags_module, "_git", changed_tag)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *a, **k: RegistryAuth())
+    monkeypatch.setattr(builder_module, "RegistryClient", lambda *a, **k: FakeClient())
+    with pytest.raises(ValueError, match="no longer identifies"):
+        builder.push(show_progress=False)
+    assert "v0.1.0" not in published
+    if platform != "linux/amd64":
+        assert builder.pushed_refs == []
+
+
+def test_tag_changed_between_index_writes_reports_confirmed_tags(
+    release_repo, tmp_path, monkeypatch
+):
+    from pycontainer import builder as builder_module
+    from pycontainer.auth import RegistryAuth
+
+    config = _config(
+        release_repo, output_dir=str(tmp_path / "out"), use_cache=False,
+        platform="linux/amd64,linux/arm64", latest_tag=True,
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
+    )
+    builder.build()
+    published = []
+    real_git = tags_module._git
+
+    def changed_tag(context, *args, **kwargs):
+        if "v0.1.0" in published and any(arg.startswith("refs/tags/") for arg in args):
+            return subprocess.CompletedProcess(args, 0, "0" * 40 + "\n", "")
+        return real_git(context, *args, **kwargs)
+
+    class FakeClient:
+        def push_blob(self, digest, path, check_exists=True):
+            return True
+
+        def push_manifest(self, reference, data):
+            pass
+
+        def push_index(self, reference, data):
+            published.append(reference)
+
+    monkeypatch.setattr(tags_module, "_git", changed_tag)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *a, **k: RegistryAuth())
+    monkeypatch.setattr(builder_module, "RegistryClient", lambda *a, **k: FakeClient())
+    with pytest.raises(ValueError, match="no longer identifies") as error:
+        builder.push(show_progress=False)
+    assert builder.pushed_refs == config.all_tags()[:1]
+    assert config.all_tags()[0] in str(error.value)
+    assert config.all_tags()[1] in str(error.value)
+    assert "latest" not in published
+
+
+def test_tag_changed_between_manifest_writes_reports_confirmed_tags(
+    release_repo, tmp_path, monkeypatch
+):
+    from pycontainer import builder as builder_module
+    from pycontainer.auth import RegistryAuth
+
+    config = _config(
+        release_repo, output_dir=str(tmp_path / "out"), use_cache=False, latest_tag=True
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None)
+    )
+    builder.build()
+    published = []
+    real_git = tags_module._git
+
+    def changed_tag(context, *args, **kwargs):
+        if published and any(arg.startswith("refs/tags/") for arg in args):
+            return subprocess.CompletedProcess(args, 0, "0" * 40 + "\n", "")
+        return real_git(context, *args, **kwargs)
+
+    class FakeClient:
+        def push_blob(self, digest, path, check_exists=True):
+            return True
+
+        def push_manifest(self, reference, data):
+            published.append(reference)
+
+    monkeypatch.setattr(tags_module, "_git", changed_tag)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *a, **k: RegistryAuth())
+    monkeypatch.setattr(builder_module, "RegistryClient", lambda *a, **k: FakeClient())
+    with pytest.raises(ValueError, match="no longer identifies") as error:
+        builder.push(show_progress=False)
+    assert published == ["v0.1.0"]
+    assert builder.pushed_refs == config.all_tags()[:1]
+    assert config.all_tags()[0] in str(error.value)
+    assert config.all_tags()[1] in str(error.value)
 
 
 def test_failed_git_preflight_clears_previous_multi_platform_push_results(
