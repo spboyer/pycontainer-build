@@ -437,8 +437,9 @@ subset for one exact repository. Verification is bound to the resolved digest
 before base-image config or layer downloads; a required policy rejects local
 OCI and Docker archives. A dry run validates the policy's shape but does not
 verify an image. The Notation subset supports single-signer COSE_Sign1 and
-flattened JWS; authenticated private-registry signature discovery is not yet
-supported.
+flattened JWS. Signature discovery uses pycontainer's registry credentials;
+verifiers receive only an isolated local layout and never registry
+credentials. No hosted private registry has been exercised yet.
 
 See [Base image trust](docs/base-image-trust.md) for configuration, verifier
 and trust-material setup, limitations, and opt-in real-provider checks.

@@ -52,11 +52,18 @@ signatures with an absent or different `docker-reference` are rejected even
 when their digest matches.
 Optionally set `trust_root` to a trusted Sigstore trusted-root JSON file;
 otherwise Cosign uses its normal trust-root configuration. The builder copies
-provided trust material into a temporary directory and removes inherited
-`COSIGN_*` and `SIGSTORE_*` overrides before invoking the verifier. Cosign
-signature discovery is isolated from local registry credentials and currently
-supports public registries only; private-registry verification fails closed.
-Its isolated trust cache may require access to Sigstore's public trust data on
+provided trust material into a temporary directory and invokes the verifier
+with an allowlisted environment: operating-system essentials plus
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE` and
+`SSL_CERT_DIR`. Inherited `COSIGN_*`, `SIGSTORE_*`, cloud and registry
+credential variables are not passed.
+
+pycontainer discovers the signature itself (see
+[Private registries](#private-registries)): it fetches the
+`sha256-<digest>.sig` signature manifest and its blobs, then runs
+`cosign verify --local-image` against an isolated OCI layout. Signatures stored
+only as Sigstore bundle referrers (without the `.sig` tag) are not discovered
+and fail closed. Its isolated trust cache may require access to Sigstore's public trust data on
 each build unless an appropriate `trust_root` is configured. Cosign
 v3.1.4 has been exercised by the opt-in checks below; other versions are not
 guaranteed compatible. On Windows, an unqualified verifier is searched on
@@ -96,10 +103,16 @@ policy. This prevents another signature with a partially matching subject or a
 single-signer COSE_Sign1 or flattened single-signer JWS signature. For JWS, it
 also checks that the envelope's leaf certificate matches the pinned
 fingerprint before Notation verifies the signature and certificate chain.
-Multi-signer envelopes, arbitrary Notation policies, plugins, and authenticated
-private-registry signature discovery are not supported. Discovery is isolated
-from local Notation and registry credentials and fails closed when evidence is
-unavailable. Notation v1.3.2 and its experimental OCI-layout mode have been
+Multi-signer envelopes (COSE_Sign, general JWS) are outside the Notary Project
+signature profile and are rejected, as are arbitrary Notation policies and
+plugins. pycontainer discovers signatures through the OCI referrers API, falling
+back to the `sha256-<digest>` tag schema only when that API is absent (HTTP 404).
+Registry thumbprint annotations are ignored: every candidate (at most 16, 64 MiB
+in total) is parsed, and exactly one envelope's leaf certificate must match
+`signer_fingerprint`. A malformed candidate fails closed, even if another
+signer produced it. Verification then runs offline with only operating-system
+environment variables, so no registry or Notation credentials reach the
+verifier. Notation v1.3.2 and its experimental OCI-layout mode have been
 exercised; other versions are not guaranteed compatible.
 
 ## Registry authentication
@@ -115,8 +128,22 @@ auth_realm = "https://auth.example.com/token"
 This setting belongs in `[build.base_image_trust]`. Authorization is retained
 for same-origin redirects but is not forwarded to a different origin; base
 metadata, token-service, and blob redirect chains in required mode must use
-HTTPS. The `auth_realm` setting does not add private-registry authentication to
-either verifier's signature discovery.
+HTTPS.
+
+## Private registries
+
+Signature discovery uses pycontainer's own registry client, with the same
+credentials, token-realm pinning and redirect rules as base-image metadata.
+Signature manifests and blobs are size-bounded and digest-verified, and the
+signed subject must be the verified base digest. The verifiers receive only an
+isolated local OCI layout; registry credentials are never placed in their
+arguments, environment or configuration. Missing, unauthorized or malformed
+signature evidence fails before any base config or layer is fetched.
+
+This has been exercised with real Cosign and Notation verifiers against real
+public signatures served by a local registry that requires Basic
+authentication (see below). No hosted private registry (for example ACR, ECR,
+GAR or GHCR with private access) has been exercised.
 
 ## Opt-in real-provider checks
 
@@ -161,3 +188,13 @@ generated on 2026-11-23 using a local test TSA: its signer expired on
 2026-11-23, its TSA root expires on 2036-11-20, and verification succeeds only
 with the correct TSA root. The fixture contains public certificates and signed
 data, not private keys. Neither local check tests remote discovery.
+
+`test_real_verifier_with_authenticated_private_registry` copies the pinned
+Quay Cosign and MCR Notation signatures into a loopback registry that requires
+Basic authentication. It then runs the real verifiers through the builder and
+checks that every request is authenticated, that unauthenticated reads fail,
+and that the verifier arguments and environment contain no credentials.
+
+Positive verification after signer expiry is exercised only with the local
+timestamped COSE fixture above. No registry-hosted signature from an expired
+signer with a valid timestamp has been exercised.
