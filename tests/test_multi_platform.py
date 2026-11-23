@@ -40,7 +40,8 @@ def _base_layer(arch: str):
 class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
-    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None):
+    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None,
+                 base_env_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
@@ -48,13 +49,16 @@ class FakeBaseRegistry:
             layer, diff_id = _base_layer(arch)
             if arch == wrong_diff_id_arch:
                 diff_id = _digest(b"not the layer content")
+            env = base_env_by_arch[arch] if base_env_by_arch is not None else base_env
+            if env is None:
+                env = [
+                    "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
+                    "PYTHON_LIBC=glibc-2.17",
+                ]
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
-                "config": {"Env": base_env if base_env is not None else [
-                    "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
-                    "PYTHON_LIBC=glibc-2.17",
-                ], "WorkingDir": "/"},
+                "config": {"Env": env, "WorkingDir": "/"},
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -364,26 +368,6 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         assert not any("native_" in name and arch not in name for name in names)
 
 
-@pytest.mark.parametrize("requirements", [False, True])
-def test_multi_platform_rejects_virtualenv_staging_before_publication(tmp_path, monkeypatch, requirements):
-    ctx = _context(tmp_path, requirements=requirements)
-    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
-    site.mkdir(parents=True)
-    (site / "demo.py").write_text("X = 1\n")
-    staged = []
-    monkeypatch.setattr(builder_module, "stage_virtualenv", lambda *a, **k: staged.append(a))
-    out = tmp_path / "out"
-    (out / "refs" / "tags").mkdir(parents=True)
-    (out / "index.json").write_text("previous")
-    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
-
-    with pytest.raises(ValueError, match=r"--exclude.*issues/180"):
-        builder.build()
-    assert staged == []
-    assert (out / "index.json").read_text() == "previous"
-    assert not (out / "refs" / "tags" / "v1").exists()
-
-
 def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, monkeypatch):
     ctx = _context(tmp_path, requirements=True)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
@@ -401,6 +385,60 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
     )
     builder.build()
     assert installs == ["amd64", "arm64"]
+
+
+@pytest.mark.parametrize("include_target_dependency", [False, True])
+def test_multi_platform_virtualenv_validates_each_target_base(
+    tmp_path, monkeypatch, include_target_dependency
+):
+    ctx = _context(tmp_path)
+    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+
+    def add_distribution(name, requirement=""):
+        module = name.replace("-", "_")
+        (site / f"{module}.py").write_text("value = 1\n")
+        info = site / f"{module}-1.0.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+            f"{requirement}\n"
+        )
+        (info / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+
+    add_distribution(
+        "app-lib",
+        'Requires-Dist: arm-only; platform_machine == "aarch64" and python_full_version >= "3.11.9"\n',
+    )
+    if include_target_dependency:
+        add_distribution("arm-only")
+
+    envs = {
+        arch: ["PYTHON_IMPLEMENTATION=CPython", f"PYTHON_VERSION=3.11.{patch}", "PYTHON_LIBC=glibc-2.17"]
+        for arch, patch in (("amd64", 8), ("arm64", 9))
+    }
+    out = tmp_path / "out"
+    refs = out / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (out / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_env_by_arch=envs),
+        include_deps=True, ctx=ctx,
+    )
+
+    if include_target_dependency:
+        builder.build()
+        assert [image.platform["architecture"] for image in builder.platform_images] == [
+            "amd64", "arm64"
+        ]
+    else:
+        with pytest.raises(ValueError, match=r"linux/arm64.*arm-only.*not installed"):
+            builder.build()
+        assert (out / "index.json").read_text() == "previous index"
+        assert (refs / "v1").read_text() == "previous tag"
 
 
 def test_missing_platform_in_base_fails_without_replacing_existing_tags(tmp_path, monkeypatch):
@@ -461,11 +499,38 @@ def test_every_configured_tag_is_selectable_in_index_layout(tmp_path, monkeypatc
         assert (out / "refs" / "tags" / tag).read_text() == builder.index_digest
 
 
+def test_multi_platform_uses_collision_safe_local_reference_names(tmp_path, monkeypatch):
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), tag="myapp:latest",
+        tags=["_dev", "v1_", "v1..2"],
+    )
+    builder.build()
+    out = tmp_path / "out"
+    layout = json.loads((out / "index.json").read_text())
+    names = ["myapp:latest"] + [
+        "pycontainer-" + f"myapp:{tag}".encode().hex()
+        for tag in ("_dev", "v1_", "v1..2")
+    ]
+    assert [item["annotations"]["org.opencontainers.image.ref.name"] for item in layout["manifests"]] == names
+    for name in names:
+        assert _select_layout_reference(layout, name)["digest"] == builder.index_digest
+
+    client = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    builder.push(show_progress=False)
+    assert builder.pushed_refs == builder.config.all_tags()
+
+
 @pytest.mark.skipif(shutil.which("skopeo") is None, reason="Skopeo is not installed")
 def test_skopeo_selects_every_index_layout_tag(tmp_path, monkeypatch):
-    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), tags=["stable"])
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), tag="myapp:latest",
+        tags=["stable", "_dev", "v1_", "v1..2"],
+    )
     builder.build()
-    for reference in builder.config.all_tags():
+    layout = json.loads((tmp_path / "out" / "index.json").read_text())
+    for descriptor in layout["manifests"]:
+        reference = descriptor["annotations"]["org.opencontainers.image.ref.name"]
         result = subprocess.run(
             ["skopeo", "inspect", "--raw", f"oci:{tmp_path / 'out'}:{reference}"],
             check=True, capture_output=True, timeout=30,
