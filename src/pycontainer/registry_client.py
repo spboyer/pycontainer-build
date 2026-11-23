@@ -420,6 +420,7 @@ def _registry_error(
     repository: Optional[str] = None,
     error_class=RegistryRequestError,
     username: Optional[str] = None,
+    include_response_detail: bool = True,
 ) -> RegistryRequestError:
     """Build an actionable error from an untrusted registry error response."""
     secrets = [secret for secret in secrets if secret]
@@ -460,7 +461,10 @@ def _registry_error(
     else:
         detail = "(empty response)"
 
-    message = f"{operation} failed with HTTP {status} from {host}: {detail}"
+    reported_detail = detail if include_response_detail else (
+        "(response details omitted)" if body else "(empty response)"
+    )
+    message = f"{operation} failed with HTTP {status} from {host}: {reported_detail}"
     if status == 429 or "TOOMANYREQUESTS" in codes:
         retry_after = _retry_after_seconds(headers)
         if retry_after is None:
@@ -622,6 +626,7 @@ class RegistryClient:
             secrets=self._secrets(),
             repository=self.repository,
             username=self.username,
+            include_response_detail=False,
             **kwargs,
         )
 
@@ -1063,16 +1068,15 @@ class RegistryClient:
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
-            preview = _sanitize_text(
-                body[:500].decode("utf-8", errors="replace"),
-                self._secrets(),
-                MAX_ERROR_TEXT_CHARS,
-                username=self.username,
-            )
+            parse_error = f" at line {error.lineno}, column {error.colno}"
+        except UnicodeDecodeError:
+            parse_error = ": expected UTF-8"
+        else:
+            parse_error = None
+        if parse_error:
             raise RegistryRequestError(
-                f"Registry returned invalid manifest JSON: {error}\n"
-                f"Body preview: {preview}"
-            ) from error
+                f"Registry returned invalid manifest JSON{parse_error}."
+            )
         if not isinstance(manifest, dict):
             raise RegistryRequestError(
                 f"Registry returned a non-object manifest for {reference}."
@@ -1082,8 +1086,8 @@ class RegistryClient:
         )
         if digest and digest.startswith("sha256:") and digest != body_digest:
             raise BlobIntegrityError(
-                f"Registry reported manifest digest {digest}, but its body hashes "
-                f"to {body_digest}."
+                f"Registry-reported manifest digest does not match its body "
+                f"digest {body_digest}."
             )
         return manifest, digest or body_digest
 
@@ -1167,10 +1171,12 @@ class RegistryClient:
             if content_length:
                 try:
                     response_size = int(content_length)
-                except ValueError as error:
+                except (TypeError, ValueError):
+                    response_size = None
+                if response_size is None:
                     raise RegistryRequestError(
                         "Registry returned an invalid blob Content-Length."
-                    ) from error
+                    )
                 if response_size != expected_size:
                     raise BlobIntegrityError(
                         f"Blob Content-Length is {response_size}, expected "

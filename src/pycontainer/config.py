@@ -109,6 +109,8 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    manifest_annotations: Optional[Dict[str, str]] = None
+    index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
     scan_executable: str = "grype"
     scan_threshold: str = "high"
@@ -141,6 +143,7 @@ class BuildConfig:
     def _validate(self):
         from .system_packages import validate_system_packages
 
+        self.validate_metadata()
         self.system_packages = validate_system_packages(self.system_packages)
         if self.scan_threshold not in SCAN_SEVERITIES:
             raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
@@ -199,6 +202,16 @@ class BuildConfig:
         identity["backend"] = backend
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def validate_metadata(self) -> None:
+        from .metadata import validate_metadata
+
+        for name in ("labels", "manifest_annotations", "index_annotations"):
+            validate_metadata(
+                getattr(self, name),
+                name,
+                protect_reference=name != "labels",
+            )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""
