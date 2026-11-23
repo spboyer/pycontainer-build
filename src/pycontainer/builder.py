@@ -185,7 +185,13 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
-from .cache import LayerCache
+from .local_image import (
+    check_local_image_bounds,
+    open_local_image_source,
+    parse_local_image_reference,
+    verify_layer_diff_ids,
+)
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
 from .tags import local_reference_names
 from .dependencies import (
@@ -194,6 +200,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 
@@ -369,26 +376,51 @@ class ImageBuilder:
         return self.config.tag
     
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
-        """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
+        """Pull or load the base image, return (base_layers, base_config)."""
+        self._base_image_name=self.config.base_image
+        requested_variant = parse_platform_variant(self.config.platform)
+        local=parse_local_image_reference(self.config.base_image)
+        if local is None:
+            registry, repo, reference=parse_image_reference(self.config.base_image)
+            auth=get_registry_auth(registry)
+            client=RegistryClient(
+                registry,
+                repo,
+                auth_token=auth.bearer_token,
+                username=auth.username,
+                password=auth.password,
+            )
+            return self._read_base_image(client, reference, layers_dir, os_name, arch)
+
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
         )
-        
+        print(f"Loading local base image {self.config.base_image} for {target}...")
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+        ) as source:
+            base_layers, base_config = self._read_base_image(
+                source, None, layers_dir, os_name, arch
+            )
+            verify_layer_diff_ids(base_layers, base_config)
+            self._base_image_name=source.source_name
+        return base_layers, base_config
+
+    def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Resolve and validate a base image through a registry or local source."""
+        local = reference is None
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        if not local:
+            print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
-            expected_digest=reference if reference.startswith("sha256:") else None,
+            expected_digest=(
+                reference if reference and reference.startswith("sha256:") else None
+            ),
         )
 
         selected_variant = None
@@ -442,6 +474,8 @@ class ImageBuilder:
             )
             for index, descriptor in enumerate(layer_descriptors, 1)
         ]
+        if local:
+            check_local_image_bounds(config_size, [size for _, size, _ in validated_layers])
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
@@ -492,13 +526,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -609,7 +643,21 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        version = target_python_version(self.config.base_image, base_config)
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
+        version = target_python_version(
+            base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, base_image_name, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
@@ -622,12 +670,20 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / requirements_relative,
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")
@@ -722,11 +778,11 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -741,6 +797,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -752,6 +809,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(
