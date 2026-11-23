@@ -1486,10 +1486,10 @@ _INJECT_INVALID_VERSION = (
     "import pip._vendor.packaging.markers as _markers\n"
     "from pip._vendor.packaging.version import InvalidVersion\n"
     "_eval_op = _markers._eval_op\n"
-    "def _raising_eval_op(lhs, op, rhs):\n"
+    "def _raising_eval_op(lhs, op, rhs, *args, **kwargs):\n"
     "    if '1-0-0' in (lhs, rhs):\n"
     "        raise InvalidVersion('injected')\n"
-    "    return _eval_op(lhs, op, rhs)\n"
+    "    return _eval_op(lhs, op, rhs, *args, **kwargs)\n"
     "_markers._eval_op = _raising_eval_op\n"
 )
 
