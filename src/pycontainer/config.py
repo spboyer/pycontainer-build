@@ -59,11 +59,17 @@ class BuildConfig:
     python_versions: List[str] = field(default_factory=list)
     python_matrix: Dict[str, str] = field(default_factory=dict)
     default_python_version: Optional[str] = None
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

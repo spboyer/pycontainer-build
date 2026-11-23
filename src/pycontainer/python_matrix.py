@@ -1,4 +1,5 @@
 """Independent Python-version builds with digest-first, non-atomic publication."""
+import logging
 import re
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -13,7 +14,10 @@ from .dependencies import _base_environment, _base_image_parts, _is_official_pyt
 from .fs_utils import context_exclude_paths, output_directory_lock
 from .local_image import _paths_overlap, parse_local_image_reference
 from .registry_client import RegistryClient, RegistryRequestError, parse_image_reference
+from .security import render_security_fragments, write_security_fragments
 from .tags import resolve_tags
+
+logger = logging.getLogger(__name__)
 
 
 def matrix_targets(config: BuildConfig) -> Dict[str, str]:
@@ -152,9 +156,17 @@ class PythonMatrixBuilder:
                 child.build()
             return self.config.tag
         with self._locks():
+            security_fragments = render_security_fragments(
+                self.config.security, self.config.context_dir
+            )
             for child in self.children.values():
                 child._build_image()
             self._verify()
+            for child in self.children.values():
+                for path in write_security_fragments(
+                    Path(child.config.output_dir), security_fragments
+                ):
+                    logger.info("Security fragment saved to %s (not enforced by the image)", path)
             for version, child in self.children.items():
                 if version != self.default:
                     refs = Path(child.config.output_dir) / "refs" / "tags"

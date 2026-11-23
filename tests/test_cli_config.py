@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from pycontainer import cli
+from pycontainer.security import KUBERNETES_FRAGMENT, render_security_fragments
 
 
 def _run_cli(monkeypatch, argv):
@@ -144,6 +145,30 @@ def test_cli_overrides_invalid_file_values_before_validation(tmp_path, monkeypat
 
     assert config.platform == "linux/arm64"
     assert config.include_deps is True
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_platform_override_is_used_for_security_validation(tmp_path, monkeypatch, capsys, table):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f"[{table}]\nplatform = 123\n"
+        f"[{table}.security.kubernetes]\nread-only-root-filesystem = true\n"
+    )
+
+    config = _capture_config(
+        monkeypatch, ["build", "--config", str(config_path), "--platform", "linux/arm64"]
+    )
+    assert config.platform == "linux/arm64"
+    assert render_security_fragments(config.security, str(tmp_path)) == {
+        KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
+    }
+
+    with pytest.raises(SystemExit) as error:
+        _capture_config(
+            monkeypatch, ["build", "--config", str(config_path), "--platform", "windows/amd64"]
+        )
+    assert error.value.code == 2
+    assert "Linux targets only" in capsys.readouterr().err
 
 
 def test_cli_build_config_ignores_unrelated_scalar_tool_key(tmp_path, monkeypatch):

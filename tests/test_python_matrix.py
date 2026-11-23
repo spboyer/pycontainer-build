@@ -16,6 +16,7 @@ from pycontainer.local_image import LocalImageError
 from pycontainer.python_matrix import MatrixPublicationError, PythonMatrixBuilder, matrix_targets
 from pycontainer.python_matrix import verify_python_version
 from pycontainer.registry_client import RegistryClient, RegistryHTTPError, RegistryRequestError
+from pycontainer.security import KUBERNETES_FRAGMENT, SECURITY_DIR
 from test_multi_platform import FakeBaseRegistry, FakePushClient, _digest
 
 
@@ -133,6 +134,59 @@ def test_changing_default_removes_current_local_aliases_from_old_default(tmp_pat
         assert (refs / f"v1.2.3-py{version}").exists()
         for alias in ("latest", "v1.2.3", "v1.2", "v1"):
             assert (refs / alias).exists() == (version == "3.12")
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_matrix_security_fragments_follow_each_layout_and_are_removed(tmp_path, monkeypatch, platform):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, platform=platform,
+        security={"kubernetes": {"read_only_root_filesystem": True}},
+    )
+    build.build()
+    digests = {version: child.manifest_digest for version, child in build.children.items()}
+    for child in build.children.values():
+        fragment = Path(child.config.output_dir) / SECURITY_DIR / KUBERNETES_FRAGMENT
+        assert json.loads(fragment.read_text()) == {"readOnlyRootFilesystem": True}
+
+    plain = PythonMatrixBuilder(replace(build.config, security=None))
+    plain.build()
+    assert {version: child.manifest_digest for version, child in plain.children.items()} == digests
+    assert all(not (Path(child.config.output_dir) / SECURITY_DIR).exists()
+               for child in plain.children.values())
+
+
+def test_matrix_invalid_security_profile_fails_before_any_base_pull(tmp_path, monkeypatch):
+    build, _, pulls = matrix(
+        tmp_path, monkeypatch, security={"oci": {"seccomp_profile": "missing.json"}}
+    )
+    with pytest.raises(ValueError, match="Seccomp profile not found"):
+        build.build()
+    assert pulls == []
+    assert not build.built
+
+
+def test_matrix_build_failure_preserves_existing_security_fragments(tmp_path, monkeypatch):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, security={"kubernetes": {"read_only_root_filesystem": True}}
+    )
+    build.build()
+    fragments = {
+        version: Path(child.config.output_dir) / SECURITY_DIR / KUBERNETES_FRAGMENT
+        for version, child in build.children.items()
+    }
+    previous = {version: path.read_bytes() for version, path in fragments.items()}
+    changed = PythonMatrixBuilder(replace(
+        build.config, security={"kubernetes": {"read_only_root_filesystem": False}}
+    ))
+
+    def fail():
+        raise RuntimeError("later Python build failed")
+
+    monkeypatch.setattr(changed.children["3.12"], "_build_image", fail)
+    with pytest.raises(RuntimeError, match="later Python build failed"):
+        changed.build()
+    assert {version: path.read_bytes() for version, path in fragments.items()} == previous
+    assert not changed.built
 
 
 @pytest.mark.parametrize("base", ["custom:stable", "python:3.11-slim@" + "sha256:" + "a" * 64,
