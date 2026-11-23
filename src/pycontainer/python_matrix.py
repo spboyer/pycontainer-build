@@ -13,6 +13,7 @@ from .config import BuildConfig, MATRIX_SCAN_ERROR
 from .dependencies import _base_environment, _base_image_parts, _is_official_python_image
 from .fs_utils import context_exclude_paths, output_directory_lock
 from .local_image import _paths_overlap, parse_local_image_reference
+from .release_notes import release_notes_labels
 from .registry_client import RegistryRequestError, parse_image_reference
 from .security import render_security_fragments, write_security_fragments
 from .tags import resolve_tags
@@ -122,9 +123,11 @@ class MatrixPublicationError(RuntimeError):
 
 
 class PythonMatrixBuilder:
-    def __init__(self, config: BuildConfig, history_timer=None):
+    def __init__(self, config: BuildConfig, history_timer=None, release_notes_snapshot=None):
         self.config = config
         self.targets = matrix_targets(config)
+        notes = (release_notes_labels(config) if release_notes_snapshot is None
+                 else dict(release_notes_snapshot))
         self.default = config.default_python_version or config.python_versions[0]
         self.children = {}
         self.operations: List[PublicationOperation] = []
@@ -143,10 +146,13 @@ class PythonMatrixBuilder:
                 config, base_image=base, output_dir=str(Path(config.output_dir) / f"py{version}"),
                 tag=tags[0], tags=tags[1:], latest_tag=False, semver_tags=False,
                 python_versions=[], python_matrix={}, default_python_version=None,
-                record_history=False,
+                record_history=False, release_notes_file=None,
                 exclude_paths=[*excludes, "**/.pycontainer-build-*.lock"],
             )
             child = ImageBuilder(child_config)
+            child.release_notes_labels = notes.copy()
+            if "framework" in notes and "framework" not in (config.labels or {}) and child.config.labels:
+                child.config.labels.pop("framework", None)
             child._history_timer = history_timer
             child.expected_python_version = version
             self.children[version] = child

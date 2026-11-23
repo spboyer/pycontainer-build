@@ -135,6 +135,28 @@ def test_matrix_preserves_image_metadata_for_every_version(tmp_path, monkeypatch
     assert all(operation.outcome == "confirmed" for operation in build.operations)
 
 
+@pytest.mark.parametrize("label", ["example.notes", "framework"])
+def test_matrix_release_notes_are_snapshotted_once_for_all_versions(tmp_path, monkeypatch, label):
+    notes = tmp_path / "notes.md"
+    notes.write_text("original notes", encoding="utf-8")
+    matrix_build, _, _ = matrix(
+        tmp_path, monkeypatch, release_notes_file=str(notes),
+        release_notes_label=label,
+    )
+    (Path(matrix_build.config.context_dir) / "app.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n"
+    )
+    builder = ImageBuilder(matrix_build.config)
+    notes.unlink()
+    builder.build()
+    builder.build()
+    for child in builder._python_matrix.children.values():
+        blobs = Path(child.config.output_dir) / "blobs" / "sha256"
+        image = child.platform_images[0]
+        config = json.loads((blobs / image.config_digest.split(":")[1]).read_text())
+        assert config["config"]["Labels"][label] == "original notes"
+
+
 def test_matrix_history_records_one_run_with_all_child_phases(tmp_path, monkeypatch):
     history_dir = tmp_path / "history"
     matrix_build, _, _ = matrix(
