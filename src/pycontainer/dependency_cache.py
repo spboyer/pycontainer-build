@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+from .credentials import url_has_credentials
 from .dependencies import (
     _is_hash_pinned,
     _target_marker_environment,
@@ -29,8 +30,8 @@ from .dependencies import (
 
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
-# Bump when the installer changes layer-affecting behavior such as marker evaluation.
-INSTALLER_BACKEND = "pip-target-v4"
+# Bump when installer or closure-verification behavior changes.
+INSTALLER_BACKEND = "pip-target-v5"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -124,6 +125,7 @@ def dependency_cache_key(
     workdir: str,
     reproducible: bool,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
     requirements: Optional[Path] = None,
     requirement_sets: Sequence[Tuple[str, str]] = (),
     lock_name: Optional[str] = None,
@@ -188,13 +190,15 @@ def dependency_cache_key(
         "target": {
             "os": os_name,
             "arch": arch,
+            "variant": variant,
             "pip_options": _target_options(
                 os_name, arch, python_version, base_image, base_config,
                 base_image_tag_verified=base_image_tag_verified,
+                variant=variant,
             ),
             "python": python_full_version or python_version,
             "marker_environment": _target_marker_environment(
-                os_name, arch, python_version, base_config
+                os_name, arch, python_version, base_config, variant=variant
             ),
         },
         "builder": {
@@ -227,7 +231,10 @@ def sanitize_url(value: str) -> str:
     if "?" in value.split("#", 1)[0]:
         # A query can route to another tenant or feed, so it is not a safe credential to drop.
         raise DependencyCacheMiss("an index or find-links URL has a query string")
-    return urlunsplit((parts.scheme.lower(), host.lower(), parts.path, "", ""))
+    identity = urlunsplit((parts.scheme.lower(), host.lower(), parts.path, "", ""))
+    if url_has_credentials(identity):
+        raise DependencyCacheMiss("an index or find-links URL has a credential-bearing path")
+    return identity
 
 
 def _key_token(token: str) -> str:

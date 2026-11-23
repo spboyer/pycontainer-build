@@ -4,6 +4,11 @@ This directory contains example applications demonstrating pycontainer-build int
 
 ## Available Examples
 
+### [Editor and Task Runners](./editor-task-runners/)
+
+Project-scoped PyCharm, Vim, and Emacs commands, plus reusable GNU Make and
+Go Task templates for builds and dry-runs.
+
 ### [FastAPI Application](./fastapi-app/)
 
 A complete FastAPI web application showcasing all integration methods:
@@ -47,6 +52,10 @@ tool's environment contract and pushes to a registry the cluster can pull from.
 See [Skaffold and Tilt](../docs/skaffold-tilt.md).
 
 ## Quick Start
+
+Dependency builds of codename-less official Python tags use digest-checked
+base-layer libc package metadata, not a guessed wheel floor. If evidence is
+unavailable, pin a mapped release or provide supported base `PYTHON_LIBC`.
 
 ### Try the FastAPI Example
 

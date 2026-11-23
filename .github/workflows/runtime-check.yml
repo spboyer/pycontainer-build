@@ -4,7 +4,24 @@ name: Runtime image check
 # produce passing evidence; a missing, skipped or failed target fails the gate.
 on:
   workflow_call:
+    inputs:
+      check-index:
+        description: Check a multi-platform OCI index on each native target
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      dependency_fixture:
+        description: Dependency fixture to verify
+        type: choice
+        options:
+          - requirements
+          - lockfile
+        default: requirements
+      check-index:
+        description: Check a multi-platform OCI index on each native target
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -13,7 +30,7 @@ jobs:
   startup:
     name: OCI import and startup (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs['check-index'] && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,12 +68,25 @@ jobs:
       - name: Build, import and start the image
         env:
           PYTHONPATH: src
+          DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}
         run: >-
           timeout 600 python scripts/check_runtime_image.py
           --base-image python:3.11-slim
           --platform ${{ matrix.platform }}
           --timeout 300
+          --dependency-fixture "$DEPENDENCY_FIXTURE"
           --evidence runtime-evidence/${{ matrix.slug }}.json
+      - name: Build, import and start a multi-platform image index
+        if: ${{ inputs['check-index'] }}
+        env:
+          PYTHONPATH: src
+        run: >-
+          timeout 600 python scripts/check_runtime_image.py
+          --base-image python:3.11-slim
+          --platform ${{ matrix.platform }}
+          --multi-platform-index
+          --timeout 300
+          --evidence index-runtime-evidence/${{ matrix.slug }}.json
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -64,6 +94,42 @@ jobs:
           name: runtime-evidence-${{ matrix.slug }}
           path: runtime-evidence/${{ matrix.slug }}.json
           if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Upload index evidence
+        if: ${{ always() && inputs['check-index'] }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: index-runtime-evidence-${{ matrix.slug }}
+          path: index-runtime-evidence/${{ matrix.slug }}.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Check out exact PR head for CMD-only import
+        if: github.event_name == 'pull_request' && matrix.slug == 'linux-amd64'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: cmd-only-pr-head
+          persist-credentials: false
+      - name: Start shell- and exec-form CMD-only imports
+        if: github.event_name == 'pull_request' && matrix.slug == 'linux-amd64'
+        working-directory: cmd-only-pr-head
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PYTHONPATH: src
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+          env HOME="$(mktemp -d)" GITHUB_SHA="$PR_HEAD" \
+            timeout 600 python scripts/check_runtime_image.py --cmd-only \
+            --platform linux/amd64 --evidence ../cmd-only-evidence.json
+      - name: Upload CMD-only evidence
+        if: always() && github.event_name == 'pull_request' && matrix.slug == 'linux-amd64'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cmd-only-runtime-evidence
+          path: cmd-only-evidence.json
+          if-no-files-found: warn
           overwrite: true
           retention-days: 90
 
@@ -84,6 +150,8 @@ jobs:
           pattern: runtime-evidence-linux-*
           path: runtime-evidence
       - name: Verify every required target passed
+        env:
+          DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}
         run: >-
           python3 scripts/verify_runtime_evidence.py
           --evidence-dir runtime-evidence
@@ -92,6 +160,7 @@ jobs:
           --commit ${{ github.sha }}
           --run-id ${{ github.run_id }}
           --run-attempt ${{ github.run_attempt }}
+          --dependency-fixture "$DEPENDENCY_FIXTURE"
           --summary runtime-evidence-summary.md
           ${{ steps.download.outcome != 'success' && '--error "evidence download did not succeed"' || '' }}
           ${{ needs.startup.result != 'success' && format('--error "startup jobs in this attempt reported {0}"', needs.startup.result) || '' }}

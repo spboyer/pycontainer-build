@@ -54,6 +54,24 @@ def relative_context_path(path):
     return relative
 
 
+def context_file_path(context_dir, path):
+    """Reject file links that escape the context or have no target."""
+    context = Path(context_dir)
+    path = Path(path)
+    try:
+        resolved = path.resolve(strict=True)
+        resolved_context = context.resolve(strict=True)
+    except FileNotFoundError as exc:
+        if path.is_symlink():
+            raise ValueError(f"{path.name} is a dangling link; it must resolve inside the build context.") from exc
+        return path
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Unable to resolve {path.name} inside the build context: {exc}") from exc
+    if not resolved.is_relative_to(resolved_context):
+        raise ValueError(f"{path.name} must resolve inside the build context.")
+    return path
+
+
 def _glob_matches(path_parts, pattern_parts):
     if not pattern_parts:
         return not path_parts
@@ -104,6 +122,34 @@ def _raise_walk_error(error):
     raise error
 
 
+def _conda_prefix_in_context(base, relative):
+    """Check context-relative ancestors and resolved link targets."""
+    for parent in (relative, *relative.parents):
+        candidate = base / parent
+        if (candidate / "conda-meta").is_dir():
+            return candidate.absolute()
+    absolute = (base / relative).absolute()
+    resolved = absolute.resolve()
+    if resolved != absolute:
+        for parent in (resolved, *resolved.parents):
+            if (parent / "conda-meta").is_dir():
+                return parent
+    return None
+
+
+def conda_prefix(base, relative):
+    """Find a Conda prefix containing a context path without reading metadata."""
+    base = Path(base)
+    relative = relative_context_path(relative)
+    prefix = _conda_prefix_in_context(base, relative)
+    if prefix is not None:
+        return prefix
+    for parent in base.absolute().parents:
+        if (parent / "conda-meta").is_dir():
+            return parent
+    return None
+
+
 def context_exclude_paths(
     context_dir,
     *,
@@ -139,6 +185,8 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
     seen = set()
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
+        if conda_prefix(base, relative) is not None:
+            continue
         absolute = base / relative
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
@@ -150,6 +198,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
+                    and _conda_prefix_in_context(base, root_relative / directory) is None
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename
@@ -157,6 +206,10 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     relative_name = child_relative.as_posix()
                     if (
                         child.is_file()
+                        and (
+                            not child.is_symlink()
+                            or _conda_prefix_in_context(base, child_relative) is None
+                        )
                         and relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)
                     ):

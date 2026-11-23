@@ -3,8 +3,8 @@
 The fake tool runners below reproduce how each tool launches a custom build
 command (environment, working directory, shell or argv form, output file
 handling) and run the commands shipped in ``examples/``. A loopback registry
-is the push boundary; a ``sitecustomize`` shim replaces only the base-image
-pull and points the registry client at plain HTTP.
+is the push boundary, explicitly opted into HTTP; a ``sitecustomize`` shim
+replaces only the base-image pull.
 """
 
 import ast
@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import trustme
 
 from scripts import check_devloop_tools as real_check
 from pycontainer import cli
@@ -47,21 +48,13 @@ SITECUSTOMIZE = textwrap.dedent(
     import os
 
     if os.environ.get("PYCONTAINER_TEST_REGISTRY"):
-        from pycontainer import builder, registry_client
+        from pycontainer import builder
 
         def _synthetic_base(self, *_args):
             return [], {"architecture": "amd64", "os": "linux",
                         "config": {"Env": [], "WorkingDir": "/"}}
 
         builder.ImageBuilder._pull_base_image = _synthetic_base
-        _original_init = registry_client.RegistryClient.__init__
-
-        def _loopback_init(self, registry, *args, **kwargs):
-            _original_init(self, registry, *args, **kwargs)
-            if registry == os.environ["PYCONTAINER_TEST_REGISTRY"]:
-                self.base_url = f"http://{registry}/v2"
-
-        registry_client.RegistryClient.__init__ = _loopback_init
     '''
 )
 
@@ -186,9 +179,10 @@ def tilt_command(project_dir: Path) -> list:
 
 
 def run_skaffold(project_dir, env, *, image, push="true", platforms=""):
-    env = dict(env, PYCONTAINER_TEST_REGISTRY=image.split("/", 1)[0])
     """Launch a buildCommand the way Skaffold's custom builder does."""
-    command = skaffold_build_command(project_dir)
+    registry = image.split("/", 1)[0]
+    env = dict(env, PYCONTAINER_TEST_REGISTRY=registry)
+    command = f"{skaffold_build_command(project_dir)} --insecure-registry {registry}"
     argv = ["cmd.exe", "/C", command] if os.name == "nt" else ["sh", "-c", command]
     repo, _, tag = image.rpartition(":")
     tool_env = dict(env)
@@ -212,6 +206,8 @@ def run_tilt(project_dir, env, argv, *, expected_ref=None, registry=None, output
     tool_env = dict(env)
     target = expected_ref or (argv[argv.index("--image") + 1] if "--image" in argv else "")
     tool_env["PYCONTAINER_TEST_REGISTRY"] = target.split("/", 1)[0]
+    if tool_env["PYCONTAINER_TEST_REGISTRY"].startswith("127.0.0.1:"):
+        argv = [*argv, "--insecure-registry", tool_env["PYCONTAINER_TEST_REGISTRY"]]
     if output_ref is not None:
         Path(output_ref).unlink(missing_ok=True)
     elif expected_ref is not None:
@@ -484,6 +480,79 @@ def test_skaffold_cli_ignores_config_tags_and_dry_run(tmp_path, monkeypatch, rec
     assert Path(builder.config.context_dir) == tmp_path
     assert builder.pushes[0][0] == "localhost:5000/a:1"
     assert builder.pushes[0][1]["username"] is None
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_runtime_metadata_overrides(tmp_path, monkeypatch, recording, command):
+    config = tmp_path / "pycontainer.toml"
+    ca_file = tmp_path / "ca.pem"
+    trustme.CA().cert_pem.write_to_path(ca_file)
+    config.write_text(
+        '[build]\nbase_image = "python:3.11-slim"\n'
+        'stop_signal = "SIGINT"\nvolumes = ["/original"]\n'
+    )
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    run_cli(
+        monkeypatch, command, "--config", str(config), "--stop-signal", "SIGTERM",
+        "--volume", "/data", "--volume", "/cache",
+        "--insecure-registry", "localhost:5000", "--registry-ca-file", str(ca_file),
+        "--record-history", "--history-dir", str(tmp_path / "history"),
+    )
+    (builder,) = recording
+    assert builder.config.stop_signal == "SIGTERM"
+    assert builder.config.volumes == ["/data", "/cache"]
+    assert builder.config.insecure_registries == ["localhost:5000"]
+    assert builder.config.registry_ca_file == str(ca_file)
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(tmp_path / "history")
+    assert builder.pushes[0][0] == "localhost:5000/a:1"
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_forwards_history_options(tmp_path, monkeypatch, recording, command):
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    history_dir = tmp_path / "history"
+    run_cli(monkeypatch, command, "--record-history", "--history-dir", str(history_dir))
+
+    (builder,) = recording
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(history_dir)
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_cli_honors_registry_transport_options(
+    tmp_path, monkeypatch, recording, command
+):
+    ca_file = tmp_path / "ca.pem"
+    trustme.CA().cert_pem.write_to_path(ca_file)
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    run_cli(
+        monkeypatch, command, "--base-image", "python:3.11-slim",
+        "--insecure-registry", "localhost:5000", "--registry-ca-file", str(ca_file),
+    )
+
+    (builder,) = recording
+    assert builder.config.insecure_registries == ["localhost:5000"]
+    assert builder.config.registry_ca_file == str(ca_file)
+    assert builder.pushes[0][0] == "localhost:5000/a:1"
 
 
 def test_devloop_cli_rejects_multi_platform_from_config(tmp_path, monkeypatch, recording):

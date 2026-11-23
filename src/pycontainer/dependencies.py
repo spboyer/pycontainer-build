@@ -17,6 +17,13 @@ from email.parser import Parser
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional, Tuple
 
+from .credentials import (
+    PLACEHOLDER,
+    find_credentials,
+    known_secrets,
+    redact,
+    url_has_credentials,
+)
 from .venv_markers import declared_roots, host_environments, venv_layout_os
 
 
@@ -30,21 +37,44 @@ MAX_STAGED_FILES = 100_000
 INSTALL_TIMEOUT_SECONDS = 300
 _LOCKFILE_STAGING_PREFIX = ".pycontainer-lockfile-"
 
+# Shared target table. Values are legacy aliases for validated glibc targets;
+# the suffix after "manylinux2014_" is the machine tag for every generated tag.
 _PIP_PLATFORMS = {
     ("linux", "amd64"): "manylinux2014_x86_64",
     ("linux", "arm64"): "manylinux2014_aarch64",
+    ("linux", "arm"): "manylinux2014_armv7l",
 }
-_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+# 32-bit ARM wheels are tagged armv7l, so only the v7 variant may use them.
+_REQUIRED_VARIANTS = {("linux", "arm"): "v7"}
+SUPPORTED_TARGETS_TEXT = "linux/amd64, linux/arm64 and linux/arm/v7"
+_NO_SOURCE_FALLBACK = (
+    "Source builds and host binaries are never used as a fallback."
+)
+_ARMV7_WHEEL_NOTE = " Many packages do not publish armv7l wheels."
+_MARKER_MACHINES = {"amd64": "x86_64", "arm64": "aarch64", "arm": "armv7l"}
 _PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
 _VENV_CLOSURE_SCRIPT = Path(__file__).with_name("_venv_closure.py")
 _CLOSURE_HEADERS = ("Metadata-Version", "Name", "Version", "Requires-Dist", "Provides-Extra", "Requires-Python")
 _MARKER_ERROR_EXIT = 86
 _PATCH_ERROR_EXIT = 87
 _MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
-_SUPPORTED_LIBC = {
-    "glibc-2.17": "manylinux_2_17",
-    "musl-1.2": "musllinux_1_2",
+_FLOOR_GLIBC_PREFIX = "manylinux2014_"
+_MIN_GLIBC_MINOR = 17
+_MIN_MUSL_MINOR = 1
+# Two-digit minors keep the generated --platform list bounded.
+_LIBC_PATTERN = re.compile(r"(glibc)-2\.([1-9]\d?)|(musl)-1\.([1-9]\d?)")
+_ALPINE_TOKEN = re.compile(r"alpine3\.\d+")
+_SUPPORTED_LIBC_TEXT = "glibc-2.N (N 17-99) and musl-1.N (N 1-99)"
+# Conservative libc bounds; see the sources in docs/libc-codename-mappings.md.
+_DEBIAN_GLIBC_MINOR = {
+    "jessie": 17,
+    "stretch": 19,
+    "buster": 24,
+    "bullseye": 28,
+    "bookworm": 31,
+    "trixie": 36,
 }
+_ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
@@ -63,6 +93,52 @@ _PIP_OVERRIDE_OPTIONS = {
     "--target",
     "--user",
 }
+# Host pip settings that only choose and authenticate to an index; every other
+# PIP_* variable or pip config key could change target selection and is ignored.
+_PIP_ENVIRONMENT_ALLOWED = {
+    "PIP_CERT",
+    "PIP_CLIENT_CERT",
+    "PIP_CONFIG_FILE",
+    "PIP_DEFAULT_TIMEOUT",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+    "PIP_INDEX_URL",
+    "PIP_KEYRING_PROVIDER",
+    "PIP_NO_INDEX",
+    "PIP_PROXY",
+    "PIP_REQUIRE_HASHES",
+    "PIP_RETRIES",
+    "PIP_TIMEOUT",
+    "PIP_TRUSTED_HOST",
+}
+_PIP_CONFIG_ALLOWED = sorted(
+    name[4:].lower().replace("_", "-")
+    for name in _PIP_ENVIRONMENT_ALLOWED - {"PIP_CONFIG_FILE"}
+)
+# Locked installs never take source-selection settings from the host: only the
+# lock's recorded index may supply artifacts.
+_PIP_SOURCE_CONFIG_KEYS = {
+    "extra-index-url",
+    "find-links",
+    "index-url",
+    "no-index",
+    "trusted-host",
+}
+_PIP_LOCKED_CONFIG_ALLOWED = sorted(set(_PIP_CONFIG_ALLOWED) - _PIP_SOURCE_CONFIG_KEYS)
+_PIP_STDERR_LIMIT = 1024 * 1024
+_PIP_EXCERPT_LINES = 6
+_PIP_EXCERPT_LINE_CHARS = 300
+_AUTH_HINT = (
+    "Provide index credentials to the builder through PIP_INDEX_URL or "
+    "PIP_EXTRA_INDEX_URL, a pip config file, .netrc (or NETRC), keyring with "
+    "PIP_KEYRING_PROVIDER=import or subprocess, or ${VAR} placeholders in the "
+    "requirements file."
+)
+_LOCKED_AUTH_HINT = (
+    "Locked installs ignore host pip settings and config files; provide index "
+    "credentials through ${VAR} placeholders in the lock's index URL or "
+    ".netrc (or NETRC)."
+)
 
 
 def _base_image_parts(base_image: str) -> Tuple[str, str]:
@@ -152,6 +228,145 @@ def _base_environment(base_config: Optional[dict]) -> dict:
     return environment
 
 
+def _parse_libc(libc: str) -> Tuple[str, int]:
+    match = _LIBC_PATTERN.fullmatch(libc)
+    family = match and (match.group(1) or match.group(3))
+    minor = match and int(match.group(2) or match.group(4))
+    if not match or (family == "glibc" and minor < _MIN_GLIBC_MINOR):
+        raise ValueError(
+            f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
+            f"supported values are {_SUPPORTED_LIBC_TEXT}."
+        )
+    return family, minor
+
+
+def _tag_tokens(image_tag: str) -> List[str]:
+    return image_tag.lower().split("-")
+
+
+def _is_alpine_tag(image_tag: str) -> bool:
+    return any(
+        token == "alpine" or _ALPINE_TOKEN.fullmatch(token)
+        for token in _tag_tokens(image_tag)
+    )
+
+
+def _codename_libc(image_tag: str) -> Optional[Tuple[str, int]]:
+    found = set()
+    for token in _tag_tokens(image_tag):
+        if token in _DEBIAN_GLIBC_MINOR:
+            found.add(("glibc", _DEBIAN_GLIBC_MINOR[token]))
+        elif token in _ALPINE_MUSL_MINOR:
+            found.add(("musl", _ALPINE_MUSL_MINOR[token]))
+    if len(found) > 1:
+        raise ValueError(
+            f"Base image tag {image_tag!r} names more than one distribution codename."
+        )
+    return found.pop() if found else None
+
+
+def _target_libc(
+    base_image: str, base_config: Optional[dict], base_image_tag_verified: bool
+) -> Tuple[str, int]:
+    """Return target libc only from explicit metadata or a mapped codename."""
+    repository, image_tag = _base_image_parts(base_image)
+    libc = _base_environment(base_config).get("PYTHON_LIBC")
+    explicit = _parse_libc(libc) if libc is not None else None
+    if not (
+        _is_official_python_image(repository)
+        and base_image_tag_verified
+        and "@" not in base_image
+    ):
+        if explicit:
+            return explicit
+        raise ValueError(
+            "Cannot validate target wheel compatibility for an unverified or custom "
+            "base image; digest references (including tag@digest) and local image "
+            f"names cannot establish libc. Set PYTHON_LIBC ({_SUPPORTED_LIBC_TEXT}) "
+            "in the image config, or use a verified tag-only registry pull."
+        )
+    tag_family = "musl" if _is_alpine_tag(image_tag) else "glibc"
+    codename = _codename_libc(image_tag)
+    if codename and codename[0] != tag_family:
+        raise ValueError(
+            f"Base image tag {image_tag!r} names a {codename[0]} codename but "
+            f"implies {tag_family}."
+        )
+    if explicit and explicit[0] != tag_family:
+        raise ValueError(
+            f"Base image tag {image_tag or 'latest'!r} implies {tag_family}, "
+            f"which conflicts with PYTHON_LIBC={libc} in its image config."
+        )
+    claims = [claim[1] for claim in (explicit, codename) if claim]
+    if claims:
+        return tag_family, min(claims)
+    raise ValueError(
+        f"Cannot validate target {tag_family} version from base image tag "
+        f"{image_tag or 'latest'!r}; pin a mapped codename tag (for example "
+        "python:3.11-slim-bookworm or python:3.11-alpine3.20) or set "
+        f"PYTHON_LIBC ({_SUPPORTED_LIBC_TEXT}) in the image config. "
+        "Codename-less and unmapped tags do not establish a compatible libc floor."
+    )
+
+
+def target_wheel_platforms(
+    os_name: str,
+    arch: str,
+    base_image: str,
+    base_config: Optional[dict],
+    *,
+    base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
+) -> List[str]:
+    """Return wheel platform tags through the selected libc bound, newest first.
+
+    Image names alone are not provenance: libc comes from explicit PYTHON_LIBC
+    metadata or, for verified tag-only official pulls, a mapped codename.
+    """
+    validate_target_platform(os_name, arch, variant)
+    floor = _PIP_PLATFORMS[(os_name, arch)]
+    machine = floor[len(_FLOOR_GLIBC_PREFIX):]
+    family, minor = _target_libc(base_image, base_config, base_image_tag_verified)
+    if family == "musl":
+        return [
+            f"musllinux_1_{value}_{machine}"
+            for value in range(minor, _MIN_MUSL_MINOR - 1, -1)
+        ]
+    return [
+        f"manylinux_2_{value}_{machine}"
+        for value in range(minor, _MIN_GLIBC_MINOR - 1, -1)
+    ] + [floor]
+
+
+def target_libc_config(
+    os_name: str, arch: str, base_image: str, base_config: Optional[dict],
+    base_layers: Iterable, *, base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
+) -> Optional[dict]:
+    """Add layer-derived libc only to staging config for verified official tag pulls."""
+    validate_target_platform(os_name, arch, variant)
+    repository, image_tag = _base_image_parts(base_image)
+    if (
+        not base_image_tag_verified
+        or "@" in base_image
+        or not _is_official_python_image(repository)
+        or "PYTHON_LIBC" in _base_environment(base_config)
+        or _codename_libc(image_tag)
+    ):
+        return base_config
+    from .base_libc import infer_libc_from_layers
+
+    family = "musl" if _is_alpine_tag(image_tag) else "glibc"
+    machine = _PIP_PLATFORMS[(os_name, arch)][len(_FLOOR_GLIBC_PREFIX):]
+    libc = infer_libc_from_layers(base_layers, family, arch, machine)
+    _parse_libc(libc)
+    config = dict(base_config or {})
+    image_config = dict(config.get("config", {}))
+    image_config["Env"] = [*image_config.get("Env", []), f"PYTHON_LIBC={libc}"]
+    config["config"] = image_config
+    return config
+
+
 def target_wheel_platform(
     os_name: str,
     arch: str,
@@ -159,44 +374,14 @@ def target_wheel_platform(
     base_config: Optional[dict],
     *,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> str:
-    """Validate libc and select a wheel platform; names alone are not provenance."""
-    try:
-        glibc_platform = _PIP_PLATFORMS[(os_name, arch)]
-    except KeyError as exc:
-        raise ValueError(
-            f"Dependency staging does not support target platform {os_name}/{arch}; "
-            "supported targets are linux/amd64 and linux/arm64."
-        ) from exc
-    repository, image_tag = _base_image_parts(base_image)
-    libc = _base_environment(base_config).get("PYTHON_LIBC")
-    if libc is not None and libc not in _SUPPORTED_LIBC:
-        raise ValueError(
-            f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
-            "supported values are glibc-2.17 and musl-1.2."
-        )
-    if (
-        _is_official_python_image(repository)
-        and base_image_tag_verified
-        and "@" not in base_image
-    ):
-        tag_family = "musl" if "alpine" in image_tag.lower() else "glibc"
-        if libc and libc.split("-", 1)[0] != tag_family:
-            raise ValueError(
-                f"Base image tag {image_tag or 'latest'!r} implies {tag_family}, "
-                f"which conflicts with PYTHON_LIBC={libc} in its image config."
-            )
-        if tag_family == "musl":
-            return glibc_platform.replace("manylinux2014", "musllinux_1_2")
-        return glibc_platform
-    if libc:
-        return glibc_platform.replace("manylinux2014", _SUPPORTED_LIBC[libc])
-    raise ValueError(
-        "Cannot validate target wheel compatibility for an unverified or custom "
-        "base image; digest references (including tag@digest) and local image "
-        "names cannot establish libc. Set PYTHON_LIBC to glibc-2.17 or musl-1.2 "
-        "in the image config, or use a verified tag-only registry pull."
-    )
+    """Validate libc and return the most specific compatible wheel platform."""
+    return target_wheel_platforms(
+        os_name, arch, base_image, base_config,
+        base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
+    )[0]
 
 
 def _target_options(
@@ -207,15 +392,16 @@ def _target_options(
     base_config: Optional[dict] = None,
     *,
     base_image_tag_verified: bool = False,
+    variant: Optional[str] = None,
 ) -> List[str]:
-    platform = target_wheel_platform(
+    platforms = target_wheel_platforms(
         os_name, arch, base_image, base_config,
         base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
     )
     major, minor = python_version.split(".")
     return [
-        "--platform",
-        platform,
+        *(option for platform in platforms for option in ("--platform", platform)),
         "--python-version",
         f"{major}.{minor}",
         "--implementation",
@@ -226,19 +412,30 @@ def _target_options(
     ]
 
 
-def validate_target_platform(os_name: str, arch: str) -> None:
-    if (os_name, arch) not in _PIP_PLATFORMS:
+def _target_text(os_name: str, arch: str, variant: Optional[str]) -> str:
+    return f"{os_name}/{arch}" + (f"/{variant}" if variant else "")
+
+
+def validate_target_platform(
+    os_name: str, arch: str, variant: Optional[str] = None
+) -> None:
+    required = _REQUIRED_VARIANTS.get((os_name, arch))
+    if (os_name, arch) not in _PIP_PLATFORMS or (
+        required is not None and variant != required
+    ):
         raise ValueError(
-            f"Dependency staging does not support target platform {os_name}/{arch}; "
-            "supported targets are linux/amd64 and linux/arm64."
+            "Dependency staging does not support target platform "
+            f"{_target_text(os_name, arch, variant)}; supported targets are "
+            f"{SUPPORTED_TARGETS_TEXT}."
         )
 
 
 def _target_marker_environment(
-    os_name: str, arch: str, python_version: str, base_config: Optional[dict]
+    os_name: str, arch: str, python_version: str, base_config: Optional[dict],
+    variant: Optional[str] = None,
 ) -> dict:
     """PEP 508 marker values for the target; omitted keys are unknown and fail closed."""
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     environment = {
         "implementation_name": "cpython",
         "os_name": "posix",
@@ -266,12 +463,18 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
+    variant: Optional[str] = None,
     *,
     locked: bool = False,
     base_image_tag_verified: bool = False,
-) -> None:
-    """Install requirements for the target; ``locked`` files are generated, hashed and complete."""
-    _, hash_pinned = _analyze_requirements(requirements, context_dir)
+) -> List[Path]:
+    """Install target wheels and return the validated requirements files."""
+    target_options = _target_options(
+        os_name, arch, python_version, base_image, base_config,
+        base_image_tag_verified=base_image_tag_verified,
+        variant=variant,
+    )
+    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
         logger.warning(
             "%s is not fully pinned with ==versions and --hash values, so the "
@@ -279,6 +482,7 @@ def install_requirements(
             "`pip-compile --generate-hashes`.",
             requirements.name,
         )
+    target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
     # Locked installs use only the generated --index-url: no pip config files or PIP_* options.
@@ -288,12 +492,14 @@ def install_requirements(
     error_file = destination.parent / _MARKER_ERROR_FILE
     marker_config = {
         "environment": _target_marker_environment(
-            os_name, arch, python_version, base_config
+            os_name, arch, python_version, base_config, variant
         ),
         "error_file": str(error_file),
+        "allowed_config_keys": _PIP_LOCKED_CONFIG_ALLOWED if locked else _PIP_CONFIG_ALLOWED,
     }
     command = [
         sys.executable,
+        # Ignore PYTHONPATH/PYTHONHOME so host modules cannot shadow the pinned pip.
         "-E",
         "-P",
         "-c",
@@ -310,61 +516,59 @@ def install_requirements(
         "--no-warn-conflicts",
         "--target",
         str(destination),
-        *_target_options(
-            os_name, arch, python_version, base_image, base_config,
-            base_image_tag_verified=base_image_tag_verified,
-        ),
+        *target_options,
         "-r",
         str(requirements),
     ]
-    environment = dict(os.environ)
-    if locked:
-        environment = {key: value for key, value in environment.items() if not key.upper().startswith("PIP_")}
-        environment["PIP_CONFIG_FILE"] = os.devnull
-    environment.update(
-        {
-            "TMP": str(destination.parent),
-            "TEMP": str(destination.parent),
-            "TMPDIR": str(destination.parent),
-            "PIP_IGNORE_REQUIRES_PYTHON": "0",
-        }
+    environment = (
+        _locked_pip_environment(destination.parent)
+        if locked
+        else _pip_environment(destination.parent)
     )
-    with open(os.devnull, "wb") as null_output:
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=context_dir,
-                env=environment,
-                stdout=null_output,
-                stderr=null_output,
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                "Unable to start pip for target dependency installation."
-            ) from exc
-        try:
-            started = time.monotonic()
-            while True:
-                try:
-                    returncode = process.wait(timeout=0.5)
-                    break
-                except subprocess.TimeoutExpired:
-                    _check_stage_limits(destination.parent)
-                    if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
-                        raise TimeoutError(
-                            f"Target dependency installation exceeded "
-                            f"{INSTALL_TIMEOUT_SECONDS} seconds."
-                        )
-        except BaseException:
-            _stop_process(process)
-            raise
+    # pip logs index HTTP failures only at debug level, so keep its debug log in
+    # host temp space (never the tarred stage) to classify authentication errors.
+    with tempfile.TemporaryDirectory(prefix="pycontainer-pip-") as diagnostics:
+        pip_log = Path(diagnostics) / "pip.log"
+        with open(Path(diagnostics) / "stderr.txt", "w+b") as pip_errors:
+            try:
+                process = subprocess.Popen(
+                    [*command, "--log", str(pip_log)],
+                    cwd=context_dir,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=pip_errors,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    "Unable to start pip for target dependency installation."
+                ) from exc
+            try:
+                started = time.monotonic()
+                while True:
+                    try:
+                        returncode = process.wait(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        _check_stage_limits(destination.parent)
+                        if time.monotonic() - started > INSTALL_TIMEOUT_SECONDS:
+                            raise TimeoutError(
+                                f"Target dependency installation for {target} exceeded "
+                                f"{INSTALL_TIMEOUT_SECONDS} seconds."
+                            )
+            except BaseException:
+                _stop_process(process)
+                raise
+            pip_errors.seek(0)
+            pip_output = pip_errors.read(_PIP_STDERR_LIMIT).decode("utf-8", "replace")
+        pip_debug = _read_tail(pip_log, _PIP_STDERR_LIMIT) if returncode else ""
 
+    secrets = known_secrets(environment, _placeholder_names(requirement_files))
     if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
-        details = _read_marker_error(error_file)
+        details = redact(_read_marker_error(error_file), secrets)
         if returncode == _MARKER_ERROR_EXIT:
             raise ValueError(
                 "Cannot evaluate dependency environment markers for target "
-                f"{os_name}/{arch}, CPython {python_version}; refusing to stage an "
+                f"{target}, CPython {python_version}; refusing to stage an "
                 f"incomplete dependency set. {details}"
             )
         raise RuntimeError(
@@ -378,17 +582,173 @@ def install_requirements(
             else ""
         )
         raise RuntimeError(
-            "Target dependency installation failed. Only wheels compatible with "
-            f"{os_name}/{arch}, CPython {python_version}, and binary-only resolution "
-            f"are supported.{hint}"
+            _pip_failure_message(
+                redact(pip_output, secrets),
+                os_name,
+                arch,
+                python_version,
+                redact(pip_debug, secrets),
+                _LOCKED_AUTH_HINT if locked else _AUTH_HINT,
+                variant,
+            ) + hint
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
         if scripts_dir.exists():
             shutil.rmtree(scripts_dir)
     _drop_external_record_entries(destination)
+    reject_credentialed_direct_urls(destination)
 
     _check_stage_limits(destination.parent)
+    return requirement_files
+
+
+def _pip_environment(temporary_dir: Path) -> dict:
+    environment = {}
+    ignored = []
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper.startswith(("PIP_", "_PIP_")) and upper not in _PIP_ENVIRONMENT_ALLOWED:
+            ignored.append(upper)
+            continue
+        environment[name] = value
+    if ignored:
+        print(
+            "Ignoring host pip settings that could change target dependency "
+            f"selection: {', '.join(sorted(ignored))}"
+        )
+    environment.update(
+        {
+            "TMP": str(temporary_dir),
+            "TEMP": str(temporary_dir),
+            "TMPDIR": str(temporary_dir),
+        }
+    )
+    return environment
+
+
+def _locked_pip_environment(temporary_dir: Path) -> dict:
+    """Environment for a locked install: no host PIP_* settings or pip config files."""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith(("PIP_", "_PIP_"))
+    }
+    environment.update(
+        {
+            "PIP_CONFIG_FILE": os.devnull,
+            "TMP": str(temporary_dir),
+            "TEMP": str(temporary_dir),
+            "TMPDIR": str(temporary_dir),
+        }
+    )
+    return environment
+
+
+def _placeholder_names(requirement_files: Iterable[Path]) -> List[str]:
+    names = set()
+    for path in requirement_files:
+        names.update(
+            PLACEHOLDER.findall(path.read_text(encoding="utf-8", errors="replace"))
+        )
+    return sorted(names)
+
+
+_PROXY_AUTH_FAILURE = re.compile(r"\b407\b[^\n]*proxy authentication", re.IGNORECASE)
+_INDEX_AUTH_FAILURE = re.compile(
+    r"\b(401|403)\b[^\n]*(unauthori[sz]ed|forbidden|client error|credentials not correct)",
+    re.IGNORECASE,
+)
+_CONNECTION_FAILURE = re.compile(
+    r"NewConnectionError|Failed to establish a new connection|ConnectTimeout"
+    r"|ReadTimeout|SSLError|CERTIFICATE_VERIFY_FAILED|ProxyError"
+    r"|Name or service not known|getaddrinfo failed|nodename nor servname"
+)
+
+
+def _pip_failure_message(
+    pip_output: str,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    pip_debug: str = "",
+    auth_hint: str = _AUTH_HINT,
+    variant: Optional[str] = None,
+) -> str:
+    """Classify a failed install from redacted pip stderr and debug log text."""
+    excerpt = _pip_excerpt(pip_output, pip_debug)
+    details = f" pip reported (redacted): {excerpt}" if excerpt else ""
+    diagnostics = f"{pip_output}\n{pip_debug}"
+    if _PROXY_AUTH_FAILURE.search(diagnostics):
+        return (
+            "Proxy authentication failed while installing target dependencies "
+            "(HTTP 407). Check the proxy credentials available to the builder."
+            + details
+        )
+    if _INDEX_AUTH_FAILURE.search(diagnostics):
+        return (
+            "Authentication to a package index failed (HTTP 401/403) while "
+            f"installing target dependencies. {auth_hint}" + details
+        )
+    if _CONNECTION_FAILURE.search(diagnostics):
+        return (
+            "Could not reach the package index while installing target "
+            "dependencies. Check the index URL, network, proxy and TLS settings."
+            + details
+        )
+    return (
+        "Target dependency installation failed. Only wheels compatible with "
+        f"{_target_text(os_name, arch, variant)}, CPython {python_version}, and binary-only resolution "
+        f"are supported. {_NO_SOURCE_FALLBACK}"
+        + (_ARMV7_WHEEL_NOTE if arch == "arm" else "")
+        + details
+    )
+
+
+def _pip_excerpt(pip_output: str, pip_debug: str = "") -> str:
+    errors = [
+        line.strip() for line in pip_output.splitlines() if line.strip()
+    ]
+    relevant = [line for line in errors if line.startswith("ERROR:")] or errors[-3:]
+    seen = set()
+    for line in pip_debug.splitlines():
+        if (
+            _PROXY_AUTH_FAILURE.search(line)
+            or _INDEX_AUTH_FAILURE.search(line)
+            or _CONNECTION_FAILURE.search(line)
+        ):
+            message = line.strip().split(" ", 1)[-1]
+            if message not in seen:
+                seen.add(message)
+                relevant.insert(0, message)
+    return " | ".join(
+        line[:_PIP_EXCERPT_LINE_CHARS] for line in relevant[:_PIP_EXCERPT_LINES]
+    )
+
+
+def _read_tail(path: Path, limit: int) -> str:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - limit))
+            return handle.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return ""
+
+
+def reject_credentialed_direct_urls(site_packages: Path) -> None:
+    for direct_url in sorted(site_packages.glob("*.dist-info/direct_url.json")):
+        try:
+            url = json.loads(direct_url.read_text(encoding="utf-8")).get("url", "")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise ValueError(
+                f"Cannot validate installed package source metadata: {direct_url.parent.name}"
+            ) from exc
+        if isinstance(url, str) and url_has_credentials(url):
+            raise ValueError(
+                f"Installed package metadata {direct_url.parent.name}/direct_url.json "
+                "records a URL with credentials; refusing to place it in the image."
+            )
 
 
 def install_locked_requirements(
@@ -401,6 +761,7 @@ def install_locked_requirements(
     base_image: str,
     base_config: Optional[dict],
     *,
+    variant: Optional[str] = None,
     base_image_tag_verified: bool = False,
 ) -> None:
     """Install each recorded index's packages from that index alone, then merge them."""
@@ -413,7 +774,7 @@ def install_locked_requirements(
             requirements.write_text(text, encoding="utf-8")
             install_requirements(
                 requirements, target, context_dir, os_name, arch, python_version,
-                base_image, base_config, locked=True,
+                base_image, base_config, variant=variant, locked=True,
                 base_image_tag_verified=base_image_tag_verified,
             )
             if target != destination:
@@ -464,11 +825,14 @@ def _is_external_record_line(line: bytes) -> bool:
     return path.startswith(("../", "/")) or PureWindowsPath(path).drive != ""
 
 
-def _read_requirements_text(path: Path) -> str:
-    data = path.read_bytes()
+def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return data.decode("utf-16")
-    return data.decode("utf-8-sig")
+        return data.decode("utf-16", errors)
+    return data.decode("utf-8-sig", errors)
+
+
+def _read_requirements_text(path: Path) -> str:
+    return _decode_requirements(path.read_bytes())
 
 
 RequirementsFile = Tuple[Path, bool, List[List[str]]]
@@ -510,9 +874,11 @@ def _inspect_requirements(
                     f"{MAX_REQUIREMENTS_BYTES}-byte limit."
                 )
 
+        text = _read_requirements_text(path)
+        reject_literal_credentials(path, text, context_root)
         logical_lines = []
         continuation = ""
-        for raw_line in _read_requirements_text(path).splitlines():
+        for raw_line in text.splitlines():
             if raw_line.rstrip().endswith("\\"):
                 continuation += raw_line.rstrip()[:-1] + " "
                 continue
@@ -580,16 +946,17 @@ def _inspect_requirements(
     return hash_pinned, roots, scanned
 
 
-def _analyze_requirements(
+def _scan_requirements(
     requirements: Path,
     context_dir: Path,
     check_overrides: bool = True,
     constraints: Optional[List[str]] = None,
-) -> Tuple[List[str], bool]:
-    hash_pinned, roots, _ = _inspect_requirements(
+) -> Tuple[List[str], List[Path], bool]:
+    """Validate a local requirements graph and report roots, files and hash pinning."""
+    hash_pinned, roots, scanned = _inspect_requirements(
         requirements, context_dir, check_overrides, constraints
     )
-    return roots, hash_pinned
+    return roots, sorted({path for path, _, _ in scanned}), hash_pinned
 
 
 def validate_requirements(
@@ -602,8 +969,7 @@ def validate_requirements(
 
     Constraint-file requirement lines are appended to ``constraints`` when given.
     """
-    roots, _ = _analyze_requirements(requirements, context_dir, check_overrides, constraints)
-    return roots
+    return _scan_requirements(requirements, context_dir, check_overrides, constraints)[0]
 
 
 def scan_requirements(
@@ -630,6 +996,63 @@ def _is_hash_pinned(options: List[str]) -> bool:
     specifier = " ".join(words).split(";", 1)[0].strip()
     exact = re.fullmatch(r"[^=<>!~@,]+===?\s*[^\s,*]+", specifier) is not None
     return exact and has_hash
+def reject_literal_credentials(path: Path, text: str, context_root: Path) -> None:
+    findings = find_credentials(text)
+    if not findings:
+        return
+    try:
+        shown = path.resolve().relative_to(context_root.resolve()).as_posix()
+    except ValueError:
+        shown = path.name
+    locations = ", ".join(f"line {line} ({url})" for line, url in findings[:5])
+    raise ValueError(
+        f"{shown} contains a URL with literal credentials at {locations}; "
+        "refusing to build because build-context files can be copied into "
+        "image layers. Reference secrets as ${VAR} placeholders, which pip "
+        "expands at install time, or supply them through PIP_INDEX_URL, a pip "
+        "config file, .netrc or keyring."
+    )
+
+
+def reject_shipped_credentials(
+    files: Iterable[Tuple[Path, Path]],
+    context_dir: Path,
+    requirement_paths: Iterable[Path] = (),
+) -> None:
+    """Fail before app-layer creation when pip inputs that would ship hold credentials."""
+    context_root = Path(context_dir).resolve()
+    requirement_set = {Path(path).resolve() for path in requirement_paths}
+    # pip runs from the context, so relative credential-file variables resolve there.
+    configured = {
+        name: (context_root / os.environ[name]).resolve()
+        for name in ("PIP_CONFIG_FILE", "NETRC")
+        if os.environ.get(name) and os.environ[name] != os.devnull
+    }
+    for source, relative in files:
+        name = relative.name.lower()
+        resolved = Path(source).resolve()
+        if name in {".netrc", "_netrc"} or resolved == configured.get("NETRC"):
+            raise ValueError(
+                f"{relative.as_posix()} is a credentials file and would be copied into "
+                "the image; exclude it from the build context."
+            )
+        if not (
+            name in {"pip.conf", "pip.ini"}
+            or re.fullmatch(r"(requirements|constraints).*\.(txt|in)", name)
+            or resolved in requirement_set
+            or resolved == configured.get("PIP_CONFIG_FILE")
+        ):
+            continue
+        with open(source, "rb") as handle:
+            data = handle.read(MAX_REQUIREMENTS_BYTES + 1)
+        if len(data) > MAX_REQUIREMENTS_BYTES:
+            raise ValueError(
+                f"{relative.as_posix()} is too large to scan for credentials "
+                f"(over {MAX_REQUIREMENTS_BYTES} bytes) and would be copied into the "
+                "image; shrink it or exclude it from the build context."
+            )
+        text = _decode_requirements(data, "replace")
+        reject_literal_credentials(Path(source), text, context_root)
 
 
 def stage_virtualenv(
@@ -641,8 +1064,9 @@ def stage_virtualenv(
     base_config: Optional[dict] = None,
     context_dir: Optional[Path] = None,
     requirements: Optional[Path] = None,
+    variant: Optional[str] = None,
 ) -> None:
-    validate_target_platform(os_name, arch)
+    validate_target_platform(os_name, arch, variant)
     files = list(dependencies)
     site_roots = set()
     for source, relative in files:
@@ -686,6 +1110,7 @@ def stage_virtualenv(
         requirements,
         version_established,
         venv_layout_os(root, _read_venv_config(files, root)),
+        variant,
     )
 
 
@@ -699,6 +1124,7 @@ def _verify_target_closure(
     requirements: Optional[Path],
     version_established: bool,
     host_os_name: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> None:
     """Reject staged packages whose target-active requirements are not installed."""
     constraint_lines: List[str] = []
@@ -724,7 +1150,7 @@ def _verify_target_closure(
     if not distributions and not any(lines for _, _, lines in roots):
         return
 
-    environment = _target_marker_environment(os_name, arch, python_version, base_config)
+    environment = _target_marker_environment(os_name, arch, python_version, base_config, variant)
     request = {
         "environment": environment,
         "hosts": host_environments(environment, version_established, host_os_name),
@@ -775,7 +1201,7 @@ def _verify_target_closure(
     if problems:
         raise ValueError(
             f"Virtualenv dependencies are incomplete or unverifiable for target "
-            f"{os_name}/{arch}, CPython {python_version}; refusing to stage: "
+            f"{_target_text(os_name, arch, variant)}, CPython {python_version}; refusing to stage: "
             + "; ".join(problems)
             + ". Use a requirements file so pip resolves dependencies for the target."
         )

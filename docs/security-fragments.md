@@ -29,6 +29,9 @@ Only the targets you configure are written. Fragments from an earlier build
 that are no longer configured are removed; other files in `security/` are left
 alone. `--dry-run` lists the fragments it would write and writes nothing.
 Invalid settings fail the build before any base image is pulled.
+Multi-platform index builds also write one set of fragments beside the layout,
+not inside the platform images. Choose profiles appropriate for each target
+runtime where the fragments will be applied.
 
 ## Configuration
 
