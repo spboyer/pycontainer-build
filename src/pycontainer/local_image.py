@@ -135,12 +135,14 @@ def open_local_image_source(
     os_name: Optional[str],
     arch: Optional[str],
     variant: Optional[str] = None,
+    quiet: bool = False,
 ):
     """Open a local base image source after rejecting overlap with the output.
 
     ``os_name=None`` and ``arch=None`` skip the Docker archive's early platform
     check for inspection; Docker archive callers must validate the returned
-    ``DockerArchiveSource.platform`` themselves.
+    ``DockerArchiveSource.platform`` themselves. ``quiet=True`` suppresses
+    Docker archive layer progress output.
     """
     if _paths_overlap(reference.path, Path(output_dir)):
         raise LocalImageError(
@@ -149,7 +151,7 @@ def open_local_image_source(
         )
     if reference.transport == OCI_TRANSPORT:
         return OCILayoutSource(reference)
-    return DockerArchiveSource(reference, Path(layers_dir), os_name, arch, variant)
+    return DockerArchiveSource(reference, Path(layers_dir), os_name, arch, variant, quiet)
 
 
 def check_local_image_bounds(config_size: int, layer_sizes: List[int]) -> None:
@@ -691,10 +693,12 @@ class DockerArchiveSource:
         os_name: Optional[str],
         arch: Optional[str],
         variant: Optional[str] = None,
+        quiet: bool = False,
     ):
         self.path = reference.path
         self.reference = reference
         self.layers_dir = layers_dir
+        self.quiet = quiet
         self.source_name = str(reference.path)
         self.platform: Optional[Dict[str, str]] = None
         self._published: Dict[str, int] = {}
@@ -894,7 +898,8 @@ class DockerArchiveSource:
         for position, (layer_path, member) in enumerate(zip(layer_paths, layer_members), 1):
             description = f"layer {position}"
             path_digest = self._path_digest(layer_path)
-            print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
+            if not self.quiet:
+                print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
             try:
                 digest, size = _stage_stream(
                     self._open_member(member), self.layers_dir, path_digest,

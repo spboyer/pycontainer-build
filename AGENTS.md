@@ -16,6 +16,8 @@ daemon without discussing the trade-off first.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
+- `layer_inspect.py`: `inspect` command; streams local image layers into a
+  union-filesystem report using the `local_image.py` sources.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `system_packages.py`: system package declaration, inference and base-image
