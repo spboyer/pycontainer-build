@@ -57,6 +57,9 @@ unauthorized export fails explicitly. Normal image authentication continues
 to accept generic environment credentials. A registry's authentication
 challenge can direct credential exchange to a token service on another origin;
 trust both the cache registry and its advertised token service.
+Cache connections honor `--registry-ca-file` and the exact-host
+`--insecure-registry` opt-in. Credentials are sent over HTTP only to loopback
+hosts, and blob redirects always use HTTPS without registry credentials.
 
 ## Components
 
@@ -224,6 +227,22 @@ pycontainer build --tag registry.example.com/app:v1 --push
   command lines in shared or recorded shells.
 
 **Recommendation**: Use Docker config with credential helpers or Azure CLI for best security.
+
+### Transport Security
+- Registry traffic is HTTPS with certificate verification by default.
+  `--registry-ca-file` adds a trusted CA; it never disables verification.
+- `--insecure-registry HOST[:PORT]` allows plain HTTP for that exact host.
+  Credentials are sent over HTTP only to loopback hosts; credentials for any
+  other HTTP registry, or a token challenge from one, fail with
+  `RegistryAuthenticationError` before secrets leave the process.
+- HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
+  rejected. `Authorization`, `Proxy-Authorization` and `Cookie` are dropped on
+  cross-origin redirects; blob storage redirects are credential-free.
+- Embedded URL credentials are rejected and error URLs omit userinfo/query
+  secrets. Registry connections ignore environment/system proxies.
+- Concurrent initial bearer challenges share token acquisition and replay once;
+  rejection of the current token is reported without indefinite refresh. See
+  [REGISTRY_PUSH.md](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
 
 ### Token Scopes
 - **GitHub**: Require minimum scope (`write:packages`)

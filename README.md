@@ -306,8 +306,8 @@ custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
              deps=['app'], skips_local_docker=True)
 ```
 
-Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
-registries and multi-platform requests are rejected.
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and
+multi-platform requests are rejected. Plain HTTP requires per-host opt-in.
 [See full documentation →](docs/skaffold-tilt.md)
 
 ### VS Code Extension
@@ -515,7 +515,9 @@ for GHCR, or Azure CLI credentials for ACR. It ignores `REGISTRY_TOKEN`,
 registry are the same, because these environment variables do not identify
 their intended host. Image-push credentials and CLI username/password values
 are not reused for caching. Configure the cache registry in
-`~/.docker/config.json` or use its host-specific provider.
+`~/.docker/config.json` or use its host-specific provider. Cache connections
+also honor `--registry-ca-file` and exact-host `--insecure-registry` settings;
+the latter warns and permits HTTP credentials only for loopback hosts.
 
 Import is best-effort: a missing record is a quiet miss, and an invalid record,
 integrity failure, auth or network error logs a warning and rebuilds the layer
@@ -525,7 +527,8 @@ from the cache registry's own provider, and control-plane redirects strip
 `Authorization` across origins. Redirected blob storage receives no registry
 credentials. A registry can direct credential exchange to its advertised token
 service, so trust both the cache registry and its token service. Every blob
-redirect must use HTTPS and contain no URL credentials. When remote caching is enabled,
+redirect must use HTTPS and contain no URL credentials, even when the cache
+registry itself is explicitly configured for HTTP. When remote caching is enabled,
 generated and cached tars are checked against the original source identity and
 sources are rechecked; mismatched cached layers are rebuilt. Export verifies
 blob presence even when the tag is current, then uploads any missing blobs
@@ -548,6 +551,19 @@ pycontainer build --tag myapp:ci --push \
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+**Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
+- `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
+  (repeatable; `[build] insecure-registries = [...]`). Each build that uses
+  one logs a warning. Credentials are sent over HTTP only to loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); any other HTTP registry must be
+  anonymous.
+- `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
+  HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
+  there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -753,7 +769,7 @@ Known limitations and future enhancements:
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 - **System packages** — Verification is advisory; installing apt/apk packages
   is not available. See [system packages](docs/system-packages.md).
-- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
+- **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;

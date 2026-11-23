@@ -31,7 +31,7 @@ from pycontainer.config import BuildConfig
 from pycontainer.registry_client import (
     RegistryClient,
     RegistryRequestError,
-    SameOriginAuthRedirect,
+    SafeRedirect,
 )
 from pycontainer.remote_cache import (
     RegistryCacheRef,
@@ -186,7 +186,6 @@ def registry(monkeypatch):
         def open(self, request, timeout=None):
             return fake.open(request, timeout)
 
-    monkeypatch.setattr("pycontainer.registry_client._open_url", fake.open)
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener",
         lambda *handlers: _Opener(),
@@ -644,6 +643,27 @@ def test_no_cache_disables_remote_import(tmp_path):
     assert builder.remote_cache_to is not None
 
 
+def test_cache_transport_http_opt_in_is_scoped_to_each_registry(
+    tmp_path, registry, caplog
+):
+    builder = _builder(
+        tmp_path,
+        "transport",
+        cache_from="type=registry,ref=localhost:5000/team/cache",
+        cache_to="type=registry,ref=localhost:5001/team/cache",
+        insecure_registries=["localhost:5000"],
+    )
+    with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
+        source = builder.remote_cache_from.client
+        destination = builder.remote_cache_to.client
+
+    assert source.base_url == "http://localhost:5000/v2"
+    assert destination.base_url == "https://localhost:5001/v2"
+    warnings = [record for record in caplog.records if "insecure registry" in record.message]
+    assert len(warnings) == 1
+    assert "localhost:5000" in warnings[0].message
+
+
 def test_export_is_idempotent_and_concurrent_writers_agree(tmp_path, registry):
     writer, layer = _export(tmp_path, registry)
     key = _key_for(writer)
@@ -839,7 +859,7 @@ def test_import_errors_warn_and_build_correctly(tmp_path, registry, monkeypatch,
         def offline(request, timeout=None):
             raise urllib.error.URLError("offline")
 
-        monkeypatch.setattr("pycontainer.registry_client._open_url", offline)
+        monkeypatch.setattr(registry, "open", offline)
         monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _: None)
 
     reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC)
@@ -867,7 +887,6 @@ def test_cache_credentials_stay_on_cache_host_and_off_storage(tmp_path, registry
     assert all(auth == CACHE_AUTH for *_, auth in cache_requests)
 
 
-@pytest.mark.xfail(strict=True, reason="HTTPS token-realm validation pending #202")
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 @pytest.mark.parametrize("credential", ["basic", "bearer"])
 def test_cache_rejects_http_token_realm_without_sending_credentials(
@@ -891,7 +910,7 @@ def test_cache_rejects_http_token_realm_without_sending_credentials(
             {"WWW-Authenticate": 'Bearer realm="http://token.example/token",service="cache.example"'},
         )
 
-    monkeypatch.setattr("pycontainer.registry_client._open_url", challenged_open)
+    monkeypatch.setattr(registry, "open", challenged_open)
     builder = _builder(tmp_path, "credentials", **{option: CACHE_SPEC})
     if option == "cache_to":
         with pytest.raises(RemoteCacheError, match="Failed to export"):
@@ -963,7 +982,14 @@ def test_cache_registry_credentials_are_scoped_to_the_actual_host(
             )
         return _Response(201)
 
-    monkeypatch.setattr("pycontainer.registry_client._open_url", fake_open)
+    class Opener:
+        def open(self, request, timeout=None):
+            return fake_open(request, timeout)
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *handlers: Opener(),
+    )
     builder = _builder(
         tmp_path, "credentials", **{option: f"type=registry,ref={host}/{CACHE_REPO}"}
     )
@@ -1036,9 +1062,22 @@ def test_cache_ignores_generic_environment_credentials(
 
 def test_blob_redirect_to_plain_http_is_refused():
     client = RegistryClient(CACHE_HOST, CACHE_REPO)
-    with pytest.raises(RegistryRequestError, match="HTTPS"):
-        client._open_redirected_blob(
+    with pytest.raises(RegistryRequestError, match="HTTPS-to-HTTP"):
+        client._open_blob_redirect(
             f"https://{CACHE_HOST}/v2/x/blobs/y", "http://storage.example/blob"
+        )
+
+
+def test_insecure_registry_blob_redirect_to_plain_http_is_refused(monkeypatch):
+    client = RegistryClient("localhost:5000", CACHE_REPO, insecure=True)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A plain HTTP blob redirect must not be opened")
+
+    monkeypatch.setattr(client._opener, "open", forbidden)
+    with pytest.raises(RegistryRequestError, match="blob redirects must use HTTPS"):
+        client._open_blob_redirect(
+            "http://localhost:5000/v2/x/blobs/y", "http://storage.example/blob"
         )
 
 
@@ -1047,12 +1086,14 @@ def test_blob_redirect_to_plain_http_is_refused():
     ["https://user:secret@storage.example/blob", "https://@storage.example/blob"],
 )
 def test_blob_redirect_rejects_embedded_credentials(monkeypatch, location):
+    client = RegistryClient(CACHE_HOST, CACHE_REPO)
+
     def forbidden(*args, **kwargs):
         pytest.fail("A credential-bearing redirect must not be opened")
 
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.build_opener", forbidden)
+    monkeypatch.setattr(client._opener, "open", forbidden)
     with pytest.raises(RegistryRequestError):
-        RegistryClient(CACHE_HOST, CACHE_REPO)._open_redirected_blob(
+        client._open_blob_redirect(
             f"https://{CACHE_HOST}/blob", location
         )
 
@@ -1092,11 +1133,6 @@ def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
             return response
 
     build_opener = urllib.request.build_opener
-    default_opener = build_opener(urllib.request.ProxyHandler({}), StorageHandler())
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen",
-        lambda request, timeout: default_opener.open(request, timeout=timeout),
-    )
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener",
         lambda *handlers: build_opener(
@@ -1105,15 +1141,19 @@ def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
     )
     client = RegistryClient(CACHE_HOST, CACHE_REPO, auth_token="registry-secret")
     if allowed:
-        with client._open_redirected_blob(
+        with client._open_blob_redirect(
             f"https://{CACHE_HOST}/blob", "https://storage.example/first"
         ) as response:
             assert response.read() == b"blob"
         assert len(requests) == 2
-        assert all(request.get_header("Authorization") is None for request in requests)
+        assert all(
+            request.get_header(header) is None
+            for request in requests
+            for header in ("Authorization", "Proxy-authorization", "Cookie")
+        )
     else:
         with pytest.raises(RegistryRequestError):
-            client._open_redirected_blob(
+            client._open_blob_redirect(
                 f"https://{CACHE_HOST}/blob", "https://storage.example/first"
             )
         assert len(requests) == 1
@@ -1123,8 +1163,8 @@ def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
     ("target", "keeps_auth"),
     [
         (f"https://{CACHE_HOST}/v2/other", True),
+        (f"https://{CACHE_HOST}:443/v2/other", True),
         (f"https://{STORAGE_HOST}/blob", False),
-        (f"http://{CACHE_HOST}/v2/other", False),
         (f"https://{CACHE_HOST}:8443/v2/other", False),
     ],
 )
@@ -1132,7 +1172,7 @@ def test_control_redirects_strip_authorization_across_origins(target, keeps_auth
     request = urllib.request.Request(
         f"https://{CACHE_HOST}/v2/x/manifests/y", headers={"Authorization": CACHE_AUTH}
     )
-    redirected = SameOriginAuthRedirect().redirect_request(
+    redirected = SafeRedirect().redirect_request(
         request, None, 307, "redirect", Message(), target
     )
     assert redirected.has_header("Authorization") is keeps_auth

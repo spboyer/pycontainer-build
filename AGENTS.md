@@ -63,6 +63,8 @@ against its source identity and rechecks sources. Mismatched cached layers are
 rebuilt; export publishes blobs before the tag and fails explicitly.
 Control-plane redirects drop `Authorization`
 across origins, and blob redirects must be HTTPS and carry no credentials.
+Cache connections honor the same custom CA and exact-host HTTP opt-in as image
+pulls and pushes; HTTP credentials are restricted to loopback hosts.
 Cache auth excludes unscoped `REGISTRY_TOKEN` and `REGISTRY_USERNAME`/
 `REGISTRY_PASSWORD` environment credentials, including for same-host caches;
 use host-scoped Docker config, GHCR or ACR providers instead.
@@ -188,7 +190,10 @@ concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
 redirected storage hosts. Registry blob downloads verify descriptor digest and
 size before publication; only safe reads use bounded retries and explicit
-request timeouts.
+request timeouts. Registry HTTP(S) requests go through the client's openers:
+keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
+explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
+credentials over HTTP to non-loopback hosts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.

@@ -15,9 +15,9 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
-from .auth import get_registry_auth
+from .auth import RegistryAuth, get_registry_auth
 from .blob_store import BlobIntegrityError, digest_filename
 from .registry_client import (
     RegistryClient,
@@ -213,9 +213,16 @@ class RegistryLayerCache:
     for image push are never used.
     """
 
-    def __init__(self, ref: RegistryCacheRef, client: Optional[RegistryClient] = None):
+    def __init__(
+        self,
+        ref: RegistryCacheRef,
+        client: Optional[RegistryClient] = None,
+        *,
+        client_factory: Optional[Callable[[str, str, RegistryAuth], RegistryClient]] = None,
+    ):
         self.ref = ref
         self._client = client
+        self._client_factory = client_factory
 
     @property
     def client(self) -> RegistryClient:
@@ -223,13 +230,18 @@ class RegistryLayerCache:
             auth = get_registry_auth(
                 self.ref.registry, include_generic_environment=False
             )
-            self._client = RegistryClient(
-                self.ref.registry,
-                self.ref.repository,
-                auth_token=auth.bearer_token,
-                username=auth.username,
-                password=auth.password,
-            )
+            if self._client_factory is not None:
+                self._client = self._client_factory(
+                    self.ref.registry, self.ref.repository, auth
+                )
+            else:
+                self._client = RegistryClient(
+                    self.ref.registry,
+                    self.ref.repository,
+                    auth_token=auth.bearer_token,
+                    username=auth.username,
+                    password=auth.password,
+                )
         return self._client
 
     def fetch(self, key: str, layers_dir: Path) -> Optional[Tuple[str, Path, int]]:
