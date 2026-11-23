@@ -668,6 +668,11 @@ See [metadata configuration and integration details](docs/metadata.md).
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+- `--registry-mirror UPSTREAM=MIRROR` — Pull base images through `MIRROR`
+  before `UPSTREAM` (repeatable, tried in order; `[build.registry_mirrors]`).
+  Pushes never use mirrors, and mirrors never receive upstream credentials.
+  See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
+
 Registry connections are direct: environment/system proxy settings are ignored.
 URLs containing embedded credentials are rejected; use the credential providers
 or authentication flags instead.

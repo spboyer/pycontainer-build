@@ -397,7 +397,7 @@ def test_all_transport_entrypoints_reject_unsafe_urls(monkeypatch, entrypoint, u
         pytest.fail("Unsafe URL reached an opener")
 
     monkeypatch.setattr(client._opener, "open", unexpected_request)
-    monkeypatch.setattr(client._blob_opener, "open", unexpected_request)
+    monkeypatch.setattr(client, "_get_blob_opener", unexpected_request)
     with pytest.raises(RegistryRequestError) as error:
         if entrypoint == "request":
             client._make_request("GET", url)
@@ -498,7 +498,7 @@ def test_blob_transfers_reuse_ca_aware_openers(
             insecure=insecure, ca_file=ca_file,
         )
 
-        assert len(opener_constructions) == 2
+        assert len(opener_constructions) == 1
         for attempt in range(2):
             destination = tmp_path / f"blob-{attempt}"
             assert client.pull_blob(digest, destination, len(content))
@@ -529,7 +529,7 @@ def test_concurrent_first_use_reuses_ca_aware_openers(
         client = RegistryClient(f"127.0.0.1:{port}", "team/app", ca_file=ca_file)
         start = threading.Barrier(4)
 
-        assert len(opener_constructions) == 2
+        assert len(opener_constructions) == 1
 
         def transfer(index):
             start.wait(timeout=SERVER_TIMEOUT_SECONDS)
@@ -548,7 +548,7 @@ def test_concurrent_first_use_reuses_ca_aware_openers(
     assert len(opener_constructions) == 2
 
 
-def test_push_only_client_reuses_eager_blob_opener(tmp_path, opener_constructions):
+def test_push_only_client_does_not_create_blob_opener(tmp_path, opener_constructions):
     content = b"push-only"
     digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
     source = tmp_path / "push-source"
@@ -557,7 +557,7 @@ def test_push_only_client_reuses_eager_blob_opener(tmp_path, opener_construction
         client = RegistryClient(f"127.0.0.1:{port}", "team/app", insecure=True)
         assert client.push_blob(digest, source)
         assert client.push_manifest("latest", json.dumps({"schemaVersion": 2}).encode())
-    assert len(opener_constructions) == 2
+    assert len(opener_constructions) == 1
     assert state.blobs[digest] == content
 
 

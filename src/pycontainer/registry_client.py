@@ -48,6 +48,7 @@ MAX_REPORTED_ERRORS = 5
 MAX_ERROR_TEXT_CHARS = 200
 LOW_RATE_LIMIT_REMAINING = 10
 QUOTA_STATUSES = {413, 507}
+DOCKER_HUB_ALIASES = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 SENSITIVE_HEADERS = ("Authorization", "Proxy-Authorization", "Cookie")
 
 logger = logging.getLogger(__name__)
@@ -68,9 +69,21 @@ _QUOTA_TEXT = re.compile(
 class RegistryRequestError(RuntimeError):
     """Raised when a registry request fails operationally."""
 
+    status: Optional[int] = None
+
+
+class RegistryConnectionError(RegistryRequestError):
+    """Raised when a registry cannot be reached after the retry budget."""
+
 
 class RegistryAuthenticationError(RegistryRequestError):
     """Raised when registry credentials cannot be exchanged or applied."""
+
+
+class RegistryAuthenticationConnectionError(
+    RegistryAuthenticationError, RegistryConnectionError
+):
+    """Raised when a token realm cannot be reached after the retry budget."""
 
 
 class RegistryRateLimitError(RegistryRequestError):
@@ -494,7 +507,9 @@ def _registry_error(
             " Authenticate to the registry (Docker Hub grants higher limits to "
             "signed-in users), wait for the reset, or use a registry mirror."
         )
-        return RegistryRateLimitError(message, retry_after)
+        error = RegistryRateLimitError(message, retry_after)
+        error.status = status
+        return error
 
     if (
         status in QUOTA_STATUSES
@@ -509,7 +524,9 @@ def _registry_error(
             "quota; free space in the repository, raise its quota, or reduce "
             "the image size."
         )
-        return RegistryQuotaError(message, blob_size)
+        error = RegistryQuotaError(message, blob_size)
+        error.status = status
+        return error
 
     if status in (401, 403) or codes & {"DENIED", "UNAUTHORIZED"}:
         target = ""
@@ -521,7 +538,9 @@ def _registry_error(
             f" Check that the credentials have pull or push permission{target}; "
             "some registries also report exhausted quotas as DENIED."
         )
-    return error_class(message)
+    error = error_class(message)
+    error.status = status
+    return error
 
 
 def _append_digest(url: str, digest: str) -> str:
@@ -554,7 +573,7 @@ class RegistryClient:
         if timeout <= 0:
             raise ValueError("Registry request timeout must be greater than zero.")
         self.registry = registry
-        if self.registry == "docker.io":
+        if self.registry in DOCKER_HUB_ALIASES:
             self.registry = "registry-1.docker.io"
         self.repository = repository
         self.auth_token = auth_token
@@ -587,11 +606,8 @@ class RegistryClient:
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPSHandler(context=self._ssl_context), SafeRedirect(insecure)
         )
-        self._blob_opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            urllib.request.HTTPSHandler(context=self._ssl_context),
-            NoRedirect(),
-        )
+        self._blob_opener = None
+        self._blob_opener_lock = threading.Lock()
 
     def _is_loopback_registry(self) -> bool:
         return is_loopback_host(urllib.parse.urlsplit(self.base_url).hostname)
@@ -779,7 +795,7 @@ class RegistryClient:
                 if attempt < MAX_REQUEST_RETRIES:
                     time.sleep(_retry_delay({}, attempt))
                     continue
-                raise RegistryAuthenticationError(
+                raise RegistryAuthenticationConnectionError(
                     "Registry bearer-token exchange failed due to a network error "
                     f"after {attempt + 1} attempt(s): {type(error).__name__}."
                 ) from None
@@ -892,7 +908,7 @@ class RegistryClient:
                 if retry_safe and attempt < MAX_REQUEST_RETRIES:
                     time.sleep(_retry_delay({}, attempt))
                     continue
-                raise RegistryRequestError(
+                raise RegistryConnectionError(
                     f"{method} request to {self._safe_request_url(url)} failed after "
                     f"{attempt + 1} attempt(s): {type(error).__name__}."
                 ) from None
@@ -1118,6 +1134,16 @@ class RegistryClient:
                 "Registry manifest HEAD descriptor does not match the built digest, size, or media type."
             )
 
+    def _get_blob_opener(self):
+        with self._blob_opener_lock:
+            if self._blob_opener is None:
+                self._blob_opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPSHandler(context=self._ssl_context),
+                    NoRedirect(),
+                )
+            return self._blob_opener
+
     def _open_blob_response(self, url: str, retry_auth: bool = True):
         _check_transport(self.base_url, url, self.insecure)
         with self._token_lock:
@@ -1128,7 +1154,7 @@ class RegistryClient:
         auth_challenge = None
         http_error = None
         try:
-            response = self._blob_opener.open(request, timeout=self.timeout)
+            response = self._get_blob_opener().open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             self._observe_rate_limit(error.headers, url)
             if retry_auth:
@@ -1181,9 +1207,11 @@ class RegistryClient:
         size = 0
         with self._open_blob_response(url) as response:
             if response.status != 200:
-                raise RegistryRequestError(
+                error = RegistryRequestError(
                     f"Blob download failed with HTTP {response.status}."
                 )
+                error.status = response.status
+                raise error
             content_length = response.headers.get("Content-Length")
             if content_length:
                 try:
@@ -1278,7 +1306,7 @@ class RegistryClient:
                     if attempt < MAX_REQUEST_RETRIES:
                         time.sleep(_retry_delay({}, attempt))
                         continue
-                    raise RegistryRequestError(
+                    raise RegistryConnectionError(
                         f"GET request to {self._safe_request_url(url)} failed after "
                         f"{attempt + 1} attempt(s): {type(error).__name__}."
                     ) from None
@@ -1349,7 +1377,7 @@ def parse_image_reference(ref: str) -> Tuple[str, str, str]:
         part in {"", ".", ".."} for part in repository.split("/")
     ):
         raise ValueError("Image reference contains an invalid repository name.")
-    if registry in {"docker.io", "index.docker.io"} and "/" not in repository:
+    if registry in DOCKER_HUB_ALIASES and "/" not in repository:
         repository = f"library/{repository}"
 
     return registry, repository, digest if separator else tag
