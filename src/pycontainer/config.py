@@ -64,6 +64,7 @@ class BuildConfig:
     latest_tag: bool = False
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -78,6 +79,10 @@ class BuildConfig:
             if not isinstance(self.registry_ca_file, str) or not self.registry_ca_file:
                 raise ValueError("registry_ca_file must be a non-empty path string.")
             create_registry_ssl_context(self.registry_ca_file)
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

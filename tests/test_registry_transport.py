@@ -801,6 +801,8 @@ def test_cli_transport_options_preserve_and_override_toml(
         "[build]\n"
         'insecure-registries = ["registry.example:5000"]\n'
         f"registry-ca-file = {json.dumps(ca_file)}\n"
+        "[build.security.kubernetes]\n"
+        "read-only-root-filesystem = true\n"
     )
 
     preserved = _capture_cli_config(monkeypatch, ["build", "--config", str(toml)])
@@ -812,6 +814,8 @@ def test_cli_transport_options_preserve_and_override_toml(
     assert preserved.insecure_registries == ["registry.example:5000"]
     assert overridden.insecure_registries == ["localhost:5000"]
     assert preserved.registry_ca_file == overridden.registry_ca_file == ca_file
+    expected_security = {"kubernetes": {"read_only_root_filesystem": True}}
+    assert preserved.security == overridden.security == expected_security
 
 
 @pytest.mark.parametrize(
