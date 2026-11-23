@@ -460,7 +460,7 @@ def test_cache_identity_for_equivalent_hardlink_topology_is_portable(tmp_path):
         files = [(context / "a.txt", Path("a.txt")), (context / "b.txt", Path("b.txt"))]
         keys.append(cache._compute_files_digest(files))
     assert keys[0] == keys[1]
-    assert keys[0].startswith("v3:")
+    assert keys[0].startswith("v4:")
 
 
 @pytest.mark.parametrize("workdir", ["/app", "/srv/app", "/"])

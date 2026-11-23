@@ -575,7 +575,7 @@ def test_multi_platform_trust_uses_scoped_base_credentials(
         tag_path = "/v2/team/base/manifests/3.11-slim"
         index_path = f"/v2/team/base/manifests/{server.subject_digest}"
         assert paths.count(tag_path) == 2
-        assert paths.count(index_path) == 2
+        assert paths.count(index_path) == 0
         for position, descriptor in enumerate(json.loads(server.subject)["manifests"]):
             child_path = f"/v2/team/base/manifests/{descriptor['digest']}"
             child_request = paths.index(child_path)

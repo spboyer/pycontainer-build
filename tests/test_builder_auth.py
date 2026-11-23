@@ -287,7 +287,8 @@ def test_multi_platform_build_scopes_auth_for_each_base_pull(
         "amd64", "arm64",
     ]
     assert all(path in fake.paths for path in config_paths)
-    assert f"/v2/team/image/manifests/{index_digest}" in fake.paths
+    assert f"/v2/team/image/manifests/{index_digest}" not in fake.paths
+    assert fake.paths.count("/v2/team/image/manifests/latest") == 2  # one 401 challenge and retry
     expected = _basic("base-user", "base-password") if scoped else None
     assert fake.headers_for("auth.base.example") == [expected, expected]
     _assert_no_destination_secret(
