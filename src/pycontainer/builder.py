@@ -171,6 +171,7 @@ from .project import (
 )
 from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
+from .release_notes import release_notes_labels
 from .registry_client import (
     RegistryClient,
     RegistryRequestError,
@@ -196,6 +197,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_libc_config,
     target_wheel_platform,
     validate_target_platform,
 )
@@ -204,6 +206,7 @@ logger=logging.getLogger(__name__)
 
 class ImageBuilder:
     def __init__(self, config: BuildConfig):
+        config.validate_metadata()
         self._history = (
             BuildHistory(config.history_dir)
             if config.record_history and not config.dry_run
@@ -252,6 +255,8 @@ class ImageBuilder:
                 and exclude not in config._conditional_excludes
             )
         )
+        self.release_notes_labels=release_notes_labels(config)
+        self._framework_label_explicit="framework" in (config.labels or {})
         self.config=config
         self._framework_before=None
         self._framework_after=None
@@ -310,10 +315,22 @@ class ImageBuilder:
             context_dir,
             files=[path for path, _ in self.context_files],
         )
+        if (
+            "framework" in self.release_notes_labels
+            and not self._framework_label_explicit
+            and config.labels
+        ):
+            # The configured release-notes key takes precedence over the framework default.
+            config.labels.pop("framework", None)
         self._framework_after={name: deepcopy(getattr(config, name)) for name in fields}
 
     def _entrypoint(self):
-        return self.config.entrypoint or detect_entrypoint(
+        # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
+        if self.config.entrypoint is not None:
+            return self.config.entrypoint
+        if self.config.cmd is not None:
+            return None
+        return detect_entrypoint(
             self.config.context_dir,
             files={relative for _, relative in self.context_files},
         )
@@ -330,6 +347,7 @@ class ImageBuilder:
         return timing.phase(name) if timing else nullcontext()
 
     def build(self):
+        self.config.validate_metadata()
         timing = BuildTiming() if self._history else None
         token = self._history_timer.set(timing) if timing else None
         try:
@@ -357,6 +375,15 @@ class ImageBuilder:
                 self._refresh_context_selection()
                 with output_directory_lock(self.config.output_dir):
                     result = self._build_image()
+                    if self.config.scan:
+                        from .scanning import scanned_image
+
+                        with scanned_image(
+                            Path(self.config.output_dir), self.manifest_digest, self.config
+                        ):
+                            logger.info(self.config.redact(
+                                f"Vulnerability gate passed for {self.manifest_digest}"
+                            ))
             except BaseException:
                 if timing:
                     self._record_failed_history(timing, self.config)
@@ -393,8 +420,15 @@ class ImageBuilder:
         app_layers=[]
         if self.config.include_deps:
             with self._time_history_phase("dependencies"):
+                staging_config = target_libc_config(
+                    os_name, arch, self.config.base_image, base_config, base_layers,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                    ),
+                )
                 deps_layer=self._create_deps_layer(
-                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                    layers_dir, base_config=staging_config, os_name=os_name, arch=arch
                 )
             if deps_layer: app_layers.append(deps_layer)
         
@@ -431,13 +465,17 @@ class ImageBuilder:
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers],
-                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes,
+                                generated_labels=self.release_notes_labels)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
         _write_content_addressed_bytes(cfg_path, cfg_bytes, cfg_digest)
 
-        manifest=build_manifest_json(cfg_digest,len(cfg_bytes),all_layers)
+        manifest=build_manifest_json(
+            cfg_digest,len(cfg_bytes),all_layers,
+            annotations=self.config.manifest_annotations,
+        )
         manifest_bytes=json.dumps(manifest,separators=(',',':')).encode()
         manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
         manifest_path=layers_dir/manifest_digest.split(":",1)[1]
@@ -457,6 +495,7 @@ class ImageBuilder:
             arch,
             os_name,
             variant=variant,
+            annotations=self.config.index_annotations,
             ref_names=ref_names,
         )
         _atomic_write_bytes(
@@ -618,8 +657,12 @@ class ImageBuilder:
         client.pull_blob(config_digest, config_path, config_size)
         try:
             base_config=json.loads(config_path.read_bytes())
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise RegistryRequestError("Base image config is not valid JSON.") from error
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            invalid_base_config = True
+        else:
+            invalid_base_config = False
+        if invalid_base_config:
+            raise RegistryRequestError("Base image config is not valid JSON.")
         if not isinstance(base_config, dict):
             raise RegistryRequestError("Base image config is not a JSON object.")
 
@@ -676,7 +719,29 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
-        
+        if self.config.scan:
+            from .scanning import scanned_image
+
+            with output_directory_lock(self.config.output_dir):
+                with scanned_image(
+                    Path(self.config.output_dir), self.manifest_digest, self.config
+                ) as (snapshot, descriptor):
+                    return self._push_image(registry_url, auth_token, username, password, show_progress, snapshot, descriptor)
+        return self._push_image(registry_url, auth_token, username, password, show_progress)
+
+    def _push_image(self, registry_url, auth_token, username, password, show_progress, output=None, descriptor=None):
+        output=output or Path(self.config.output_dir)
+        layers_dir=output/'blobs'/'sha256'
+        manifest_digest=descriptor["digest"] if descriptor else self.manifest_digest
+        manifest_path=layers_dir/manifest_digest.split(":",1)[1]
+        manifest_data=manifest_path.read_bytes()
+        if descriptor:
+            manifest=json.loads(manifest_data)
+            layers=manifest["layers"]
+            config_digest=manifest["config"]["digest"]
+        else:
+            layers=[layer.to_descriptor() for layer in self.layers]
+            config_digest=self.config_digest
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         push_tags=[tag]
@@ -693,24 +758,21 @@ class ImageBuilder:
             **log_options,
         )
         client=self._registry_client(registry, repo, auth)
-        output=Path(self.config.output_dir)
-        layers_dir=output/'blobs'/'sha256'
         
         if show_progress: self._print(f"Pushing to {registry}/{repo}:{tag}")
         
-        for i, layer in enumerate(self.layers, 1):
-            if show_progress: self._print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
-            blob_path=layers_dir/layer.digest.split(":",1)[1]
-            skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
+        for i, layer in enumerate(layers, 1):
+            digest=layer["digest"]
+            if show_progress: self._print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
+            blob_path=layers_dir/digest.split(":",1)[1]
+            skipped=not client.push_blob(digest, blob_path, check_exists=True)
             if show_progress and skipped: self._print("    Layer exists, skipped")
         
-        if show_progress: self._print(f"  Pushing config ({self.config_digest[:19]}...)")
-        cfg_path=layers_dir/self.config_digest.split(":",1)[1]
-        client.push_blob(self.config_digest, cfg_path, check_exists=True)
+        if show_progress: self._print(f"  Pushing config ({config_digest[:19]}...)")
+        cfg_path=layers_dir/config_digest.split(":",1)[1]
+        client.push_blob(config_digest, cfg_path, check_exists=True)
         
-        if show_progress: self._print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
-        manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
-        manifest_data=manifest_path.read_bytes()
+        if show_progress: self._print(f"  Pushing manifest ({manifest_digest[:19]}...)")
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
             if show_progress: self._print(f"✓ Pushed {registry}/{repo}:{push_tag}")
@@ -726,13 +788,26 @@ class ImageBuilder:
         self._print(f"  Base Image: {self.config.base_image}")
         self._print(f"  Context: {self.config.context_dir}")
         self._print(f"  Working Dir: {self.config.workdir}")
-        self._print(f"  Entrypoint: {' '.join(self._entrypoint())}")
+        entrypoint = self._entrypoint()
+        if entrypoint is None:
+            entrypoint = '<inherited from base image>'
+        else:
+            entrypoint = ' '.join(entrypoint) or '<none>'
+        self._print(f"  Entrypoint: {entrypoint}")
+        if self.config.cmd is not None:
+            self._print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
         if self.config.exposed_ports:
             self._print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:
             self._print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
-            self._print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+            self._print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
+        for key, notes in self.release_notes_labels.items():
+            self._print(f"  Release Notes: label {key}, {len(notes.encode('utf-8'))} bytes (contents hidden)")
+        if self.config.manifest_annotations:
+            self._print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
+        if self.config.index_annotations:
+            self._print(f"  Index Annotations: {len(self.config.index_annotations)} configured (values hidden)")
         if self.config.stop_signal:
             self._print(f"  Stop Signal: {self.config.stop_signal}")
         if self.config.volumes:

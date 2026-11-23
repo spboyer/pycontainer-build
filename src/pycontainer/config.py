@@ -7,7 +7,10 @@ from typing import Dict, List, Optional, Tuple, Union
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 from .file_rules import evaluate_file_rules
 
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
+
 SBOM_FORMATS = ("spdx", "cyclonedx")
+SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
@@ -109,6 +112,17 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    manifest_annotations: Optional[Dict[str, str]] = None
+    index_annotations: Optional[Dict[str, str]] = None
+    scan: bool = False
+    scan_executable: str = "grype"
+    scan_threshold: str = "high"
+    scan_unknown: str = "fail"
+    scan_report_format: str = "json"
+    scan_report: Optional[str] = None
+    scan_offline: bool = False
+    scan_db_dir: Optional[str] = None
+    scan_db_max_age_hours: int = 120
     record_history: bool = False
     history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
@@ -116,6 +130,8 @@ class BuildConfig:
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
+    release_notes_file: Optional[str] = None
+    release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
     build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
     file_rules: List[Dict[str, Union[str, List[str]]]] = field(default_factory=list)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
@@ -137,9 +153,22 @@ class BuildConfig:
             raise ValueError(self.redact(str(exc))) from None
 
     def _validate(self):
+        from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
+        self.validate_metadata()
+        validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.scan_threshold not in SCAN_SEVERITIES:
+            raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
+        if self.scan_unknown not in ("fail", "ignore"):
+            raise ValueError("scan_unknown must be fail or ignore")
+        if self.scan_report_format not in ("json", "sarif"):
+            raise ValueError("scan_report_format must be json or sarif")
+        if type(self.scan_db_max_age_hours) is not int or self.scan_db_max_age_hours <= 0:
+            raise ValueError("scan_db_max_age_hours must be a positive integer")
+        if not isinstance(self.scan_executable, str) or not self.scan_executable.strip():
+            raise ValueError("scan_executable must be a nonempty executable path or name")
         self.insecure_registries = validate_insecure_registries(
             self.insecure_registries
         )
@@ -192,6 +221,16 @@ class BuildConfig:
             }
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def validate_metadata(self) -> None:
+        from .metadata import validate_metadata
+
+        for name in ("labels", "manifest_annotations", "index_annotations"):
+            validate_metadata(
+                getattr(self, name),
+                name,
+                protect_reference=name != "labels",
+            )
 
     def all_tags(self) -> List[str]:
         """Return every full image reference this build is tagged with."""

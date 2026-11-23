@@ -169,6 +169,39 @@ def test_cli_override_order_and_empty_value(tmp_path, monkeypatch):
     assert configs[0].labels == {"version": "last=with=equals"}
 
 
+@pytest.mark.parametrize("operation", ["build", "push"])
+@pytest.mark.parametrize(("category", "exit_code"), [("findings", 3), ("scanner", 4)])
+def test_scan_errors_redact_arguments_and_preserve_exit_code(
+    tmp_path, monkeypatch, capsys, operation, category, exit_code,
+):
+    from pycontainer.scanning import ScanError
+
+    value = "private-scan-value"
+    path = tmp_path / "config.toml"
+    path.write_text(f'[build.build-args]\nVALUE = "{value}"\n')
+
+    class FailingBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            if operation == "build":
+                raise ScanError(category, f"failure: {value}")
+            return "layout"
+
+        def push(self, **kwargs):
+            raise ScanError(category, f"failure: {value}")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FailingBuilder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--config", str(path), "--push"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    output = capsys.readouterr()
+    assert error.value.code == exit_code
+    assert value not in output.out + output.err
+    assert "<redacted>" in output.err
+
+
 def test_semantic_validation_redacts_escaped_argument_values(tmp_path, monkeypatch, capsys):
     path = tmp_path / "config.toml"
     path.write_text(
@@ -199,6 +232,35 @@ def test_real_dry_run_redacts_arguments_and_resolves_cli_fields(tmp_path, monkey
     assert "private-version" not in output.out + output.err + caplog.text
     assert "cli:<redacted>" in output.out
     assert not (tmp_path / "dist").exists()
+
+
+def test_cli_label_precedence_interpolates_and_hides_metadata(tmp_path, monkeypatch, capsys):
+    (tmp_path / "app.py").write_text("print('hello')")
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[build.labels]\nversion = "file:${VERSION}"\nretained = "file"\n'
+        '[build.build-args]\nVERSION = "private-version"\n'
+    )
+    configs = []
+
+    class CaptureBuilder(ImageBuilder):
+        def __init__(self, config):
+            super().__init__(config)
+            configs.append(config)
+
+    monkeypatch.setattr(cli, "ImageBuilder", CaptureBuilder)
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", "build", "--config", str(path), "--context", str(tmp_path),
+        "--label", "version=cli:${VERSION}", "--manifest-annotation", "example=manifest-value",
+        "--index-annotation", "example=index-value", "--dry-run",
+    ])
+    cli.main()
+    assert configs[0].labels == {"version": "cli:private-version", "retained": "file"}
+    assert configs[0].manifest_annotations == {"example": "manifest-value"}
+    assert configs[0].index_annotations == {"example": "index-value"}
+    output = capsys.readouterr()
+    for value in ("private-version", "manifest-value", "index-value"):
+        assert value not in output.out + output.err
 
 
 def test_dry_run_redacts_values_in_non_expandable_fields(tmp_path, capsys):
@@ -280,6 +342,9 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
     builder.manifest_digest = "sha256:" + "a" * 64
     builder.config_digest = "sha256:" + "b" * 64
     builder.layers = []
+    manifest = tmp_path / "out" / "blobs" / "sha256" / ("a" * 64)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"{}")
 
     with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError, match="stopped"):
         if operation == "pull":
