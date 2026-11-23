@@ -2437,6 +2437,20 @@ def test_arm_v7_verified_tag_inspects_libc_from_base_layers(tmp_path):
     assert tags[-1] == "manylinux2014_armv7l"
 
 
+def test_arm_v7_verified_alpine_tag_inspects_apk_libc(tmp_path):
+    layer = _base_metadata_layer(
+        tmp_path, [("lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:armv7\n")]
+    )
+    config = target_libc_config(
+        "linux", "arm", "python:3.11-alpine", UNPROVEN_BASE_CONFIG, [layer],
+        base_image_tag_verified=True, variant="v7",
+    )
+    assert target_wheel_platforms(
+        "linux", "arm", "python:3.11-alpine", config,
+        base_image_tag_verified=True, variant="v7",
+    ) == ["musllinux_1_2_armv7l", "musllinux_1_1_armv7l"]
+
+
 def test_arm_v7_requirements_stage_only_armv7l_wheels(tmp_path, monkeypatch):
     context = tmp_path / "context"
     context.mkdir()

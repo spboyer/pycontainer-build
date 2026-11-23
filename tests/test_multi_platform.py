@@ -613,6 +613,55 @@ def test_multi_platform_annotation_changes_recompute_only_dependent_digests(
     assert [image.config_digest for image in builder.platform_images] == original_configs
 
 
+@pytest.mark.parametrize("release_key", ["example.notes", "framework"])
+def test_multi_platform_release_notes_respect_label_precedence(
+    tmp_path, monkeypatch, release_key
+):
+    ctx = _context(tmp_path)
+    (ctx / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    (ctx / "notes.md").write_bytes(b"release notes\r\n")
+    bases = {
+        arch: {"Labels": {release_key: f"base-{arch}", "shared": "base"}}
+        for arch in ("amd64", "arm64", "arm")
+    }
+    builder = _builder(
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_runtime_by_arch=bases),
+        ctx=ctx, platform="linux/amd64,linux/arm64,linux/arm/v7",
+        release_notes_file="notes.md", release_notes_label=release_key,
+        labels={"shared": "explicit"},
+        manifest_annotations={"example.manifest": "one"},
+        index_annotations={"example.index": "one"},
+    )
+    builder.build()
+    for image in builder.platform_images:
+        image_config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        if image.platform["architecture"] == "arm":
+            assert image.platform["variant"] == image_config["variant"] == "v7"
+        config = image_config["config"]
+        assert config["Labels"][release_key] == "release notes\n"
+        assert config["Labels"]["shared"] == "explicit"
+
+
+@pytest.mark.parametrize("release_key", ["example.notes", "framework"])
+def test_multi_platform_release_notes_reject_explicit_label_collisions_before_pull(
+    tmp_path, monkeypatch, release_key
+):
+    from pycontainer.release_notes import ReleaseNotesError
+
+    ctx = _context(tmp_path)
+    (ctx / "notes.md").write_text("notes")
+    registry = FakeBaseRegistry()
+    with pytest.raises(ReleaseNotesError, match="conflict"):
+        _builder(
+            tmp_path, monkeypatch, registry, ctx=ctx,
+            release_notes_file="notes.md", release_notes_label=release_key,
+            labels={release_key: "explicit"},
+        )
+    assert registry.manifest_calls == []
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
 @pytest.mark.parametrize("override", [False, True])
 def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
     tmp_path, monkeypatch, override
