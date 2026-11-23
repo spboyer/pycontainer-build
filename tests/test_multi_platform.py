@@ -41,7 +41,7 @@ class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
     def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None,
-                 base_env_by_arch=None):
+                 base_env_by_arch=None, base_runtime_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
@@ -55,10 +55,13 @@ class FakeBaseRegistry:
                     "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
                     "PYTHON_LIBC=glibc-2.17",
                 ]
+            runtime = {"Env": env, "WorkingDir": "/"}
+            if base_runtime_by_arch is not None:
+                runtime.update(base_runtime_by_arch[arch])
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
-                "config": {"Env": env, "WorkingDir": "/"},
+                "config": runtime,
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -332,6 +335,40 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
+    tmp_path, monkeypatch, override
+):
+    bases = {
+        "amd64": {"StopSignal": "SIGQUIT", "Volumes": {"/amd64": {}}},
+        "arm64": {"StopSignal": "SIGINT", "Volumes": {"/arm64": {}}},
+    }
+    options = {"stop_signal": "SIGTERM", "volumes": ["/shared"]} if override else {}
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), **options
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+
+    for descriptor in index["manifests"]:
+        arch = descriptor["platform"]["architecture"]
+        manifest_bytes = _blob(out, descriptor["digest"])
+        assert _digest(manifest_bytes) == descriptor["digest"]
+        assert len(manifest_bytes) == descriptor["size"]
+        manifest = json.loads(manifest_bytes)
+        config_descriptor = manifest["config"]
+        config_bytes = _blob(out, config_descriptor["digest"])
+        assert _digest(config_bytes) == config_descriptor["digest"]
+        assert len(config_bytes) == config_descriptor["size"]
+        config = json.loads(config_bytes)["config"]
+        assert config["StopSignal"] == ("SIGTERM" if override else bases[arch]["StopSignal"])
+        volumes = {f"/{arch}": {}}
+        if override:
+            volumes["/shared"] = {}
+        assert config["Volumes"] == volumes
+
+
 def test_repeated_reproducible_builds_have_same_index_digest(tmp_path, monkeypatch):
     registry = FakeBaseRegistry()
     first = _builder(tmp_path, monkeypatch, registry)
@@ -474,6 +511,44 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
         tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True,
         ctx=ctx, exclude_paths=[".venv"],
     )
+    builder.build()
+    assert installs == ["amd64", "arm64"]
+
+
+def test_multi_platform_rejects_conda_only_before_pulling_or_publication(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    (ctx / "environment.yml").write_text("name: example\n")
+    out = tmp_path / "out"
+    refs = out / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (out / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, include_deps=True, ctx=ctx)
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+    assert registry.manifest_calls == []
+    assert (out / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
+
+
+def test_multi_platform_conda_with_requirements_stages_each_target(tmp_path, monkeypatch):
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "environment.yml").write_text("name: example\n")
+    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "demo.py").write_text("X = 1\n")
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, **kwargs):
+        installs.append(arch)
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
     builder.build()
     assert installs == ["amd64", "arm64"]
 

@@ -78,6 +78,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--stop-signal",help="OCI StopSignal, e.g. SIGTERM or SIGRTMIN+3 (overrides the base image value)")
+    b.add_argument("--volume",dest="volumes",action="append",help="Declare an absolute container path as an OCI volume (repeatable; merged with base volumes; metadata only, no mount is created)")
 
 def main():
     _tolerate_unencodable_output()
@@ -97,6 +99,7 @@ def main():
     imp.add_argument("--output","-o",help="Write settings to this pyproject.toml (default: print to stdout)")
     imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
+    imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
     history=sub.add_parser("history",help="Inspect or delete local build history")
     history_actions=history.add_subparsers(dest="history_action",required=True)
@@ -129,10 +132,11 @@ def main():
         return
 
     if args.cmd=="import":
-        from .dockerfile_import import run_import
+        from .dockerfile_import import parse_shell_option, run_import
         build_args=dict(a.partition("=")[::2] for a in args.build_arg)
         try:
-            message,code=run_import(Path(args.dockerfile),Path(args.output) if args.output else None,args.force,build_args)
+            shell=parse_shell_option(args.shell) if args.shell is not None else None
+            message,code=run_import(Path(args.dockerfile),Path(args.output) if args.output else None,args.force,build_args,shell)
         except (FileNotFoundError,ValueError) as exc:
             parser.error(str(exc))
         print(message)
@@ -188,6 +192,8 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'stop_signal': args.stop_signal,
+        'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
         'registry_ca_file': args.registry_ca_file,
     }

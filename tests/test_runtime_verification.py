@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +85,86 @@ def test_gate_passes_only_with_full_evidence_for_every_target(tmp_path):
     assert "| `linux/amd64` |" in summary
     assert "| `linux/arm64` |" in summary
     assert "Not validated" not in summary
+
+
+@pytest.mark.parametrize(
+    ("shell_command", "mode"),
+    [(False, "oci-import-startup"), (True, "shell-command")],
+)
+@pytest.mark.parametrize("startup_fails", [False, True], ids=["passed", "failed-startup"])
+def test_runtime_modes_preserve_release_evidence_boundary(
+    tmp_path, monkeypatch, shell_command, mode, startup_fails
+):
+    configs = []
+    calls = []
+
+    class FakeBuilder:
+        def __init__(self, config):
+            configs.append(config)
+            self.config = config
+            self.manifest_digest = "sha256:" + "b" * 64
+            self.config_digest = "sha256:" + "c" * 64
+            self.layers = [SimpleNamespace(digest="sha256:" + "d" * 64)]
+
+        def build(self):
+            output = Path(self.config.output_dir)
+            output.mkdir()
+            (output / "sbom.json").write_text('{"name": "runtime-fixture"}')
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["docker", "version"]:
+            stdout = "linux/arm64" if ".Os" in command[-1] else "28.0.0"
+        elif command[:3] == ["docker", "image", "inspect"]:
+            stdout = "linux/arm64"
+        elif command[:2] == ["skopeo", "--version"]:
+            stdout = "skopeo version 1.13.3"
+        elif command[:2] == ["docker", "run"]:
+            if startup_fails:
+                raise subprocess.CalledProcessError(
+                    1, command, output="startup failed", stderr="container error"
+                )
+            stdout = (
+                runtime_check.SHELL_COMMAND_EXPECTED
+                if shell_command
+                else runtime_check.RUNTIME_MARKER + "\n"
+            )
+        else:
+            stdout = ""
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+    monkeypatch.setattr(runtime_check, "ImageBuilder", FakeBuilder)
+    monkeypatch.setattr(runtime_check.shutil, "which", lambda name: name)
+    monkeypatch.setattr(runtime_check.subprocess, "run", run)
+    monkeypatch.setenv("GITHUB_SHA", COMMIT)
+    monkeypatch.setenv("GITHUB_RUN_ID", RUN_ID)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT)
+    evidence_path = tmp_path / "evidence.json"
+    args = ["--platform", "linux/arm64", "--evidence", str(evidence_path)]
+    if shell_command:
+        args += ["--shell-command", "--shell", '["/bin/bash", "-c"]']
+    if startup_fails:
+        with pytest.raises(subprocess.CalledProcessError):
+            runtime_check.main(args)
+    else:
+        runtime_check.main(args)
+    record = json.loads(evidence_path.read_text())
+
+    assert record["status"] == ("failed" if startup_fails else "passed")
+    assert record["mode"] == mode
+    assert configs[0].platform == "linux/arm64"
+    assert any(command[:3] == ["docker", "image", "rm"] for command in calls)
+    reason = verifier.rejection_reason(
+        record, "linux/arm64", COMMIT, RUN_ID, RUN_ATTEMPT
+    )
+    if startup_fails:
+        assert "CalledProcessError" in record["error"]
+        assert reason.startswith("check failed:")
+    elif shell_command:
+        assert configs[0].entrypoint[:2] == ["/bin/bash", "-c"]
+        assert "not a full OCI import and startup" in reason
+    else:
+        assert reason is None
 
 
 def _failed(record):
@@ -248,7 +329,8 @@ def test_runtime_check_records_failure_when_docker_is_missing(tmp_path, monkeypa
     assert "required executable not found: docker" in record["error"]
 
 
-def test_runtime_check_refuses_emulated_daemon(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra_args", [[], ["--shell-command"]], ids=["full", "shell"])
+def test_runtime_check_refuses_emulated_daemon(tmp_path, monkeypatch, extra_args):
     monkeypatch.setattr(runtime_check.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     class Result:
@@ -263,11 +345,14 @@ def test_runtime_check_refuses_emulated_daemon(tmp_path, monkeypatch):
     evidence = tmp_path / "evidence.json"
 
     with pytest.raises(RuntimeError, match="emulated runs are not runtime evidence"):
-        runtime_check.main(["--platform", "linux/arm64", "--evidence", str(evidence)])
+        runtime_check.main(
+            ["--platform", "linux/arm64", "--evidence", str(evidence), *extra_args]
+        )
 
     record = json.loads(evidence.read_text())
     assert record["status"] == "failed"
     assert record["daemon_platform"] == "linux/amd64"
+    assert record["mode"] == ("shell-command" if extra_args else "oci-import-startup")
 
 
 def _mock_index_runtime(monkeypatch, target, *, fail_copy=False, wrong_config=False):

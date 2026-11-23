@@ -462,6 +462,16 @@ pycontainer build \
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
   establish the Python ABI. These metadata checks apply to requirements and
   virtualenv staging alike.
+- **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
+  `conda-lock.yml`, and `conda-meta/` directories in the context. With
+  `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
+  selected pip requirements file takes precedence over a venv, with a warning
+  that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
+  ordinary Conda projects still build application-only images. Host Conda
+  prefixes are never copied, even with explicit includes or
+  `--no-default-excludes`; a context inside a Conda prefix requires a source-only
+  context instead. See the [export workaround](docs/local-development.md#conda-projects).
+  Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
 
 ### Local base images
 
@@ -556,6 +566,9 @@ error handling, and custom-directory inspection.
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
   `linux/arm64` or `linux/arm/v7`), or `linux/amd64,linux/arm64` to build an
   OCI image index
+- `--stop-signal SIGNAL` — Image `StopSignal`, as a canonical Linux name such
+  as `SIGTERM`, `SIGINT` or `SIGRTMIN+3`
+- `--volume PATH` — Declare an image volume (repeatable; absolute Linux path)
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
@@ -664,6 +677,31 @@ values intact, and settings absent from both use `BuildConfig` defaults. Keys
 in `[build]` may use hyphens or underscores. After overrides are applied,
 unknown settings and values with the wrong TOML type are reported as
 configuration errors.
+
+#### Stop signal and volumes
+
+`stop_signal` (`--stop-signal`) and `volumes` (`--volume`, repeatable) set the
+OCI image config `StopSignal` and `Volumes` fields:
+
+```toml
+[build]
+stop_signal = "SIGINT"
+volumes = ["/data", "/var/cache/app"]
+```
+
+- When unset, the base image's `StopSignal` and `Volumes` are inherited
+  unchanged. A configured `stop_signal` replaces the base value.
+- Configured volumes are merged with the base volumes as a sorted,
+  de-duplicated set, so the config digest is deterministic. Base volumes
+  cannot be removed. `--volume` values replace (not extend) the file's list.
+- Signals must be canonical Linux names (`SIGTERM`, not `term`, `15` or
+  `sigterm`). Volume paths must be absolute, normalized Linux paths; `/`,
+  relative paths, `.`/`..` segments, backslashes, trailing slashes and control
+  characters are rejected.
+- Volumes are image metadata only: pycontainer does not create mounts, and the
+  container runtime decides how to back them. The stop signal is honored only by
+  runtimes that read it, such as `docker stop`.
+- These are config fields, not OCI labels; `labels` are unaffected.
 
 `--config` also accepts a `pyproject.toml` whose settings live under
 `[tool.pycontainer]` (with `[tool.pycontainer.env]` and
