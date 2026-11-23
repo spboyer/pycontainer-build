@@ -137,6 +137,16 @@ def _detect_framework(
             continue
         selected_path = ctx / relative
         if not selected_path.resolve().is_relative_to(ctx):
+            if any(
+                (ctx / parent).is_symlink()
+                for parent in relative.parents
+                if parent != Path(".")
+            ):
+                logger.warning(
+                    "Skipping source %s: its directory symlink resolves outside the build context.",
+                    relative,
+                )
+                continue
             raise ValueError(f"Selected source is outside the build context: {path}")
         if not selected_path.is_file():
             raise FileNotFoundError(f"Selected source file not found: {path}")

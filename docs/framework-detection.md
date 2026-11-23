@@ -77,6 +77,8 @@ opts out. With automatic file selection, notebook files outside excluded paths
 are included when Jupyter is declared; explicit includes remain authoritative.
 Source and notebook symlinks are skipped with a warning unless every target in
 the link chain is selected, not excluded, and a relative POSIX-style path.
+Sources reached through a directory symlink outside the build context are also
+skipped with a warning, even when that directory is selected.
 Notebooks without a declared Jupyter dependency do not trigger detection, and
 `--verbose` reports why. Include any accompanying data files explicitly when
 they are outside the other automatically selected paths.

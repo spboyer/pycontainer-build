@@ -446,6 +446,20 @@ def test_detector_accepts_preselected_files_and_never_executes_them(tmp_path):
     assert not marker.exists()
 
 
+def test_linked_source_directory_outside_context_is_not_detected(tmp_path, caplog):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "streamlit\n")
+    source = tmp_path / "external"
+    write_file(source, "app.py", "import streamlit\n")
+    try:
+        (context / "src").symlink_to(source, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Directory symlink unavailable: {error}")
+
+    assert detect_framework(context, include_paths=["src"]) is None
+    assert "directory symlink resolves outside the build context" in caplog.text
+
+
 def test_preselected_files_still_respect_explicit_and_default_excludes(tmp_path):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
     excluded = write_file(tmp_path, "tests/example.py", "import streamlit\n")

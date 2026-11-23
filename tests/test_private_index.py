@@ -28,7 +28,9 @@ from pycontainer.dependencies import (
     staged_packages,
     validate_requirements,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
+from test_dependency_staging import (
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _write_named_wheel, _write_wheel,
+)
 
 
 USER = "synthetic-user"
@@ -534,6 +536,30 @@ def test_host_platform_override_cannot_select_foreign_wheels(
         assert "Ignoring host pip settings" in capsys.readouterr().out
 
 
+def test_host_platform_override_cannot_admit_newer_libc_wheel(tmp_path, monkeypatch, home):
+    context = _context(
+        tmp_path, "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux_2_28_x86_64")
+    monkeypatch.setenv("PIP_PLATFORM", "manylinux_2_28_x86_64")
+    raw = subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-input", "--target", str(tmp_path / "raw"),
+            "--platform", "manylinux_2_17_x86_64", "--python-version", "3.11",
+            "--implementation", "cp", "--only-binary=:all:", "-r", "requirements.txt",
+        ],
+        cwd=context,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert raw.returncode == 0, raw.stderr
+    with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+        _install(tmp_path, context)
+
+
 def test_host_pip_overrides_do_not_change_target_install(
     tmp_path, monkeypatch, capsys, home
 ):
@@ -773,10 +799,15 @@ def test_cached_build_keeps_index_credentials_out_of_cache(
     tmp_path, monkeypatch, capfd, home, index
 ):
     monkeypatch.setenv("PIP_INDEX_URL", index.url_with(f"{USER}:{SECRET}"))
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    base_config = {
+        **BASE_CONFIG,
+        "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
+    }
     monkeypatch.setattr(
         ImageBuilder,
         "_pull_base_image",
-        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
+        lambda self, layers_dir, os_name, arch: ([layer], base_config),
     )
     cache = tmp_path / "cache"
     context = _context(tmp_path)

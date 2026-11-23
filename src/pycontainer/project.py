@@ -68,7 +68,15 @@ def declared_dependency_names(
                 raise OSError("Cannot access an environment-based requirements file.") from None
             raise
         if not contained:
-            raise ValueError(f"Dependency file is outside the build context: {display or relative}")
+            if conda_prefix(ctx, relative) is not None:
+                raise ValueError(
+                    "Conda staging is unsupported. Export pip-compatible requirements "
+                    "with `python -m pip freeze > requirements.txt` inside the build context."
+                )
+            raise ValueError(
+                f"Dependency file is outside the build context: {display or relative}; "
+                "requirements must stay inside the build context."
+            )
         return path
 
     def read_requirements(relative, *, required=False, environment_path=False, ancestors=frozenset()):

@@ -207,6 +207,7 @@ def test_build_output_and_cache_are_excluded_but_requested_venv_deps_are_staged(
         cache_dir=str(context / "cache"),
         use_cache=True,
         include_deps=True,
+        base_image="python:3.11-slim-bookworm",
     )
     from pycontainer.builder import ImageBuilder
 

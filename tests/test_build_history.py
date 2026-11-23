@@ -14,6 +14,8 @@ from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.history import BuildHistory, HistoryStorageError
 
+from test_dependency_staging import _base_metadata_layer, _dpkg_libc
+
 
 BASE_CONFIG = {
     "architecture": "amd64",
@@ -148,8 +150,22 @@ def test_successful_repeated_builds_record_timings_without_changing_oci(
 def test_enabled_optional_phases_are_reported(tmp_path, monkeypatch):
     import pycontainer.builder as builder_module
 
-    _offline_base(monkeypatch)
-    monkeypatch.setattr(ImageBuilder, "_create_deps_layer", lambda *args, **kwargs: None)
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    base_config = {
+        **BASE_CONFIG,
+        "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
+    }
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([layer], base_config),
+    )
+    staged_configs = []
+
+    def stage_deps(self, layers_dir, **kwargs):
+        staged_configs.append(kwargs["base_config"])
+        return None
+
+    monkeypatch.setattr(ImageBuilder, "_create_deps_layer", stage_deps)
     monkeypatch.setattr(
         builder_module,
         "generate_sbom",
@@ -159,8 +175,23 @@ def test_enabled_optional_phases_are_reported(tmp_path, monkeypatch):
 
     ImageBuilder(config).build()
 
+    assert "PYTHON_LIBC=glibc-2.36" in staged_configs[0]["config"]["Env"]
+    assert base_config["config"]["Env"] == []
     phases = BuildHistory(Path(config.history_dir)).list()[0]["phases_ns"]
     assert set(phases) == {"base_image", "dependencies", "application", "sbom"}
+
+
+def test_libc_evidence_failure_records_dependency_phase(tmp_path, monkeypatch):
+    _offline_base(monkeypatch)
+    config = _history_config(tmp_path, include_deps=True)
+
+    with pytest.raises(ValueError, match="absent or ambiguous"):
+        ImageBuilder(config).build()
+
+    record = BuildHistory(Path(config.history_dir)).list()[0]
+    assert record["status"] == "failed"
+    assert "dependencies" in record["phases_ns"]
+    assert "application" not in record["phases_ns"]
 
 
 def test_history_and_security_fragments_are_both_preserved(tmp_path, monkeypatch):
