@@ -24,6 +24,7 @@ from ._venv_closure import (
 )
 from .dependencies import _MARKER_MACHINES, _read_staged_distributions, validate_target_platform
 from .fs_utils import context_file_path
+from .registry_client import is_loopback_host
 
 try:
     from packaging.markers import InvalidMarker, Marker, UndefinedComparison
@@ -335,6 +336,11 @@ def _index_url(url: str, source: str) -> Optional[str]:
         )
     if parts.scheme == "http" and (userinfo or query_values or _PLACEHOLDER.search(url)):
         raise LockfileError(f"Package index credentials for {source} require HTTPS.")
+    if parts.scheme == "http" and not is_loopback_host(parts.hostname):
+        # pip would send matching netrc credentials over plain HTTP.
+        raise LockfileError(
+            f"Package index for {source} requires HTTPS; plain HTTP is accepted only for loopback hosts."
+        )
     location = parts.netloc.rsplit("@", 1)[-1] + parts.path
     if "$" in location or "%24" in location.lower():
         raise LockfileError(
@@ -878,7 +884,7 @@ def _load_pdm(path: Path, environment, context_dir: Path):
     targets = metadata.get("targets", [])
     if any(set(target) - {"requires_python"} for target in targets):
         raise LockfileError("pdm.lock platform-specific targets are unsupported; lock for requires-python only.")
-    index = _pdm_index(path, pyproject)
+    index = _pdm_index(path, pyproject, context_dir)
     if environment is None:
         return []
     _require_python(pyproject.get("project", {}).get("requires-python"), environment, "pyproject.toml")
@@ -936,9 +942,12 @@ def _load_pdm(path: Path, environment, context_dir: Path):
     return packages
 
 
-def _pdm_index(path: Path, pyproject: dict) -> Optional[str]:
+def _pdm_index(path: Path, pyproject: dict, context_dir: Path) -> Optional[str]:
     """PDM locks do not record a package's index, so only a single project index is accepted."""
-    if (path.parent / "pdm.toml").is_file() and "pypi" in _read_toml(path.parent / "pdm.toml"):
+    pdm_toml = path.parent / "pdm.toml"
+    if pdm_toml.is_symlink() or pdm_toml.exists():
+        pdm_toml = _manifest(path, "pdm.toml", context_dir)
+    if pdm_toml.is_file() and "pypi" in _read_toml(pdm_toml):
         raise LockfileError("pdm.toml [pypi] index settings are unsupported; declare one [[tool.pdm.source]].")
     sources = pyproject.get("tool", {}).get("pdm", {}).get("source", [])
     indexes = []

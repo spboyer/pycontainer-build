@@ -752,6 +752,18 @@ def test_pdm_toml_index_settings_are_rejected(tmp_path):
         load_lockfile(context, Path("pdm.lock"), PY311)
 
 
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+def test_pdm_toml_link_cannot_leave_context(tmp_path, target_kind):
+    context = _copy(tmp_path, "pdm")
+    target = tmp_path / "outside.toml"
+    if target_kind == "outside":
+        target.write_text("[other]\n")
+    _symlink_or_skip(context / "pdm.toml", target)
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        load_lockfile(context, Path("pdm.lock"), PY311)
+
+
 def test_uv_records_each_packages_registry(tmp_path):
     context = _write_uv_project(tmp_path / "uv", registry=PRIVATE)
 
@@ -909,6 +921,16 @@ def test_index_credentials_require_https(tmp_path, registry):
     context = _write_uv_project(tmp_path / "context", registry=registry)
     with pytest.raises(LockfileError, match="HTTPS"):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_plain_http_index_is_loopback_only(tmp_path):
+    remote = _write_uv_project(tmp_path / "remote", registry="http://example.com/simple")
+    with pytest.raises(LockfileError, match="only for loopback hosts"):
+        load_lockfile(remote, Path("uv.lock"), PY311)
+
+    loopback = _write_uv_project(tmp_path / "loopback", registry="http://127.0.0.1:8080/simple")
+    text = load_lockfile(loopback, Path("uv.lock"), PY311).requirement_sets()[0][1]
+    assert "--trusted-host 127.0.0.1" in text
 
 
 @pytest.mark.parametrize(

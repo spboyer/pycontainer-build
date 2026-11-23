@@ -619,10 +619,15 @@ come from uv `source.registry`, Poetry `source` (none means PyPI, which must
 then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
 first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
 only with a single effective index (PyPI or one source named `pypi`), and
-`pdm.toml` `[pypi]` settings are rejected. To build through a PyPI mirror,
+`pdm.toml` `[pypi]` settings are rejected. User or global PDM index settings
+(`pdm config pypi.url`, `PDM_PYPI_URL`) are not recorded in the lock and
+cannot be detected; such a lock is installed from PyPI, where its hashes must
+still match. To build through a PyPI mirror,
 relock against the mirror so the lock records it. The recorded index is
 trusted for the files its pages link to (PyPI serves them from
-files.pythonhosted.org), and hashes verify the bytes. Index credentials must
+files.pythonhosted.org), and hashes verify the bytes. Recorded indexes must
+use HTTPS; plain HTTP is accepted only for loopback hosts, because pip may
+send netrc credentials. Index credentials must
 be `${VARIABLE}` placeholders in the URL's credentials or query values (never
 its host or path, which fix the source) over HTTPS, or netrc, never literal
 secrets; proxy and CA bundle variables such as
