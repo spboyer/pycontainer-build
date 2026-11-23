@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig
+from .fs_utils import read_bytes_limited
 
 
 BUILD_TABLE = "[build]"
@@ -19,8 +20,7 @@ def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, 'rb') as f:
-        data=tomllib.load(f)
+    data=tomllib.loads(read_bytes_limited(path).decode())
 
     found = []
     if 'build' in data:

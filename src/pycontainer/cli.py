@@ -23,12 +23,13 @@ def _tolerate_unencodable_output():
         try: "\u2713".encode(encoding)
         except (UnicodeEncodeError, LookupError): reconfigure(errors="replace")
 
-def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
+def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,preview=False):
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
     if tagging:
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
-        b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
-        b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
+        if not preview:
+            b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
+            b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
     b.add_argument("--base-image",help="Base image to layer on: a registry reference, oci:<path>[:<ref>|@sha256:<digest>], or docker-archive:<path>[:<repo-tag>] (auto-detected from requires-python if not specified)")
     if context:
         b.add_argument("--context",dest="context_dir")
@@ -42,7 +43,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
-    b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
+    if not preview:
+        b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
     b.add_argument(
@@ -52,23 +54,25 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         help="Stage target-compatible dependencies from a venv or requirements file",
     )
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer")
-    b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
+    if not preview:
+        b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     if platform:
         b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
-    b.add_argument(
-        "--sbom",
-        dest="generate_sbom",
-        nargs="?",
-        const="spdx",
-        choices=SBOM_FORMATS,
-        default=None,
-        help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
-    )
-    b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
-    b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    if not preview:
+        b.add_argument(
+            "--sbom",
+            dest="generate_sbom",
+            nargs="?",
+            const="spdx",
+            choices=SBOM_FORMATS,
+            default=None,
+            help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
+        )
+        b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
+        b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
 
 def main():
     _tolerate_unencodable_output()
@@ -96,6 +100,10 @@ def main():
     ins.add_argument("--layer",dest="layers",type=int,action="append",help="List the entries of this 1-based layer (repeatable)")
     ins.add_argument("--diff",nargs=2,type=int,metavar=("FROM","TO"),help="Compare the filesystem after layer FROM (0 = empty) with the filesystem after layer TO")
     ins.add_argument("--json",action="store_true",help="Emit the report as JSON")
+    pre=sub.add_parser("preview",help="Compare the planned build with an existing image without building it")
+    pre.add_argument("--baseline",required=True,help="Image to compare with: oci:<dir>[:<ref>|@sha256:<digest>], docker-archive:<file>[:<tag>], an OCI layout directory (offline), or docker://<registry>/<repository>[:<tag>|@sha256:<digest>]")
+    _add_build_options(pre,push=False,preview=True)
+    pre.add_argument("--json",action="store_true",help="Emit the report as JSON")
     gen=sub.add_parser("generate",help="Generate deployment artifacts for an existing image")
     targets=gen.add_subparsers(dest="target",required=True)
     kubernetes=targets.add_parser("kubernetes",help="Generate Kubernetes resources and a Helm chart")
@@ -112,6 +120,39 @@ def main():
     if args.cmd=="inspect":
         from .layer_inspect import run_inspect
         output,code=run_inspect(args.image,args.platform,args.files,args.layers,args.diff,args.json)
+        print(output,file=sys.stderr if code else sys.stdout)
+        raise SystemExit(code)
+
+    if args.cmd=="preview":
+        from .preview import run_preview
+        overrides={
+            'tag': args.tag[0] if args.tag else None,
+            'tags': args.tag[1:] if args.tag else None,
+            'base_image': args.base_image,
+            'context_dir': args.context_dir,
+            'include_paths': args.include_paths,
+            'exclude_paths': args.exclude_paths,
+            'exclude_defaults': args.exclude_defaults,
+            'use_cache': args.use_cache,
+            'cache_dir': args.cache_dir,
+            'include_deps': args.include_deps,
+            'requirements_file': args.requirements_file,
+            'platform': args.platform,
+            'reproducible': args.reproducible,
+            'insecure_registries': args.insecure_registries,
+            'registry_ca_file': args.registry_ca_file,
+        }
+        overrides={k:v for k,v in overrides.items() if v is not None}
+        try:
+            if args.config:
+                cfg=config_from_file(Path(args.config),overrides)
+            else:
+                cfg=BuildConfig(**overrides)
+                if 'base_image' not in overrides:
+                    cfg.base_image=f"python:{detect_python_version(cfg.context_dir)}-slim"
+        except (FileNotFoundError,ValueError) as exc:
+            parser.error(str(exc))
+        output,code=run_preview(cfg,args.baseline,args.json)
         print(output,file=sys.stderr if code else sys.stdout)
         raise SystemExit(code)
 

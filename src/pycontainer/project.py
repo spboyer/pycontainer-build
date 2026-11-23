@@ -6,6 +6,7 @@ from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     iter_files,
     path_is_excluded,
+    read_text_limited,
     relative_context_path,
 )
 
@@ -13,7 +14,7 @@ def detect_python_version(context_dir):
     """Detect Python version from pyproject.toml requires-python field."""
     ctx=Path(context_dir); py=ctx/'pyproject.toml'
     if py.exists():
-        data=tomllib.loads(py.read_text())
+        data=tomllib.loads(read_text_limited(py))
         proj=data.get("project",{}); requires_py=proj.get("requires-python")
         if requires_py:
             match=re.search(r'(\d+\.\d+)', requires_py)
@@ -23,7 +24,7 @@ def detect_python_version(context_dir):
 def detect_entrypoint(context_dir):
     ctx=Path(context_dir); py=ctx/'pyproject.toml'
     if py.exists():
-        data=tomllib.loads(py.read_text())
+        data=tomllib.loads(read_text_limited(py))
         proj=data.get("project",{}); scripts=proj.get("scripts") or {}
         if scripts:
             name,target=next(iter(scripts.items()))

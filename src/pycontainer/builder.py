@@ -207,6 +207,33 @@ from .dependencies import (
 
 logger=logging.getLogger(__name__)
 
+
+def write_app_files(tar, files, workdir: str, reproducible: bool, opener=None) -> List[Tuple[Path, Path]]:
+    """Write application files to ``tar`` exactly as the application layer stores them.
+
+    ``opener`` replaces ``open(path, "rb")`` so callers can observe the content as it is written.
+    Returns the written files in member order, for ``emitted_hardlinks``.
+    """
+    opener = opener or (lambda path, _info: open(path, "rb"))
+    written = []
+    for abs_path, rel in ordered_app_files(files, reproducible):
+        info = tar.gettarinfo(abs_path, arcname=app_layer_arcname(workdir, rel))
+        if info is None:
+            continue
+        written.append((abs_path, rel))
+        if reproducible:
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+        if info.isreg():
+            with opener(abs_path, info) as source:
+                tar.addfile(info, source)
+        else:
+            tar.addfile(info)
+    return written
+
 class ImageBuilder:
     def __init__(self, config: BuildConfig): 
         context_dir=Path(config.context_dir)
@@ -796,26 +823,10 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
-                for abs_path, rel in files_sorted:
-                    arc=app_layer_arcname(self.config.workdir, rel)
-                    if self.config.reproducible:
-                        tarinfo=tar.gettarinfo(abs_path, arcname=arc)
-                        tarinfo.mtime=0
-                        tarinfo.uid=0
-                        tarinfo.gid=0
-                        tarinfo.uname="root"
-                        tarinfo.gname="root"
-                        if tarinfo.isfile():
-                            with open(abs_path, 'rb') as f:
-                                tar.addfile(tarinfo, f)
-                        else:
-                            tar.addfile(tarinfo)
-                    else:
-                        tar.add(abs_path,arcname=arc)
-                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
+                written=write_app_files(tar, files, self.config.workdir, self.config.reproducible)
+                hardlinks=emitted_hardlinks(written, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)

@@ -177,16 +177,53 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     )
     assert manifest["schemaVersion"] == 2
     assert returned_digest == digest
+    assert requests[0][3] == len(body)
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
         requests[0][2]["Accept"]
     )
-    assert requests[0][3] == len(body)
 
     with pytest.raises(BlobIntegrityError, match="size"):
         client.pull_manifest(digest, expected_size=len(body) + 1)
 
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
+
+
+@pytest.mark.parametrize("size", [None, 1, 32 * 1024 * 1024])
+def test_manifest_response_bound_uses_descriptor_and_ceiling(monkeypatch, size):
+    from pycontainer.registry_client import MAX_MANIFEST_BYTES
+
+    client = RegistryClient("registry.example", "team/app")
+    bounds = []
+
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        bounds.append(max_response_bytes)
+        return 404, b"", {}
+
+    monkeypatch.setattr(client, "_make_request", fake_request)
+    with pytest.raises(RegistryRequestError):
+        client.pull_manifest("latest", expected_size=size)
+    assert bounds == [MAX_MANIFEST_BYTES if size is None else min(size, MAX_MANIFEST_BYTES)]
+
+
+def test_bearer_retry_preserves_response_bound(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(b"large")
+
+    def open_request(request, timeout):
+        if request.get_header("Authorization"):
+            return response
+        raise _http_error(
+            request.full_url, 401,
+            {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+        )
+
+    monkeypatch.setattr(client, "_get_bearer_token", lambda _: "token")
+    monkeypatch.setattr(client._opener, "open", open_request)
+    with pytest.raises(RegistryRequestError, match="exceeds 2 bytes"):
+        client._make_request("GET", f"{client.base_url}/test", max_response_bytes=2)
+    assert response.read_sizes == [3]
+
 
 def test_registry_client_construction():
     """Test RegistryClient initialization."""
@@ -1207,6 +1244,22 @@ def test_rate_limit_headers_are_logged_and_low_remaining_warns_once(
     assert "9 of 100" in warnings[0]
 
 
+def test_bounded_manifest_response_still_observes_rate_limits(monkeypatch, caplog):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(
+        b"{}",
+        headers={"RateLimit-Limit": "100", "RateLimit-Remaining": "9"},
+    )
+    _patch_urlopen(monkeypatch, lambda request, count: response)
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.registry_client"):
+        manifest, _ = client.pull_manifest("latest", expected_size=2)
+
+    assert manifest == {}
+    assert response.read_sizes == [3]
+    assert "9 of 100" in caplog.text
+
+
 @pytest.mark.parametrize(
     "headers",
     [
@@ -1493,3 +1546,87 @@ if __name__=="__main__":
     test_registry_client_construction()
     test_registry_url_construction()
     print("✅ All registry client tests passed")
+
+
+class _RedirectServer:
+    """Loopback HTTP server recording the Authorization header per path."""
+
+    def __init__(self, routes):
+        import http.server
+        import threading
+
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                status, headers = routes(self.path, self.headers.get("Authorization"))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                return None
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _loopback_client(origin):
+    return RegistryClient(origin.removeprefix("http://"), "team/app",
+                          auth_token="synthetic-secret", insecure=True)
+
+
+def test_same_origin_registry_redirect_keeps_credentials():
+    def routes(path, auth):
+        if path == "/v2/start":
+            return 307, {"Location": "/v2/target"}
+        return (200 if auth == "Bearer synthetic-secret" else 401), {}
+
+    with _RedirectServer(routes) as server:
+        client = _loopback_client(server.origin)
+        status, body, _ = client._make_request("GET", f"{server.origin}/v2/start")
+
+    assert (status, body) == (200, b"ok")
+    assert server.seen == [
+        ("/v2/start", "Bearer synthetic-secret"),
+        ("/v2/target", "Bearer synthetic-secret"),
+    ]
+
+
+def test_cross_origin_registry_redirect_strips_credentials():
+    with _RedirectServer(lambda _path, _auth: (200, {})) as other:
+        def routes(_path, _auth):
+            return 302, {"Location": f"{other.origin}/target"}
+
+        with _RedirectServer(routes) as server:
+            client = _loopback_client(server.origin)
+            status, _, _ = client._make_request("GET", f"{server.origin}/v2/start")
+
+    assert status == 200
+    assert server.seen == [("/v2/start", "Bearer synthetic-secret")]
+    assert other.seen == [("/target", None)]
+
+
+def test_redirect_handler_strips_credentials_on_port_change():
+    from pycontainer.registry_client import SafeRedirect
+
+    request = urllib.request.Request(
+        "https://registry.example/v2/start", headers={"Authorization": "Bearer secret"}
+    )
+    redirected = SafeRedirect().redirect_request(
+        request, None, 302, "Found", {}, "https://registry.example:8443/v2/target"
+    )
+    assert redirected.get_header("Authorization") is None

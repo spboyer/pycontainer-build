@@ -193,6 +193,7 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
 - ✅ **Layer inspection** — `pycontainer inspect` reports local image layer sizes, contents, and diffs without a daemon
+- ✅ **Build preview** — `pycontainer preview` compares a planned build with a local or registry image before building
 - ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
   configuration for an existing image without applying it
 
@@ -514,6 +515,32 @@ mislabeled layers, or an ambiguous multi-platform index without `--platform`.
 It does not start the image; use the opt-in runtime check for that. See
 [Image inspection](docs/inspection.md).
 
+### Previewing a build
+
+`pycontainer preview` compares the image a build *would* produce with an
+existing image, without building, caching, or running anything. Name the
+baseline explicitly; local baselines are read offline, and a registry image
+requires the `docker://` prefix:
+
+```bash
+pycontainer preview --baseline dist/image                        # last local build
+pycontainer preview --baseline docker-archive:./app.tar:app:v1 --json
+pycontainer preview --baseline docker://ghcr.io/me/app:v1 --base-image python:3.12-slim
+```
+
+It accepts the same content-affecting flags as `build` (`--config`,
+`--base-image`, `--context`, `--include`, `--exclude`, `--include-deps`,
+`--platform`, `--no-reproducible`, `--no-cache`, ...). The report shows the base,
+dependency and application components, added/modified/deleted application
+files, and image settings. Anything the evidence cannot establish is reported
+as `unknown`, never as unchanged, and environment values are always redacted.
+`exact` requires a reproducible build; the layer cache key includes hardlink
+topology, and `--no-cache` previews a cache-free build. Baseline and project
+reads are size-bounded (16 MiB per metadata, credential or scanned source
+file, shared with `build`, failing explicitly when exceeded); see
+[Build preview](docs/preview.md) for the limits, how provenance is established
+and the accuracy limits.
+
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
 - `--exclude PATH` — Exclude a context-root-relative path or glob; repeat to add exclusions
@@ -828,6 +855,7 @@ This style is intentional for the experimental phase.
 
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Image inspection](docs/inspection.md)** — Daemon-free layer sizes, contents, diffs, and observations
+- **[Build preview](docs/preview.md)** — Compare a planned build with an existing image before building
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop

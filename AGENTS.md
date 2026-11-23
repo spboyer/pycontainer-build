@@ -18,6 +18,8 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `layer_inspect.py`: `inspect` command; streams local image layers into a
   union-filesystem report using the `local_image.py` sources.
+- `preview.py`: `preview` command; serializes the planned app layer with the
+  builder's tar writer and compares it with one explicit baseline image.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `system_packages.py`: system package declaration, inference and base-image

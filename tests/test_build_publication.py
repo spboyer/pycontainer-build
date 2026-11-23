@@ -104,7 +104,7 @@ def test_failed_layer_write_cleans_only_its_staging_file(
     def interrupt_write(*args, **kwargs):
         raise OSError("simulated interrupted layer write")
 
-    monkeypatch.setattr(tarfile.TarFile, "add", interrupt_write)
+    monkeypatch.setattr(tarfile.TarFile, "addfile", interrupt_write)
     with pytest.raises(OSError, match="simulated interrupted"):
         if layer_kind == "app":
             builder._create_app_layer(layers_dir, ["app.py"])
