@@ -574,11 +574,13 @@ def _glibc_tags(newest, machine):
         ("amd64", "python:3.11-slim", (), True, ["manylinux2014_x86_64"]),
         ("arm64", "python:3.11", (), True, ["manylinux2014_aarch64"]),
         ("amd64", "python:3.11-alpine", (), True, ["musllinux_1_2_x86_64"]),
-        ("arm64", "python:3.11-slim-bookworm", (), True, _glibc_tags(36, "aarch64")),
+        ("arm64", "python:3.11-slim-bookworm", (), True, _glibc_tags(31, "aarch64")),
         ("amd64", "docker.io/library/python:3.11-bullseye", (), True,
-         _glibc_tags(31, "x86_64")),
+         _glibc_tags(28, "x86_64")),
         ("amd64", "python:3.13-slim-trixie", (), True, _glibc_tags(36, "x86_64")),
-        ("amd64", "python:3.8-buster", (), True, _glibc_tags(28, "x86_64")),
+        ("amd64", "python:3.8-buster", (), True, _glibc_tags(24, "x86_64")),
+        ("amd64", "python:3.6-stretch", (), True, _glibc_tags(19, "x86_64")),
+        ("amd64", "python:3.5-jessie", (), True, _glibc_tags(17, "x86_64")),
         ("arm64", "python:3.11-alpine3.20", (), True,
          ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
         ("amd64", "python:3.9-alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
@@ -593,7 +595,7 @@ def _glibc_tags(newest, machine):
         ("arm64", f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.2",), False,
          ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
         ("amd64", "python:3.11-notalpine", (), True, ["manylinux2014_x86_64"]),
-        ("amd64", "python:3.11-Slim-Bookworm", (), True, _glibc_tags(36, "x86_64")),
+        ("amd64", "python:3.11-Slim-Bookworm", (), True, _glibc_tags(31, "x86_64")),
         ("amd64", "python:3.11-Alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
         ("amd64", "python:3.11-alpine3.24", (), True,
          ["musllinux_1_2_x86_64", "musllinux_1_1_x86_64"]),
@@ -700,6 +702,8 @@ def test_real_pip_selects_compatible_newer_or_older_libc_wheels(
         ("manylinux_2_28_aarch64", "arm64", "python:3.11-stretch", (), False),
         ("manylinux_2_28_x86_64", "amd64", "example/python:custom",
          ("PYTHON_LIBC=glibc-2.27",), False),
+        ("manylinux_2_32_aarch64", "arm64", "python:3.11-slim-bookworm", (), False),
+        ("manylinux_2_29_x86_64", "amd64", "python:3.11-bullseye", (), False),
         ("manylinux_2_37_x86_64", "amd64", "python:3.11-slim-trixie", (), False),
         ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine", (), True),
         ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine3.12", (), False),
@@ -708,7 +712,7 @@ def test_real_pip_selects_compatible_newer_or_older_libc_wheels(
         ("manylinux_2_28_aarch64", "amd64", "python:3.11-slim-bookworm", (), False),
     ],
 )
-def test_real_pip_rejects_wheels_incompatible_with_target_libc(
+def test_real_pip_rejects_wheels_outside_selected_platforms(
     tmp_path, wheel_tag, arch, base_image, env, hint
 ):
     with pytest.raises(RuntimeError, match="Only wheels compatible with") as error:

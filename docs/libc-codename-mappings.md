@@ -14,38 +14,36 @@ Verified on 2026-11-22. The tables in `src/pycontainer/dependencies.py`
 
 ## Debian (glibc)
 
-Official images were first published from the earliest
-[`docker-library/python`](https://github.com/docker-library/python) commit
-adding a Dockerfile for that codename. Except for trixie, the bound is based
-on the `glibc` source version in the Debian suite at that commit time, read
-from the snapshot archive. `Extra-Source-Only: yes` stanzas, which
-`Built-Using` keeps for older versions, are excluded: they are not the
-version the suite ships. A suite snapshot alone does not identify the base
-image digest used for a particular Python image build.
+An official Python Dockerfile refers to a Debian base tag, not a pinned base
+digest. A suite snapshot at the Python Dockerfile commit therefore does not
+establish which libc the image contains. These bounds instead use the suite
+version when the codename first appeared in the official Debian image
+declarations. Source snapshots exclude `Extra-Source-Only: yes` stanzas.
 
-| Codename | Floor | First `docker-library/python` commit | Suite `glibc` at that time | Snapshot file (content-addressed) |
-| --- | --- | --- | --- | --- |
-| `jessie` | glibc 2.19 | [`4faf7f1b13a1`](https://github.com/docker-library/python/commit/4faf7f1b13a13b24367307acc254bd2d0d48a46e) (2014-11-26) | 2.19-13 | [`86fdd161c47f`](https://snapshot.debian.org/file/86fdd161c47ff046eac8e34c2b9b00739670a9db) |
-| `stretch` | glibc 2.24 | [`d8cda13511fc`](https://github.com/docker-library/python/commit/d8cda13511fcfac951ccb5a0d39a7da7568c2004) (2017-07-17) | 2.24-11 | [`a2c07bf36f9c`](https://snapshot.debian.org/file/a2c07bf36f9c494a2d5eeca0938bc476ded10902) |
-| `buster` | glibc 2.28 | [`4fc051f0aa8e`](https://github.com/docker-library/python/commit/4fc051f0aa8ef60931474b23567a7f232095d85f) (2019-06-24) | 2.28-10 | [`cdaf35df7daa`](https://snapshot.debian.org/file/cdaf35df7daa46319a10d7d2d718b9474bc79e15) |
-| `bullseye` | glibc 2.31 | [`f154e5d1c8f5`](https://github.com/docker-library/python/commit/f154e5d1c8f5b582aa2fd782df880b9cc96bb431) (2021-08-16) | 2.31-13 | [`03025ea20540`](https://snapshot.debian.org/file/03025ea2054005cfcf1a5388db7ab3d331d7d45b) |
-| `bookworm` | glibc 2.36 | [`5d908b0477c0`](https://github.com/docker-library/python/commit/5d908b0477c003712550c84ac4d133367b912f78) (2023-06-13) | 2.36-9 | [`054d29885795`](https://snapshot.debian.org/file/054d298857955a2542fccbf2646402cd8e22a2bd) |
-| `trixie` | glibc 2.36 | [`093598a0190b`](https://github.com/docker-library/python/commit/093598a0190ba9074b899d6a0a21a00c859aac56) (2025-08-08) | 2.41-12 | [`ade6a38d80ac`](https://snapshot.debian.org/file/ade6a38d80ac022757c3646185ee20047b5e7482) |
+| Codename | Bound | First Debian declaration | Suite glibc and snapshot |
+| --- | --- | --- | --- |
+| `jessie` | 2.17 | [2013-10-16](https://github.com/docker-library/official-images/blob/3e681864479143fb9181da30535537b82e5d0a10/library/debian) | [2.17-93](https://snapshot.debian.org/file/04b8bae698b81a912f8de7674a0a790a1b037363) |
+| `stretch` | 2.19 | [2015-04-29](https://github.com/docker-library/official-images/blob/3268afd76587dee2bd822b80ffad094a26366ce8/library/debian) | [2.19-18](https://snapshot.debian.org/file/2e2a7fc2d5e9432881c561f1940dda10f607e094) |
+| `buster` | 2.24 | [2017-06-20](https://github.com/docker-library/official-images/blob/abbad2317e1d87ed1e18415daf3449761749120c/library/debian) | [2.24-11](https://snapshot.debian.org/file/8ff887859eb9de9cbe75fdecfd6579b65f53f3f9) |
+| `bullseye` | 2.28 | [2019-07-09](https://github.com/docker-library/official-images/blob/30378f3a56360e87b280dd8fea13fa6d1846dfb5/library/debian) | [2.28-10](https://snapshot.debian.org/file/3eb44153c215e6fab6d7e1a010ccbb729d7d0075) |
+| `bookworm` | 2.31 | [2021-08-16](https://github.com/docker-library/official-images/blob/2b8712cd578f655aff4e26face274d8f702dadb9/library/debian) | [2.31-13](https://snapshot.debian.org/file/03025ea2054005cfcf1a5388db7ab3d331d7d45b) |
+| `trixie` | 2.36 | [2023-06-12](https://github.com/docker-library/official-images/blob/da90f58ec995f7ab5a5c871a42f46b9bd84c4709/library/debian) | [2.36-9](https://snapshot.debian.org/file/602efa7f4269b8718797aea88b35b439b8055279) |
 
-Each snapshot file is `dists/<codename>/main/source/Sources.xz` as resolved
-from `https://snapshot.debian.org/archive/debian/<UTC commit time>/`, for
-example `20250808T182034Z` for trixie. Trixie's Sources also lists `2.40-5`,
-but only as an `Extra-Source-Only` stanza.
+On 2026-11-22, the archived image manifests below were fetched from Docker Hub.
+Their manifest and layer digests and sizes were verified; the `libc6` version
+was read from `var/lib/dpkg/status` inside each layer without extracting it.
+The date tags identify the observed images; the SHA-256 manifest digests, not
+the mutable tags, identify the checked artifacts.
 
-Trixie deliberately uses a lower bound than its suite version at the Python
-commit. That Dockerfile refers to the mutable `debian:trixie-slim` tag, and
-its selected base digest is not established by the suite snapshot. The
-[initial Debian trixie image declaration](https://github.com/docker-library/official-images/blob/da90f58ec995f7ab5a5c871a42f46b9bd84c4709/library/debian)
-is dated 2023-06-12, when the
-[trixie suite Sources](https://snapshot.debian.org/file/602efa7f4269b8718797aea88b35b439b8055279)
-listed glibc 2.36-9. The 2.36 bound avoids assuming that an image used the
-latest suite version at the time its Dockerfile was committed; it is not a
-claim that a Python image was actually built using the older base.
+| Debian image | Architecture | Manifest SHA-256 | `libc6` |
+| --- | --- | --- | --- |
+| `buster-20170620` | amd64 | `a4f78f38cf60ed790efe91fcea9333ba634fe2ecbbc1418a55ac5d04047d32eb` | 2.24-11 |
+| `bullseye-20190708-slim` | amd64 | `62adebce7f39b0603644bca1aaff7678f5abe50776bf4334cd5a7e7facbb1d85` | 2.28-10 |
+| `bullseye-20190708-slim` | arm64 | `a342b414ce3c37fd6e12b7ba416a7c4f0aa29b7302eb2a8cf7b257be2d164de5` | 2.28-10 |
+| `bookworm-20210816-slim` | amd64 | `454b407ad1612c8a30f55a71b49333ea2d88855eadec9c10f16cfaaf59786d81` | 2.31-13 |
+| `bookworm-20210816-slim` | arm64 | `b6fac6322e14853f243e0385e7d9983bcc5b5c1491ad30429945a763b002f834` | 2.31-13 |
+| `trixie-20230612-slim` | amd64 | `89e094999244cf2481fd2af9535f18c647f9f0b216bdaed98e7d6350af2e6191` | 2.36-9 |
+| `trixie-20230612-slim` | arm64 | `9e76f56013f737abb3e980dcbaa05c0bc7c7a210a6b270fde5bcd9de48af6bb1` | 2.36-9 |
 
 ## Alpine (musl)
 
@@ -93,6 +91,8 @@ values from `git ls-remote https://git.alpinelinux.org/aports`.
 - New codenames and Alpine releases stay on the codename-less floor until a
   row is verified and added here and in the code table.
 - Docker Hub tags are mutable. These source records do not verify the libc
-  installed in each published image digest; digest references still require
-  explicit `PYTHON_LIBC` metadata.
+  installed in every published Python image digest, or prove that no
+  intermediate suite update ever contained an older version. These
+  conservative bounds may reject wheels that a particular newer image could
+  run. Digest references still require explicit `PYTHON_LIBC` metadata.
 - No tags below glibc 2.17 or musl 1.1 are generated.

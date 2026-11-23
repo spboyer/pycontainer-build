@@ -343,7 +343,7 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and `PYTHON_LIBC=glibc-2.N` (N 17-99) or
   `PYTHON_LIBC=musl-1.N` (N 1-99) in their image config so wheel tags can be
-  validated. pip receives every compatible tag, newest first:
+  validated. pip receives tags through the selected libc bound, newest first:
   `manylinux_2_N` down to `manylinux_2_17` plus the `manylinux2014` alias for
   glibc, or `musllinux_1_N` down to `musllinux_1_1` for musl. Official
   `python` tag-only registry pulls derive libc from the resolved tag (`alpine`
@@ -352,14 +352,15 @@ pycontainer build \
 
   | Tag codename | Target libc |
   | --- | --- |
-  | `jessie` / `stretch` / `buster` | glibc 2.19 / 2.24 / 2.28 |
-  | `bullseye` / `bookworm` / `trixie` | glibc 2.31 / 2.36 / 2.36 |
+  | `jessie` / `stretch` / `buster` | glibc 2.17 / 2.19 / 2.24 |
+  | `bullseye` / `bookworm` / `trixie` | glibc 2.28 / 2.31 / 2.36 |
   | `alpine3.0`-`alpine3.12` | musl 1.1 |
   | `alpine3.13`-`alpine3.24` | musl 1.2 |
 
-  Each row is pinned to immutable sources (content-addressed
-  snapshot.debian.org files, `docker-library/python` and Alpine `aports`
-  commit SHAs) in [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
+  Each row is pinned to immutable sources (content-addressed Debian snapshots,
+  official image declarations and Alpine `aports` commits) in
+  [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
+  These bounds may reject wheels that a newer image could actually run.
 
   Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`, and
   unmapped codenames, keep the conservative `manylinux2014` or `musllinux_1_2`

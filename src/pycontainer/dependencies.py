@@ -36,11 +36,11 @@ _ALPINE_TOKEN = re.compile(r"alpine3\.\d+")
 _SUPPORTED_LIBC_TEXT = "glibc-2.N (N 17-99) and musl-1.N (N 1-99)"
 # Conservative libc bounds; see the sources in docs/libc-codename-mappings.md.
 _DEBIAN_GLIBC_MINOR = {
-    "jessie": 19,
-    "stretch": 24,
-    "buster": 28,
-    "bullseye": 31,
-    "bookworm": 36,
+    "jessie": 17,
+    "stretch": 19,
+    "buster": 24,
+    "bullseye": 28,
+    "bookworm": 31,
     "trixie": 36,
 }
 _ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
@@ -216,7 +216,7 @@ def target_wheel_platforms(
     *,
     base_image_tag_verified: bool = False,
 ) -> List[str]:
-    """Return every compatible wheel platform tag, most specific first.
+    """Return wheel platform tags through the selected libc bound, newest first.
 
     Image names alone are not provenance: libc comes from explicit PYTHON_LIBC
     metadata or, for verified tag-only official pulls, a mapped codename.

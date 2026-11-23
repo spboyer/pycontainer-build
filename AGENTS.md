@@ -148,7 +148,7 @@ pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
 `PYTHON_LIBC` value (`glibc-2.N`, N 17-99, or `musl-1.N`, N 1-99); pip
-receives every compatible tag newest first (`manylinux_2_N`..`manylinux_2_17`
+receives tags through the selected libc bound, newest first (`manylinux_2_N`..`manylinux_2_17`
 plus `manylinux2014`, or `musllinux_1_N`..`musllinux_1_1`). Official `python`
 tag-only registry pulls derive the libc family from the resolved tag (`alpine`
 means musl, otherwise glibc) and the version from mapped Debian/Alpine
