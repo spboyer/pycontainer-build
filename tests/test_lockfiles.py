@@ -11,7 +11,7 @@ import pytest
 from pycontainer import lockfiles as lockfile_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.dependencies import _analyze_requirements, install_requirements, staged_packages
+from pycontainer.dependencies import _scan_requirements, install_requirements, staged_packages
 from pycontainer.lockfiles import (
     LockfileError,
     detect_lockfile,
@@ -1705,7 +1705,7 @@ def test_requirements_hash_pinning_detection(tmp_path, lines, pinned):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("\n".join(lines) + "\n")
 
-    _, hash_pinned = _analyze_requirements(requirements, tmp_path)
+    _, _, hash_pinned = _scan_requirements(requirements, tmp_path)
     assert hash_pinned is pinned
 
 
@@ -1723,7 +1723,7 @@ def test_requirements_also_used_as_constraints_still_need_hashes(tmp_path, monke
         requirements.stat().st_size + shared.stat().st_size,
     )
 
-    roots, hash_pinned = _analyze_requirements(requirements, tmp_path)
+    roots, _, hash_pinned = _scan_requirements(requirements, tmp_path)
     assert roots == ["fixture-dep==1.0"]
     assert not hash_pinned
 

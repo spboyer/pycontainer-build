@@ -90,6 +90,20 @@ dist/image/
       └── <tag-name>              # Tag reference
 ```
 
+### Generate Deployment Artifacts
+
+After publishing an image, generate Kubernetes resources and a matching Helm
+chart, or a Compose service that references that image:
+
+```bash
+pycontainer generate kubernetes --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --service-port 80 -o deploy
+pycontainer generate compose --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --host-port 8080 -o compose.yaml
+```
+
+Generation does not run a daemon or apply resources, and refuses existing
+output. See the [deployment artifact guide](docs/deployment-artifacts.md) for
+supported fields, output safety, versions, and optional validation.
+
 ### Testing Locally
 
 **Important**: `pycontainer` creates OCI-compliant image layouts, not Docker-specific images. To test locally:
@@ -178,6 +192,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Platform auto-selection** — Pulls correct architecture variant from multi-arch base images
 - ✅ **Verbose logging** — Detailed build progress with `--verbose`
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
+- ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
+  configuration for an existing image without applying it
 
 ### Coming Soon
 
@@ -231,6 +247,7 @@ builder.build()  # Creates dist/image/
 Perfect for integration with:
 - **Azure Developer CLI (azd)** — Custom build strategies ([docs](docs/azd-integration.md))
 - **GitHub Actions** — Automated CI/CD workflows ([docs](docs/github-actions.md))
+- **GitLab CI, Jenkins, CircleCI** — Standalone pipeline examples ([GitLab](docs/ci/gitlab.md), [Jenkins](docs/ci/jenkins.md), [CircleCI](docs/ci/circleci.md))
 - **Poetry/Hatch** — Build plugins ([plugins](plugins/))
 - **VS Code** — Extension for container builds ([plugin](plugins/vscode-pycontainer/))
 - **AI agents** — Copilot, MCP servers, automated scaffolding
@@ -306,8 +323,8 @@ custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
              deps=['app'], skips_local_docker=True)
 ```
 
-Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`), plain-HTTP
-registries and multi-platform requests are rejected.
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and
+multi-platform requests are rejected. Plain HTTP requires per-host opt-in.
 [See full documentation →](docs/skaffold-tilt.md)
 
 ### VS Code Extension
@@ -317,6 +334,11 @@ Install from VS Code Marketplace or command palette:
 - "Build and Push Container Image"
 
 [See full documentation →](plugins/vscode-pycontainer/)
+
+### Other editors and task runners
+
+Project-scoped PyCharm, Vim, Emacs, GNU Make, and Go Task examples are
+available in the [integration examples](examples/editor-task-runners/).
 
 ---
 
@@ -406,6 +428,14 @@ pycontainer build \
   setuptools or Flit tables mentioning host markers fail, as do unreadable
   dynamic dependencies. Unmarked declarations in those unparsed sources are
   not verified. Use a requirements file when a virtualenv cannot be verified.
+  Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
+  `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
+  placeholders in the requirements file, including in URL paths. Literal
+  credentials in requirements files (URL userinfo, secret-like query values
+  and recognized URL path tokens) are rejected, and host pip settings that
+  could change target selection (for example `PIP_PLATFORM` or
+  `PIP_NO_BINARY`) are ignored; see
+  [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
@@ -486,6 +516,8 @@ unrecognized equivalences are rejected even if they are logically equal.
 Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
 PyPI itself is left to your pip configuration so mirrors keep working, and
 pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
+The same pip bootstrap used for ordinary requirements ignores inherited settings
+that can override the wheel target or add requirements.
 Hashes verify the bytes, not which server supplied them. Index credentials
 must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
 
@@ -568,6 +600,19 @@ exclude-defaults = true
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+**Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
+- `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
+  (repeatable; `[build] insecure-registries = [...]`). Each build that uses
+  one logs a warning. Credentials are sent over HTTP only to loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); any other HTTP registry must be
+  anonymous.
+- `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
+  HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
+  there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -773,7 +818,7 @@ Known limitations and future enhancements:
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 - **System packages** — Verification is advisory; installing apt/apk packages
   is not available. See [system packages](docs/system-packages.md).
-- **Registry access** — HTTPS registries only; Docker `credsStore`/`credHelpers` are not read
+- **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
