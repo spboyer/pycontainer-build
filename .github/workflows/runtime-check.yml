@@ -11,6 +11,13 @@ on:
         default: false
   workflow_dispatch:
     inputs:
+      dependency_fixture:
+        description: Dependency fixture to verify
+        type: choice
+        options:
+          - requirements
+          - lockfile
+        default: requirements
       check-index:
         description: Check a multi-platform OCI index on each native target
         type: boolean
@@ -65,11 +72,13 @@ jobs:
       - name: Build, import and start the image
         env:
           PYTHONPATH: src
+          DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}
         run: >-
           timeout 600 python scripts/check_runtime_image.py
           --base-image python:3.11-slim
           --platform ${{ matrix.platform }}
           --timeout 300
+          --dependency-fixture "$DEPENDENCY_FIXTURE"
           --evidence runtime-evidence/${{ matrix.slug }}.json
       - name: Build, import and start a multi-platform image index
         if: ${{ inputs['check-index'] }}
@@ -145,6 +154,8 @@ jobs:
           pattern: runtime-evidence-linux-*
           path: runtime-evidence
       - name: Verify every required target passed
+        env:
+          DEPENDENCY_FIXTURE: ${{ inputs.dependency_fixture || 'requirements' }}
         run: >-
           python3 scripts/verify_runtime_evidence.py
           --evidence-dir runtime-evidence
@@ -153,6 +164,7 @@ jobs:
           --commit ${{ github.sha }}
           --run-id ${{ github.run_id }}
           --run-attempt ${{ github.run_attempt }}
+          --dependency-fixture "$DEPENDENCY_FIXTURE"
           --summary runtime-evidence-summary.md
           ${{ steps.download.outcome != 'success' && '--error "evidence download did not succeed"' || '' }}
           ${{ needs.startup.result != 'success' && format('--error "startup jobs in this attempt reported {0}"', needs.startup.result) || '' }}
