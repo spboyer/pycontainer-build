@@ -1,6 +1,6 @@
 import argparse, json, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS
+from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .history import BuildHistory, HistoryStorageError
@@ -83,6 +83,15 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
     b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
     b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
+    b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
+    b.add_argument("--scan-executable",help="Grype executable path or name")
+    b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
+    b.add_argument("--scan-unknown",choices=("fail","ignore"),help="Unknown severity policy (default: fail)")
+    b.add_argument("--scan-report-format",choices=("json","sarif"),help="Report format (default: json)")
+    b.add_argument("--scan-report",help="Report destination (default: output directory)")
+    b.add_argument("--scan-offline",action="store_true",default=None,help="Use an imported database without updates; freshness still enforced")
+    b.add_argument("--scan-db-dir",help="Grype database cache (default: ~/.pycontainer/grype-db)")
+    b.add_argument("--scan-db-max-age-hours",type=int,help="Maximum database build age (default: 120 hours)")
     b.add_argument("--stop-signal",help="OCI StopSignal, e.g. SIGTERM or SIGRTMIN+3 (overrides the base image value)")
     b.add_argument("--volume",dest="volumes",action="append",help="Declare an absolute container path as an OCI volume (repeatable; merged with base volumes; metadata only, no mount is created)")
 
@@ -197,6 +206,15 @@ def main():
         'labels': dict(args.labels) if args.labels is not None else None,
         'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
         'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
+        'scan': args.scan,
+        'scan_executable': args.scan_executable,
+        'scan_threshold': args.scan_threshold,
+        'scan_unknown': args.scan_unknown,
+        'scan_report_format': args.scan_report_format,
+        'scan_report': args.scan_report,
+        'scan_offline': args.scan_offline,
+        'scan_db_dir': args.scan_db_dir,
+        'scan_db_max_age_hours': args.scan_db_max_age_hours,
         'stop_signal': args.stop_signal,
         'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
@@ -244,11 +262,14 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+    from .scanning import ScanError
     try:
         builder=ImageBuilder(cfg)
         out=builder.build()
     except HistoryStorageError as exc:
         parser.exit(1,f"Build history error: {exc}\n")
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
     print("Built:", out)
     
     if push:
@@ -256,12 +277,15 @@ def main():
             password=os.getenv('REGISTRY_PASSWORD')
         if args.cmd=="tilt-build" and push_target is None:
             push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
-        pushed=builder.push(
-            registry_url=push_target,
-            username=username,
-            password=password,
-            show_progress=not args.no_progress,
-        )
+        try:
+            pushed=builder.push(
+                registry_url=push_target,
+                username=username,
+                password=password,
+                show_progress=not args.no_progress,
+            )
+        except ScanError as exc:
+            parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
         if getattr(args,"output_ref",None):
             write_reference(Path(args.output_ref),pushed)
             print("Wrote image reference to", args.output_ref)

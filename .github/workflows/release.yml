@@ -32,7 +32,7 @@ jobs:
         run: uv sync --locked --group test
       
       - name: Run tests
-        run: uv run --locked --group test python -m pytest tests/ -v -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests/ -v -m "not registry_integration and not scanner_integration"
 
   build:
     name: Build Package
