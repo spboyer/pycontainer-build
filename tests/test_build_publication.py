@@ -45,6 +45,7 @@ def _create_builder(tmp_path, monkeypatch, *, use_cache, output_dir=None):
             output_dir=str(output_dir or tmp_path / "output"),
             include_paths=["app.py", "requirements.txt"],
             include_deps=True,
+            base_image="python:3.11-slim-bookworm",
             use_cache=use_cache,
             cache_dir=str(tmp_path / "cache") if use_cache else None,
         )

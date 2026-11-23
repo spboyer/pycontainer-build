@@ -1,5 +1,6 @@
 import base64
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,10 +27,13 @@ from pycontainer.dependencies import (
     install_requirements,
     staged_packages,
     target_python_version,
+    target_libc_config,
     target_wheel_platform,
+    target_wheel_platforms,
     validate_requirements,
 )
 from pycontainer.registry_client import parse_image_reference
+from pycontainer.oci import OCILayer
 
 
 BASE_CONFIG = {
@@ -85,6 +90,7 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
         "_pull_base_image",
         lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
     )
+    options.setdefault("base_image", "python:3.11-slim-bookworm")
     return ImageBuilder(
         BuildConfig(
             context_dir=str(context),
@@ -895,7 +901,7 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
     with pytest.raises(ValueError, match="does not support target platform"):
         _target_options("windows", "amd64", "3.11")
     assert _target_options(
-        "linux", "amd64", "3.11", "python:3.11-alpine",
+        "linux", "amd64", "3.11", "python:3.11-alpine3.20",
         base_image_tag_verified=True,
     )[1] == "musllinux_1_2_x86_64"
     with pytest.raises(ValueError, match="custom base image"):
@@ -917,8 +923,9 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
         "linux", "amd64", "3.11", "example/python:custom", custom_config
     )[1] == "manylinux_2_17_x86_64"
     assert _target_options(
-        "linux", "arm64", "3.11", base_image_tag_verified=True
-    )[1] == "manylinux2014_aarch64"
+        "linux", "arm64", "3.11", "python:3.11-slim-bookworm",
+        base_image_tag_verified=True,
+    )[1] == "manylinux_2_31_aarch64"
 
     context = tmp_path / "context"
     context.mkdir()
@@ -930,6 +937,7 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
             context_dir=str(context),
             include_deps=True,
             use_cache=False,
+            base_image="python:3.11-slim-bookworm",
         )
     )
     with pytest.raises(ValueError, match="Requirements files exceed"):
@@ -938,6 +946,620 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
 
 def _libc_config(*env):
     return {"config": {"Env": ["PYTHON_VERSION=3.11.8", *env]}}
+
+
+def _base_metadata_layer(tmp_path, entries, *, compressed=False):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, content in entries:
+            member = tarfile.TarInfo(name)
+            if isinstance(content, tarfile.TarInfo):
+                member = content
+                archive.addfile(member)
+            else:
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+    data = gzip.compress(buffer.getvalue()) if compressed else buffer.getvalue()
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    path = tmp_path / digest.split(":")[1]
+    path.write_bytes(data)
+    media_type = "application/vnd.oci.image.layer.v1.tar" + ("+gzip" if compressed else "")
+    return OCILayer(media_type, digest, len(data), str(path))
+
+
+def _dpkg_libc(version="2.36-9", architecture="amd64"):
+    return (
+        f"Package: libc6\nStatus: install ok installed\nVersion: {version}\n"
+        f"Architecture: {architecture}\n\n"
+    ).encode()
+
+
+def _layer_libc_config(layers, *, base_image="python:3.11-slim", arch="amd64"):
+    config = {**BASE_CONFIG, "architecture": arch}
+    return target_libc_config(
+        "linux", arch, base_image, config, layers, base_image_tag_verified=True
+    )
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("replacement_first", [False, True])
+def test_layer_libc_uses_final_regular_database_after_whiteouts(
+    tmp_path, compressed, replacement_first
+):
+    database = "var/lib/dpkg/status"
+    lower = _base_metadata_layer(tmp_path, [(database, _dpkg_libc("2.31-13"))])
+    entries = [
+        ("var/lib/dpkg/.wh..wh..opq", b""),
+        (database, _dpkg_libc("2.36-9")),
+    ]
+    if replacement_first:
+        entries.reverse()
+    upper = _base_metadata_layer(tmp_path, entries, compressed=compressed)
+    original = json.loads(json.dumps(BASE_CONFIG))
+    config = _layer_libc_config([lower, upper])
+    assert target_wheel_platform("linux", "amd64", "python:3.11-slim", config) == (
+        "manylinux_2_36_x86_64"
+    )
+    assert BASE_CONFIG == original
+    assert config["config"]["Env"] is not BASE_CONFIG["config"]["Env"]
+    assert "PYTHON_LIBC=glibc-2.36" in config["config"]["Env"]
+
+
+@pytest.mark.parametrize(
+    "whiteout", ["var/lib/dpkg/.wh.status", "var/lib/.wh.dpkg",
+                 "var/lib/dpkg/.wh..wh..opq", ".wh.var"]
+)
+def test_layer_libc_does_not_reuse_deleted_lower_metadata(tmp_path, whiteout):
+    lower = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    upper = _base_metadata_layer(tmp_path, [(whiteout, b"")])
+    with pytest.raises(ValueError, match="absent or ambiguous"):
+        _layer_libc_config([lower, upper])
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_layer_libc_applies_zero_device_whiteouts_before_additions(tmp_path, replace):
+    database = "var/lib/dpkg/status"
+    lower = _base_metadata_layer(tmp_path, [(database, _dpkg_libc("2.31-13"))])
+    whiteout = tarfile.TarInfo("var/lib/dpkg/.wh.status")
+    whiteout.type = tarfile.CHRTYPE
+    entries = [(whiteout.name, whiteout)]
+    if replace:
+        entries.insert(0, (database, _dpkg_libc()))
+    upper = _base_metadata_layer(tmp_path, entries)
+    if replace:
+        config = _layer_libc_config([lower, upper])
+        assert "PYTHON_LIBC=glibc-2.36" in config["config"]["Env"]
+    else:
+        with pytest.raises(ValueError, match="absent or ambiguous"):
+            _layer_libc_config([lower, upper])
+
+
+@pytest.mark.parametrize("pax_size", ["-1", "not-a-size", "9" * 5000],
+                         ids=["negative", "non-numeric", "overflow"])
+def test_layer_libc_rejects_invalid_device_whiteouts_and_pax_sizes(tmp_path, pax_size):
+    whiteout = tarfile.TarInfo("var/lib/dpkg/.wh.status")
+    whiteout.type = tarfile.CHRTYPE
+    whiteout.devmajor = 1
+    layer = _base_metadata_layer(tmp_path, [(whiteout.name, whiteout)])
+    with pytest.raises(ValueError, match="invalid whiteout"):
+        _layer_libc_config([layer])
+    invalid = tarfile.TarInfo("unrelated")
+    invalid.pax_headers = {"size": pax_size}
+    layer = _base_metadata_layer(tmp_path, [(invalid.name, invalid)])
+    with pytest.raises(ValueError, match="invalid tar member size"):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize(
+    ("records", "message"),
+    [
+        ([], "absent or ambiguous"),
+        ([("var/lib/dpkg/status", _dpkg_libc("2.13-38+deb7u12"))], "Unsupported"),
+        ([("var/lib/dpkg/status", _dpkg_libc(architecture="arm64"))], "architecture"),
+        ([("var/lib/dpkg/status", _dpkg_libc("not-a-version"))], "version"),
+        ([("var/lib/dpkg/status", b"Package: libc6\nVersion: 2.36-9\n")], "incomplete"),
+        ([("var/lib/dpkg/status", _dpkg_libc().replace(b"install ok", b"deinstall ok"))],
+         "not installed"),
+        ([("var/lib/dpkg/status", _dpkg_libc() + _dpkg_libc())], "ambiguous"),
+        ([("var/lib/dpkg/status", _dpkg_libc().replace(
+            b"Version: 2.36-9", b"Version: 2.36-9\nVersion: 2.13-1"))], "ambiguous"),
+        ([("var/lib/dpkg/status", b"\xff")], "utf-8"),
+        ([("var/lib/dpkg/status", _dpkg_libc()),
+          ("lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n")], "ambiguous"),
+        ([("var/lib/dpkg/status", _dpkg_libc()),
+          ("var/lib/dpkg/status", _dpkg_libc())], "one regular file"),
+    ],
+)
+def test_layer_libc_rejects_missing_ambiguous_or_unsupported_evidence(
+    tmp_path, records, message
+):
+    layer = _base_metadata_layer(tmp_path, records)
+    with pytest.raises(ValueError, match=message):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize("name", ["var", "var/lib/dpkg", "var/lib/dpkg/status"])
+@pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_layer_libc_rejects_linked_metadata_or_ancestors(tmp_path, name, link_type):
+    link = tarfile.TarInfo(name)
+    link.type = link_type
+    link.linkname = "elsewhere"
+    layer = _base_metadata_layer(tmp_path, [(name, link)])
+    with pytest.raises(ValueError, match="linked ancestor|one regular file"):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "unrelated", "active", "expected"),
+    [
+        ("python:3.11-slim", "var/lib/dpkg/status", _dpkg_libc(), "lib", "var",
+         "glibc-2.36"),
+        ("python:3.11-alpine", "lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n",
+         "var", "lib", "musl-1.2"),
+    ],
+    ids=["glibc-usr-merged-lib", "musl"],
+)
+def test_layer_libc_ignores_only_links_above_the_other_database(
+    tmp_path, base_image, database, record, unrelated, active, expected
+):
+    # Real python:3.11-slim layers contain lib -> usr/lib (usr-merged Debian).
+    def link(name):
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.SYMTYPE
+        info.linkname = f"usr/{name}"
+        return info
+
+    layer = _base_metadata_layer(tmp_path, [(unrelated, link(unrelated)), (database, record)])
+    config = _layer_libc_config([layer], base_image=base_image)
+    assert f"PYTHON_LIBC={expected}" in config["config"]["Env"]
+    layer = _base_metadata_layer(tmp_path, [(active, link(active)), (database, record)])
+    with pytest.raises(ValueError, match="linked ancestor"):
+        _layer_libc_config([layer], base_image=base_image)
+
+
+_FOREIGN_DATABASE_LINK_CASES = [
+    pytest.param(
+        "python:3.11-slim", "var/lib/dpkg/status", _dpkg_libc(), "lib",
+        "usr/lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n",
+        "glibc-2.36", id="glibc",
+    ),
+    pytest.param(
+        "python:3.11-alpine", "lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:x86_64\n",
+        "var", "usr/var/lib/dpkg/status", _dpkg_libc(), "musl-1.2", id="musl",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize("placement", ["same-layer", "link-first", "link-last"])
+def test_layer_libc_rejects_mixed_databases_hidden_by_foreign_link(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, placement
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    if placement == "same-layer":
+        layers = [_base_metadata_layer(tmp_path, [(root, link), (database, record), (alias, foreign)])]
+    elif placement == "link-first":
+        layers = [
+            _base_metadata_layer(tmp_path, [(root, link), (database, record)]),
+            _base_metadata_layer(tmp_path, [(alias, foreign)]),
+        ]
+    else:
+        layers = [
+            _base_metadata_layer(tmp_path, [(database, record), (alias, foreign)]),
+            _base_metadata_layer(tmp_path, [(root, link)]),
+        ]
+    with pytest.raises(ValueError, match="ambiguous"):
+        _layer_libc_config(layers, base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize("whiteout", ["file", "parent", "opaque"])
+@pytest.mark.parametrize("replace", [False, True])
+def test_layer_libc_applies_whiteouts_to_linked_foreign_database(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, whiteout, replace
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    lower = _base_metadata_layer(tmp_path, [(root, link), (database, record), (alias, foreign)])
+    parent, _, name = alias.rpartition("/")
+    if whiteout == "parent":
+        grandparent, _, directory = parent.rpartition("/")
+        marker = f"{grandparent}/.wh.{directory}"
+    elif whiteout == "opaque":
+        marker = f"{parent}/.wh..wh..opq"
+    else:
+        marker = f"{parent}/.wh.{name}"
+    entries = [(marker, b"")]
+    if replace:
+        entries.insert(0, (alias, foreign))
+    upper = _base_metadata_layer(tmp_path, entries)
+    if replace:
+        with pytest.raises(ValueError, match="ambiguous"):
+            _layer_libc_config([lower, upper], base_image=base_image)
+    else:
+        config = _layer_libc_config([lower, upper], base_image=base_image)
+        assert f"PYTHON_LIBC={expected}" in config["config"]["Env"]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+def test_layer_libc_does_not_forget_foreign_database_through_root_replacement(
+    tmp_path, base_image, database, record, root, alias, foreign, expected
+):
+    link = tarfile.TarInfo(root)
+    link.type = tarfile.SYMTYPE
+    link.linkname = f"usr/{root}"
+    canonical = alias.removeprefix("usr/")
+    lower = _base_metadata_layer(
+        tmp_path, [(root, link), (database, record), (canonical, foreign)]
+    )
+    upper = _base_metadata_layer(tmp_path, [(f".wh.{root}", b""), (root, link)])
+    with pytest.raises(ValueError, match="ambiguous"):
+        _layer_libc_config([lower, upper], base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    ("base_image", "database", "record", "root", "alias", "foreign", "expected"),
+    _FOREIGN_DATABASE_LINK_CASES,
+)
+@pytest.mark.parametrize(
+    "link_location",
+    ["unexpected-root", "escaping-root", "absolute-root", "hardlink-root", "nonempty-root",
+     "canonical-target", "nested-target"],
+)
+def test_layer_libc_rejects_unverifiable_foreign_links(
+    tmp_path, base_image, database, record, root, alias, foreign, expected, link_location
+):
+    root_link = tarfile.TarInfo(root)
+    root_link.type = tarfile.LNKTYPE if link_location == "hardlink-root" else tarfile.SYMTYPE
+    root_link.linkname = {
+        "unexpected-root": "elsewhere",
+        "escaping-root": f"../usr/{root}",
+        "absolute-root": f"/usr/{root}",
+        "hardlink-root": f"usr/{root}",
+        "nonempty-root": f"usr/{root}",
+        "canonical-target": f"usr/{root}",
+        "nested-target": f"usr/{root}",
+    }[link_location]
+    if link_location == "nonempty-root":
+        root_link.size = 1
+    entries = [(root, root_link), (database, record)]
+    if link_location in {"canonical-target", "nested-target"}:
+        nested_path = alias.rsplit("/", 2)[0]
+        if link_location == "canonical-target":
+            nested_path = nested_path.removeprefix("usr/")
+        nested = tarfile.TarInfo(nested_path)
+        nested.type = tarfile.SYMTYPE
+        nested.linkname = "elsewhere"
+        entries.append((nested_path, nested))
+    with pytest.raises(ValueError, match="linked ancestor"):
+        _layer_libc_config([_base_metadata_layer(tmp_path, entries)], base_image=base_image)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../usr/lib/apk/db/installed", "/usr/lib/apk/db/installed",
+     "usr\\lib\\apk\\db\\installed", "usr/lib/apk/db/installed\0ignored"],
+)
+def test_layer_libc_rejects_unsafe_foreign_database_paths(tmp_path, name):
+    entry = tarfile.TarInfo("placeholder")
+    entry.pax_headers = {"path": name}
+    layer = _base_metadata_layer(
+        tmp_path, [("var/lib/dpkg/status", _dpkg_libc()), (entry.name, entry)]
+    )
+    with pytest.raises(ValueError, match="unsafe layer path"):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        (b"P:musl\nV:1.2.5-r0\nV:1.1.22-r3\nA:x86_64\n", "ambiguous"),
+        (b"P:musl\nV:1.2.5-r0\nA:aarch64\n", "architecture"),
+    ],
+)
+def test_layer_libc_rejects_ambiguous_or_foreign_apk_metadata(tmp_path, record, message):
+    layer = _base_metadata_layer(tmp_path, [("lib/apk/db/installed", record)])
+    with pytest.raises(ValueError, match=message):
+        _layer_libc_config([layer], base_image="python:3.11-alpine")
+
+
+@pytest.mark.parametrize(
+    ("limit", "value", "message"),
+    [
+        ("MAX_METADATA_BYTES", 1, "metadata exceeds"),
+        ("MAX_LAYER_BYTES", 1000, "layer size limit"),
+        ("MAX_LAYER_MEMBERS", 1, "member limit"),
+    ],
+)
+def test_layer_libc_inspection_is_bounded(tmp_path, monkeypatch, limit, value, message):
+    layer = _base_metadata_layer(
+        tmp_path, [("unrelated", b""), ("var/lib/dpkg/status", _dpkg_libc())],
+        compressed=True,
+    )
+    monkeypatch.setattr(f"pycontainer.base_libc.{limit}", value)
+    with pytest.raises(ValueError, match=message):
+        _layer_libc_config([layer])
+
+
+def test_layer_libc_rejects_corruption_and_timeout(tmp_path, monkeypatch):
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    original = Path(layer.tar_path).read_bytes()
+    Path(layer.tar_path).write_bytes(b"x" + original[1:])
+    with pytest.raises(ValueError, match="digest or size"):
+        _layer_libc_config([layer])
+    Path(layer.tar_path).write_bytes(original)
+    ticks = iter([0, 301])
+    monkeypatch.setattr("pycontainer.base_libc.time.monotonic", lambda: next(ticks, 301))
+    with pytest.raises(TimeoutError, match="time limit"):
+        _layer_libc_config([layer])
+
+
+def test_layer_libc_bounds_extended_headers_before_tarfile_parses_them(
+    tmp_path, monkeypatch
+):
+    extended = tarfile.TarInfo("unrelated")
+    extended.pax_headers = {"comment": "x" * 200}
+    layer = _base_metadata_layer(
+        tmp_path, [("unrelated", extended), ("var/lib/dpkg/status", _dpkg_libc())]
+    )
+    monkeypatch.setattr("pycontainer.base_libc.MAX_METADATA_BYTES", 128)
+    with pytest.raises(ValueError, match="extended tar metadata"):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize("damage", ["gzip_crc", "tar_end", "media_type"])
+def test_layer_libc_checks_entire_archive_and_media_type(tmp_path, damage):
+    layer = _base_metadata_layer(
+        tmp_path, [("var/lib/dpkg/status", _dpkg_libc())], compressed=True
+    )
+    data = Path(layer.tar_path).read_bytes()
+    if damage == "gzip_crc":
+        data = data[:-8] + bytes([data[-8] ^ 1]) + data[-7:]
+    elif damage == "tar_end":
+        data = gzip.compress(gzip.decompress(data)[:1024])
+    else:
+        layer.media_type = "application/vnd.oci.image.layer.v1.tar"
+    Path(layer.tar_path).write_bytes(data)
+    layer.digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    layer.size = len(data)
+    with pytest.raises((ValueError, OSError), match="CRC|end blocks|media type"):
+        _layer_libc_config([layer])
+
+
+@pytest.mark.parametrize(
+    ("base_image", "verified"),
+    [("python:3.11-slim", False), ("example/python:3.11-slim", True),
+     ("python:3.11-slim@sha256:" + "a" * 64, True)],
+)
+def test_layer_libc_cannot_establish_digest_custom_or_local_provenance(
+    tmp_path, base_image, verified
+):
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc())])
+    config = target_libc_config(
+        "linux", "amd64", base_image, BASE_CONFIG, [layer],
+        base_image_tag_verified=verified,
+    )
+    assert config is BASE_CONFIG
+    with pytest.raises(ValueError, match="unverified"):
+        target_wheel_platform(
+            "linux", "amd64", base_image, config, base_image_tag_verified=verified
+        )
+
+
+@pytest.mark.parametrize(
+    ("base_image", "version", "arch", "record", "wheel_platform"),
+    [
+        ("python:3.12-slim", "3.12", "arm64", _dpkg_libc(architecture="arm64"),
+         "manylinux_2_36_aarch64"),
+        (None, "3.11", "amd64", _dpkg_libc(), "manylinux_2_36_x86_64"),
+        ("python:3.8.0-alpine", "3.8", "amd64",
+         b"P:musl\nV:1.1.22-r3\nA:x86_64\n\n", "musllinux_1_1_x86_64"),
+        ("python:3.11-alpine", "3.11", "amd64",
+         b"P:musl\nV:1.2.5-r0\nA:x86_64\n\n", "musllinux_1_2_x86_64"),
+        ("python:3.4-wheezy", "3.4", "amd64",
+         _dpkg_libc("2.13-38+deb7u12"), None),
+    ],
+)
+def test_aspire_and_default_cli_stage_using_verified_base_layer_libc(
+    tmp_path, monkeypatch, base_image, version, arch, record, wheel_platform
+):
+    from pycontainer import cli
+    from pycontainer.registry_client import RegistryClient
+
+    context = tmp_path / "api"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    requirements = context / ".pycontainer-aspire" / "api" / "requirements.txt"
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text("--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n")
+    abi = "cp" + version.replace(".", "")
+    if wheel_platform:
+        _write_wheel(context / "wheelhouse", tag=f"{abi}-{abi}-{wheel_platform}")
+    else:
+        _write_wheel(context / "wheelhouse", tag="cp34-abi3-manylinux2014_x86_64")
+    if "alpine" in (base_image or ""):
+        for minor in (1, 2, 3):
+            _write_wheel(
+                context / "wheelhouse", tag=f"{abi}-{abi}-musllinux_1_{minor}_x86_64"
+            )
+    database = "lib/apk/db/installed" if "alpine" in (base_image or "") else (
+        "var/lib/dpkg/status"
+    )
+    layer = _base_metadata_layer(tmp_path, [(database, record)], compressed=True)
+    layer_data = Path(layer.tar_path).read_bytes()
+    base_config = {
+        "architecture": arch, "os": "linux",
+        "config": {"Env": [f"PYTHON_VERSION={version}.0"], "WorkingDir": "/"},
+        "rootfs": {"type": "layers", "diff_ids": [
+            "sha256:" + hashlib.sha256(gzip.decompress(layer_data)).hexdigest()
+        ]},
+    }
+    config_data = json.dumps(base_config).encode()
+    config_digest = "sha256:" + hashlib.sha256(config_data).hexdigest()
+    blobs = {layer.digest: layer_data, config_digest: config_data}
+    manifest_data = json.dumps({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": config_digest, "size": len(config_data)},
+        "layers": [{"mediaType": layer.media_type, "digest": layer.digest,
+                    "size": layer.size}],
+    }).encode()
+
+    def manifest_response(self, method, url, **kwargs):
+        assert method == "GET" and "/manifests/" in url
+        return 200, manifest_data, {
+            "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+            "Docker-Content-Digest": "sha256:" + hashlib.sha256(manifest_data).hexdigest(),
+        }
+
+    def blob_response(self, url):
+        data = blobs[url.rsplit("/", 1)[1]]
+        response = io.BytesIO(data)
+        response.status = 200
+        response.headers = {"Content-Length": str(len(data))}
+        return response
+
+    monkeypatch.setattr(
+        "pycontainer.builder.get_registry_auth",
+        lambda registry: SimpleNamespace(bearer_token=None, username=None, password=None),
+    )
+    monkeypatch.setattr(RegistryClient, "_make_request", manifest_response)
+    monkeypatch.setattr(RegistryClient, "_open_blob_response", blob_response)
+    pushes = []
+    monkeypatch.setattr(ImageBuilder, "push", lambda self, **kwargs: pushes.append(kwargs))
+    output = tmp_path / "obj" / "image"
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(f'[build]\noutput-dir = "{output.as_posix()}"\nworkdir = "/app"\n')
+    arguments = [
+        "pycontainer", "build", "--context", str(context), "--tag", "api:latest",
+        "--platform", f"linux/{arch}", "--no-progress",
+        "--include-deps", "--requirements", ".pycontainer-aspire/api/requirements.txt",
+        "--exclude", ".venv", "--exclude", "venv", "--exclude", "env",
+        "--exclude", ".pycontainer-aspire", "--push",
+        "--registry", "localhost:5443/samples/api:latest", "--no-cache",
+    ]
+    if base_image:
+        arguments.extend(["--base-image", base_image, "--config", str(config_path)])
+    else:
+        arguments.extend(["--config", str(config_path)])
+    monkeypatch.setattr(sys, "argv", arguments)
+    if wheel_platform is None:
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: pytest.fail("pip must not run for glibc 2.13")
+        )
+        with pytest.raises(ValueError, match="Unsupported PYTHON_LIBC"):
+            cli.main()
+        assert pushes == []
+        return
+    cli.main()
+    index = json.loads((output / "index.json").read_text())
+    blob_dir = output / "blobs" / "sha256"
+    manifest = json.loads(
+        (blob_dir / index["manifests"][0]["digest"].split(":")[1]).read_text()
+    )
+    with tarfile.open(blob_dir / manifest["layers"][1]["digest"].split(":")[1]) as archive:
+        wheel = archive.extractfile(
+            "app/.python/site-packages/fixture_dep-1.0.dist-info/WHEEL"
+        ).read().decode()
+    assert f"Tag: {abi}-{abi}-{wheel_platform}" in wheel
+    image_config = json.loads(
+        (blob_dir / manifest["config"]["digest"].split(":")[1]).read_text()
+    )
+    assert not any(value.startswith("PYTHON_LIBC=") for value in image_config["config"]["Env"])
+    assert json.loads((blob_dir / config_digest.split(":")[1]).read_text()) == base_config
+    assert pushes[0]["show_progress"] is False
+
+
+@pytest.mark.parametrize(
+    ("base_image", "version", "wheel_tag", "family"),
+    [
+        ("python:3.8.0-alpine", "3.8", "cp38-cp38-musllinux_1_2_x86_64", "musl"),
+        ("python:3.4-wheezy", "3.4", "cp34-abi3-manylinux2014_x86_64", "glibc"),
+    ],
+)
+def test_unproven_old_image_cannot_select_newer_libc_wheel(
+    tmp_path, base_image, version, wheel_tag, family
+):
+    _write_wheel(tmp_path / "wheelhouse", tag=wheel_tag)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    with pytest.raises(ValueError, match=f"Cannot validate target {family}"):
+        install_requirements(
+            requirements, tmp_path / "staged", tmp_path,
+            "linux", "amd64", version, base_image,
+            {"config": {"Env": [f"PYTHON_VERSION={version}"]}},
+            base_image_tag_verified=True,
+        )
+    assert not (tmp_path / "staged").exists()
+
+
+@pytest.mark.parametrize("source", ["requirements", "venv"])
+@pytest.mark.parametrize("base_image", [None, "python:3.11-alpine"])
+def test_unproven_default_or_alpine_rejects_before_dependency_staging(
+    tmp_path, monkeypatch, source, base_image
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    if source == "requirements":
+        (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    else:
+        site_packages = context / "venv" / "Lib" / "site-packages"
+        site_packages.mkdir(parents=True)
+        (site_packages / "fixture_dep.py").write_text("value = 1\n")
+    options = {"base_image": base_image} if base_image else {}
+    builder = ImageBuilder(
+        BuildConfig(context_dir=str(context), include_deps=True, use_cache=False, **options)
+    )
+
+    def unexpected_staging(*args, **kwargs):
+        pytest.fail("dependencies must not be staged without validated target libc")
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", unexpected_staging)
+    monkeypatch.setattr("pycontainer.builder.stage_virtualenv", unexpected_staging)
+    with pytest.raises(ValueError, match="Cannot validate target") as error:
+        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+    assert "python:3.11-slim-bookworm" in str(error.value)
+
+
+@pytest.mark.parametrize("include_deps", [False, True])
+def test_default_image_build_requires_libc_only_for_dependency_staging(
+    tmp_path, monkeypatch, include_deps
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    (context / "requirements.txt").write_text("# no dependencies\n")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
+    )
+    builder = ImageBuilder(
+        BuildConfig(
+            context_dir=str(context), output_dir=str(tmp_path / "output"),
+            use_cache=False, include_deps=include_deps,
+        )
+    )
+    if include_deps:
+        with pytest.raises(ValueError, match="Cannot validate target libc"):
+            builder.build()
+    else:
+        builder.build()
+        assert (tmp_path / "output" / "index.json").is_file()
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -952,8 +1574,8 @@ DIGEST = "sha256:" + "a" * 64
         (f"python:3.11-slim@{DIGEST}", "glibc-2.17", "manylinux_2_17_x86_64"),
         (f"python:3.11-slim@{DIGEST}", "musl-1.2", "musllinux_1_2_x86_64"),
         ("python:3.11-alpine", "musl-1.2", "musllinux_1_2_x86_64"),
-        ("python:3.11-slim", "glibc-2.17", "manylinux2014_x86_64"),
-        ("python", None, "manylinux2014_x86_64"),
+        ("python:3.11-slim", "glibc-2.17", "manylinux_2_17_x86_64"),
+        ("python", "glibc-2.17", "manylinux_2_17_x86_64"),
     ],
 )
 def test_official_image_libc_uses_tag_or_explicit_metadata(base_image, libc, expected):
@@ -970,7 +1592,7 @@ def test_official_image_libc_uses_tag_or_explicit_metadata(base_image, libc, exp
         (f"python@{DIGEST}", (), "unverified"),
         (f"python:3.11-slim@{DIGEST}", (), "unverified"),
         (f"python:3.11-alpine@{DIGEST}", (), "unverified"),
-        (f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.1",), "Unsupported PYTHON_LIBC"),
+        (f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.0",), "Unsupported PYTHON_LIBC"),
         (f"python@{DIGEST}", ("PYTHON_LIBC=",), "Unsupported PYTHON_LIBC"),
         ("python:3.11-alpine", ("PYTHON_LIBC=glibc-2.17",), "conflicts"),
         ("python:3.11-slim", ("PYTHON_LIBC=musl-1.2",), "conflicts"),
@@ -1116,6 +1738,232 @@ def test_digest_only_source_name_with_musl_metadata_stages_musl_wheels_only(
     assert "Tag: cp311-cp311-musllinux_1_2_x86_64" in wheel
 
 
+def _glibc_tags(newest, machine):
+    return [f"manylinux_2_{minor}_{machine}" for minor in range(newest, 16, -1)] + [
+        f"manylinux2014_{machine}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arch", "base_image", "env", "verified", "expected"),
+    [
+        ("amd64", "python:3.11-slim", ("PYTHON_LIBC=glibc-2.17",), True,
+         _glibc_tags(17, "x86_64")),
+        ("arm64", "python:3.11", ("PYTHON_LIBC=glibc-2.17",), True,
+         _glibc_tags(17, "aarch64")),
+        ("amd64", "python:3.11-alpine", ("PYTHON_LIBC=musl-1.1",), True,
+         ["musllinux_1_1_x86_64"]),
+        ("arm64", "python:3.11-slim-bookworm", (), True, _glibc_tags(31, "aarch64")),
+        ("amd64", "docker.io/library/python:3.11-bullseye", (), True,
+         _glibc_tags(28, "x86_64")),
+        ("amd64", "python:3.13-slim-trixie", (), True, _glibc_tags(36, "x86_64")),
+        ("amd64", "python:3.8-buster", (), True, _glibc_tags(24, "x86_64")),
+        ("amd64", "python:3.6-stretch", (), True, _glibc_tags(19, "x86_64")),
+        ("amd64", "python:3.5-jessie", (), True, _glibc_tags(17, "x86_64")),
+        ("arm64", "python:3.11-alpine3.20", (), True,
+         ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
+        ("amd64", "python:3.9-alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
+        ("amd64", "python:3.11-slim-bookworm", ("PYTHON_LIBC=glibc-2.31",), True,
+         _glibc_tags(31, "x86_64")),
+        ("amd64", "example/python:custom", ("PYTHON_LIBC=glibc-2.28",), True,
+         _glibc_tags(28, "x86_64")),
+        ("amd64", "python:3.11-slim-bookworm", ("PYTHON_LIBC=glibc-2.17",), False,
+         _glibc_tags(17, "x86_64")),
+        ("amd64", f"python:3.11-slim-bookworm@{DIGEST}", ("PYTHON_LIBC=glibc-2.17",),
+         True, _glibc_tags(17, "x86_64")),
+        ("arm64", f"python@{DIGEST}", ("PYTHON_LIBC=musl-1.2",), False,
+         ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"]),
+        ("amd64", "python:3.11-notalpine", ("PYTHON_LIBC=glibc-2.17",), True,
+         _glibc_tags(17, "x86_64")),
+        ("amd64", "python:3.11-Slim-Bookworm", (), True, _glibc_tags(31, "x86_64")),
+        ("amd64", "python:3.11-Alpine3.12", (), True, ["musllinux_1_1_x86_64"]),
+        ("amd64", "python:3.11-alpine3.24", (), True,
+         ["musllinux_1_2_x86_64", "musllinux_1_1_x86_64"]),
+        ("amd64", "python:3.11-alpine3.25", ("PYTHON_LIBC=musl-1.2",), True,
+         ["musllinux_1_2_x86_64", "musllinux_1_1_x86_64"]),
+        ("arm64", "python:3.11-alpine3.99", ("PYTHON_LIBC=musl-1.1",), True,
+         ["musllinux_1_1_aarch64"]),
+    ],
+)
+def test_compatible_wheel_platforms_follow_verified_libc(
+    arch, base_image, env, verified, expected
+):
+    platforms = target_wheel_platforms(
+        "linux", arch, base_image, _libc_config(*env),
+        base_image_tag_verified=verified,
+    )
+    assert platforms == expected
+    options = _target_options(
+        "linux", arch, "3.11", base_image, _libc_config(*env),
+        base_image_tag_verified=verified,
+    )
+    assert options[: 2 * len(expected)] == [
+        item for platform in expected for item in ("--platform", platform)
+    ]
+    assert options[2 * len(expected):] == [
+        "--python-version", "3.11", "--implementation", "cp", "--abi", "cp311",
+        "--only-binary=:all:",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("base_image", "env", "verified", "message"),
+    [
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-x.y",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.16",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.017",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=glibc-2.100",), True, "Unsupported"),
+        ("example/python:custom", ("PYTHON_LIBC=musl-2.1",), True, "Unsupported"),
+        ("python:3.11-slim-bookworm", ("PYTHON_LIBC=musl-1.2",), True, "conflicts"),
+        ("python:3.11-alpine3.20", ("PYTHON_LIBC=glibc-2.36",), True, "conflicts"),
+        ("python:3.11-alpine-bookworm", (), True, "glibc codename"),
+        ("python:3.11-alpine3.20-bookworm", (), True, "more than one"),
+        ("python:3.8.0-alpine", (), True, "Cannot validate target musl"),
+        ("python:3.11-alpine", (), True, "Cannot validate target musl"),
+        ("python:3.11-alpine3.25", (), True, "Cannot validate target musl"),
+        ("python:3.11-Alpine3.99", (), True, "Cannot validate target musl"),
+        ("python:3.4-wheezy", (), True, "Cannot validate target glibc"),
+        ("python:3.4-wheezy", ("PYTHON_LIBC=glibc-2.13",), True, "Unsupported"),
+        ("python:3.11-slim", (), True, "Cannot validate target glibc"),
+        ("python", (), True, "Cannot validate target glibc"),
+        ("python:3.11-slim-future", (), True, "Cannot validate target glibc"),
+        ("python:3.11-slim-bookworm", (), False, "unverified"),
+        (f"python:3.11-slim-bookworm@{DIGEST}", (), True, "unverified"),
+        ("example/python:3.11-slim-bookworm", (), True, "unverified"),
+    ],
+)
+def test_wheel_platforms_reject_invalid_or_unverifiable_libc_before_pip(
+    tmp_path, monkeypatch, base_image, env, verified, message
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0\n")
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda *a, **k: pytest.fail("pip must not run without a validated libc"),
+    )
+    with pytest.raises(ValueError, match=message):
+        install_requirements(
+            requirements, tmp_path / "staged", tmp_path,
+            "linux", "amd64", "3.11", base_image, _libc_config(*env),
+            base_image_tag_verified=verified,
+        )
+    assert not (tmp_path / "staged").exists()
+
+
+def _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env=()):
+    context = tmp_path / wheel_tag / base_image.replace(":", "_").replace("/", "_")
+    context.mkdir(parents=True)
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    _write_wheel(context / "wheelhouse", tag=f"cp311-cp311-{wheel_tag}")
+    destination = context / "staged"
+    install_requirements(
+        context / "requirements.txt", destination, context,
+        "linux", arch, "3.11", base_image, _libc_config(*env),
+        base_image_tag_verified="@" not in base_image and not env,
+    )
+    return (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
+
+
+@pytest.mark.parametrize(
+    ("wheel_tag", "arch", "base_image", "env"),
+    [
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-slim-bookworm", ()),
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-bullseye", ()),
+        ("manylinux_2_28_x86_64", "amd64", "example/python:custom",
+         ("PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=glibc-2.28")),
+        ("manylinux_2_36_x86_64", "amd64", "python:3.11-slim-trixie", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine3.20", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine3.10", ()),
+        ("musllinux_1_2_aarch64", "arm64", "python:3.11-alpine3.20", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-alpine",
+         ("PYTHON_LIBC=musl-1.1",)),
+        ("musllinux_1_1_aarch64", "arm64", f"python@{DIGEST}",
+         ("PYTHON_LIBC=musl-1.2",)),
+    ],
+)
+def test_real_pip_selects_compatible_newer_or_older_libc_wheels(
+    tmp_path, wheel_tag, arch, base_image, env
+):
+    wheel = _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env)
+    assert f"Tag: cp311-cp311-{wheel_tag}" in wheel
+
+
+@pytest.mark.parametrize(
+    ("wheel_tag", "arch", "base_image", "env"),
+    [
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-slim",
+         ("PYTHON_LIBC=glibc-2.17",)),
+        ("manylinux_2_28_aarch64", "arm64", "python:3.11-stretch", ()),
+        ("manylinux_2_28_x86_64", "amd64", "example/python:custom",
+         ("PYTHON_LIBC=glibc-2.27",)),
+        ("manylinux_2_32_aarch64", "arm64", "python:3.11-slim-bookworm", ()),
+        ("manylinux_2_29_x86_64", "amd64", "python:3.11-bullseye", ()),
+        ("manylinux_2_37_x86_64", "amd64", "python:3.11-slim-trixie", ()),
+        ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine",
+         ("PYTHON_LIBC=musl-1.1",)),
+        ("musllinux_1_2_x86_64", "amd64", "python:3.11-alpine3.12", ()),
+        ("musllinux_1_1_x86_64", "amd64", "python:3.11-slim-bookworm", ()),
+        ("manylinux2014_x86_64", "amd64", "python:3.11-alpine3.20", ()),
+        ("manylinux_2_28_aarch64", "amd64", "python:3.11-slim-bookworm", ()),
+    ],
+)
+def test_real_pip_rejects_wheels_outside_selected_platforms(
+    tmp_path, wheel_tag, arch, base_image, env
+):
+    with pytest.raises(RuntimeError, match="Only wheels compatible with"):
+        _install_fixture_wheel(tmp_path, wheel_tag, arch, base_image, env)
+
+
+def test_real_pip_prefers_newest_compatible_libc_wheel(tmp_path):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    for tag in ("manylinux2014_aarch64", "manylinux_2_28_aarch64",
+                "manylinux_2_39_aarch64"):
+        _write_wheel(context / "wheelhouse", tag=f"cp311-cp311-{tag}")
+    for base_image, expected, env in (
+        ("python:3.11-slim-bookworm", "manylinux_2_28_aarch64", ()),
+        ("python:3.11-slim", "manylinux2014_aarch64", ("PYTHON_LIBC=glibc-2.17",)),
+    ):
+        destination = tmp_path / base_image.replace(":", "_")
+        install_requirements(
+            context / "requirements.txt", destination, context,
+            "linux", "arm64", "3.11", base_image, _libc_config(*env),
+            base_image_tag_verified=True,
+        )
+        wheel = (destination / "fixture_dep-1.0.dist-info" / "WHEEL").read_text()
+        assert f"Tag: cp311-cp311-{expected}" in wheel
+
+
+def test_codename_tag_keeps_dependency_layer_digest_for_same_wheel(
+    tmp_path, monkeypatch
+):
+    digests = []
+    for base_image in ("python:3.11-slim", "python:3.11-slim-bookworm"):
+        context = tmp_path / base_image.replace(":", "_")
+        context.mkdir()
+        _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_x86_64")
+        (context / "requirements.txt").write_text(
+            "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+        )
+        builder = _builder(
+            tmp_path, monkeypatch, context=context, include_deps=True,
+            base_image=base_image, workdir="/app", reproducible=True,
+        )
+        layers = tmp_path / "layers" / base_image.replace(":", "_")
+        layers.mkdir(parents=True)
+        config = BASE_CONFIG
+        if base_image == "python:3.11-slim":
+            config = {**BASE_CONFIG, **_libc_config("PYTHON_LIBC=glibc-2.17")}
+        digests.append(builder._create_deps_layer(layers, base_config=config).digest)
+    assert digests[0] == digests[1]
+
+
 def test_requirements_install_rejects_incompatible_cpython_wheel(tmp_path, monkeypatch):
     context = tmp_path / "context"
     context.mkdir()
@@ -1196,7 +2044,7 @@ def test_requirements_install_terminates_when_staging_limit_is_exceeded(
             "linux",
             "amd64",
             "3.11",
-            "python:3.11-slim",
+            "python:3.11-slim-bookworm",
             BASE_CONFIG,
             base_image_tag_verified=True,
         )
@@ -1248,7 +2096,7 @@ def test_requirements_install_tolerates_files_pip_moves_during_limit_check(
         "linux",
         "amd64",
         "3.11",
-        "python:3.11-slim",
+        "python:3.11-slim-bookworm",
         BASE_CONFIG,
         base_image_tag_verified=True,
     )
@@ -1289,7 +2137,9 @@ def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> N
             wheel.writestr(path, content)
 
 
-def _install_marker_fixture(tmp_path, requirements, arch, python_version, full_version):
+def _install_marker_fixture(
+    tmp_path, requirements, arch, python_version, full_version, libc="glibc-2.17"
+):
     context = tmp_path / "context"
     requirements_file = context / "requirements.txt"
     requirements_file.write_text(
@@ -1304,7 +2154,7 @@ def _install_marker_fixture(tmp_path, requirements, arch, python_version, full_v
         arch,
         python_version,
         f"python:{python_version}-slim",
-        {"config": {"Env": [f"PYTHON_VERSION={full_version}"]}},
+        {"config": {"Env": [f"PYTHON_VERSION={full_version}", f"PYTHON_LIBC={libc}"]}},
         base_image_tag_verified=True,
     )
     return {name for name, _ in staged_packages(destination)}
@@ -1380,6 +2230,24 @@ def test_requirements_install_keeps_markers_that_match_host_and_target(tmp_path)
     )
 
     assert installed == {"marker-root", "marker-plain", "marker-cpython", "marker-full"}
+
+
+def test_target_marker_selects_newest_compatible_libc_wheel(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse, "marker-root",
+        requires=['fixture-dep; platform_machine == "aarch64"'],
+    )
+    for minor in (17, 28, 39):
+        _write_wheel(wheelhouse, tag=f"cp311-cp311-manylinux_2_{minor}_aarch64")
+
+    installed = _install_marker_fixture(
+        tmp_path, ["marker-root"], "arm64", "3.11", "3.11.8", "glibc-2.28"
+    )
+
+    assert installed == {"marker-root", "fixture-dep"}
+    wheel = (tmp_path / "stage" / "site-packages" / "fixture_dep-1.0.dist-info" / "WHEEL")
+    assert "Tag: cp311-cp311-manylinux_2_28_aarch64" in wheel.read_text()
 
 
 def test_requirements_install_without_markers_needs_no_full_python_version(tmp_path):
@@ -1884,6 +2752,170 @@ def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
     (context / "requirements.txt").write_text("venv-egg[speed-ups]\n")
 
     with pytest.raises(ValueError, match=r"venv-egg 1.0 \[speed-ups\] requires .*venv-fast"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+_REPRODUCER_MARKER = 'extra != "" and extra in "other,Speed_Ups"'
+_LEGACY_PACKAGING = (
+    "import pip._vendor.packaging.markers as _markers\n"
+    "_markers._normalize = lambda *values, key: values\n"
+)
+
+
+def _write_extra_venv(context, marker, requested="speed-ups", installed=False):
+    dists = {"marker-root": [
+        "Provides-Extra: Speed_Ups",
+        f"Requires-Dist: missing-child; {marker}",
+    ]}
+    if installed:
+        dists["missing-child"] = []
+    _write_base_venv(context, dists)
+    (context / "requirements.txt").write_text(f"marker-root[{requested}]\n")
+
+
+def _simulate_legacy_packaging(tmp_path, monkeypatch):
+    # Simulate packaging 21.3, which compares extra strings literally.
+    script = tmp_path / "_venv_closure.py"
+    script.write_text(
+        _LEGACY_PACKAGING + dependencies._VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8")
+    )
+    monkeypatch.setattr(dependencies, "_VENV_CLOSURE_SCRIPT", script)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("arch", ["amd64", "arm64"])
+def test_virtualenv_normalizes_extra_list_operands(
+    tmp_path, monkeypatch, arch, legacy
+):
+    if legacy:
+        _simulate_legacy_packaging(tmp_path, monkeypatch)
+    context = tmp_path / "context"
+    _write_extra_venv(context, _REPRODUCER_MARKER)
+    with pytest.raises(
+        ValueError, match=r"marker-root 1.0 \[speed-ups\] requires .*missing-child.*not installed"
+    ):
+        _stage_base_venv(tmp_path, monkeypatch, context, arch)
+
+    shutil.rmtree(context)
+    _write_extra_venv(context, _REPRODUCER_MARKER, installed=True)
+    assert _stage_base_venv(tmp_path, monkeypatch, context, arch) is not None
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    ("marker", "requested", "missing"),
+    [
+        ('extra == "Speed_Ups"', "speed-ups", True),
+        ('"Speed_Ups" == extra', "speed-ups", True),
+        ('extra != "" and extra != "Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra in "Other, Fast"', "speed-ups", False),
+        ('extra != "" and extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra not in "other,fast"', "speed-ups", True),
+        # PEP 508 `in` is a Python substring test: "" is in every string.
+        ('extra in "other,fast"', "speed-ups", True),
+        ('extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra != "" and extra in "Speed_Ups"', "ups", True),
+        ('"Speed" in extra', "speed-ups", True),
+        ('"other" in extra', "speed-ups", False),
+        ('"Fast" not in extra', "speed-ups", True),
+        ('extra in "other,Speed_Ups" and sys_platform == "linux"', "speed-ups", True),
+        ('extra in "other,Speed_Ups" and sys_platform == "win32"', "speed-ups", False),
+        ('sys_platform == "win32" or "Speed_Ups" == extra', "speed-ups", True),
+    ],
+)
+def test_virtualenv_extra_operators_are_verified(
+    tmp_path, monkeypatch, marker, requested, missing, legacy
+):
+    if legacy:
+        _simulate_legacy_packaging(tmp_path, monkeypatch)
+    context = tmp_path / "context"
+    _write_extra_venv(context, marker, requested=requested)
+    if requested != "speed-ups":
+        metadata = context / ".venv" / "Lib" / "site-packages" / "marker_root-1.0.dist-info" / "METADATA"
+        metadata.write_text(metadata.read_text().replace("Speed_Ups\n", f"{requested}\n", 1))
+    if missing:
+        with pytest.raises(ValueError, match="missing-child.*not installed"):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+
+@pytest.mark.parametrize(
+    "marker", ['extra >= "speed"', 'extra === "speed"', 'extra ~= "1.0"']
+)
+def test_virtualenv_unsupported_extra_comparisons_fail_closed(
+    tmp_path, monkeypatch, marker
+):
+    context = tmp_path / "context"
+    _write_extra_venv(context, marker, installed=True)
+    with pytest.raises(ValueError, match="only extra ==, !=, in and not in comparisons"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    ("marker", "message"),
+    [
+        # Substring matches differ between pip versions, so they cannot prove
+        # that an unselected extra was never requested.
+        ('extra != "" and extra in "fast,turbo"', r"Cannot determine whether extra \[fast\]"),
+        ('extra in "other,Speed_Ups"', "missing-child.*not installed"),
+    ],
+)
+def test_virtualenv_substring_extras_cannot_prove_unrequested(
+    tmp_path, monkeypatch, marker, message
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        "Provides-Extra: Fast",
+        f"Requires-Dist: missing-child; {marker}",
+    ]})
+    (context / "requirements.txt").write_text("marker-root\n")
+    with pytest.raises(ValueError, match=message):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+_INJECT_INVALID_VERSION = (
+    "import pip._vendor.packaging.markers as _markers\n"
+    "from pip._vendor.packaging.version import InvalidVersion\n"
+    "_eval_op = _markers._eval_op\n"
+    "def _raising_eval_op(lhs, op, rhs, *args, **kwargs):\n"
+    "    if '1-0-0' in (lhs, rhs):\n"
+    "        raise InvalidVersion('injected')\n"
+    "    return _eval_op(lhs, op, rhs, *args, **kwargs)\n"
+    "_markers._eval_op = _raising_eval_op\n"
+)
+
+
+def test_virtualenv_version_like_extra_evaluation_errors_fail_closed(
+    tmp_path, monkeypatch
+):
+    # packaging 22+ raises InvalidVersion comparing "1-0-0" with "==1-0";
+    # inject it so every vendored packaging version takes the error path.
+    script = tmp_path / "_venv_closure.py"
+    script.write_text(
+        _INJECT_INVALID_VERSION
+        + dependencies._VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8")
+    )
+    monkeypatch.setattr(dependencies, "_VENV_CLOSURE_SCRIPT", script)
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        "Provides-Extra: 1.0.0",
+        'Requires-Dist: missing-child; extra == "1.0"',
+    ]})
+    (context / "requirements.txt").write_text("marker-root[1.0.0]\n")
+    with pytest.raises(ValueError, match=r"marker-root 1.0 \[1-0-0\] requires .*missing-child.*not installed"):
+        _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_substring_extras_without_provides_extra_fail_closed(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"marker-root": [
+        'Requires-Dist: missing-child; extra != "" and extra in "fast"',
+    ]})
+    (context / "requirements.txt").write_text("marker-root\n")
+    with pytest.raises(ValueError, match="Cannot determine which extras of marker-root"):
         _stage_base_venv(tmp_path, monkeypatch, context)
 
 
