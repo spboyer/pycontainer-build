@@ -1,4 +1,6 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
+from contextlib import nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -177,7 +179,11 @@ def _select_index_descriptor(
         f"variant. Available platforms: {available_text}."
     )
 from .oci import OCILayer, build_config_json, build_manifest_json, build_oci_layout, build_index_json
-from .project import detect_entrypoint, default_include_paths, find_dependencies
+from .project import (
+    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    default_include_paths, find_dependencies,
+)
+from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
 from .registry_client import (
     RegistryClient,
@@ -192,6 +198,7 @@ from .local_image import (
     verify_layer_diff_ids,
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
@@ -203,6 +210,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_libc_config,
     target_wheel_platform,
     validate_target_platform,
 )
@@ -210,7 +218,29 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): 
+    def __init__(self, config: BuildConfig):
+        self._history = (
+            BuildHistory(config.history_dir)
+            if config.record_history and not config.dry_run
+            else None
+        )
+        self._history_timer = (
+            ContextVar("pycontainer_build_history", default=None)
+            if self._history else None
+        )
+        if self._history:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            timing = BuildTiming()
+            try:
+                with timing.phase("initialization"):
+                    self._initialize(config)
+            except BaseException:
+                self._record_failed_history(timing, config)
+                raise
+        else:
+            self._initialize(config)
+
+    def _initialize(self, config: BuildConfig):
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -257,14 +287,66 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _record_failed_history(self, timing, config):
+        try:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            self._history.append(timing.record("failed"))
+        except BaseException as error:
+            # Recording must never replace the original build failure.
+            logger.error("Build history could not be saved or confirmed: %s", error)
+
+    def _time_history_phase(self, name):
+        timing = self._history_timer.get() if self._history_timer else None
+        return timing.phase(name) if timing else nullcontext()
+
     def build(self):
+        self._conda_warning_emitted = False
+        if conda_prefix(self.config.context_dir, ".") is not None:
+            raise ValueError(
+                "The build context is inside a host Conda environment; use a "
+                "source-only build context to avoid copying host environment files. "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` and select that "
+                "file with --requirements and --include-deps."
+            )
+        if self.config.include_deps:
+            self._check_conda_dependencies()
         if self.dry_run:
             logger.info("DRY RUN: Would build image %s", self.config.tag)
             self._show_build_plan()
             return self.config.tag
 
-        with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+        timing = BuildTiming() if self._history else None
+        token = self._history_timer.set(timing) if timing else None
+        try:
+            try:
+                if self._history:
+                    self._history.validate_location(
+                        self.config.context_dir, self.config.output_dir
+                    )
+                with output_directory_lock(self.config.output_dir):
+                    result = self._build_image()
+                    if self.config.scan:
+                        from .scanning import scanned_image
+
+                        with scanned_image(
+                            Path(self.config.output_dir), self.manifest_digest, self.config
+                        ):
+                            logger.info("Vulnerability gate passed for %s", self.manifest_digest)
+            except BaseException:
+                if timing:
+                    self._record_failed_history(timing, self.config)
+                raise
+
+            if timing:
+                self._history.validate_location(
+                    self.config.context_dir, self.config.output_dir
+                )
+                self._history.append(timing.record("success"))
+            return result
+        finally:
+            if timing:
+                self._history_timer.reset(token)
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -276,7 +358,8 @@ class ImageBuilder:
         security_fragments=render_security_fragments(
             self.config.security, self.config.context_dir
         )
-        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        with self._time_history_phase("base_image"):
+            base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
@@ -287,12 +370,21 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
+            with self._time_history_phase("dependencies"):
+                staging_config = target_libc_config(
+                    os_name, arch, self.config.base_image, base_config, base_layers,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                    ),
+                )
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=staging_config, os_name=os_name, arch=arch
+                )
             if deps_layer: app_layers.append(deps_layer)
         
-        app_layer=self._create_app_layer(layers_dir, include)
+        with self._time_history_phase("application"):
+            app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(app_layer)
         
         all_layers=base_layers+app_layers
@@ -323,7 +415,8 @@ class ImageBuilder:
 
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
-                                layer_diff_ids=[layer.digest for layer in app_layers])
+                                layer_diff_ids=[layer.digest for layer in app_layers],
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -367,16 +460,17 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(
-                Path(self.config.context_dir),
-                sbom_path,
-                format=(
-                    self.config.generate_sbom
-                    if isinstance(self.config.generate_sbom, str)
-                    else "spdx"
-                ),
-                package_inventory=getattr(self, "_staged_packages", []),
-            )
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
             logger.info(f"✓ SBOM saved to {sbom_path}")
 
         for fragment_path in write_security_fragments(output, security_fragments):
@@ -564,7 +658,29 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
-        
+        if self.config.scan:
+            from .scanning import scanned_image
+
+            with output_directory_lock(self.config.output_dir):
+                with scanned_image(
+                    Path(self.config.output_dir), self.manifest_digest, self.config
+                ) as (snapshot, descriptor):
+                    return self._push_image(registry_url, auth_token, username, password, show_progress, snapshot, descriptor)
+        return self._push_image(registry_url, auth_token, username, password, show_progress)
+
+    def _push_image(self, registry_url, auth_token, username, password, show_progress, output=None, descriptor=None):
+        output=output or Path(self.config.output_dir)
+        layers_dir=output/'blobs'/'sha256'
+        manifest_digest=descriptor["digest"] if descriptor else self.manifest_digest
+        manifest_path=layers_dir/manifest_digest.split(":",1)[1]
+        manifest_data=manifest_path.read_bytes()
+        if descriptor:
+            manifest=json.loads(manifest_data)
+            layers=manifest["layers"]
+            config_digest=manifest["config"]["digest"]
+        else:
+            layers=[layer.to_descriptor() for layer in self.layers]
+            config_digest=self.config_digest
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         push_tags=[tag]
@@ -579,24 +695,21 @@ class ImageBuilder:
             password=password,
         )
         client=self._registry_client(registry, repo, auth)
-        output=Path(self.config.output_dir)
-        layers_dir=output/'blobs'/'sha256'
         
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
         
-        for i, layer in enumerate(self.layers, 1):
-            if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
-            blob_path=layers_dir/layer.digest.split(":",1)[1]
-            skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
+        for i, layer in enumerate(layers, 1):
+            digest=layer["digest"]
+            if show_progress: print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
+            blob_path=layers_dir/digest.split(":",1)[1]
+            skipped=not client.push_blob(digest, blob_path, check_exists=True)
             if show_progress and skipped: print(f"    Layer exists, skipped")
         
-        if show_progress: print(f"  Pushing config ({self.config_digest[:19]}...)")
-        cfg_path=layers_dir/self.config_digest.split(":",1)[1]
-        client.push_blob(self.config_digest, cfg_path, check_exists=True)
+        if show_progress: print(f"  Pushing config ({config_digest[:19]}...)")
+        cfg_path=layers_dir/config_digest.split(":",1)[1]
+        client.push_blob(config_digest, cfg_path, check_exists=True)
         
-        if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
-        manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
-        manifest_data=manifest_path.read_bytes()
+        if show_progress: print(f"  Pushing manifest ({manifest_digest[:19]}...)")
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
             if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
@@ -619,12 +732,61 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        if self.config.stop_signal:
+            print(f"  Stop Signal: {self.config.stop_signal}")
+        if self.config.volumes:
+            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         for name in render_security_fragments(self.config.security, self.config.context_dir):
             print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
+
+    def _check_conda_dependencies(self):
+        ctx = Path(self.config.context_dir)
+        relative = relative_context_path(self.config.requirements_file)
+        signals = detect_conda_inputs(
+            ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
+            selected_paths=self.context_include_paths,
+        )
+        requirements = ctx / relative
+        requirements_exist = requirements.is_file()
+        conda_requirements = requirements_exist and (
+            relative.name in CONDA_FILES
+            or requirements.resolve().name in CONDA_FILES
+        )
+        requirements_prefix = (
+            conda_prefix(ctx, relative) if requirements_exist else None
+        )
+        if conda_requirements or requirements_prefix is not None:
+            if relative not in signals:
+                signals.append(relative)
+        if not signals:
+            return False
+        if (
+            conda_requirements
+            or not requirements_exist
+            or requirements_prefix is not None
+        ):
+            raise ValueError(
+                f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` in your Conda "
+                "environment, then select that file with --requirements and "
+                "--include-deps. Conda-only packages must be provided by the base "
+                "image; host Conda environments are never copied."
+            )
+        if not requirements.resolve().is_relative_to(ctx.resolve()):
+            raise ValueError("Requirements file must stay inside the build context.")
+        if not getattr(self, "_conda_warning_emitted", False):
+            logger.warning(
+                "Conda inputs ignored (%s); installing only pip requirements from %s. "
+                "Conda-only packages are not staged.",
+                ", ".join(path.as_posix() for path in signals), relative.as_posix(),
+            )
+            self._conda_warning_emitted = True
+        return True
 
     def _create_deps_layer(
         self,
@@ -636,15 +798,15 @@ class ImageBuilder:
     ) -> Optional[OCILayer]:
         """Create a target-compatible dependency layer from a venv or requirements."""
         ctx=Path(self.config.context_dir)
+        prefer_requirements = self._check_conda_dependencies()
         deps_paths=find_dependencies(
             ctx,
             self.config.requirements_file,
             exclude_paths=self.dependency_excludes,
             exclude_defaults=False,
+            prefer_requirements=prefer_requirements,
         )
-        requirements_relative = Path(self.config.requirements_file)
-        if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
-            raise ValueError("Requirements path must be relative and stay inside the build context.")
+        requirements_relative = relative_context_path(self.config.requirements_file)
         is_requirements = any(
             relative == requirements_relative for _, relative in deps_paths
         )
