@@ -203,6 +203,22 @@ def test_symlink_to_unselected_file_is_rejected(tmp_path, overrides):
         _app_layer(context, tmp_path, use_cache=False, **overrides)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows resolves '..' in link targets lexically")
+def test_symlink_through_directory_link_dot_dot_is_rejected(tmp_path):
+    context = _context(tmp_path)
+    (context / "shared" / "inner").mkdir(parents=True)
+    (context / "shared" / "data.py").write_text("value = 'excluded'\n")
+    (context / "data.py").write_text("value = 'selected'\n")
+    _link(context / "alias", os.path.join("shared", "inner"), directory=True)
+    _link(context / "link.py", os.path.join("alias", "..", "data.py"))
+
+    with pytest.raises(ValueError, match="another selected file"):
+        _app_layer(
+            context, tmp_path, use_cache=False,
+            include_paths=["link.py", "data.py"], exclude_paths=["shared"],
+        )
+
+
 def test_changed_symlink_target_invalidates_cache(tmp_path):
     context = _context(tmp_path)
     (context / "src" / "other.py").write_text("print('other')\n")

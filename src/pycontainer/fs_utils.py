@@ -282,11 +282,17 @@ def select_context_files(base, include_paths, excludes):
     files = list(
         iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
     )
-    selected_paths = {os.path.abspath(path) for path, _ in files}
+    # Lexical membership keeps the link valid inside the image; resolved
+    # membership stops ``..`` after an in-context link from naming other files.
+    lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
+    resolved_paths = {os.path.normcase(os.path.realpath(path)) for path, _ in files}
     for path, relative in files:
         if path.is_symlink():
-            target = os.path.abspath(path.parent / os.readlink(path))
-            if target not in selected_paths:
+            target = path.parent / os.readlink(path)
+            if (
+                os.path.normcase(os.path.abspath(target)) not in lexical_paths
+                or os.path.normcase(os.path.realpath(target)) not in resolved_paths
+            ):
                 raise ValueError(
                     f"Selected symlink {relative.as_posix()!r} must target "
                     "another selected file."
