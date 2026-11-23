@@ -118,6 +118,11 @@ The client:
 4. Extracts token from response
 5. Retries original request with bearer token
 
+Authenticated request replays run after leaving the original `401` exception
+handler, so subsequent failures do not retain its potentially credential-bearing
+reason in their exception chain. Upload replays restore the body's original
+stream offset before retrying; rewind failures propagate outside that handler too.
+
 #### Auth Methods
 - **Bearer Token**: `Authorization: Bearer <token>`
 - **Basic Auth**: `Authorization: Basic <base64(username:password)>`

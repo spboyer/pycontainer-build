@@ -852,16 +852,7 @@ class RegistryClient:
                 self._observe_rate_limit(response_headers, url)
                 if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
                     error.close()
-                    if body_position is not None:
-                        data.seek(body_position)
-                    return self._make_request(
-                        method,
-                        url,
-                        data,
-                        headers,
-                        retry_auth=False,
-                        max_response_bytes=max_response_bytes,
-                    )
+                    break
                 if retry_safe and _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
                     continue
@@ -884,8 +875,21 @@ class RegistryClient:
                     f"{attempt + 1} attempt(s): {type(error).__name__}."
                 ) from None
 
-        raise RegistryRequestError(
-            f"{method} request to {self._safe_request_url(url)} failed."
+        else:
+            raise RegistryRequestError(
+                f"{method} request to {self._safe_request_url(url)} failed."
+            )
+
+        # Leave the 401 handler before rewinding or replaying to avoid leaking its context.
+        if body_position is not None:
+            data.seek(body_position)
+        return self._make_request(
+            method,
+            url,
+            data,
+            headers,
+            retry_auth=False,
+            max_response_bytes=max_response_bytes,
         )
 
     def blob_exists(self, digest: str) -> bool:
@@ -1077,6 +1081,7 @@ class RegistryClient:
 
     def _open_blob_response(self, url: str, retry_auth: bool = True):
         _check_transport(self.base_url, url, self.insecure)
+        replay_auth = False
         with self._token_lock:
             sent_token = self._bearer_token
             request = urllib.request.Request(
@@ -1088,16 +1093,20 @@ class RegistryClient:
             self._observe_rate_limit(error.headers, url)
             if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
                 error.close()
-                return self._open_blob_response(url, retry_auth=False)
-            if error.code not in REDIRECT_STATUSES:
-                raise
-            location = error.headers.get("Location")
-            error.close()
-            if not location:
-                raise RegistryRequestError(
-                    "Registry blob redirect did not include a Location."
-                ) from None
-            return self._open_blob_redirect(url, location)
+                replay_auth = True
+            else:
+                if error.code not in REDIRECT_STATUSES:
+                    raise
+                location = error.headers.get("Location")
+                error.close()
+                if not location:
+                    raise RegistryRequestError(
+                        "Registry blob redirect did not include a Location."
+                    ) from None
+                return self._open_blob_redirect(url, location)
+
+        if replay_auth:
+            return self._open_blob_response(url, retry_auth=False)
 
         self._observe_rate_limit(response.headers, url)
         if response.status in REDIRECT_STATUSES:
