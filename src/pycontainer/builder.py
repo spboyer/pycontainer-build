@@ -191,8 +191,10 @@ from .local_image import (
     parse_local_image_reference,
     verify_layer_diff_ids,
 )
-from .cache import LayerCache
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
+from .tags import local_reference_names
+from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
@@ -269,6 +271,9 @@ class ImageBuilder:
         refs_dir=ensure_dir(output/'refs'/'tags')
 
         os_name, arch = parse_platform(self.config.platform)
+        security_fragments=render_security_fragments(
+            self.config.security, self.config.context_dir
+        )
         base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
@@ -334,13 +339,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             manifest_digest,
             len(manifest_bytes),
-            self.config.tag,
+            ref_names[0],
             arch,
             os_name,
             variant=variant,
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -369,9 +376,33 @@ class ImageBuilder:
                 package_inventory=getattr(self, "_staged_packages", []),
             )
             logger.info(f"✓ SBOM saved to {sbom_path}")
+
+        for fragment_path in write_security_fragments(output, security_fragments):
+            logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
         
         return self.config.tag
     
+    def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
+        """Create a registry client honoring insecure-host and CA settings."""
+        insecure=registry.lower() in self.config.insecure_registries
+        client=RegistryClient(
+            registry,
+            repo,
+            auth_token=auth.bearer_token,
+            username=auth.username,
+            password=auth.password,
+            insecure=insecure,
+            ca_file=self.config.registry_ca_file,
+        )
+        warned=self.__dict__.setdefault('_warned_insecure_registries', set())
+        if insecure and registry.lower() not in warned:
+            warned.add(registry.lower())
+            logger.warning(
+                f"WARNING: using plain HTTP for insecure registry {registry}; "
+                "traffic is unencrypted and unauthenticated by TLS."
+            )
+        return client
+
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
         self._base_image_name=self.config.base_image
@@ -380,13 +411,7 @@ class ImageBuilder:
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
             auth=get_registry_auth(registry)
-            client=RegistryClient(
-                registry,
-                repo,
-                auth_token=auth.bearer_token,
-                username=auth.username,
-                password=auth.password,
-            )
+            client=self._registry_client(registry, repo, auth)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 
         target = f"{os_name}/{arch}" + (
@@ -550,13 +575,7 @@ class ImageBuilder:
             username=username,
             password=password,
         )
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
-        )
+        client=self._registry_client(registry, repo, auth)
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         
@@ -600,6 +619,8 @@ class ImageBuilder:
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+        for name in render_security_fragments(self.config.security, self.config.context_dir):
+            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
 
     def _create_deps_layer(
@@ -775,11 +796,11 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -794,6 +815,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -805,6 +827,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(

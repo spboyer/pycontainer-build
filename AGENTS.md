@@ -8,6 +8,9 @@ dependencies**. Do not introduce a runtime dependency or an external build
 daemon without discussing the trade-off first.
 
 - `src/pycontainer/cli.py`: argparse interface and configuration overrides.
+- `devloop.py`: Skaffold (`skaffold-build`) and Tilt (`tilt-build`) custom-builder
+  environment contracts; registry push only, single platform, see
+  `docs/skaffold-tilt.md` and `examples/skaffold`, `examples/tilt`.
 - `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
@@ -17,6 +20,12 @@ daemon without discussing the trade-off first.
   union-filesystem report using the `local_image.py` sources.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `system_packages.py`: system package declaration, inference and base-image
+  verification (warning only). `system_install.py`: fail-closed groundwork for
+  #31; it executes no package manager and has no callers until the #22
+  isolated executor exists.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -34,7 +43,9 @@ currently has no `__main__.py`.
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings.
+content, normalized relative paths, workdir, and reproducibility settings, plus
+the context-relative hardlink targets `tarfile` emits (never inode numbers or
+absolute paths); key version 3 invalidated earlier keys that lacked them.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -91,18 +102,52 @@ a pass/fail gate. A passing layout assertion is not evidence that an image
 starts in a container runtime. Do not silently remove, mock away, or claim
 success for unrun integration tests.
 
-An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
-and a running Docker daemon:
-`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+A real OCI import/startup check runs on Linux/WSL with Skopeo and a running
+Docker daemon:
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json`.
 It pulls the selected base image, imports the generated layout into Docker, and
-starts a container. To test only dependency importability in the real target
-base image, without Skopeo, add `--dependency-layer-only`. These checks are not
-part of the default test suite or CI.
+starts a container. `--platform` must match the daemon; emulated runs fail
+rather than count as evidence. `--evidence` writes a passed or failed JSON
+record. To test only dependency importability in the real target base image,
+without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+It is not part of default pytest.
+
+`.github/workflows/runtime-check.yml` runs the full check natively on
+`linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
+same-repository PRs, pushes to main and release tags. Each target first runs
+`tests/test_skopeo_tag_refs.py`, which requires Skopeo to select every
+configured tag through its `index.json` descriptor reference.
+`scripts/verify_runtime_evidence.py` then requires exactly one passing full
+record per target for the current commit, workflow run and attempt; missing,
+skipped, failed, emulated, partial, stale or duplicate evidence fails the gate
+and is listed separately as not validated. Re-run all jobs, not just failed
+jobs, to produce fresh evidence for every target. The release job depends on
+this gate, re-verifies evidence for its own attempt and appends the summary to
+the release notes. Only targets listed as validated have runtime evidence.
+
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
+
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
+
+`tests/test_devloop.py` runs the Skaffold and Tilt example commands through
+fake tool launchers against a loopback registry. Real interoperability is
+opt-in: `python scripts/check_devloop_tools.py --registry <https-registry>/ns`
+needs `skaffold`, `tilt`, `kubectl`, a current cluster context and an HTTPS
+registry the cluster can pull from, plus permission to create and delete a
+test namespace. It is not part of CI.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
-and 3.15. The benchmark includes synthetic loopback registry transfers at
+and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
 multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
 does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
@@ -130,7 +175,10 @@ concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
 redirected storage hosts. Registry blob downloads verify descriptor digest and
 size before publication; only safe reads use bounded retries and explicit
-request timeouts.
+request timeouts. Registry HTTP(S) requests go through the client's openers:
+keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
+explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
+credentials over HTTP to non-loopback hosts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
@@ -145,6 +193,10 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
+- The registry client is HTTPS-only and does not read Docker `credsStore`,
+  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
+  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
+  (#29) are rejected, not emulated.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
@@ -173,20 +225,25 @@ extras, transitive `Requires-Dist`) onto the target environment and fails
 closed on `platform_release`, `platform_version`, unknown variables, or
 `python_full_version` without a full base-image `PYTHON_VERSION`. It relies on
 pip's vendored `packaging`; a self-test refuses to install if that changes.
-Virtualenv staging cannot re-resolve, so `venv_markers.py` verifies the copied
-closure instead: roots (requirements file, pyproject dependencies, optional
-dependencies, dependency groups) and installed `Requires-Dist`/egg-info
-`requires.txt` are re-evaluated for each target, failing on missing,
-unknown-marker, or possibly-requested extra/group requirements. An extra is
-ruled out only if every Windows/Linux/macOS CPython host of the venv minor
-(narrowed to posix by a `lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`,
-or to Windows by a `Lib` site-packages layout) would have installed one of its
-missing requirements; `python_version` is
-shared only when the venv minor is established (`python3.X` path or
-`pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
-root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic
-dependency files, Poetry/PDM/Hatch/setuptools/Flit tables) fail closed when they
-mention host markers, and unreadable dynamic dependencies always fail closed.
+Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
+with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
+target-active roots, transitive `Requires-Dist`, versions, extras, constraint
+files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
+collects project roots, plausible venv hosts and checks unparsed sources. The
+verifier never imports staged packages and fails closed on unknown markers, egg
+distributions, missing or unsupported `Metadata-Version`, invalid metadata,
+direct URLs, and patch-dependent `Requires-Python` without a full
+`PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
+can contain credentials. An unrecorded extra or optional group is ruled out
+only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
+`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
+`Lib` layout; `python_version` shared only when
+the venv minor is established) would have installed one of its missing
+requirements; otherwise unsatisfied target-active requirements fail closed.
+Loose modules without metadata remain unverified; host-only packages remain
+staged. Unparsed root sources with host markers and unreadable dynamic
+dependencies fail closed. Unmarked declarations in those unparsed sources are
+not verified.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

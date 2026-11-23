@@ -1,8 +1,7 @@
 """Run pip with environment markers evaluated for the target image.
 
 This file is executed as ``python -c <source> <config-json> <pip args...>``
-by ``dependencies.install_requirements``; ``venv_markers`` imports only its
-side-effect-free marker helpers.
+by ``dependencies.install_requirements``; it is not imported by the package.
 pip selects wheels with ``--platform``/``--python-version`` but evaluates
 markers against the build host, so every marker evaluation (requirements-file
 roots, extras and transitive ``Requires-Dist``) is forced through the target
