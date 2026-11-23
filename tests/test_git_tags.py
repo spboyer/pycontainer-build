@@ -385,6 +385,26 @@ def test_git_tag_and_security_config_can_be_used_together(release_repo, tmp_path
     assert config.security["kubernetes"]["read_only_root_filesystem"] is True
 
 
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_rejects_git_tagged_config_before_build(release_repo, tmp_path, monkeypatch, capsys, command):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text("[build]\ntag_from_git = true\n", encoding="utf-8")
+    monkeypatch.setenv("IMAGE", "registry.example/app:tool-tag")
+    monkeypatch.setenv("BUILD_CONTEXT", str(release_repo))
+    monkeypatch.setenv("PUSH_IMAGE", "true")
+    monkeypatch.setenv("EXPECTED_REF", "registry.example/app:tool-tag")
+    monkeypatch.setattr(cli, "ImageBuilder", lambda config: pytest.fail("must not build"))
+    args = ["pycontainer", command, "--config", str(config_path)]
+    if command == "tilt-build":
+        args.extend(["--context", str(release_repo)])
+    monkeypatch.setattr(sys, "argv", args)
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Git-derived tags cannot be used with Skaffold or Tilt" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
 @pytest.mark.parametrize("key", ["allow_dirty", "allow-dirty"])
 def test_config_file_cannot_silently_allow_dirty_worktrees(release_repo, tmp_path, table, key):

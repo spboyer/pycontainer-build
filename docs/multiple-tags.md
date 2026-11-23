@@ -102,27 +102,45 @@ enabled in the configuration file.
 
 ## Output
 
-The OCI layout gets one `refs/tags/<tag>` file per tag, all pointing at the
-same manifest or index digest. After a push, `builder.pushed_refs` lists every
-pushed reference. For multi-platform index pushes, it is reset at the start of each
-attempt and records confirmed successes as they happen. If a tag push fails,
-the error reports confirmed pushes, the failed or unknown-outcome reference,
-and references not attempted, regardless of progress output; tags are not
-rolled back. A single `--tag` behaves exactly as before.
+The layout's `index.json` has one descriptor per tag, pointing to a manifest
+for single-platform builds or an image index for multi-platform builds. Every
+descriptor has the same digest and size, and its
+`org.opencontainers.image.ref.name` annotation is the reference to select.
+Names use the primary's repository spelling. For example,
+`--tag myapp:v1.2.3 --tag stable` produces
+`myapp:v1.2.3` and `myapp:stable`, and `--tag ghcr.io/me/app:v1.2.3
+--semver-tags` produces `ghcr.io/me/app:v1.2.3`, `ghcr.io/me/app:v1.2` and
+`ghcr.io/me/app:v1`. Single-platform layouts also name the primary descriptor
+at the index level.
 
-For single-platform builds, the layout index currently has only the primary
-reference on its manifest descriptor. Skopeo does not use `refs/tags` to select
-an additional tag; use the complete primary reference or omit the reference
-when the index has one manifest. Registry pushes publish each tag separately.
+Standard OCI tools select an image by that annotation:
 
-For multi-platform builds, the layout `index.json` has one image-index
-descriptor per configured tag. Each has the same digest and size, and an
-`org.opencontainers.image.ref.name` annotation holding the full configured
-reference (for example `registry.example/team/app:stable`). Because several
-descriptors exist, select with an explicit reference such as
-`oci:<layout>:registry.example/team/app:stable`. Hermetic tests check this
-descriptor shape; a Skopeo selection test runs only when Skopeo is installed.
-The normalized local reference can differ from the input spelling, and
-registry-valid tags such as `_dev`, `v1_`, or `v1..2` may not be valid OCI
-reference selectors. [#185](https://github.com/spboyer/pycontainer-build/pull/185)
-tracks consistent, collision-safe local names; registry pushes are unaffected.
+```bash
+skopeo inspect oci:dist/image:ghcr.io/me/app:v1.2.3
+skopeo copy oci:dist/image:ghcr.io/me/app:v1 docker-daemon:ghcr.io/me/app:v1
+```
+
+With a single tag, `oci:dist/image` without a reference also works. With
+several tags, standard tools such as Skopeo require an explicit reference,
+even though every descriptor points to the same image. Bare tag names such as
+`oci:dist/image:stable` are not descriptor references.
+
+Some valid registry tags do not satisfy the OCI reference-name grammar. For
+these, the layout reference is `pycontainer-` followed by lowercase hexadecimal
+UTF-8 bytes of the complete reference in the primary's repository spelling.
+For example, `myapp:_dev` becomes `pycontainer-6d796170703a5f646576`:
+
+```bash
+skopeo inspect oci:dist/image:pycontainer-6d796170703a5f646576
+```
+
+In the unlikely event an encoded name collides with another descriptor name,
+`0` is appended until it is unique. Inspect `index.json` for the exact
+reference. Registry tags and `refs/tags` filenames retain their original values.
+
+The layout also gets one `refs/tags/<tag>` file per tag, all pointing at the
+same manifest or index digest; standard tools do not read these files. After a push,
+`builder.pushed_refs` lists every pushed reference. Registry pushes publish
+each tag separately and are unaffected by the layout index. For multi-platform
+pushes, a later tag failure reports confirmed, failed or unknown-outcome, and
+unattempted references; previously pushed tags are not rolled back.

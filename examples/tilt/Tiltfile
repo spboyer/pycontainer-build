@@ -1,0 +1,39 @@
+# Tilt custom_build that builds and pushes with pycontainer-build.
+# pycontainer never writes to the local Docker image store, so
+# skips_local_docker=True is required and the command pushes the image itself.
+
+# Tilt's background pruner can otherwise alter the local Docker cache.
+docker_prune_settings(disable=True)
+
+registry = os.getenv('PYCONTAINER_TILT_REGISTRY', '')
+if registry:
+    default_registry(registry)
+
+k8s_yaml('k8s/deployment.yaml')
+
+deps = ['app', 'pyproject.toml']
+command = ['python', '-m', 'pycontainer.cli', 'tilt-build', '--no-progress']
+
+if os.getenv('PYCONTAINER_TILT_MODE', '') == 'output-ref':
+    # Content-tag mode: Tilt does not set EXPECTED_REF, so pycontainer pushes
+    # <registry>/pycontainer-demo:tilt-<manifest digest> and reports that ref.
+    if not registry:
+        fail('PYCONTAINER_TILT_MODE=output-ref requires PYCONTAINER_TILT_REGISTRY')
+    ref_file = os.path.join(os.getcwd(), 'dist', 'tilt-image-ref.txt')
+    custom_build(
+        'pycontainer-demo',
+        command + ['--image', registry + '/pycontainer-demo', '--output-ref', ref_file],
+        deps=deps,
+        skips_local_docker=True,
+        outputs_image_ref_to=ref_file,
+    )
+else:
+    # Default mode: pycontainer pushes exactly $EXPECTED_REF.
+    custom_build(
+        'pycontainer-demo',
+        command,
+        deps=deps,
+        skips_local_docker=True,
+    )
+
+k8s_resource('pycontainer-demo', port_forwards='8000:8000')
