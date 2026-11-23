@@ -163,6 +163,23 @@ def test_enabled_optional_phases_are_reported(tmp_path, monkeypatch):
     assert set(phases) == {"base_image", "dependencies", "application", "sbom"}
 
 
+def test_history_and_security_fragments_are_both_preserved(tmp_path, monkeypatch):
+    from pycontainer.security import KUBERNETES_FRAGMENT, SECURITY_DIR
+
+    _offline_base(monkeypatch)
+    config = _history_config(
+        tmp_path, security={"kubernetes": {"read_only_root_filesystem": True}}
+    )
+
+    ImageBuilder(config).build()
+
+    fragment = Path(config.output_dir) / SECURITY_DIR / KUBERNETES_FRAGMENT
+    assert json.loads(fragment.read_text()) == {"readOnlyRootFilesystem": True}
+    record = BuildHistory(config.history_dir).list()[0]
+    assert record["status"] == "success"
+    assert "base_image" in record["phases_ns"]
+
+
 def test_failed_build_records_partial_phase_without_error_text(tmp_path, monkeypatch):
     secret = "synthetic-failure-secret"
 

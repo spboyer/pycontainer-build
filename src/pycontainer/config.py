@@ -37,11 +37,16 @@ class BuildConfig:
     latest_tag: bool = False
     record_history: bool = False
     history_dir: Optional[str] = None
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"

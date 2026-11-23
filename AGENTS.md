@@ -8,6 +8,9 @@ dependencies**. Do not introduce a runtime dependency or an external build
 daemon without discussing the trade-off first.
 
 - `src/pycontainer/cli.py`: argparse interface and configuration overrides.
+- `devloop.py`: Skaffold (`skaffold-build`) and Tilt (`tilt-build`) custom-builder
+  environment contracts; registry push only, single platform, see
+  `docs/skaffold-tilt.md` and `examples/skaffold`, `examples/tilt`.
 - `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
@@ -15,6 +18,8 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
+  config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
 - External consumer: `spboyer/PyContainer.Aspire.Hosting` runs the CLI with
   the flags and `[build]` keys pinned in `tests/test_aspire_contract.py`.
@@ -112,10 +117,24 @@ jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
 
+Runtime security fragments (`security.py`) are deployment artifacts written
+beside the layout, never image config. Verify them with the opt-in Linux
+harness `PYTHONPATH=src timeout 900 python scripts/check_security_fragments.py`
+(runc or crun; add `--kubernetes` for a cluster). It reports unavailable
+AppArmor, SELinux, non-root and Kubernetes checks as SKIP, which is not
+evidence of enforcement.
+
 `.github/workflows/execution-backend-probe.yml` records isolated-execution host
 prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
 runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
 gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
+
+`tests/test_devloop.py` runs the Skaffold and Tilt example commands through
+fake tool launchers against a loopback registry. Real interoperability is
+opt-in: `python scripts/check_devloop_tools.py --registry <https-registry>/ns`
+needs `skaffold`, `tilt`, `kubectl`, a current cluster context and an HTTPS
+registry the cluster can pull from, plus permission to create and delete a
+test namespace. It is not part of CI.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
@@ -163,6 +182,10 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
+- The registry client is HTTPS-only and does not read Docker `credsStore`,
+  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
+  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
+  (#29) are rejected, not emulated.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
