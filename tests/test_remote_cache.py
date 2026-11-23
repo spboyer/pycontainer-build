@@ -18,6 +18,7 @@ import pytest
 
 from pycontainer import remote_cache
 from pycontainer import auth as auth_module
+from pycontainer import builder as builder_module
 from pycontainer.auth import (
     AzureCLIAuthProvider,
     ChainAuthProvider,
@@ -269,10 +270,11 @@ def test_cache_spec_and_config_validation():
 
 
 def test_cache_key_covers_sources_and_toolchain(monkeypatch):
-    baseline = app_layer_cache_key("v2:sha256:" + "1" * 64)
-    assert app_layer_cache_key("v2:sha256:" + "2" * 64) != baseline
-    monkeypatch.setattr(remote_cache.platform, "python_version", lambda: "0.0.0")
+    baseline = app_layer_cache_key("v3:sha256:" + "1" * 64)
+    assert app_layer_cache_key("v3:sha256:" + "2" * 64) != baseline
     assert app_layer_cache_key("v2:sha256:" + "1" * 64) != baseline
+    monkeypatch.setattr(remote_cache.platform, "python_version", lambda: "0.0.0")
+    assert app_layer_cache_key("v3:sha256:" + "1" * 64) != baseline
     assert len(cache_tag(baseline)) <= 128
 
 
@@ -294,7 +296,6 @@ def test_cold_export_then_warm_import_skips_rebuild(tmp_path, registry, monkeypa
     assert registry.requests == []
 
 
-@pytest.mark.xfail(strict=True, reason="hard-link cache identity requires #230")
 def test_cache_key_distinguishes_hardlinks(tmp_path, registry):
     writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
     writer.context_include_paths.append("copy.py")
@@ -321,6 +322,64 @@ def test_cache_key_distinguishes_hardlinks(tmp_path, registry):
         assert archive.getmember("app/copy.py").islnk()
     assert linked.digest == local.digest
     assert linked.digest != independent.digest
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_remote_export_rejects_transient_hardlink_topology_change(
+    tmp_path, registry, monkeypatch, use_cache
+):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC, use_cache=use_cache)
+    writer.context_include_paths.append("copy.py")
+    context = Path(writer.config.context_dir)
+    source, copy = context / "app.py", context / "copy.py"
+    content = source.read_bytes()
+    copy.write_bytes(content)
+    write_layer = ImageBuilder._write_app_layer
+    collect_hardlinks = builder_module.emitted_hardlinks
+
+    def restore_after_emission(ordered_files, members):
+        hardlinks = collect_hardlinks(ordered_files, members)
+        copy.unlink()
+        copy.write_bytes(content)
+        return hardlinks
+
+    def write_with_transient_links(self, *args, **kwargs):
+        copy.unlink()
+        try:
+            os.link(source, copy)
+        except OSError as error:
+            pytest.skip(f"Hard links are unavailable: {error}")
+        try:
+            return write_layer(self, *args, **kwargs)
+        finally:
+            copy.unlink()
+            copy.write_bytes(content)
+
+    monkeypatch.setattr(builder_module, "emitted_hardlinks", restore_after_emission)
+    monkeypatch.setattr(ImageBuilder, "_write_app_layer", write_with_transient_links)
+    with pytest.raises(RemoteCacheError, match="changed during the build"):
+        _app_layer(writer, tmp_path, "writer")
+
+    assert not registry.manifest_puts()
+
+
+def test_hardlinked_layer_round_trips_through_remote_cache(tmp_path, registry, monkeypatch):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    writer.context_include_paths.append("copy.py")
+    context = Path(writer.config.context_dir)
+    try:
+        os.link(context / "app.py", context / "copy.py")
+    except OSError as error:
+        pytest.skip(f"Hard links are unavailable: {error}")
+    cold = _app_layer(writer, tmp_path, "writer")
+
+    reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC)
+    reader.context_include_paths.append("copy.py")
+    _forbid_tar_build(monkeypatch)
+    warm = _app_layer(reader, tmp_path, "reader")
+    assert warm.digest == cold.digest
+    with tarfile.open(warm.tar_path) as archive:
+        assert archive.getmember("app/copy.py").islnk()
 
 
 def test_full_build_uses_remote_layer(tmp_path, registry, monkeypatch):

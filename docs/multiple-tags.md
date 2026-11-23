@@ -55,4 +55,11 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 
 The OCI layout gets one `refs/tags/<tag>` file per tag, all pointing at the
 same manifest digest. After a push, `builder.pushed_refs` lists every pushed
-reference. A single `--tag` behaves exactly as before.
+reference.
+
+The layout's index currently has only the primary reference on its manifest
+descriptor. Skopeo does not use `refs/tags` to select an additional tag, so
+`oci:<layout>:<additional-tag>` cannot select it. Use the complete primary
+reference (`oci:<layout>:ghcr.io/me/app:v1.2.3`) or omit the reference
+(`oci:<layout>`) when the index has one manifest. Registry pushes still publish
+each tag separately.

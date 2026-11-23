@@ -149,8 +149,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -459,8 +459,7 @@ shared; the dependency layer and base image are not cached remotely. Records
 are OCI artifacts tagged `app-<key>` in the cache repository, where the key is
 a SHA-256 over the record schema, layer format, tar settings, builder Python
 version, and the same file identity used by the local cache (file content,
-relative paths, modes, workdir, reproducibility). The current identity does
-not yet include hard-link relationships; #230 addresses this limitation.
+relative paths, modes, hard-link topology, workdir and reproducibility).
 Remote caching requires reproducible builds. The same settings
 are available in `[build]` as `cache-from` and `cache-to`; `ref` must not include
 a tag or digest. Only
@@ -520,6 +519,8 @@ The cache automatically:
 - Invalidates when file contents, relative paths, permission bits, the
   workdir or reproducibility settings change (mtime is ignored for
   reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
 
 **Saving and restoring the cache (offline export/import):** the `--cache-dir`

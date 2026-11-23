@@ -191,7 +191,7 @@ from .local_image import (
     parse_local_image_reference,
     verify_layer_diff_ids,
 )
-from .cache import LayerCache
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .remote_cache import (
     RegistryLayerCache,
     RemoteCacheError,
@@ -780,7 +780,7 @@ class ImageBuilder:
         if layer is None and self.remote_cache_from:
             layer=self._app_layer_from_remote_cache(layers_dir, files, identity)
         if layer is None:
-            layer=self._write_app_layer(layers_dir, files)
+            layer=self._write_app_layer(layers_dir, files, identity)
         if self.remote_cache_to:
             self._export_app_layer(layer, files, identity)
         return layer
@@ -833,26 +833,29 @@ class ImageBuilder:
             )
         return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
 
-    def _export_app_layer(self, layer, files, identity):
+    def _verify_app_identity(self, files, identity, *, hardlinks=None):
         current=LayerCache().files_identity(
-            files, self.config.workdir, self.config.reproducible
+            files, self.config.workdir, self.config.reproducible, hardlinks=hardlinks
         )
         if current!=identity:
             raise RemoteCacheError(
                 "Application sources changed during the build; refusing to export "
                 "a remote cache record that may not match its key."
             )
+
+    def _export_app_layer(self, layer, files, identity):
+        self._verify_app_identity(files, identity)
         self.remote_cache_to.store(
             app_layer_cache_key(identity), layer.digest, Path(layer.tar_path), layer.size
         )
 
-    def _write_app_layer(self, layers_dir, files):
+    def _write_app_layer(self, layers_dir, files, identity=None):
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -867,6 +870,9 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
+            if self.remote_cache_to:
+                self._verify_app_identity(files, identity, hardlinks=hardlinks)
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -878,6 +884,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(
