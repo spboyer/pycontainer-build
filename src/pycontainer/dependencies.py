@@ -33,6 +33,10 @@ _PIP_TARGET_SCRIPT = Path(__file__).with_name("_pip_target.py")
 _MARKER_ERROR_EXIT = 86
 _PATCH_ERROR_EXIT = 87
 _MARKER_ERROR_FILE = "pycontainer-marker-error.txt"
+_SUPPORTED_LIBC = {
+    "glibc-2.17": "manylinux_2_17",
+    "musl-1.2": "musllinux_1_2",
+}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
@@ -72,18 +76,27 @@ def _is_official_python_image(repository: str) -> bool:
     }
 
 
-def target_python_version(base_image: str, base_config: Optional[dict]) -> str:
+def target_python_version(
+    base_image: str,
+    base_config: Optional[dict],
+    *,
+    base_image_tag_verified: bool = False,
+) -> str:
     """Resolve the CPython major/minor version from the pulled base image."""
     environment = _base_environment(base_config)
     repository, image_tag = _base_image_parts(base_image)
-    official_python = _is_official_python_image(repository)
+    official_python = (
+        _is_official_python_image(repository)
+        and base_image_tag_verified
+        and "@" not in base_image
+    )
     implementation = environment.get("PYTHON_IMPLEMENTATION")
     if not official_python and implementation not in {
         "CPython",
         "cpython",
     }:
         raise ValueError(
-            "Cannot validate the target Python ABI for a custom base image; "
+            "Cannot validate the target Python ABI for an unverified or custom base image; "
             "set PYTHON_IMPLEMENTATION=CPython and PYTHON_VERSION in its image config."
         )
     if implementation and implementation.lower() != "cpython":
@@ -98,7 +111,7 @@ def target_python_version(base_image: str, base_config: Optional[dict]) -> str:
         return match.group(1)
     raise ValueError(
         "Cannot determine the target CPython version from the base image; "
-        "use an official python:<major>.<minor> image or a base image with "
+        "use a verified tag-only official python:<major>.<minor> pull or a base image with "
         "PYTHON_VERSION metadata."
     )
 
@@ -113,13 +126,15 @@ def _base_environment(base_config: Optional[dict]) -> dict:
     return environment
 
 
-def _target_options(
+def target_wheel_platform(
     os_name: str,
     arch: str,
-    python_version: str,
-    base_image: str = "python:3.11-slim",
-    base_config: Optional[dict] = None,
-) -> List[str]:
+    base_image: str,
+    base_config: Optional[dict],
+    *,
+    base_image_tag_verified: bool = False,
+) -> str:
+    """Validate libc and select a wheel platform; names alone are not provenance."""
     try:
         glibc_platform = _PIP_PLATFORMS[(os_name, arch)]
     except KeyError as exc:
@@ -129,21 +144,48 @@ def _target_options(
         ) from exc
     repository, image_tag = _base_image_parts(base_image)
     libc = _base_environment(base_config).get("PYTHON_LIBC")
-    if _is_official_python_image(repository):
-        if "alpine" in image_tag.lower():
-            platform = glibc_platform.replace("manylinux2014", "musllinux_1_2")
-        else:
-            platform = glibc_platform
-    elif libc == "glibc-2.17":
-        platform = glibc_platform.replace("manylinux2014", "manylinux_2_17")
-    elif libc == "musl-1.2":
-        platform = glibc_platform.replace("manylinux2014", "musllinux_1_2")
-    else:
+    if libc is not None and libc not in _SUPPORTED_LIBC:
         raise ValueError(
-            "Cannot validate target wheel compatibility for this base image; "
-            "set PYTHON_LIBC to glibc-2.17 or musl-1.2 in its image config."
+            f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
+            "supported values are glibc-2.17 and musl-1.2."
         )
+    if (
+        _is_official_python_image(repository)
+        and base_image_tag_verified
+        and "@" not in base_image
+    ):
+        tag_family = "musl" if "alpine" in image_tag.lower() else "glibc"
+        if libc and libc.split("-", 1)[0] != tag_family:
+            raise ValueError(
+                f"Base image tag {image_tag or 'latest'!r} implies {tag_family}, "
+                f"which conflicts with PYTHON_LIBC={libc} in its image config."
+            )
+        if tag_family == "musl":
+            return glibc_platform.replace("manylinux2014", "musllinux_1_2")
+        return glibc_platform
+    if libc:
+        return glibc_platform.replace("manylinux2014", _SUPPORTED_LIBC[libc])
+    raise ValueError(
+        "Cannot validate target wheel compatibility for an unverified or custom "
+        "base image; digest references (including tag@digest) and local image "
+        "names cannot establish libc. Set PYTHON_LIBC to glibc-2.17 or musl-1.2 "
+        "in the image config, or use a verified tag-only registry pull."
+    )
 
+
+def _target_options(
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_image: str = "python:3.11-slim",
+    base_config: Optional[dict] = None,
+    *,
+    base_image_tag_verified: bool = False,
+) -> List[str]:
+    platform = target_wheel_platform(
+        os_name, arch, base_image, base_config,
+        base_image_tag_verified=base_image_tag_verified,
+    )
     major, minor = python_version.split(".")
     return [
         "--platform",
@@ -198,6 +240,8 @@ def install_requirements(
     python_version: str,
     base_image: str,
     base_config: Optional[dict],
+    *,
+    base_image_tag_verified: bool = False,
 ) -> None:
     validate_requirements(requirements, context_dir)
 
@@ -224,7 +268,8 @@ def install_requirements(
         "--target",
         str(destination),
         *_target_options(
-            os_name, arch, python_version, base_image, base_config
+            os_name, arch, python_version, base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
         ),
         "-r",
         str(requirements),

@@ -193,6 +193,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_wheel_platform,
     validate_target_platform,
 )
 
@@ -606,7 +607,15 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        version = target_python_version(self.config.base_image, base_config)
+        base_image_tag_verified = "@" not in self.config.base_image
+        version = target_python_version(
+            self.config.base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
+        target_wheel_platform(
+            os_name, arch, self.config.base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+        )
         layers_dir=Path(layers_dir)
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
@@ -621,6 +630,7 @@ class ImageBuilder:
                     version,
                     self.config.base_image,
                     base_config,
+                    base_image_tag_verified=base_image_tag_verified,
                 )
             else:
                 stage_virtualenv(

@@ -366,6 +366,18 @@ pycontainer build \
   also fail the build, as do dynamic dependencies that cannot be read. Use a
   requirements file, which pip resolves for the target, when verification
   fails.
+  Official `python` tag-only registry pulls derive libc from the resolved tag
+  (`alpine` tags use musl, others glibc). All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to requirements and
+  virtualenv staging alike.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
