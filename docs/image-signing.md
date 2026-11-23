@@ -4,10 +4,11 @@ Image signing is experimental and strictly opt-in. The core package adds no
 runtime dependency or daemon: install the optional provider CLI separately.
 Cosign versions `>=2.6.1,<4.0.0` and Notation versions `>=1.3.2,<2.0.0` pass
 the version preflight; this is not a claim that every version or registry has
-been exercised. Cosign key-mode signing and build-time signature verification
-have been exercised against `ttl.sh` with v2.6.1 and v3.1.4 (through the
-stacked provenance test in #219); Notation and keyless signing have not been
-validated against a real registry.
+been exercised. Against `ttl.sh`, synthetic-base manifest and index builds
+passed Cosign key-mode signing and verification with v2.6.1 and v3.1.4 in
+stacked #219. Notation v1.3.2 named-key signing and verification also passed for
+both subjects with a self-signed test key and isolated strict trust policy.
+Cosign keyless, Notation plugin mode and other registries remain unverified.
 
 ## Prerequisites and use
 
@@ -152,10 +153,14 @@ Notation verification uses its configured trust policy and trust store.
 Build-time verification uses the trust configuration supplied to the build; it
 is not independent verification by the consumer. A separate `cosign verify`
 with a public key succeeded against `ttl.sh` using v2.6.1 and v3.1.4 with
-default transparency settings; a wrong key failed. Keyless Cosign and Notation
-verification have not been exercised against real providers or registries. A
-valid signature authenticates an artifact only under the verifier's policy;
-it does not establish that an image is free of vulnerabilities or safe to run.
+default transparency settings; a wrong key failed. Notation named-key
+signatures were independently verified with the strict test policy. A separate
+real-base multi-platform run in #219 failed during Cosign v3.1.4 signing before
+tag publication. Later direct signing of the same index and a fresh full index
+run succeeded; the original failure's cause remains unknown. Keyless Cosign
+verification has not been exercised against real providers or registries. A
+valid signature authenticates an artifact only under the verifier's policy; it
+does not establish that an image is free of vulnerabilities or safe to run.
 
 ## Real-registry tests
 
@@ -171,7 +176,7 @@ mode-specific variables for the tests you want to run:
 
 | Mode | Required variables |
 |---|---|
-| Cosign key | `PYCONTAINER_COSIGN_TEST_KEY`, `PYCONTAINER_COSIGN_TEST_PUBLIC_KEY` |
+| Cosign key | `PYCONTAINER_COSIGN_TEST_KEY`, `PYCONTAINER_COSIGN_TEST_PUBLIC_KEY`, `PYCONTAINER_COSIGN_TEST_WRONG_PUBLIC_KEY` |
 | Cosign OIDC | `PYCONTAINER_COSIGN_TEST_IDENTITY`, `PYCONTAINER_COSIGN_TEST_ISSUER`, plus an ambient OIDC identity |
 | Notation named key | `PYCONTAINER_NOTATION_TEST_KEY` and a configured strict verifier trust policy without overrides |
 | Notation plugin | `PYCONTAINER_NOTATION_TEST_PLUGIN`, `PYCONTAINER_NOTATION_TEST_KEY_ID` and a configured strict verifier trust policy without overrides |
@@ -190,8 +195,55 @@ uv run --locked --group test python -m pytest tests/test_signing_integration.py 
 Each configured mode signs and independently verifies both a single-platform
 manifest and a multi-platform index with unique content. Notation tests reject
 skip, audit, permissive or overridden trust policies. Unconfigured modes skip.
-This check is not part of the default suite or CI and should be run with an
-external timeout.
+This check is not part of the default suite or automatic CI and should be run
+with an external timeout.
 
 Cosign SLSA provenance attestation (`--attest-provenance`) and its separate
 real-registry test are described in the [provenance guide](provenance.md).
+
+For both Cosign modes, `test_real_provider_wrong_trust_fails_before_tags`
+configures the build with untrusted verification material (the wrong public
+key, or the expected identity with an `.invalid` suffix). It requires that the
+requested tags are absent before the push, that the push fails during
+pre-tag signature verification, that the tags are still absent afterwards, and
+that the signature itself verifies with the correct trust.
+
+When `PYCONTAINER_COSIGN_TEST_ISSUER` is
+`https://token.actions.githubusercontent.com`, the keyless tests also require
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_SHA`,
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_REPOSITORY`,
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_REF` and
+`PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER`. Independent verification then checks those
+certificate claims, and requires a wrong identity, wrong issuer and wrong
+workflow SHA to fail. Optional `PYCONTAINER_SIGNING_EVIDENCE_FILE` receives one
+line per verified keyless subject with its digest and Rekor log indexes.
+
+### Gated GitHub Actions keyless check
+
+`.github/workflows/tests.yml` contains an opt-in keyless job that uses the
+workflow's own GitHub OIDC identity; it needs no stored credentials or
+interactive login. It runs only on a manual `workflow_dispatch` in
+`spboyer/pycontainer-build`, from the reviewed signing branch, by the
+repository owner. Its `expected-sha` input must be the full commit SHA of the
+dispatched ref, and must equal both `github.sha` and `github.workflow_sha`.
+
+```bash
+# Prove the gate and inputs without requesting an OIDC token.
+gh workflow run tests.yml --ref <branch> -f keyless-signing=preflight -f expected-sha=<sha>
+# Sign and verify synthetic images in ttl.sh with Cosign v2 and v3.
+gh workflow run tests.yml --ref <branch> -f keyless-signing=run -f expected-sha=<sha>
+```
+
+Only the signing job receives `id-token: write`. It checks out the expected SHA
+without persisted credentials, uses commit-pinned actions, installs Cosign
+v2.6.1 and v3.1.4 from release downloads checked against fixed SHA-256 values,
+and isolates `HOME`, `DOCKER_CONFIG`, `TUF_ROOT` and XDG directories after
+clearing ambient registry, signer, proxy and token variables. It asserts exactly
+four executed tests per Cosign version with no failures, errors or skips, and
+writes only digests and Rekor log indexes to the job summary.
+
+This repository is public, and so is the public-good Sigstore transparency log.
+Each keyless signature permanently publishes the signing certificate, including
+the repository, workflow path and ref, commit SHA, trigger, run URL, runner
+environment and repository visibility, and the signed image digest. Use the
+job only with synthetic images and disposable `ttl.sh` repositories.
