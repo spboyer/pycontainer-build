@@ -375,7 +375,9 @@ available in the [integration examples](examples/editor-task-runners/).
 By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
-- **Entry point**: A detected framework, then a supported project script module or `python -m app`
+- **Entry point**: A detected framework, then a supported project script module or `python -m app`.
+  A configured `cmd` without an `entrypoint` keeps the base image's `Entrypoint`;
+  explicit `entrypoint = []` and `cmd = []` clear the corresponding base values.
 - **Include paths**: `src/`, `app/`, `package/`, root Python files, and project metadata; notebook files are included when Jupyter is declared
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`

@@ -1878,7 +1878,7 @@ def test_generated_celery_image_does_not_inherit_base_command_or_ports(tmp_path,
     )
     image = image_config_from_build(tmp_path, monkeypatch, config)
     assert image["Entrypoint"] == ["celery", "-A", "worker:app", "worker", "--loglevel=INFO"]
-    assert image["Cmd"] == []
+    assert "Cmd" not in image
     assert image["ExposedPorts"] == {}
 
 
@@ -1911,6 +1911,6 @@ def test_explicit_empty_entrypoint_clears_the_base_entrypoint(tmp_path, monkeypa
         exposed_ports=[],
     )
     image = image_config_from_build(tmp_path, monkeypatch, config)
-    assert image["Entrypoint"] == []
+    assert "Entrypoint" not in image
     assert image["Cmd"] == ["python3"]
     assert image["ExposedPorts"] == {}
