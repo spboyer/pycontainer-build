@@ -67,6 +67,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--insecure-registry",dest="insecure_registries",action="append",metavar="HOST[:PORT]",help="Use plain HTTP for this exact registry host[:port] (repeatable; unsafe outside trusted networks)")
     b.add_argument("--registry-ca-file",metavar="PATH",help="Trust an additional PEM CA bundle for registry HTTPS (verification stays enabled)")
+    b.add_argument("--registry-mirror",dest="registry_mirrors",action="append",metavar="UPSTREAM=MIRROR",help="Pull base images from UPSTREAM through MIRROR host[:port] first (repeatable, tried in order; pushes never use mirrors)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
@@ -222,6 +223,15 @@ def main():
     if push and username and not (password or os.getenv('REGISTRY_PASSWORD')):
         parser.error("--username requires --password or REGISTRY_PASSWORD.")
 
+    registry_mirrors=None
+    if args.registry_mirrors:
+        registry_mirrors={}
+        for entry in args.registry_mirrors:
+            upstream,separator,mirror=entry.partition("=")
+            if not separator or not upstream or not mirror or "=" in mirror:
+                parser.error(f"Invalid --registry-mirror {entry!r}: expected UPSTREAM=MIRROR, e.g. docker.io=mirror.example.com.")
+            registry_mirrors.setdefault(upstream,[]).append(mirror)
+
     tag_args=getattr(args,"tag",None)
     cli_overrides={
         'tag': tag_args[0] if tag_args else None,
@@ -264,6 +274,7 @@ def main():
         'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
         'registry_ca_file': args.registry_ca_file,
+        'registry_mirrors': registry_mirrors,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 

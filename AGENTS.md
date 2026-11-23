@@ -200,7 +200,10 @@ size before publication; only safe reads use bounded retries and explicit
 request timeouts. Registry HTTP(S) requests go through the client's openers:
 keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
 explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
-credentials over HTTP to non-loopback hosts.
+credentials over HTTP to non-loopback hosts. Base-image mirrors
+(`registry_mirrors.py`) apply only to pulls; each mirror uses only its own
+host-scoped credentials, integrity and rate-limit failures never fall back,
+and pushes bypass mirrors.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
