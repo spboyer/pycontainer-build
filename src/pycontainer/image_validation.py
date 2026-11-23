@@ -513,8 +513,21 @@ def _ports_text(ports):
     return ", ".join(f"{port}/{protocol}" for port, protocol in sorted(ports))
 
 
+def _ambiguous_option(arg, names):
+    """True for attached/clustered short options (`-p80`, `-Rb:80`) or abbreviated long options (`--bin`)."""
+    if arg.startswith("--"):
+        option = arg.split("=", 1)[0]
+        return any(name.startswith("--") and name != option and name.startswith(option) for name in names)
+    return arg.startswith("-") and len(arg) > 2 and any(
+        len(name) == 2 and name[1] in arg[1:] for name in names
+    )
+
+
 def _option_values(args, names):
-    """Return values of `--name value`, `-n value` and `--name=value` options, stopping at `--`."""
+    """Return values of `--name value`, `-n value` and `--name=value` options, stopping at `--`.
+
+    Returns _UNKNOWN when an argument may set the option in a form this parser does not model.
+    """
     values = []
     index = 0
     while index < len(args):
@@ -528,13 +541,15 @@ def _option_values(args, names):
             prefix = next((name for name in names if name.startswith("--") and arg.startswith(name + "=")), None)
             if prefix is not None:
                 values.append(arg[len(prefix) + 1:])
+            elif _ambiguous_option(arg, names):
+                return _UNKNOWN
         index += 1
     return values
 
 
 def _last_port(args, names):
     values = _option_values(args, names)
-    if not values:
+    if values is _UNKNOWN or not values:
         return _UNKNOWN
     port = _port_number(values[-1])
     return _UNKNOWN if port is None else {port}
@@ -599,7 +614,7 @@ def _runserver_port(args):
 
 def _gunicorn_ports(args):
     binds = _option_values(args, ("-b", "--bind"))
-    if not binds:
+    if binds is _UNKNOWN or not binds:
         return _UNKNOWN
     ports = set()
     for bind in binds:

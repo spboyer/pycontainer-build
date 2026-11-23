@@ -94,7 +94,8 @@ and `server` (`--port`, `--ServerApp.port`, `--NotebookApp.port`), directly
 or through `python -m` (including `python -m django`). Gradio apps launched as `python app.py`, Celery
 workers and other commands produce PCB010 when ports are exposed. Django
 options other than the standard `runserver` options also make the listener
-unknown.
+unknown, as do attached or clustered short options (`-p8000`, `-Rb :8000`)
+and abbreviated long options (`--bin`), whose effect is parser-specific.
 
 This check does not guess. Ports set through environment variables
 (`UVICORN_PORT`, `FLASK_RUN_PORT`, `STREAMLIT_SERVER_PORT`,
