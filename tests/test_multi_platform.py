@@ -26,13 +26,22 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _base_layer(arch: str):
+def _base_layer(arch: str, libc_version=None):
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as tar:
         payload = f"base for {arch}".encode()
         info = tarfile.TarInfo(f"etc/{arch}")
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
+        if libc_version is not None:
+            payload = (
+                "Package: libc6\nStatus: install ok installed\n"
+                f"Version: {libc_version}-1\n"
+                f"Architecture: {'armhf' if arch.startswith('arm-') else arch}\n\n"
+            ).encode()
+            info = tarfile.TarInfo("var/lib/dpkg/status")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
     uncompressed = raw.getvalue()
     return gzip.compress(uncompressed, mtime=0), _digest(uncompressed)
 
@@ -41,13 +50,16 @@ class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
     def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, config_variants=None,
-                 base_env=None, base_env_by_arch=None, base_runtime_by_arch=None):
+                 base_env=None, base_env_by_arch=None, base_runtime_by_arch=None,
+                 libc_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
         for entry in platforms:
             arch, _, variant = entry.partition("/")
-            layer, diff_id = _base_layer(entry.replace("/", "-"))
+            layer, diff_id = _base_layer(
+                entry.replace("/", "-"), libc_by_arch[arch] if libc_by_arch is not None else None
+            )
             if entry == wrong_diff_id_arch:
                 diff_id = _digest(b"not the layer content")
             platform = {"os": "linux", "architecture": arch}
@@ -258,7 +270,10 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
 def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     tmp_path, monkeypatch, by_digest, arm_first
 ):
-    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"), base_env=[])
+    registry = FakeBaseRegistry(
+        platforms=("amd64", "arm64", "arm/v6", "arm/v7"),
+        base_env=[], libc_by_arch={"amd64": "2.28", "arm64": "2.36", "arm": "2.31"},
+    )
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
@@ -296,11 +311,107 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
         assert installs == expected
 
 
+@pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
+def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
+    tmp_path, monkeypatch, source
+):
+    registry = FakeBaseRegistry(
+        platforms=("amd64", "arm64", "arm/v7"),
+        base_env=["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"],
+        libc_by_arch={"amd64": "2.28", "arm64": "2.36", "arm": "2.31"},
+    )
+    if source == "unresolved-tag":
+        client_factory = registry.client
+
+        def unresolved_client(*args, **kwargs):
+            client = client_factory(*args, **kwargs)
+            pull = client.pull_manifest
+
+            def pull_manifest(reference, **expected):
+                manifest, digest = pull(reference, **expected)
+                return manifest, None if reference == "3.11-slim" else digest
+
+            client.pull_manifest = pull_manifest
+            return client
+
+        registry.client = unresolved_client
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, *, base_image_tag_verified, variant=None):
+        installs.append((arch, base_config["config"]["Env"], base_image_tag_verified))
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    base_image = "python:3.11-slim"
+    if source == "digest":
+        base_image += "@" + registry.index_digest
+    builder = _builder(
+        tmp_path, monkeypatch, registry, include_deps=True,
+        ctx=_context(tmp_path, requirements=True), base_image=base_image,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+    )
+
+    if source != "verified-tag":
+        with pytest.raises(ValueError, match="unverified or custom"):
+            builder.build()
+        assert installs == []
+        assert not (tmp_path / "out" / "index.json").exists()
+        return
+
+    builder.build()
+    assert [
+        (arch, next(item for item in env if item.startswith("PYTHON_LIBC=")), verified)
+        for arch, env, verified in installs
+    ] == [
+        ("amd64", "PYTHON_LIBC=glibc-2.28", True),
+        ("arm64", "PYTHON_LIBC=glibc-2.36", True),
+        ("arm", "PYTHON_LIBC=glibc-2.31", True),
+    ]
+    for image in builder.platform_images:
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert not any(item.startswith("PYTHON_LIBC=") for item in config["config"]["Env"])
+
+
 def test_normalize_platforms_strips_and_dedupes():
     assert normalize_platforms(" linux/amd64 , linux/arm64,linux/amd64") == [
         "linux/amd64",
         "linux/arm64",
     ]
+
+
+def test_scanning_multi_platform_config_is_rejected():
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        BuildConfig(platform=MULTI, scan=True)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_enabling_scanning_after_configuration_rejects_index_build(
+    tmp_path, monkeypatch, dry_run
+):
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, dry_run=dry_run)
+    builder.config.scan = True
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.build()
+    assert registry.manifest_calls == []
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_enabling_scanning_after_index_build_rejects_push_before_auth(
+    tmp_path, monkeypatch
+):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry())
+    builder.build()
+    original_index = (tmp_path / "out" / "index.json").read_bytes()
+    builder.config.scan = True
+    builder.config.platform = "linux/amd64"
+    monkeypatch.setattr(
+        builder_module, "get_registry_auth", lambda *args, **kwargs: pytest.fail("auth before gate")
+    )
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.push(show_progress=False)
+    assert (tmp_path / "out" / "index.json").read_bytes() == original_index
     with pytest.raises(ValueError):
         normalize_platforms("linux/amd64,,linux/arm64")
 
