@@ -84,10 +84,11 @@ def test_cli_preserves_required_base_image_trust(tmp_path, monkeypatch):
     }
 
 
-def test_cli_accepts_base_image_trust_with_security_fragments(tmp_path, monkeypatch):
+def test_cli_accepts_base_image_trust_with_security_and_history(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         '[build]\nbase_image = "registry.example/team/base:v1"\n'
+        'record_history = true\nhistory_dir = "history"\n'
         '[build.base_image_trust]\nprovider = "cosign"\n'
         'repository = "registry.example/team/base"\n'
         'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
@@ -97,6 +98,8 @@ def test_cli_accepts_base_image_trust_with_security_fragments(tmp_path, monkeypa
     config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
 
     assert config.base_image_trust["repository"] == "registry.example/team/base"
+    assert config.record_history is True
+    assert config.history_dir == "history"
     assert render_security_fragments(config.security, str(tmp_path)) == {
         KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
     }
