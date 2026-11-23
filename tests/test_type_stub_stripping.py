@@ -14,7 +14,7 @@ from pycontainer.dependencies import staged_packages, strip_type_stubs
 BASE_CONFIG = {
     "architecture": "amd64",
     "os": "linux",
-    "config": {"Env": ["PYTHON_VERSION=3.11.8", "PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
+    "config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8", "PYTHON_LIBC=glibc-2.17"], "WorkingDir": "/"},
     "rootfs": {"type": "layers", "diff_ids": []},
 }
 
