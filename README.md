@@ -501,13 +501,18 @@ pycontainer build \
   `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
   Virtualenvs do not record selected extras or groups. An extra or group
-  counts as not requested only when it is missing a requirement that any
-  Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
-  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
-  its target requirements are not satisfied, verification fails rather than
-  guessing.
+  counts as not requested only when it is missing a requirement that the
+  venv's creator host provably would have installed. Only facts the venv
+  establishes are used: CPython, the venv's Python minor version when known,
+  and the OS family from the layout (`lib/pythonX.Y/site-packages` with a
+  POSIX `pyvenv.cfg` `home` is non-Windows; MSYS2 CPython is Windows with that
+  layout; `Lib/site-packages` is Windows). Markers on any other host value,
+  such as `platform_machine` or a specific non-Windows `sys_platform`, are
+  unknown rather than assumed, so a requirement like
+  `fast; extra == "speed" and platform_machine != "armv7l"` cannot rule the
+  extra out. Otherwise, if its target requirements are not satisfied,
+  verification fails rather than guessing; install the extra into the venv or
+  use a requirements file instead.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
