@@ -186,8 +186,8 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     requests = []
 
-    def fake_request(method, url, headers=None):
-        requests.append((method, url, headers))
+    def fake_request(method, url, headers=None, max_response_bytes=None):
+        requests.append((method, url, headers, max_response_bytes))
         return 200, body, {"Docker-Content-Digest": digest}
 
     monkeypatch.setattr(client, "_make_request", fake_request)
@@ -195,6 +195,7 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     manifest, returned_digest = client.pull_manifest(
         digest, expected_digest=digest, expected_size=len(body)
     )
+    assert requests[0][3] == len(body)
     assert manifest["schemaVersion"] == 2
     assert returned_digest == digest
     assert "application/vnd.docker.distribution.manifest.list.v2+json" in (
@@ -206,6 +207,59 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
 
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
+
+
+def test_pull_manifest_bounds_read_to_expected_size(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(b"{}" + b" " * 4096)
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda request, timeout: response,
+    )
+    with pytest.raises(RegistryRequestError, match="exceeded 2 bytes"):
+        client.pull_manifest("sha256:" + "a" * 64, expected_size=2)
+    assert response.read_sizes == [3]
+
+
+def test_manifest_bound_survives_bearer_auth_retry(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(b"{}extra")
+
+    def handler(request, _count):
+        if not request.full_url.startswith(client.base_url):
+            return _Response(b'{"token": "synthetic-token"}')
+        if not request.get_header("Authorization"):
+            raise _http_error(
+                request.full_url,
+                401,
+                {"Www-Authenticate": 'Bearer realm="https://auth.example/token"'},
+            )
+        return response
+
+    _patch_urlopen(monkeypatch, handler)
+    with pytest.raises(RegistryRequestError, match="exceeded 2 bytes"):
+        client.pull_manifest("latest", expected_size=2)
+    assert response.read_sizes == [3]
+
+
+@pytest.mark.parametrize("operation", ["blob", "manifest_get", "manifest_put"])
+def test_artifact_registry_errors_preserve_rate_limit_and_redaction(monkeypatch, operation):
+    client = RegistryClient("registry.example", "team/app", auth_token="synthetic-secret")
+    monkeypatch.setattr(
+        client, "_make_request",
+        lambda *args, **kwargs: (
+            429, b"Bearer synthetic-secret", {"Retry-After": "30"}
+        ),
+    )
+    with pytest.raises(RegistryRateLimitError) as error:
+        if operation == "blob":
+            client.blob_descriptor_matches("sha256:" + "a" * 64, 2)
+        elif operation == "manifest_get":
+            client.fetch_manifest_bytes("latest", "application/test", 4096)
+        else:
+            client.put_manifest("latest", b"{}", "application/test")
+    assert error.value.retry_after_seconds == 30
+    assert "synthetic-secret" not in str(error.value)
 
 
 @pytest.mark.parametrize("mismatch", [None, "digest", "size", "media_type", "missing"])
@@ -576,6 +630,67 @@ def test_blob_download_rejects_insecure_redirect(monkeypatch):
     )
     with pytest.raises(RegistryRequestError, match="HTTPS"):
         client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["http://storage.example/blob", "https://user:secret@storage.example/blob"],
+)
+def test_blob_response_redirect_rejects_unsafe_target(monkeypatch, target):
+    class Opener:
+        def open(self, request, timeout):
+            return _Response(status=302, headers={"Location": target})
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request",
+        lambda *args, **kwargs: pytest.fail("unsafe redirect must not be followed"),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("unsafe redirect must not be followed"),
+    )
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    with pytest.raises(RegistryRequestError, match="HTTPS"):
+        client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
+
+
+def test_blob_response_redirect_strips_registry_authorization(monkeypatch):
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            requests.append(request)
+            return _Response(
+                status=302, headers={"Location": "https://storage.example/blob"}
+            )
+
+    def follow_redirect(request, timeout):
+        requests.append(request)
+        return _Response(b"blob")
+
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *_handlers: Opener(),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client._open_registry_request", follow_redirect
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("redirect bypassed the safe opener"),
+    )
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    assert client._open_blob_response(
+        "https://registry.example/v2/team/app/blobs/sha256:abc"
+    ).read() == b"blob"
+    assert requests[0].get_header("Authorization") == "Bearer secret"
+    assert requests[1].get_header("Authorization") is None
 
 
 def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
@@ -1314,8 +1429,8 @@ def test_rate_limit_headers_are_logged_and_low_remaining_warns_once(
     )
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
-        client._make_request("GET", f"{client.base_url}/")
-        client._make_request("GET", f"{client.base_url}/")
+        client._make_request("GET", f"{client.base_url}/", max_response_bytes=16)
+        client._make_request("GET", f"{client.base_url}/", max_response_bytes=16)
 
     debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]

@@ -18,6 +18,9 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `artifact.py`: non-runnable OCI 1.1 artifacts (empty config, one typed
+  payload, optional subject), layout/registry round trips and referrers
+  discovery; see `docs/oci-artifacts.md`.
 - `system_packages.py`: system package declaration, inference and base-image
   verification (warning only). `system_install.py`: fail-closed groundwork for
   #31; it executes no package manager and has no callers until the #22
@@ -94,11 +97,13 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_tag_extraction`
 - `tests/test_signing_integration.py::test_real_provider_signs_and_independently_verifies` (eight provider/platform combinations)
 - `tests/test_signing_integration.py::test_real_provider_wrong_trust_fails_before_tags` (four Cosign mode/platform combinations)
+- `tests/test_artifact_integration.py::test_real_registry_artifact_round_trip_and_referrers` (set `PYCONTAINER_ARTIFACT_TEST_REPOSITORY`; optional ORAS check)
 
 The opt-in `keyless-signing` dispatch job in `.github/workflows/tests.yml` runs
 the Cosign keyless subset with the workflow's GitHub OIDC identity; it is gated
 to a manual owner dispatch of the reviewed branch and expected SHA. See
 `docs/image-signing.md`.
+
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
 in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`
