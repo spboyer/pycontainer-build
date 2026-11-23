@@ -124,6 +124,15 @@ and is listed separately as not validated. Re-run all jobs, not just failed
 jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
+An opt-in `workflow_dispatch` choice `dependency_fixture=lockfile` (or
+`--dependency-fixture lockfile` on the script) instead stages the offline
+`tests/fixtures/runtime-lock` uv lock. It verifies wheel archive hashes against
+the lock before staging and checks imported distribution names, versions and
+installed module/METADATA hashes in the container. The platform-tagged wheels
+contain only Python; this is not native-binary evidence. Lock evidence records
+the fixture path, lock digest and assertion-script digest and is gated against
+the committed fixture and the exact commit/run/attempt for both native targets.
+Workflow calls and release gates continue to use the default requirements fixture.
 
 Runtime security fragments (`security.py`) are deployment artifacts written
 beside the layout, never image config. Verify them with the opt-in Linux
