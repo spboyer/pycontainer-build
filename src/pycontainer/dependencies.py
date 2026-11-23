@@ -480,7 +480,7 @@ def stage_virtualenv(
         context_dir,
         requirements,
         version_established,
-        venv_layout_os(root),
+        venv_layout_os(root, _read_venv_config(files, root)),
     )
 
 
@@ -616,18 +616,8 @@ def _validate_virtualenv_version(
                 f"Python {python_version}."
             )
         established |= bool(match)
-    if not files:
-        return established
-    source, relative = files[0]
-    context_root = source
-    for _ in relative.parts:
-        context_root = context_root.parent
-    venv_dirs = [context_root.joinpath(*root[:index]) for index in range(len(root) - 1, 0, -1)]
-    venv_config = next(
-        (path / "pyvenv.cfg" for path in venv_dirs if (path / "pyvenv.cfg").is_file()), None
-    )
-    if venv_config is not None:
-        text = venv_config.read_text(errors="replace")
+    text = _read_venv_config(files, root)
+    if text is not None:
         match = re.search(r"(?im)^\s*version(?:_info)?\s*=\s*(\d+\.\d+)", text)
         if match and match.group(1) != python_version:
             raise ValueError(
@@ -636,6 +626,21 @@ def _validate_virtualenv_version(
             )
         established |= bool(match)
     return established
+
+
+def _read_venv_config(files: List[Tuple[Path, Path]], root: Tuple[str, ...]) -> Optional[str]:
+    """Return the text of the pyvenv.cfg enclosing the site-packages root, if any."""
+    if not files:
+        return None
+    source, relative = files[0]
+    context_root = source
+    for _ in relative.parts:
+        context_root = context_root.parent
+    venv_dirs = [context_root.joinpath(*root[:index]) for index in range(len(root) - 1, 0, -1)]
+    venv_config = next(
+        (path / "pyvenv.cfg" for path in venv_dirs if (path / "pyvenv.cfg").is_file()), None
+    )
+    return venv_config.read_text(errors="replace") if venv_config is not None else None
 
 
 def _validate_virtualenv_file(source: Path, relative: Path) -> None:

@@ -165,8 +165,9 @@ distributions, missing or unsupported `Metadata-Version`, invalid metadata,
 direct URLs, and patch-dependent `Requires-Python` without a full
 `PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
 can contain credentials. An unrecorded extra or optional group is ruled out
-only if every plausible Windows/Linux/macOS CPython host (narrowed by the
-`lib/pythonX.Y` or `Lib` site-packages layout; `python_version` shared only when
+only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
+`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
+`Lib` layout; `python_version` shared only when
 the venv minor is established) would have installed one of its missing
 requirements; otherwise unsatisfied target-active requirements fail closed.
 Loose modules without metadata remain unverified; host-only packages remain

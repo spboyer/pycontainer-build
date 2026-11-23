@@ -1283,12 +1283,19 @@ def test_virtualenv_rejects_malformed_metadata_headers(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("lib", "fails"), [(("lib", "python3.11"), False), (("Lib",), True)]
+    ("lib", "home", "fails"),
+    [
+        (("lib", "python3.11"), "/usr/bin", False),
+        (("lib", "python3.11"), "C:/msys64/mingw64/bin", True),
+        (("lib", "python3.11"), None, True),
+        (("Lib",), "C:\\Python311", True),
+    ],
 )
 def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
-    tmp_path, monkeypatch, lib, fails
+    tmp_path, monkeypatch, lib, home, fails
 ):
     context = tmp_path / "context"
+    pyvenv = "version = 3.11.7\n" + (f"home = {home}\n" if home else "")
     _write_base_venv(
         context,
         {
@@ -1297,6 +1304,7 @@ def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
                 'Requires-Dist: venv-uvloop; sys_platform != "win32" and extra == "uvloop"',
             ]
         },
+        pyvenv=pyvenv,
         lib=lib,
     )
     (context / "requirements.txt").write_text("venv-root\n")

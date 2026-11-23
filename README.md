@@ -359,8 +359,9 @@ pycontainer build \
   Virtualenvs do not record selected extras or groups. An extra or group
   counts as not requested only when it is missing a requirement that any
   Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout limits the hosts to Linux
-  and macOS, and `Lib/site-packages` to Windows. Otherwise, if its target
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if its target
   requirements are not satisfied, verification fails rather than guessing.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
