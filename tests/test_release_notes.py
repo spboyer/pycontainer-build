@@ -59,6 +59,7 @@ def _build(tmp_path, monkeypatch, base_config=None, output="output", **settings)
         (b"one\r\ntwo\rthree\n", "one\ntwo\nthree\n"),
         (b"", ""),
     ],
+    ids=["ascii-cap", "utf8-cap", "crlf-cap", "bom-cap", "bom-crlf-cap", "mixed-lines", "empty"],
 )
 def test_release_notes_at_cap_are_accepted_and_normalized(tmp_path, raw, expected):
     path = tmp_path / "notes.md"
@@ -75,6 +76,7 @@ def test_release_notes_at_cap_are_accepted_and_normalized(tmp_path, raw, expecte
         (b"\r\n" * (MAX_RELEASE_NOTES_BYTES + 2), "exceeds 8192 bytes"),
         (b"a" * 1_000_000, "exceeds 8192 bytes"),
     ],
+    ids=["ascii-over", "utf8-over", "crlf-over", "raw-over", "large-file"],
 )
 def test_release_notes_over_cap_are_rejected_without_truncation(tmp_path, raw, message):
     path = tmp_path / "notes.md"

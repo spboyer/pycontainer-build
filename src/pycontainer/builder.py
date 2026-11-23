@@ -771,7 +771,8 @@ class ImageBuilder:
         local=parse_local_image_reference(self.config.base_image)
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
-            auth=get_registry_auth(registry)
+            # Generic REGISTRY_* variables target the destination, not the base registry.
+            auth=get_registry_auth(registry, include_generic_environment=False)
             client=self._registry_client(registry, repo, auth)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 

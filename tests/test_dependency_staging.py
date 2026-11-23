@@ -1464,7 +1464,7 @@ def test_aspire_and_default_cli_stage_using_verified_base_layer_libc(
 
     monkeypatch.setattr(
         "pycontainer.builder.get_registry_auth",
-        lambda registry: SimpleNamespace(bearer_token=None, username=None, password=None),
+        lambda registry, **kwargs: SimpleNamespace(bearer_token=None, username=None, password=None),
     )
     monkeypatch.setattr(RegistryClient, "_make_request", manifest_response)
     monkeypatch.setattr(RegistryClient, "_open_blob_response", blob_response)
