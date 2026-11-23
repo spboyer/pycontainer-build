@@ -319,6 +319,11 @@ Install from VS Code Marketplace or command palette:
 
 [See full documentation →](plugins/vscode-pycontainer/)
 
+### Other editors and task runners
+
+Project-scoped PyCharm, Vim, Emacs, GNU Make, and Go Task examples are
+available in the [integration examples](examples/editor-task-runners/).
+
 ---
 
 ## 🎓 Configuration
