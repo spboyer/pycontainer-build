@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from pycontainer import lockfiles as lockfile_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import _analyze_requirements, install_requirements, staged_packages
@@ -856,6 +857,82 @@ def test_staged_wheel_closure_allows_an_extra_with_no_dependencies(tmp_path):
     verify_locked_installation(selection, context, site, PY311)
 
 
+@pytest.mark.parametrize(
+    ("operator", "literal", "expected"),
+    [
+        ("==", "Speed_Ups", True),
+        ("!=", "Speed_Ups", False),
+        ("in", "other,Speed_Ups", True),
+        ("not in", "other,Speed_Ups", False),
+    ],
+)
+def test_extra_markers_normalize_with_legacy_packaging(monkeypatch, operator, literal, expected):
+    marker_type = lockfile_module.Marker
+
+    class LegacyMarker:
+        def __init__(self, expression):
+            self.expression = expression
+            self._markers = marker_type(expression)._markers
+            self._markers[0][2].value = literal
+
+        def __str__(self):
+            return self.expression
+
+        def evaluate(self, values):
+            extra, value = values["extra"], self._markers[0][2].value
+            return {
+                "==": extra == value,
+                "!=": extra != value,
+                "in": extra in value,
+                "not in": extra not in value,
+            }[operator]
+
+    monkeypatch.setattr(lockfile_module, "Marker", LegacyMarker)
+
+    assert lockfile_module._marker_applies(
+        f"extra {operator} '{literal}'", PY311, "wheel metadata", "speed-ups"
+    ) is expected
+
+
+def test_lock_marker_rejects_unrecognized_packaging_structure(monkeypatch):
+    class UnsupportedMarker:
+        def __init__(self, expression):
+            self._markers = [object()]
+
+        def __str__(self):
+            return "extra == 'feature'"
+
+        def evaluate(self, values):
+            return True
+
+    monkeypatch.setattr(lockfile_module, "Marker", UnsupportedMarker)
+
+    with pytest.raises(LockfileError, match="Cannot inspect environment marker"):
+        lockfile_module._marker_applies("extra == 'feature'", PY311, "wheel metadata", "feature")
+
+
+def test_extra_marker_normalization_does_not_change_platform_values():
+    assert not lockfile_module._marker_applies(
+        "sys_platform == 'LINUX' or extra == 'Speed_Ups'", PY311, "wheel metadata", "other"
+    )
+
+
+def test_staged_wheel_closure_checks_normalized_requested_extras(tmp_path):
+    context = _write_pipenv_project(tmp_path / "context", extras=["speed-ups"])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\n"
+        "Requires-Dist: missing-child; extra == 'Speed_Ups'\n\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
 @pytest.mark.parametrize("requested", [False, True])
 def test_staged_wheel_closure_rejects_only_applicable_direct_urls(tmp_path, requested):
     context = _write_pipenv_project(tmp_path / "context", extras=["feature"] if requested else [])
@@ -919,6 +996,29 @@ def test_staged_wheel_closure_rejects_malformed_metadata(tmp_path, headers):
     metadata = site / "marker_root-1.0.dist-info" / "METADATA"
     metadata.parent.mkdir(parents=True)
     metadata.write_text(f"Metadata-Version: 2.1\n{headers}\n", encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Invalid staged package metadata"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["oversized", "mismatched-directory", "unsupported-version", "missing"]
+)
+def test_staged_wheel_closure_checks_metadata_bounds_and_identity(tmp_path, monkeypatch, invalid):
+    context = _write_pipenv_project(tmp_path / "context")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    directory = "other-1.0.dist-info" if invalid == "mismatched-directory" else "marker_root-1.0.dist-info"
+    metadata = site / directory / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    if invalid != "missing":
+        metadata_version = "3.0" if invalid == "unsupported-version" else "2.1"
+        metadata.write_text(
+            f"Metadata-Version: {metadata_version}\nName: marker-root\nVersion: 1.0\n\n",
+            encoding="utf-8",
+        )
+    if invalid == "oversized":
+        monkeypatch.setattr("pycontainer.dependencies.MAX_METADATA_BYTES", 16)
 
     with pytest.raises(LockfileError, match="Invalid staged package metadata"):
         verify_locked_installation(selection, context, site, PY311)

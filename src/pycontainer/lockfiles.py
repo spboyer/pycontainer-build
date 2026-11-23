@@ -11,10 +11,12 @@ import re
 import tokenize
 import tomllib
 from dataclasses import dataclass
-from email.parser import Parser
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
+
+from ._venv_closure import ClosureError as _MarkerStructureError, _walk as _walk_marker
+from .dependencies import _read_staged_distributions
 
 try:
     from packaging.markers import InvalidMarker, Marker
@@ -214,7 +216,17 @@ def _marker_applies(
         parsed = Marker(str(marker))
     except InvalidMarker as exc:
         raise LockfileError(f"Invalid environment marker in {source}: {marker!r}") from exc
-    names = {token.string for token in _marker_tokens(str(parsed), source) if token.type == tokenize.NAME}
+    names = set()
+    try:
+        _walk_marker(parsed._markers, names, set(), canonical_name)
+    except (AttributeError, TypeError, _MarkerStructureError) as exc:
+        raise LockfileError(f"Cannot inspect environment marker in {source}: {marker!r}") from exc
+    unknown = names - set(environment) - {"extra"}
+    if unknown:
+        raise LockfileError(
+            f"Cannot evaluate marker {str(parsed)!r} in {source}; "
+            f"unknown target variables: {', '.join(sorted(unknown))}."
+        )
     for variable, value in environment.items():
         if value is None and variable in names:
             raise LockfileError(
@@ -222,7 +234,7 @@ def _marker_applies(
                 f"image because {variable} is unknown."
             )
     values = {key: value or "" for key, value in environment.items()}
-    values["extra"] = extra
+    values["extra"] = canonical_name(extra)
     return parsed.evaluate(values)
 
 
@@ -856,33 +868,44 @@ def verify_locked_installation(
 
     expected = {package.name: package for package in selection.packages}
     installed = {}
-    for metadata in sorted(site_packages.glob("*.dist-info/METADATA")):
-        try:
-            with metadata.open(encoding="utf-8") as stream:
-                message = Parser().parse(stream, headersonly=True)
-        except (OSError, UnicodeDecodeError) as exc:
-            raise LockfileError(f"Cannot read staged package metadata: {metadata}.") from exc
-        if message.defects or any(
-            len(message.get_all(field, [])) != 1 for field in ("Metadata-Version", "Name", "Version")
-        ) or len(message.get_all("Requires-Python", [])) > 1:
+    try:
+        distributions = _read_staged_distributions(site_packages)
+    except ValueError as exc:
+        raise LockfileError(f"Invalid staged package metadata: {exc}") from exc
+    for distribution in distributions:
+        metadata = distribution["path"]
+        headers = distribution["headers"]
+        if any(len(headers[field]) != 1 for field in ("Metadata-Version", "Name", "Version")) or len(
+            headers["Requires-Python"]
+        ) > 1:
             raise LockfileError(f"Invalid staged package metadata: {metadata}.")
-        name, version = message.get("Name"), message.get("Version")
+        name, version = headers["Name"][0], headers["Version"][0]
         if not name or not version:
             raise LockfileError(f"Staged package metadata is missing Name or Version: {metadata}.")
         name = canonical_name(name.strip())
         if name in installed or name not in expected:
             raise LockfileError(f"Unexpected or duplicate staged package {name} in {selection.path.name}.")
         try:
+            metadata_version = Version(headers["Metadata-Version"][0].strip())
+            directory_name, separator, directory_version = distribution["directory"].rpartition("-")
+            if (
+                metadata_version.release[0] not in {1, 2}
+                or not separator
+                or canonical_name(directory_name) != name
+                or Version(directory_version) != Version(version.strip())
+            ):
+                raise LockfileError(f"Invalid staged package metadata: {metadata}.")
             if Version(version.strip()) != Version(expected[name].version):
                 raise LockfileError(
                     f"Staged package {name} does not match the version in {selection.path.name}."
                 )
         except InvalidVersion as exc:
             raise LockfileError(f"Staged package {name} has an invalid version.") from exc
-        _require_python(message.get("Requires-Python"), environment, f"staged package {name}")
+        requires_python = headers["Requires-Python"]
+        _require_python(requires_python[0] if requires_python else None, environment, f"staged package {name}")
         installed[name] = [
             _parse_requirement(text, f"staged package {name}", allow_url=True)
-            for text in message.get_all("Requires-Dist", [])
+            for text in headers["Requires-Dist"]
         ]
     missing = sorted(set(expected) - set(installed))
     if missing:
