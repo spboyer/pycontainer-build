@@ -1,12 +1,13 @@
 """Verify a staged virtualenv's dependency closure for the target image.
 
 This file is executed as ``python -P -c <source>`` by
-``dependencies.stage_virtualenv``; it is not imported by the package. It reads
-a JSON request on stdin containing parsed ``METADATA`` headers and the target
-marker environment, and writes a JSON list of problems to stdout. It only uses
-pip's vendored ``packaging`` to parse requirements, versions and markers; it
-never imports staged packages. Markers that reference a variable without a
-known target value are rejected instead of being evaluated with host values.
+``dependencies.stage_virtualenv``. Its marker-tree helper is also used by
+lockfile validation. It reads a JSON request on stdin containing parsed
+``METADATA`` headers and the target marker environment, and writes a JSON list
+of problems to stdout. It only uses pip's vendored ``packaging`` to parse
+requirements, versions and markers; it never imports staged packages. Markers
+that reference a variable without a known target value are rejected instead of
+being evaluated with host values.
 """
 import copy
 import json
