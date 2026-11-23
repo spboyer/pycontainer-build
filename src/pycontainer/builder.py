@@ -283,7 +283,10 @@ class ImageBuilder:
         if self.config.include_deps:
             staging_config = target_libc_config(
                 os_name, arch, self.config.base_image, base_config, base_layers,
-                base_image_tag_verified="@" not in self.config.base_image,
+                base_image_tag_verified=(
+                    parse_local_image_reference(self.config.base_image) is None
+                    and "@" not in self.config.base_image
+                ),
             )
             deps_layer=self._create_deps_layer(
                 layers_dir, base_config=staging_config, os_name=os_name, arch=arch
