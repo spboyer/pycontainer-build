@@ -15,6 +15,7 @@ from pycontainer.blob_store import BlobIntegrityError
 from pycontainer.registry_client import (
     MAX_REQUEST_RETRIES,
     TRANSFER_CHUNK_SIZE,
+    NoRedirect,
     RegistryAuthenticationError,
     RegistryClient,
     RegistryRequestError,
@@ -471,12 +472,13 @@ def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
             content, headers={"Content-Length": str(len(content))}
         )
 
+    class StorageOpener:
+        def open(self, request, timeout):
+            return fake_urlopen(request, timeout)
+
     monkeypatch.setattr(
         "pycontainer.registry_client.urllib.request.build_opener",
-        lambda *_handlers: Opener(),
-    )
-    monkeypatch.setattr(
-        "pycontainer.registry_client.urllib.request.urlopen", fake_urlopen
+        lambda handler: Opener() if isinstance(handler, NoRedirect) else StorageOpener(),
     )
     monkeypatch.setattr(
         "pycontainer.registry_client.time.sleep", delays.append

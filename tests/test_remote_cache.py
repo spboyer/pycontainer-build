@@ -4,7 +4,9 @@ import hashlib
 import io
 import json
 import logging
+import os
 import subprocess
+import tarfile
 import threading
 import urllib.error
 import urllib.parse
@@ -187,7 +189,6 @@ def registry(monkeypatch):
         "pycontainer.registry_client.urllib.request.build_opener",
         lambda *handlers: _Opener(),
     )
-    monkeypatch.setattr("pycontainer.registry_client.urllib.request.urlopen", fake.open)
     monkeypatch.setattr(remote_cache, "get_registry_auth", fake_auth)
     monkeypatch.setattr(
         ImageBuilder,
@@ -293,6 +294,35 @@ def test_cold_export_then_warm_import_skips_rebuild(tmp_path, registry, monkeypa
     assert registry.requests == []
 
 
+@pytest.mark.xfail(strict=True, reason="hard-link cache identity requires #230")
+def test_cache_key_distinguishes_hardlinks(tmp_path, registry):
+    writer = _builder(tmp_path, "writer", cache_to=CACHE_SPEC)
+    writer.context_include_paths.append("copy.py")
+    context = Path(writer.config.context_dir)
+    source, copy = context / "app.py", context / "copy.py"
+    copy.write_bytes(source.read_bytes())
+    independent = _app_layer(writer, tmp_path, "writer")
+    with tarfile.open(independent.tar_path) as archive:
+        assert archive.getmember("app/copy.py").isreg()
+
+    copy.unlink()
+    try:
+        os.link(source, copy)
+    except OSError as error:
+        pytest.skip(f"Hard links are unavailable: {error}")
+    writer.remote_cache_to = None
+    local = _app_layer(writer, tmp_path, "writer-linked")
+    with tarfile.open(local.tar_path) as archive:
+        assert archive.getmember("app/copy.py").islnk()
+    reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC)
+    reader.context_include_paths.append("copy.py")
+    linked = _app_layer(reader, tmp_path, "reader")
+    with tarfile.open(linked.tar_path) as archive:
+        assert archive.getmember("app/copy.py").islnk()
+    assert linked.digest == local.digest
+    assert linked.digest != independent.digest
+
+
 def test_full_build_uses_remote_layer(tmp_path, registry, monkeypatch):
     _, cold = _export(tmp_path, registry)
     reader = _builder(tmp_path, "reader", cache_from=CACHE_SPEC)
@@ -340,6 +370,24 @@ def test_export_is_idempotent_and_concurrent_writers_agree(tmp_path, registry):
     assert errors == []
     assert registry.manifests[tag] == record
     assert RegistryLayerCache(writer.remote_cache_to.ref).fetch(key, tmp_path / "x") is not None
+
+
+@pytest.mark.parametrize("missing", ["layer", "config"])
+def test_export_restores_missing_blob_for_current_record(tmp_path, registry, missing):
+    writer, layer = _export(tmp_path, registry)
+    key = _key_for(writer)
+    tag = cache_tag(key)
+    record = json.loads(registry.manifests[tag])
+    digest = layer.digest if missing == "layer" else record["config"]["digest"]
+    del registry.blobs[digest]
+    manifest_puts = len(registry.manifest_puts())
+
+    assert writer.remote_cache_to.store(
+        key, layer.digest, Path(layer.tar_path), layer.size
+    ) is False
+    assert digest in registry.blobs
+    assert len(registry.manifest_puts()) == manifest_puts
+    assert RegistryLayerCache(writer.remote_cache_to.ref).fetch(key, tmp_path / "reader")
 
 
 @pytest.mark.parametrize("failure", [("PUT", "manifests/"), ("POST", "blobs/uploads/")])
@@ -632,6 +680,83 @@ def test_blob_redirect_to_plain_http_is_refused():
         client._open_redirected_blob(
             f"https://{CACHE_HOST}/v2/x/blobs/y", "http://storage.example/blob"
         )
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["https://user:secret@storage.example/blob", "https://@storage.example/blob"],
+)
+def test_blob_redirect_rejects_embedded_credentials(monkeypatch, location):
+    def forbidden(*args, **kwargs):
+        pytest.fail("A credential-bearing redirect must not be opened")
+
+    monkeypatch.setattr("pycontainer.registry_client.urllib.request.build_opener", forbidden)
+    with pytest.raises(RegistryRequestError):
+        RegistryClient(CACHE_HOST, CACHE_REPO)._open_redirected_blob(
+            f"https://{CACHE_HOST}/blob", location
+        )
+
+
+@pytest.mark.parametrize(
+    ("location", "allowed"),
+    [
+        ("https://storage.example/final", True),
+        ("http://storage.example/final", False),
+        ("https://user:secret@storage.example/final", False),
+    ],
+)
+def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
+    requests = []
+
+    class StorageHandler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, request):
+            return self._respond(request)
+
+        def http_open(self, request):
+            return self._respond(request)
+
+        def _respond(self, request):
+            requests.append(request)
+            headers = Message()
+            if request.full_url.endswith("/first"):
+                headers["Location"] = location
+                code, content = 302, b""
+            else:
+                code, content = 200, b"blob"
+            response = urllib.response.addinfourl(
+                io.BytesIO(content), headers, request.full_url, code
+            )
+            response.msg = "redirect" if code == 302 else "OK"
+            return response
+
+    build_opener = urllib.request.build_opener
+    default_opener = build_opener(urllib.request.ProxyHandler({}), StorageHandler())
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.urlopen",
+        lambda request, timeout: default_opener.open(request, timeout=timeout),
+    )
+    monkeypatch.setattr(
+        "pycontainer.registry_client.urllib.request.build_opener",
+        lambda *handlers: build_opener(
+            urllib.request.ProxyHandler({}), *handlers, StorageHandler()
+        ),
+    )
+    client = RegistryClient(CACHE_HOST, CACHE_REPO, auth_token="registry-secret")
+    if allowed:
+        with client._open_redirected_blob(
+            f"https://{CACHE_HOST}/blob", "https://storage.example/first"
+        ) as response:
+            assert response.read() == b"blob"
+        assert len(requests) == 2
+        assert all(request.get_header("Authorization") is None for request in requests)
+    else:
+        with pytest.raises(RegistryRequestError):
+            client._open_redirected_blob(
+                f"https://{CACHE_HOST}/blob", "https://storage.example/first"
+            )
+        assert len(requests) == 1
 
 
 @pytest.mark.parametrize(

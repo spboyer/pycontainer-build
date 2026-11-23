@@ -294,14 +294,15 @@ class RegistryLayerCache:
         manifest_digest = f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}"
         config_digest = f"sha256:{hashlib.sha256(config_bytes).hexdigest()}"
         try:
-            if self._current_record_digest(tag) == manifest_digest:
-                logger.info("Remote cache record %s in %s is current", tag, self.ref)
-                return False
+            current = self._current_record_digest(tag) == manifest_digest
             self.client.push_blob(digest, Path(layer_path))
             with tempfile.TemporaryDirectory(prefix="pycontainer-cache-") as directory:
                 config_path = Path(directory) / "config"
                 config_path.write_bytes(config_bytes)
                 self.client.push_blob(config_digest, config_path)
+            if current:
+                logger.info("Remote cache record %s in %s is current", tag, self.ref)
+                return False
             # The record is published last so readers never see missing blobs.
             self.client.push_manifest(tag, manifest_bytes)
         except (RegistryRequestError, BlobIntegrityError, OSError) as error:

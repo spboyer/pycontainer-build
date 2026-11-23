@@ -68,6 +68,31 @@ class SameOriginAuthRedirect(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
+def _validate_blob_redirect(url: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() != "https":
+            raise RegistryRequestError("Registry blob redirects must use HTTPS.")
+        if not parsed.hostname or "@" in parsed.netloc:
+            raise RegistryRequestError(
+                "Registry blob redirects must name a host without credentials."
+            )
+    except ValueError as error:
+        raise RegistryRequestError("Registry blob redirect URL is invalid.") from error
+
+
+class SecureBlobRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep every redirected blob request HTTPS and free of registry credentials."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_blob_redirect(newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.remove_header("Authorization")
+            redirected.remove_header("Proxy-Authorization")
+        return redirected
+
+
 _CONTROL_OPENER = urllib.request.build_opener(SameOriginAuthRedirect())
 
 
@@ -512,12 +537,9 @@ class RegistryClient:
                 "Registry blob redirect did not include a Location."
             )
         target = urllib.parse.urljoin(url, location)
-        if urllib.parse.urlsplit(target).scheme.lower() != "https":
-            raise RegistryRequestError(
-                "Registry blob redirect must use HTTPS; refusing "
-                f"{_safe_url(target)}."
-            )
-        return urllib.request.urlopen(
+        _validate_blob_redirect(target)
+        opener = urllib.request.build_opener(SecureBlobRedirect())
+        return opener.open(
             urllib.request.Request(target), timeout=self.timeout
         )
 
