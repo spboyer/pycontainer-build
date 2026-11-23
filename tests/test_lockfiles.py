@@ -28,7 +28,8 @@ from pycontainer.lockfiles import (
     verify_locked_installation,
 )
 from test_dependency_staging import (
-    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _write_named_wheel, _write_wheel,
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _symlink_or_skip,
+    _write_named_wheel, _write_wheel,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
@@ -62,6 +63,96 @@ def _copy(tmp_path, kind):
 
 def _selected(selection):
     return {package.name: package.version for package in selection.packages}
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+@pytest.mark.parametrize("operation", ["preflight", "load", "verify"])
+def test_lock_manifest_link_cannot_leave_context_or_dangle(tmp_path, kind, target_kind, operation):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    manifest = context / manifest_name
+    target = tmp_path / "outside" / manifest_name
+    target.parent.mkdir()
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        if operation == "preflight":
+            preflight_lockfile(context, Path(lock_name))
+        elif operation == "load":
+            load_lockfile(context, Path(lock_name), PY311)
+        else:
+            verify_locked_installation(selection, context, tmp_path / "site", PY311)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_manifest_link_within_context_is_supported(tmp_path, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    manifest = context / manifest_name
+    target = context / "nested" / manifest_name
+    target.parent.mkdir()
+    manifest.rename(target)
+    _symlink_or_skip(manifest, target)
+
+    preflight_lockfile(context, Path(lock_name))
+    assert _selected(load_lockfile(context, Path(lock_name), PY311)) == EXPECTED_311
+
+
+def test_nested_lock_accepts_manifest_link_elsewhere_in_context(tmp_path):
+    context = _copy(tmp_path, "uv")
+    nested = context / "nested"
+    nested.mkdir()
+    shutil.copy2(context / "uv.lock", nested / "uv.lock")
+    _symlink_or_skip(nested / "pyproject.toml", context / "pyproject.toml")
+
+    preflight_lockfile(context, Path("nested/uv.lock"))
+    assert _selected(load_lockfile(context, Path("nested/uv.lock"), PY311)) == EXPECTED_311
+
+
+@pytest.mark.parametrize("kind", ["uv", "pipenv"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+def test_build_rejects_external_or_dangling_lock_manifest(
+    tmp_path, monkeypatch, kind, dry_run, target_kind
+):
+    context = _copy(tmp_path, kind)
+    manifest = context / FORMATS[kind][1]
+    target = tmp_path / "outside" / manifest.name
+    target.parent.mkdir()
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+    monkeypatch.setattr("pycontainer.builder.install_requirements", lambda *args, **kwargs: pytest.fail("pip ran"))
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, dry_run=dry_run,
+        include_paths=[], cmd=["python", "app.py"],
+    )
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        builder.build()
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+@pytest.mark.parametrize("detector", ["detect_python_version", "detect_entrypoint"])
+def test_project_manifest_detectors_reject_unsafe_links(tmp_path, target_kind, detector):
+    from pycontainer import project
+
+    context = _copy(tmp_path, "uv")
+    manifest = context / "pyproject.toml"
+    target = tmp_path / "outside.toml"
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+
+    with pytest.raises(ValueError, match="inside the build context|dangling"):
+        getattr(project, detector)(context)
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))
@@ -810,6 +901,34 @@ def _write_pipenv_project(context, *, requires=(), extras=()):
     }
     (context / "Pipfile.lock").write_text(json.dumps(lock), encoding="utf-8")
     return context
+
+
+@pytest.mark.parametrize("kind", ["uv", "pipenv"])
+def test_build_rechecks_manifest_link_after_installation(tmp_path, monkeypatch, kind):
+    context = tmp_path / "context"
+    context.mkdir()
+    if kind == "uv":
+        wheel = _offline_wheelhouse(monkeypatch, context)
+        _write_uv_project(context, wheel)
+    else:
+        _write_pipenv_project(context)
+        monkeypatch.setenv("PIP_NO_INDEX", "1")
+        monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    manifest = context / FORMATS[kind][1]
+    target = tmp_path / manifest.name
+
+    def install_and_replace_manifest(*args, **kwargs):
+        install_requirements(*args, **kwargs)
+        manifest.rename(target)
+        _symlink_or_skip(manifest, target)
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", install_and_replace_manifest)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        include_paths=[], cmd=["python", "app.py"],
+    )
+    with pytest.raises(LockfileError, match="inside the build context"):
+        builder.build()
 
 
 def test_pipenv_build_rejects_missing_target_transitive_dependency(tmp_path, monkeypatch):

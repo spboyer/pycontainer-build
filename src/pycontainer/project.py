@@ -7,6 +7,7 @@ from .fs_utils import (
     iter_files,
     path_is_excluded,
     relative_context_path,
+    context_file_path,
     conda_prefix,
     _raise_walk_error,
 )
@@ -83,7 +84,7 @@ def detect_conda_inputs(
 
 def detect_python_version(context_dir):
     """Detect Python version from pyproject.toml requires-python field."""
-    ctx=Path(context_dir); py=ctx/'pyproject.toml'
+    ctx=Path(context_dir); py=context_file_path(ctx, ctx/'pyproject.toml')
     if py.exists():
         data=tomllib.loads(py.read_text())
         proj=data.get("project",{}); requires_py=proj.get("requires-python")
@@ -93,7 +94,7 @@ def detect_python_version(context_dir):
     return "3.11"
 
 def detect_entrypoint(context_dir):
-    ctx=Path(context_dir); py=ctx/'pyproject.toml'
+    ctx=Path(context_dir); py=context_file_path(ctx, ctx/'pyproject.toml')
     if py.exists():
         data=tomllib.loads(py.read_text())
         proj=data.get("project",{}); scripts=proj.get("scripts") or {}

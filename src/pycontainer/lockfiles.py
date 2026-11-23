@@ -21,6 +21,7 @@ from ._venv_closure import (
     _walk as _walk_marker,
 )
 from .dependencies import _read_staged_distributions
+from .fs_utils import context_file_path
 
 try:
     from packaging.markers import InvalidMarker, Marker, UndefinedComparison
@@ -137,14 +138,14 @@ def load_lockfile(
             "Lockfile staging needs a consistent, final full target Python version; use a base image "
             "with PYTHON_VERSION=<major>.<minor>.<patch> metadata."
         )
-    packages, indexes = reader(path, environment)
+    packages, indexes = reader(path, environment, context_dir)
     return LockSelection(kind, Path(relative), _finalize(packages, path.name), tuple(indexes))
 
 
 def preflight_lockfile(context_dir: Path, relative: Path) -> None:
     """Check locally verifiable freshness before a dry run, without a target image."""
     path, _, reader = _lock_reader(context_dir, relative)
-    reader(path, None)
+    reader(path, None, context_dir)
 
 
 def _lock_reader(context_dir: Path, relative: Path):
@@ -191,8 +192,12 @@ def _read_toml(path: Path) -> dict:
         raise LockfileError(f"Unable to parse {path.name}: {exc}") from exc
 
 
-def _manifest(lock_path: Path, name: str) -> Path:
+def _manifest(lock_path: Path, name: str, context_dir: Path) -> Path:
     manifest = lock_path.parent / name
+    try:
+        context_file_path(context_dir, manifest)
+    except ValueError as exc:
+        raise LockfileError(str(exc)) from exc
     if not manifest.is_file():
         raise LockfileError(f"{lock_path.name} requires {name} next to it to verify the lock is current.")
     return manifest
@@ -501,9 +506,9 @@ def _check_poetry_complete(pyproject: dict, entries: List[dict], environment) ->
                         require_pep508(text, source, extra)
 
 
-def _load_poetry(path: Path, environment):
+def _load_poetry(path: Path, environment, context_dir: Path):
     lock = _read_toml(path)
-    pyproject = _read_toml(_manifest(path, "pyproject.toml"))
+    pyproject = _read_toml(_manifest(path, "pyproject.toml", context_dir))
     metadata = lock.get("metadata", {})
     version = str(metadata.get("lock-version", ""))
     match = re.fullmatch(r"(\d+)\.(\d+)", version)
@@ -696,12 +701,12 @@ def pipfile_hash(pipfile: dict) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _load_pipenv(path: Path, environment):
+def _load_pipenv(path: Path, environment, context_dir: Path):
     try:
         lock = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise LockfileError(f"Unable to parse Pipfile.lock: {exc}") from exc
-    pipfile = _read_toml(_manifest(path, "Pipfile"))
+    pipfile = _read_toml(_manifest(path, "Pipfile", context_dir))
     meta = lock.get("_meta", {})
     if meta.get("pipfile-spec") != 6:
         raise LockfileError("Pipfile.lock pipfile-spec is unsupported; relock with a current Pipenv.")
@@ -779,9 +784,9 @@ def pdm_content_hash(pyproject: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _load_pdm(path: Path, environment):
+def _load_pdm(path: Path, environment, context_dir: Path):
     lock = _read_toml(path)
-    pyproject = _read_toml(_manifest(path, "pyproject.toml"))
+    pyproject = _read_toml(_manifest(path, "pyproject.toml", context_dir))
     metadata = lock.get("metadata", {})
     if not str(metadata.get("lock_version", "")).startswith("4."):
         raise LockfileError("pdm.lock lock_version is unsupported; relock with PDM 2.11 or newer.")
@@ -863,10 +868,10 @@ def verify_locked_installation(
     """Verify target dependency closure against the installed wheel metadata."""
     lock_path = Path(context_dir) / selection.path
     if selection.kind == "pipenv":
-        roots = _pipfile_requirements(_read_toml(_manifest(lock_path, "Pipfile")))
+        roots = _pipfile_requirements(_read_toml(_manifest(lock_path, "Pipfile", context_dir)))
         root_source = "Pipfile"
     else:
-        pyproject = _read_toml(_manifest(lock_path, "pyproject.toml"))
+        pyproject = _read_toml(_manifest(lock_path, "pyproject.toml", context_dir))
         roots = _project_requirements(
             pyproject, "pyproject.toml", allow_dynamic=selection.kind == "poetry"
         )
@@ -1144,9 +1149,9 @@ def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
             raise _stale("uv.lock", "uv lock")
 
 
-def _load_uv(path: Path, environment):
+def _load_uv(path: Path, environment, context_dir: Path):
     lock = _read_toml(path)
-    pyproject = _read_toml(_manifest(path, "pyproject.toml"))
+    pyproject = _read_toml(_manifest(path, "pyproject.toml", context_dir))
     _project_requirements(pyproject, "pyproject.toml")
     if lock.get("version") != 1:
         raise LockfileError("uv.lock version is unsupported; relock with a current uv.")
