@@ -53,7 +53,7 @@ pycontainer build --tag myapp:latest
 # Build with custom base image and dependencies
 pycontainer build \
   --tag myapp:v1 \
-  --base-image python:3.12-slim \
+  --base-image python:3.12-slim-bookworm \
   --include-deps
 
 # Build FastAPI app (auto-detected, entrypoint configured)
@@ -362,7 +362,7 @@ By default, `pycontainer` auto-detects:
 pycontainer build \
   --tag myapp:v1.2.3 \
   --context /my/project \
-  --base-image python:3.11-slim \
+  --base-image python:3.11-slim-bookworm \
   --include-deps \
   --workdir /app \
   --env KEY=value \
@@ -399,8 +399,60 @@ pycontainer build \
   including Windows, and retain executable mode in the dependency layer.
   Copied application files are not normalized.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
-  `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
-  `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  `PYTHON_VERSION`, and `PYTHON_LIBC=glibc-2.N` (N 17-99) or
+  `PYTHON_LIBC=musl-1.N` (N 1-99) in their image config so wheel tags can be
+  validated. pip receives tags through the selected libc bound, newest first:
+  `manylinux_2_N` down to `manylinux_2_17` plus the `manylinux2014` alias for
+  glibc, or `musllinux_1_N` down to `musllinux_1_1` for musl. Official
+  `python` tag-only registry pulls derive libc from the resolved tag (`alpine`
+  tags use musl, others glibc). A codename token in such a tag raises the
+  libc version to a conservative bound for that release:
+
+  | Tag codename | Target libc |
+  | --- | --- |
+  | `jessie` / `stretch` / `buster` | glibc 2.17 / 2.19 / 2.24 |
+  | `bullseye` / `bookworm` / `trixie` | glibc 2.28 / 2.31 / 2.36 |
+  | `alpine3.0`-`alpine3.12` | musl 1.1 |
+  | `alpine3.13`-`alpine3.24` | musl 1.2 |
+
+  Each row is pinned to immutable sources (content-addressed Debian snapshots,
+  official image declarations and Alpine `aports` commits) in
+  [docs/libc-codename-mappings.md](docs/libc-codename-mappings.md).
+  These bounds may reject wheels that a newer image could actually run.
+
+  Codename-less tags such as `python:3.11-slim` or `python:3.11-alpine`,
+  and unmapped releases, cannot establish a libc floor from their names: official
+  `python:3.8.0-alpine` uses musl 1.1 and `python:3.4-wheezy` uses glibc 2.13,
+  so the previous `musllinux_1_2` / `manylinux2014` fallbacks were unsafe.
+  For verified official tag-only pulls, the builder instead reads the effective
+  `libc6`/`musl` package record from digest-checked base layers. It applies
+  whiteouts and rejects missing, linked, ambiguous, unsupported or wrong-architecture
+  records. A foreign-database root link such as Debian's `lib -> usr/lib` is
+  allowed only when its redirected database has no conflicting evidence;
+  other foreign links and links on the active database path fail closed.
+  Inspection is bounded (8 MiB metadata, 2 GiB decoded bytes and 100,000
+  members per layer, 300 seconds overall) and never extracts base files.
+  Thus the CLI's automatic selection, `BuildConfig`'s `python:3.11-slim`
+  default, and Aspire's `python:3.12-slim --include-deps` invocation remain
+  supported when the pulled image supplies valid package evidence.
+  If evidence is unavailable, explicitly select a mapped release, for example
+  `--base-image python:3.11-slim-bookworm`, or provide supported libc metadata
+  in the base image config. Application `--env` values are not base metadata.
+  Inferred `PYTHON_LIBC` is confined to a staging config copy, not added to
+  the final image environment. No distribution is silently substituted.
+  When both a codename and `PYTHON_LIBC` are present they must
+  name the same family, and the lower version wins. All digest references, including
+  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
+  the digest is fetched without verifying that it matches any supplied tag.
+  Local image names/annotations also cannot establish libc. Adding a tag to a
+  digest does not make it safe; use an image config with supported metadata
+  or a tag-only registry pull. Unsupported metadata always fails, as does
+  metadata conflicting with a verified tag-only pull.
+  Digest and unverified local sources also require explicit
+  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
+  establish the Python ABI. These metadata checks apply to lockfile,
+  requirements and virtualenv staging alike.
+
   Environment markers in the requirements file and in transitive
   `Requires-Dist` metadata are evaluated for the target (`linux`, the target
   machine, CPython and the base image's Python version), not the build host.
@@ -429,6 +481,7 @@ pycontainer build \
   setuptools or Flit tables mentioning host markers fail, as do unreadable
   dynamic dependencies. Unmarked declarations in those unparsed sources are
   not verified. Use a requirements file when a virtualenv cannot be verified.
+
   Private indexes can authenticate through `PIP_INDEX_URL`, a pip config file,
   `.netrc`, keyring (`PIP_KEYRING_PROVIDER=import` or `subprocess`) or `${VAR}`
   placeholders in the requirements file, including in URL paths. Literal
@@ -437,18 +490,6 @@ pycontainer build \
   could change target selection (for example `PIP_PLATFORM` or
   `PIP_NO_BINARY`) are ignored; see
   [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
-  Official `python` tag-only registry pulls derive libc from the resolved tag
-  (`alpine` tags use musl, others glibc). All digest references, including
-  `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
-  the digest is fetched without verifying that it matches any supplied tag.
-  Local image names/annotations also cannot establish libc. Adding a tag to a
-  digest does not make it safe; use an image config with supported metadata
-  or a tag-only registry pull. Unsupported metadata always fails, as does
-  Python or libc metadata conflicting with a verified tag-only pull.
-  Digest and unverified local sources also require explicit
-  `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
-  establish the Python ABI. These metadata checks apply to lockfile,
-  requirements and virtualenv staging alike.
 - `--requirements FILE` — Install this requirements file (`[build]
   requirements-file`). A requirements file that is not fully pinned with
   `==` versions and `--hash` values logs a warning that the dependency layer
@@ -578,7 +619,8 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
 - OCI annotations and Docker archive tags do not establish an image's Python
   ABI or libc. For `--include-deps`, local images must set
   `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
-  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  `PYTHON_LIBC=glibc-2.N` (N 17-99) or `PYTHON_LIBC=musl-1.N` (N 1-99)
+  in their image config,
   even if their name claims to be an official Python image. These settings are
   not required when dependency staging is disabled.
 

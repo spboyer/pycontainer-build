@@ -27,7 +27,9 @@ from pycontainer.lockfiles import (
     target_environment,
     verify_locked_installation,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
+from test_dependency_staging import (
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _write_named_wheel, _write_wheel,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
 FORMATS = {
@@ -1354,7 +1356,7 @@ def test_locked_requirements_use_target_marker_bootstrap(tmp_path, arch, expecte
     destination = tmp_path / "stage" / "site-packages"
 
     install_requirements(
-        requirements, destination, context, "linux", arch, "3.11", "python:3.11-slim",
+        requirements, destination, context, "linux", arch, "3.11", "python:3.11-slim-bookworm",
         BASE_CONFIG, locked=True, base_image_tag_verified=True,
     )
 
@@ -1377,7 +1379,7 @@ def test_locked_requirements_fail_closed_for_unknown_target_marker(tmp_path):
     with pytest.raises(ValueError, match="refusing to stage.*platform_release"):
         install_requirements(
             requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
-            "3.11", "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1401,7 +1403,7 @@ def test_generated_locked_requirements_validate_options_before_pip(tmp_path, mon
     with pytest.raises(ValueError, match=message):
         install_requirements(
             requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
-            "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1428,7 +1430,7 @@ def test_generated_locked_requirements_enforce_size_and_location(tmp_path, monke
     with pytest.raises(ValueError, match=message):
         install_requirements(
             requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
-            "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1485,8 +1487,8 @@ def test_locked_build_keeps_generated_requirements_inside_context_and_cleans_up(
 @pytest.mark.parametrize(
     ("base_image", "environment", "wheel_tag"),
     [
-        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
-        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        ("python:3.11-slim-bookworm", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine3.20", [], "cp311-cp311-musllinux_1_2_x86_64"),
         (
             "python:3.11-slim@sha256:" + "a" * 64,
             ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
@@ -1517,6 +1519,58 @@ def test_locked_build_uses_verified_base_abi_and_libc(
     builder.build()
 
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
+
+
+@pytest.mark.parametrize(
+    ("base_image", "version", "family"),
+    [
+        ("python:3.11-slim", "3.11", "glibc"),
+        ("python:3.8.0-alpine", "3.8", "musl"),
+        ("python:3.4-wheezy", "3.4", "glibc"),
+    ],
+)
+def test_locked_requirements_reject_unproven_base_libc_before_pip(
+    tmp_path, monkeypatch, base_image, version, family
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0 --hash=sha256:" + "a" * 64)
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran without validated target libc"),
+    )
+
+    with pytest.raises(ValueError, match=f"Cannot validate target {family}"):
+        install_requirements(
+            requirements, tmp_path / "stage", tmp_path, "linux", "amd64", version,
+            base_image, {"config": {"Env": [f"PYTHON_VERSION={version}.0"]}},
+            locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize(("wheel_minor", "success"), [(28, True), (31, False)])
+def test_locked_build_uses_libc_derived_from_verified_base_layers(
+    tmp_path, monkeypatch, wheel_minor, success
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(
+        context / "wheelhouse", tag=f"cp311-cp311-manylinux_2_{wheel_minor}_x86_64"
+    )
+    _write_uv_project(context, wheel)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc("2.28-1"))])
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:3.11-slim"
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([layer], BASE_CONFIG))
+
+    if not success:
+        with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+            builder.build()
+        return
+
+    builder.build()
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[1])
 
 
 @pytest.mark.parametrize(
