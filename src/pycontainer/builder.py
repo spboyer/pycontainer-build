@@ -313,6 +313,7 @@ class ImageBuilder:
 
     def build(self):
         self._conda_warning_emitted = False
+        self._dependency_source_cache = None
         if conda_prefix(self.config.context_dir, ".") is not None:
             raise ValueError(
                 "The build context is inside a host Conda environment; use a "
