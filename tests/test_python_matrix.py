@@ -105,6 +105,25 @@ def test_bases_tags_default_and_independent_layouts(tmp_path, monkeypatch):
     assert not (root / "index.json").exists()
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_matrix_layout_references_encode_tags_invalid_in_oci(tmp_path, monkeypatch, platform):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, platform=platform, tag="registry.example/team/app:_dev",
+        tags=["stable"], latest_tag=False, semver_tags=False,
+    )
+    build.build()
+    for version, child in build.children.items():
+        root = Path(child.config.output_dir)
+        index = json.loads((root / "index.json").read_text())
+        first = index["manifests"][0]
+        encoded = "pycontainer-" + child.config.tag.encode("utf-8").hex()
+        assert first["annotations"]["org.opencontainers.image.ref.name"] == encoded
+        assert first["digest"] == child.manifest_digest
+        assert (root / "refs" / "tags" / f"_dev-py{version}").read_text() == child.manifest_digest
+        if child.index_digest is None:
+            assert index["annotations"]["org.opencontainers.image.ref.name"] == encoded
+
+
 def test_each_minor_has_its_own_architecture_index_and_deps(tmp_path, monkeypatch):
     build, _, _ = matrix(tmp_path, monkeypatch, platform="linux/amd64,linux/arm64", include_deps=True)
     targets = []
