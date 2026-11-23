@@ -2,10 +2,10 @@
 
 Dependency staging raises the target libc above the conservative
 `manylinux2014`/`musllinux_1_2` floor only for a codename token in a tag-only
-registry pull of the official `python` image. Each mapped value is the lowest
-libc minor any image published under that codename tag can carry. Every value
-below is pinned to an immutable source: a content-addressed Debian snapshot
-file, or a commit SHA in Alpine `aports` or `docker-library/python`. Mutable
+registry pull of the official `python` image. Mapped values are conservative
+bounds based on the source evidence below, not measurements of individual
+image digests. The evidence is pinned to content-addressed Debian snapshot
+files and commits in Alpine `aports` or `docker-library/python`. Mutable
 pointers such as `sources.debian.org` suite views or `3.N-stable` branch names
 are not provenance.
 
@@ -16,12 +16,12 @@ Verified on 2026-11-22. The tables in `src/pycontainer/dependencies.py`
 
 Official images were first published from the earliest
 [`docker-library/python`](https://github.com/docker-library/python) commit
-adding a Dockerfile for that codename. The glibc floor is the `glibc` source
-version in the Debian suite at that commit time, read from the snapshot
-archive. `Extra-Source-Only: yes` stanzas, which `Built-Using` keeps for older
-versions, are excluded: they are not the version the suite ships.
-After first publication, a suite's package versions only increase, so later
-rebuilds cannot fall below the floor.
+adding a Dockerfile for that codename. Except for trixie, the bound is based
+on the `glibc` source version in the Debian suite at that commit time, read
+from the snapshot archive. `Extra-Source-Only: yes` stanzas, which
+`Built-Using` keeps for older versions, are excluded: they are not the
+version the suite ships. A suite snapshot alone does not identify the base
+image digest used for a particular Python image build.
 
 | Codename | Floor | First `docker-library/python` commit | Suite `glibc` at that time | Snapshot file (content-addressed) |
 | --- | --- | --- | --- | --- |
@@ -30,12 +30,22 @@ rebuilds cannot fall below the floor.
 | `buster` | glibc 2.28 | [`4fc051f0aa8e`](https://github.com/docker-library/python/commit/4fc051f0aa8ef60931474b23567a7f232095d85f) (2019-06-24) | 2.28-10 | [`cdaf35df7daa`](https://snapshot.debian.org/file/cdaf35df7daa46319a10d7d2d718b9474bc79e15) |
 | `bullseye` | glibc 2.31 | [`f154e5d1c8f5`](https://github.com/docker-library/python/commit/f154e5d1c8f5b582aa2fd782df880b9cc96bb431) (2021-08-16) | 2.31-13 | [`03025ea20540`](https://snapshot.debian.org/file/03025ea2054005cfcf1a5388db7ab3d331d7d45b) |
 | `bookworm` | glibc 2.36 | [`5d908b0477c0`](https://github.com/docker-library/python/commit/5d908b0477c003712550c84ac4d133367b912f78) (2023-06-13) | 2.36-9 | [`054d29885795`](https://snapshot.debian.org/file/054d298857955a2542fccbf2646402cd8e22a2bd) |
-| `trixie` | glibc 2.41 | [`093598a0190b`](https://github.com/docker-library/python/commit/093598a0190ba9074b899d6a0a21a00c859aac56) (2025-08-08) | 2.41-12 | [`ade6a38d80ac`](https://snapshot.debian.org/file/ade6a38d80ac022757c3646185ee20047b5e7482) |
+| `trixie` | glibc 2.36 | [`093598a0190b`](https://github.com/docker-library/python/commit/093598a0190ba9074b899d6a0a21a00c859aac56) (2025-08-08) | 2.41-12 | [`ade6a38d80ac`](https://snapshot.debian.org/file/ade6a38d80ac022757c3646185ee20047b5e7482) |
 
 Each snapshot file is `dists/<codename>/main/source/Sources.xz` as resolved
 from `https://snapshot.debian.org/archive/debian/<UTC commit time>/`, for
 example `20250808T182034Z` for trixie. Trixie's Sources also lists `2.40-5`,
 but only as an `Extra-Source-Only` stanza.
+
+Trixie deliberately uses a lower bound than its suite version at the Python
+commit. That Dockerfile refers to the mutable `debian:trixie-slim` tag, and
+its selected base digest is not established by the suite snapshot. The
+[initial Debian trixie image declaration](https://github.com/docker-library/official-images/blob/da90f58ec995f7ab5a5c871a42f46b9bd84c4709/library/debian)
+is dated 2023-06-12, when the
+[trixie suite Sources](https://snapshot.debian.org/file/602efa7f4269b8718797aea88b35b439b8055279)
+listed glibc 2.36-9. The 2.36 bound avoids assuming that an image used the
+latest suite version at the time its Dockerfile was committed; it is not a
+claim that a Python image was actually built using the older base.
 
 ## Alpine (musl)
 
@@ -82,7 +92,7 @@ values from `git ls-remote https://git.alpinelinux.org/aports`.
   Alpine stable branches only take patch updates.
 - New codenames and Alpine releases stay on the codename-less floor until a
   row is verified and added here and in the code table.
-- Docker Hub tags are mutable. The mapping is a floor for every published
-  image under a codename tag, not a statement about a particular digest, which
-  is why digest references still require explicit `PYTHON_LIBC` metadata.
+- Docker Hub tags are mutable. These source records do not verify the libc
+  installed in each published image digest; digest references still require
+  explicit `PYTHON_LIBC` metadata.
 - No tags below glibc 2.17 or musl 1.1 are generated.

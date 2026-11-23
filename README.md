@@ -348,12 +348,12 @@ pycontainer build \
   glibc, or `musllinux_1_N` down to `musllinux_1_1` for musl. Official
   `python` tag-only registry pulls derive libc from the resolved tag (`alpine`
   tags use musl, others glibc). A codename token in such a tag raises the
-  libc version to the lowest one any official image under that tag can carry:
+  libc version to a conservative bound for that release:
 
   | Tag codename | Target libc |
   | --- | --- |
   | `jessie` / `stretch` / `buster` | glibc 2.19 / 2.24 / 2.28 |
-  | `bullseye` / `bookworm` / `trixie` | glibc 2.31 / 2.36 / 2.41 |
+  | `bullseye` / `bookworm` / `trixie` | glibc 2.31 / 2.36 / 2.36 |
   | `alpine3.0`-`alpine3.12` | musl 1.1 |
   | `alpine3.13`-`alpine3.24` | musl 1.2 |
 
