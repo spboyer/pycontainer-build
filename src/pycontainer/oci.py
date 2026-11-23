@@ -46,10 +46,10 @@ class OCIIndex:
         if annotations: idx["annotations"]={key: annotations[key] for key in sorted(annotations)}
         return idx
 
-def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None, stop_signal=None, volumes=None):
+def build_config_json(architecture, os_name, env, working_dir, entrypoint, exposed_ports, labels=None, user=None, cmd=None, base_config=None, layer_diff_ids=None, stop_signal=None, volumes=None, generated_labels=None):
     """Build OCI config, optionally merging with base image config."""
     base_labels=base_config.get('config',{}).get('Labels') if base_config else None
-    merged_labels=merge_image_labels(base_labels=base_labels, labels=labels)
+    merged_labels=merge_image_labels(base_labels=base_labels, labels=labels, generated_labels=generated_labels)
     if base_config:
         cfg=deepcopy(base_config)
         base_env={kv.split('=',1)[0]:kv.split('=',1)[1] for kv in base_config.get('config',{}).get('Env',[]) if '=' in kv}
