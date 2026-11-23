@@ -50,9 +50,11 @@ per-connection`). For each `--layer-layouts` entry (`COUNTxMIB` or
 `MIB+MIB+...`) and `--network-repetitions` sample, they time the real
 sequential base pull, local build, cold push and repeat push, then interleave
 benchmark-only `RegistryClient` probes with one and `--probe-workers` workers.
-Every sample uses fresh repositories and unique blob digests, so registry and
-local caches are cold. The 1-worker probe calibrates the probe against the
-product path; the projected saving is an upper bound for concurrent transfers,
+Every sample uses fresh repositories, so registry and local caches are cold;
+the sequential and both probe variants pull byte-identical base blobs from
+separate repositories. The projected saving is the paired 1-worker minus
+N-worker probe transfer time, with its share taken against the product pull,
+local build and push total. It is an estimate of concurrency headroom,
 not a measured product speedup. The delay approximates one round trip per HTTP
 request; real HTTPS without connection reuse pays several. Pass
 `--layer-layouts` with no value to skip these cases.

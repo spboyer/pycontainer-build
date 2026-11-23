@@ -1,3 +1,6 @@
+import argparse
+import contextlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -5,6 +8,79 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_benchmarks():
+    spec = importlib.util.spec_from_file_location(
+        "run_build_benchmarks", ROOT / "benchmarks" / "run_build_benchmarks.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_network_savings_come_from_matched_probes_with_identical_bases(
+    tmp_path, monkeypatch
+):
+    benchmarks = _load_benchmarks()
+    seeds = []
+
+    @contextlib.contextmanager
+    def fake_registry(*_args):
+        yield "http://127.0.0.1:1"
+
+    def fake_seed(_storage, repository, _layer_bytes, seed):
+        seeds.append((repository, seed))
+
+    def fake_worker(spec):
+        timings = {
+            "process_peak_rss_bytes": 1,
+            "base_requests": 2,
+            "push_requests": 3,
+        }
+        if spec["mode"] == "network-build":
+            # Product pull + push is 12s; the probes are equal at 7s, so the
+            # 5s difference is probe overhead, not a concurrency saving.
+            return {
+                **timings,
+                "pull_seconds": 2.0,
+                "local_build_seconds": 3.0,
+                "push_seconds": 10.0,
+                "repeat_push_seconds": 4.0,
+                "image": {},
+            }
+        return {
+            **timings,
+            "workers": spec["workers"],
+            "pull_seconds": 3.0,
+            "push_seconds": 4.0,
+            "repeat_push_seconds": 1.0,
+        }
+
+    monkeypatch.setattr(benchmarks, "_network_registry", fake_registry)
+    monkeypatch.setattr(benchmarks, "_seed_base_image", fake_seed)
+    monkeypatch.setattr(benchmarks, "_invoke_worker", fake_worker)
+    args = argparse.Namespace(
+        bandwidth_mbit=[0],
+        request_delay_ms=[0],
+        bandwidth_scope="shared",
+        layer_layouts=[{"name": "1x1", "layer_bytes": [1]}],
+        network_repetitions=2,
+        probe_workers=2,
+    )
+
+    [case] = benchmarks._network_transfer_cases(args, tmp_path, tmp_path)
+
+    summary = case["summary"]
+    assert summary["projected_saving_seconds"] == 0
+    assert summary["projected_saving_share"] == 0
+    assert summary["projected_saving_range_seconds"] == [0, 0]
+    assert summary["repeat_push_projected_saving_seconds"] == 0
+    for sample in ("s0", "s1"):
+        sample_seeds = {seed for repository, seed in seeds if f"-{sample}-" in repository}
+        assert len(sample_seeds) == 1
+    assert len({seed for _, seed in seeds}) == 2
+    assert len({repository for repository, _ in seeds}) == 6
 
 
 def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):

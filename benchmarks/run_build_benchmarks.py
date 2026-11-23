@@ -799,7 +799,9 @@ def _summarize_network_samples(samples, workers):
         result["pull_seconds"] + result["local_build_seconds"] + result["push_seconds"]
         for result in sequential
     ]
-    savings = [transfer(seq) - transfer(probe) for seq, probe in zip(sequential, concurrent)]
+    # Concurrency savings come only from the matched probe pair; the product path
+    # also differs from the probe in builder overhead, which is not a saving.
+    savings = [transfer(one) - transfer(many) for one, many in zip(calibration, concurrent)]
     summary["sequential_build_and_push_seconds"] = _median(totals)
     summary["sequential_transfer_share"] = _median(
         transfer(seq) / total for seq, total in zip(sequential, totals)
@@ -813,8 +815,8 @@ def _summarize_network_samples(samples, workers):
     )
     summary["projected_saving_range_seconds"] = [min(savings), max(savings)]
     summary["repeat_push_projected_saving_seconds"] = _median(
-        seq["repeat_push_seconds"] - probe["repeat_push_seconds"]
-        for seq, probe in zip(sequential, concurrent)
+        one["repeat_push_seconds"] - many["repeat_push_seconds"]
+        for one, many in zip(calibration, concurrent)
     )
     return summary
 
@@ -839,13 +841,13 @@ def _network_transfer_cases(args, root, context):
                             + sample
                         ) * 10
                         repositories = {}
-                        for offset, variant in enumerate(("seq", "p1", "pn")):
+                        for variant in ("seq", "p1", "pn"):
                             repositories[variant] = f"base-{prefix}-{variant}"
                             _seed_base_image(
                                 storage,
                                 repositories[variant],
                                 layout["layer_bytes"],
-                                seed + offset,
+                                seed,
                             )
                         sequential = _invoke_worker(
                             {
@@ -1144,7 +1146,7 @@ def run_benchmarks(args):
                     "bandwidth_scope": args.bandwidth_scope,
                     "repetitions": args.network_repetitions,
                     "probe_workers": args.probe_workers,
-                    "cache_state": "Fresh output and empty app-layer cache per sample; every sample pulls a uniquely seeded base and pushes to a fresh repository, then repeats the push (all blobs present).",
+                    "cache_state": "Fresh output and empty app-layer cache per sample; every sample seeds byte-identical base images into separate per-variant repositories (sequential, 1-worker and N-worker probes), so each variant pulls the same blobs cold and pushes to a fresh repository, then repeats the push (all blobs present).",
                 },
                 "base_image": "synthetic empty OCI base",
                 "excluded": [
@@ -1159,7 +1161,7 @@ def run_benchmarks(args):
                 "output_bytes": "App-layer tar bytes for app-only; total local OCI output file bytes for full builds.",
                 "cache_hits": "App-layer cache hits observed during the measured build.",
                 "registry_transfer": "Per-sample loopback synthetic registry upload/download; server storage and fixture generation are excluded from the measured worker process. These are not external registry throughput results.",
-                "registry_network": "The registry runs in a separate process and sleeps request_delay_ms before every response, approximating one round trip per HTTP request. The client opens a new connection per request; real HTTPS adds TCP and TLS handshakes per request, so a delay of about three RTTs approximates one HTTPS request. Bandwidth is paced in 64 KiB chunks either across all connections (shared, one bottleneck link) or per connection (per-connection, models per-flow TCP limits). Probe workers transfer the same blobs through RegistryClient with a thread pool and are an estimate of concurrency headroom, not a product path; probe_1_worker calibrates the probe against the real sequential path. projected_saving_* are paired per-sample medians against the sequential pull + local build + push total. No tracemalloc runs during network cases.",
+                "registry_network": "The registry runs in a separate process and sleeps request_delay_ms before every response, approximating one round trip per HTTP request. The client opens a new connection per request; real HTTPS adds TCP and TLS handshakes per request, so a delay of about three RTTs approximates one HTTPS request. Bandwidth is paced in 64 KiB chunks either across all connections (shared, one bottleneck link) or per connection (per-connection, models per-flow TCP limits). Probe workers transfer the same blobs through RegistryClient with a thread pool and are an estimate of concurrency headroom, not a product path; probe_1_worker calibrates the probe against the real sequential path. projected_saving_* are paired per-sample medians of the 1-worker minus N-worker probe transfer time; projected_saving_share divides that by the sequential product pull + local build + push total. No tracemalloc runs during network cases.",
                 "timing_gates": "None; compare trends only across matching environments and fixture parameters.",
             },
             "cases": cases,
