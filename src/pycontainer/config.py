@@ -36,6 +36,7 @@ class BuildConfig:
     semver_tags: bool = False
     latest_tag: bool = False
     base_image_trust: Optional[Dict[str, str]] = None
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -45,6 +46,10 @@ class BuildConfig:
 
             validate_trust_policy(self.base_image_trust)
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
