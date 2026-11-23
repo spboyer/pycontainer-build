@@ -624,6 +624,9 @@ error handling, and custom-directory inspection.
 - `--label KEY=VALUE` — Set an image-config label; repeat to add labels
 - `--manifest-annotation KEY=VALUE` — Set an image-manifest annotation; repeat to add annotations
 - `--index-annotation KEY=VALUE` — Set a local layout-index annotation; repeat to add annotations
+- `--release-notes FILE` — Embed a UTF-8 release notes file (at most 8 KiB after
+  line endings become LF) in the `io.github.spboyer.pycontainer.release-notes`
+  label; `--release-notes-label KEY` selects another key
 - `--sbom [FORMAT]` — Generate an SBOM (defaults to `spdx`; accepts `spdx` or `cyclonedx`)
 - `--platform PLATFORM` — Target platform (`os/architecture[/variant]`, e.g.,
   `linux/arm64` or `linux/arm/v7`)
@@ -729,6 +732,7 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
 maintainer = "team@example.com"
