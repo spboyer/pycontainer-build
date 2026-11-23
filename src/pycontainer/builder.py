@@ -185,6 +185,12 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_registry_auth
+from .local_image import (
+    check_local_image_bounds,
+    open_local_image_source,
+    parse_local_image_reference,
+    verify_layer_diff_ids,
+)
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
 from .dependencies import (
@@ -367,26 +373,51 @@ class ImageBuilder:
         return self.config.tag
     
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
-        """Pull base image from registry, return (base_layers, base_config)."""
-        registry, repo, reference=parse_image_reference(self.config.base_image)
-        auth=get_registry_auth(registry)
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
+        """Pull or load the base image, return (base_layers, base_config)."""
+        self._base_image_name=self.config.base_image
+        requested_variant = parse_platform_variant(self.config.platform)
+        local=parse_local_image_reference(self.config.base_image)
+        if local is None:
+            registry, repo, reference=parse_image_reference(self.config.base_image)
+            auth=get_registry_auth(registry)
+            client=RegistryClient(
+                registry,
+                repo,
+                auth_token=auth.bearer_token,
+                username=auth.username,
+                password=auth.password,
+            )
+            return self._read_base_image(client, reference, layers_dir, os_name, arch)
+
+        target = f"{os_name}/{arch}" + (
+            f"/{requested_variant}" if requested_variant else ""
         )
-        
+        print(f"Loading local base image {self.config.base_image} for {target}...")
+        with open_local_image_source(
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+        ) as source:
+            base_layers, base_config = self._read_base_image(
+                source, None, layers_dir, os_name, arch
+            )
+            verify_layer_diff_ids(base_layers, base_config)
+            self._base_image_name=source.source_name
+        return base_layers, base_config
+
+    def _read_base_image(self, client, reference: Optional[str], layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
+        """Resolve and validate a base image through a registry or local source."""
+        local = reference is None
         platform = self.config.platform
         requested_variant = parse_platform_variant(platform)
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Pulling base image {self.config.base_image} for {target}...")
+        if not local:
+            print(f"Pulling base image {self.config.base_image} for {target}...")
         manifest, _ = client.pull_manifest(
             reference,
-            expected_digest=reference if reference.startswith("sha256:") else None,
+            expected_digest=(
+                reference if reference and reference.startswith("sha256:") else None
+            ),
         )
 
         selected_variant = None
@@ -440,6 +471,8 @@ class ImageBuilder:
             )
             for index, descriptor in enumerate(layer_descriptors, 1)
         ]
+        if local:
+            check_local_image_bounds(config_size, [size for _, size, _ in validated_layers])
 
         config_path=layers_dir/_digest_filename(config_digest)
         client.pull_blob(config_digest, config_path, config_size)
@@ -490,13 +523,13 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  Pulling layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image pulled ({len(base_layers)} layers)")
+        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -607,13 +640,19 @@ class ImageBuilder:
                 "Pulled base image platform does not match the requested "
                 f"target {os_name}/{arch}."
             )
-        base_image_tag_verified = "@" not in self.config.base_image
+        base_image_name = getattr(self, "_base_image_name", self.config.base_image)
+        # Local annotations/tags and any digest reference are identity claims, not
+        # a resolved registry tag, so they cannot establish the Python ABI or libc.
+        base_image_tag_verified = (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+        )
         version = target_python_version(
-            self.config.base_image, base_config,
+            base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
         )
         target_wheel_platform(
-            os_name, arch, self.config.base_image, base_config,
+            os_name, arch, base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
         )
         layers_dir=Path(layers_dir)
@@ -628,7 +667,7 @@ class ImageBuilder:
                     os_name,
                     arch,
                     version,
-                    self.config.base_image,
+                    base_image_name,
                     base_config,
                     base_image_tag_verified=base_image_tag_verified,
                 )
