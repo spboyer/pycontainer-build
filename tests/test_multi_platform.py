@@ -341,6 +341,30 @@ def test_repeated_reproducible_builds_have_same_index_digest(tmp_path, monkeypat
     assert second.index_digest == first.index_digest
 
 
+def test_multi_platform_history_records_each_base_and_one_shared_app(tmp_path, monkeypatch):
+    from pycontainer.history import BuildHistory, BuildTiming
+
+    phases = []
+    original_phase = BuildTiming.phase
+
+    def record_phase(self, name):
+        phases.append(name)
+        return original_phase(self, name)
+
+    monkeypatch.setattr(BuildTiming, "phase", record_phase)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), record_history=True,
+        history_dir=str(tmp_path / "history"),
+    )
+    phases.clear()
+    builder.build()
+
+    assert phases == ["base_image", "application", "base_image"]
+    record = BuildHistory(tmp_path / "history").list()[0]
+    assert record["status"] == "success"
+    assert set(record["phases_ns"]) == {"base_image", "application"}
+
+
 def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
     registry = FakeBaseRegistry()
     installs = []
