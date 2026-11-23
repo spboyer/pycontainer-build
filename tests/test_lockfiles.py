@@ -2,12 +2,15 @@ import hashlib
 import http.server
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import threading
 import tomllib
+import venv
 import zipfile
 from pathlib import Path
 
@@ -2132,6 +2135,183 @@ def test_locked_build_requires_a_matching_wheel_hash_for_each_target(tmp_path, m
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
     layer = builder._create_deps_layer(layers, base_config=base, os_name="linux", arch="arm64")
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+
+
+def _bypass_locked_pip_isolation(monkeypatch, key):
+    """Negative control: disable every locked isolation layer so host settings reach pip."""
+    from pycontainer import dependencies
+
+    monkeypatch.setattr(
+        dependencies,
+        "_locked_pip_environment",
+        lambda temporary_dir: {
+            **os.environ,
+            **{name: str(temporary_dir) for name in ("TMP", "TEMP", "TMPDIR")},
+        },
+    )
+    monkeypatch.setattr(
+        dependencies,
+        "_PIP_LOCKED_CONFIG_ALLOWED",
+        [*dependencies._PIP_LOCKED_CONFIG_ALLOWED, key],
+    )
+    popen = dependencies.subprocess.Popen
+    monkeypatch.setattr(
+        dependencies.subprocess,
+        "Popen",
+        lambda command, *args, **kwargs: popen(
+            [arg for arg in command if arg != "--isolated"], *args, **kwargs
+        ),
+    )
+
+
+def _locked_index_project(context, indexes):
+    wheel = _write_wheel(context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=indexes(wheel).url)
+
+
+def _host_pip_setting(monkeypatch, tmp_path, source, key, value, *, bypass):
+    from pycontainer import dependencies
+
+    config = tmp_path / "pip.ini"
+    if source == "environment":
+        monkeypatch.setenv(f"PIP_{key.upper()}", value)
+        config.write_text("")
+    else:
+        config.write_text(f"[install]\n{key} = {value}\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    if bypass:
+        # Negative control: allowlisting the key must let it reach pip.
+        monkeypatch.setattr(
+            dependencies,
+            "_PIP_ENVIRONMENT_ALLOWED",
+            dependencies._PIP_ENVIRONMENT_ALLOWED | {f"PIP_{key.upper()}"},
+        )
+        monkeypatch.setattr(
+            dependencies, "_PIP_CONFIG_ALLOWED", [*dependencies._PIP_CONFIG_ALLOWED, key]
+        )
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_requirement_injection(
+    tmp_path, monkeypatch, indexes, source, bypass
+):
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    extra_wheels = tmp_path / "extra-wheels"
+    _write_named_wheel(extra_wheels, "injected-dep")
+    injected = extra_wheels / "injected_dep-1.0-py3-none-any.whl"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(
+        f"--find-links {extra_wheels.as_uri()}\n"
+        f"injected-dep==1.0 --hash=sha256:{hashlib.sha256(injected.read_bytes()).hexdigest()}\n"
+    )
+    _host_pip_setting(monkeypatch, tmp_path, source, "requirement", str(extra), bypass=False)
+    if bypass:
+        _bypass_locked_pip_isolation(monkeypatch, "requirement")
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    if bypass:
+        with pytest.raises(LockfileError, match="Unexpected or duplicate staged package injected-dep"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+        return
+    layer = builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+    names = _layer_names(layer)
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("injected_dep" in name for name in names)
+
+
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_target_platform_override(tmp_path, monkeypatch, source):
+    # Allowlisting platform trips _pip_target's self-test; test_private_index proves raw pip honors it.
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    wheel = _write_wheel(wheelhouse, tag="py3-none-win_amd64")
+    _write_uv_project(context, wheel)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    _host_pip_setting(monkeypatch, tmp_path, source, "platform", "win_amd64", bypass=False)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+
+
+@pytest.mark.parametrize("scope", ["global", "site"])
+@pytest.mark.parametrize("bypass", [False, True])
+def test_locked_build_filters_global_and_site_pip_config(
+    tmp_path, monkeypatch, indexes, scope, bypass
+):
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    extra_wheels = tmp_path / "extra-wheels"
+    _write_named_wheel(extra_wheels, "injected-dep")
+    injected = extra_wheels / "injected_dep-1.0-py3-none-any.whl"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(
+        f"--find-links {extra_wheels.as_uri()}\n"
+        f"injected-dep==1.0 --hash=sha256:{hashlib.sha256(injected.read_bytes()).hexdigest()}\n"
+    )
+
+    env_dir = tmp_path / "builder-env"
+    venv.EnvBuilder(with_pip=False).create(env_dir)
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    python = env_dir / scripts / ("python.exe" if os.name == "nt" else "python")
+    site = (
+        env_dir / "Lib" / "site-packages"
+        if os.name == "nt"
+        else env_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    import pip
+    shutil.copytree(Path(pip.__file__).parent, site / "pip")
+    config = (
+        env_dir / ("pip.ini" if os.name == "nt" else "pip.conf")
+        if scope == "site" else tmp_path / "global-pip.conf"
+    )
+    config.write_text(f"[install]\nrequirement = {extra}\n")
+    # Redirect global discovery to a temporary file; preserve pip's real site path.
+    (site / "sitecustomize.py").write_text(
+        "import pip._internal.configuration as c\n"
+        "_original = c.get_configuration_files\n"
+        "def _files():\n"
+        "    files = _original()\n"
+        f"    files['global'] = {[str(config)] if scope == 'global' else []!r}\n"
+        "    files['user'] = []\n"
+        "    return files\n"
+        "c.get_configuration_files = _files\n"
+    )
+    for name in list(os.environ):
+        if name.upper().startswith(("PIP_", "_PIP_")):
+            monkeypatch.delenv(name)
+    probe = subprocess.run(
+        [
+            str(python), "-E", "-P", "-c",
+            "from pip._internal.configuration import Configuration; "
+            "c=Configuration(isolated=False); c.load(); print(c.get_value('install.requirement'))",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == str(extra)
+
+    if bypass:
+        _bypass_locked_pip_isolation(monkeypatch, "requirement")
+    monkeypatch.setattr(sys, "executable", str(python))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    if bypass:
+        with pytest.raises(LockfileError, match="Unexpected or duplicate staged package injected-dep"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+    else:
+        layer = builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+        names = _layer_names(layer)
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+        assert not any("injected_dep" in name for name in names)
 
 
 def _source(tmp_path, context, **options):
