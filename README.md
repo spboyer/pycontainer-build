@@ -487,6 +487,16 @@ pycontainer build \
   could change target selection (for example `PIP_PLATFORM` or
   `PIP_NO_BINARY`) are ignored; see
   [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
+- **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
+  `conda-lock.yml`, and `conda-meta/` directories in the context. With
+  `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
+  selected pip requirements file takes precedence over a venv, with a warning
+  that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
+  ordinary Conda projects still build application-only images. Host Conda
+  prefixes are never copied, even with explicit includes or
+  `--no-default-excludes`; a context inside a Conda prefix requires a source-only
+  context instead. See the [export workaround](docs/local-development.md#conda-projects).
+  Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
 
 ### Local base images
 
