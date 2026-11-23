@@ -45,6 +45,12 @@ Demonstrates building container images for different CPU architectures:
 
 [View Example →](./cross-platform/)
 
+### [Skaffold Custom Builder](./skaffold/) and [Tilt custom_build](./tilt/)
+
+Kubernetes inner-loop builds without a Docker daemon. pycontainer reads each
+tool's environment contract and pushes to a registry the cluster can pull from.
+See [Skaffold and Tilt](../docs/skaffold-tilt.md).
+
 ## Quick Start
 
 ### Try the FastAPI Example
@@ -88,6 +94,8 @@ Each example includes:
 | **VS Code** | Command Palette | Settings UI | IDE users |
 | **GitHub Actions** | Workflow file | YAML inputs | Automation |
 | **azd** | `azd up` | azure.yaml hooks | Azure deployment |
+| **Skaffold** | `skaffold dev` | `skaffold.yaml` custom builder | Kubernetes inner loop |
+| **Tilt** | `tilt up` | `Tiltfile` `custom_build` | Kubernetes inner loop |
 
 ## Contributing Examples
 
