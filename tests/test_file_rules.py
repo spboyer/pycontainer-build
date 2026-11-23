@@ -550,6 +550,62 @@ def test_same_size_same_time_edit_changes_cached_layer(tmp_path):
     assert content == b"DEBUG"
 
 
+@pytest.mark.parametrize("reproducible", [False, True])
+def test_conditional_selection_tracks_hardlinks_in_cache(tmp_path, reproducible):
+    context = tmp_path / "context"
+    context.mkdir()
+    original = context / "a.txt"
+    linked = context / "b.txt"
+    original.write_text("same content")
+    try:
+        os.link(original, linked)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"hardlinks unavailable: {error}")
+    rules = [{"when": 'BUILD_MODE == "dev"', "include": "b.txt"}]
+    hits = []
+
+    def build():
+        config = _config(context, tmp_path, rules, include_paths=["a.txt"],
+                         build_args={"BUILD_MODE": "dev"}, reproducible=reproducible,
+                         use_cache=True, cache_dir=str(tmp_path / "cache"))
+        builder = ImageBuilder(config)
+        lookup = builder.cache.get_layer
+
+        def record_lookup(*args, **kwargs):
+            cached = lookup(*args, **kwargs)
+            hits.append(cached is not None)
+            return cached
+
+        builder.cache.get_layer = record_lookup
+        layers = tmp_path / "layers"
+        layers.mkdir(exist_ok=True)
+        layer = builder._create_app_layer(layers)
+        with tarfile.open(layer.tar_path) as archive:
+            members = [(member.name, member.type, member.linkname)
+                       for member in archive.getmembers()]
+        return layer.digest, members
+
+    first = build()
+    assert build() == first
+    metadata = linked.stat()
+    linked.unlink()
+    linked.write_text("same content")
+    os.chmod(linked, metadata.st_mode)
+    os.utime(linked, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    changed = build()
+    assert build() == changed
+    assert first[1] == [
+        ("app/a.txt", tarfile.REGTYPE, ""),
+        ("app/b.txt", tarfile.LNKTYPE, "app/a.txt"),
+    ]
+    assert changed[1] == [
+        ("app/a.txt", tarfile.REGTYPE, ""),
+        ("app/b.txt", tarfile.REGTYPE, ""),
+    ]
+    assert changed[0] != first[0]
+    assert hits == [False, True, False, True]
+
+
 def test_cache_identity_uses_canonical_active_rules():
     include_a = {"when": 'BUILD_MODE == "dev"', "include": "a/**"}
     include_b = {"when": 'BUILD_MODE == "dev"', "include": "b/**"}

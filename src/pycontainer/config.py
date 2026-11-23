@@ -37,6 +37,7 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    security: Optional[dict] = None
     build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
     file_rules: List[Dict[str, Union[str, List[str]]]] = field(default_factory=list)
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
@@ -61,6 +62,10 @@ class BuildConfig:
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
