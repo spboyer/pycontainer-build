@@ -18,6 +18,10 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `system_packages.py`: system package declaration, inference and base-image
+  verification (warning only). `system_install.py`: fail-closed groundwork for
+  #31; it executes no package manager and has no callers until the #22
+  isolated executor exists.
 - `security.py`: opt-in Kubernetes/OCI runtime security fragments (not image
   config); see `docs/security-fragments.md`.
 - `plugins/`: separate Poetry, Hatch and VS Code integrations.
