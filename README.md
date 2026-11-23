@@ -156,8 +156,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -350,8 +350,35 @@ pycontainer build \
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
+  Environment markers in the requirements file and in transitive
+  `Requires-Dist` metadata are evaluated for the target (`linux`, the target
+  machine, CPython and the base image's Python version), not the build host.
+  Markers on `platform_release` or `platform_version`, and on
+  `python_full_version` when the base image does not declare a full
+  `PYTHON_VERSION`, cannot be known in advance and fail the build. In
+  single-platform builds, a virtualenv cannot be re-resolved, so it is verified
+  instead: root requirements (the
+  requirements file and pyproject `[project]` dependencies, optional
+  dependencies and dependency groups) and every installed `Requires-Dist` are
+  re-evaluated for each target, and the build fails if a requirement the
+  target needs is missing, uses an unknown marker value, or belongs to an extra
+  or group whose request cannot be ruled out. An extra or group counts as not
+  requested only when it is missing a requirement that any Windows, Linux or
+  macOS CPython host of the venv's Python version would have installed; a
+  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
+  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
+  layout), and `Lib/site-packages` to Windows. Only
+  package presence is checked, not versions; extra host-only packages are
+  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
+  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
+  also fail the build, as do dynamic dependencies that cannot be read. Use a
+  requirements file, which pip resolves for the target, when verification
+  fails.
   Official `python` tag-only registry pulls derive libc from the resolved tag
-  (`alpine` tags use musl, others glibc). All digest references, including
+  (`alpine` tags use musl, others glibc). This does not verify the actual libc
+  version and can select incompatible wheels for older images; see
+  [#191](https://github.com/spboyer/pycontainer-build/pull/191).
+  All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
   the digest is fetched without verifying that it matches any supplied tag.
   Local image names/annotations also cannot establish libc. Adding a tag to a
@@ -405,9 +432,10 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
   current directory, and the source must not overlap `--output`.
 - Every blob is checked against its digest and size, and every base layer is
   checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
-  needs Python 3.14+). Unknown layer media types, unsafe or duplicate archive
-  members, sparse members, symlinked OCI layout blobs, archive links that
-  escape the archive, and
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
   more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
   Each OCI index, including nested indexes, is limited to 1,000 entries.
   Layers are limited to 64 GiB (including decompressed content); Docker archive
@@ -460,8 +488,34 @@ inside the base image.
 
 The cache automatically:
 - Reuses unchanged layers across builds (content-addressable by SHA256)
-- Invalidates on file content changes (mtime + size checks)
+- Invalidates when file contents, relative paths, permission bits, the
+  workdir or reproducibility settings change (mtime is ignored for
+  reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Saving and restoring the cache (offline export/import):** the `--cache-dir`
+directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only
+relative source paths, so it can be archived or saved by CI (for example with
+`actions/cache`) and restored to a different absolute path and checkout
+location. A restored cache produces cache hits and an identical OCI manifest,
+config and layers. Partial restores are handled as follows:
+
+- Blobs without `index.json`: a clean miss; the layer is rebuilt and indexed.
+- `index.json` with missing or corrupt blobs: those entries are discarded and
+  rebuilt.
+- Malformed `index.json`: the build fails with `CacheIndexError`; delete the
+  reported `index.json` (cached layers are rebuilt) or rerun with `--no-cache`.
+- Concurrent builds may share a restored directory; index updates are locked.
+
+Caches are portable between machines of the same OS, not across operating
+systems: Windows reports source files as mode `0o666`, Linux checkouts as
+`0o644`/`0o755`, and the mode is recorded in the layer, so a cache saved on
+Windows misses on Linux (and vice versa) by design. Windows checkouts with
+`core.autocrlf` also change file content. Key saved caches on the OS. Blobs
+left without an index entry are not counted or evicted; delete the directory to
+reclaim them. See [GitHub Actions](docs/github-actions.md#caching-application-layers).
 
 ### Python API
 
@@ -514,8 +568,18 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -629,8 +693,9 @@ wheel-only dependency layer, and shares the byte-identical application layer
 Multi-platform dependency staging requires a requirements file; detected
 virtualenvs take precedence, so exclude them (for example, `--exclude .venv`)
 to select the requirements file. Copying a host virtualenv is rejected until
-target-closure checks land in
-[#180](https://github.com/spboyer/pycontainer-build/issues/180).
+the per-platform target-closure fix
+[#190](https://github.com/spboyer/pycontainer-build/pull/190) is integrated
+([#180](https://github.com/spboyer/pycontainer-build/issues/180)).
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
@@ -644,12 +709,13 @@ unknown-outcome reference, and references not attempted, even with
 `--no-progress`. `builder.pushed_refs` contains only confirmed successes from
 the current index push; no rollback is attempted.
 SBOM generation is not yet supported for index builds. A local single-platform
-`docker-archive:` base cannot satisfy an index build. Pip still evaluates
-dependency environment markers such as `platform_machine` against the build
-host for every cross-target build, so marker-dependent requirements may be
-wrong for a target ([#142](https://github.com/spboyer/pycontainer-build/issues/142)). These are hermetic
-layout and protocol checks; they are not evidence that each image starts on
-its architecture, and `scripts/check_runtime_image.py` remains single-platform.
+`docker-archive:` base cannot satisfy an index build. Requirements and
+transitive dependency markers are evaluated separately for each target, and
+unknown target marker values fail the build. Hermetic layout and protocol
+checks do not prove that images start. The optional
+`scripts/check_runtime_image.py --multi-platform-index` check builds an index,
+imports its native target with Skopeo, and starts it; see
+[runtime testing](docs/TESTING.md).
 
 ---
 
@@ -710,6 +776,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 

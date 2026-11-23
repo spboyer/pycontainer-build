@@ -4,6 +4,15 @@ import json, tempfile, shutil
 from pathlib import Path
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.oci import build_index_json
+
+def test_index_ref_name_is_on_manifest_descriptor():
+    """OCI image-layout tools such as Skopeo resolve tags on the descriptor."""
+    index=build_index_json("sha256:"+"a"*64,10,"runtime-check","arm64","linux")
+
+    assert index["manifests"][0]["annotations"]=={"org.opencontainers.image.ref.name":"runtime-check"}
+    assert index["annotations"]["org.opencontainers.image.ref.name"]=="runtime-check"
+    assert "annotations" not in build_index_json("sha256:"+"a"*64,10)["manifests"][0]
 
 @pytest.mark.registry_integration
 def test_oci_layout_structure():
@@ -29,6 +38,7 @@ def test_oci_layout_structure():
         assert index["annotations"]["org.opencontainers.image.ref.name"]=="test:v1"
         
         manifest_desc=index["manifests"][0]
+        assert manifest_desc["annotations"]["org.opencontainers.image.ref.name"]=="test:v1"
         assert manifest_desc["platform"]["architecture"]=="amd64"
         assert manifest_desc["platform"]["os"]=="linux"
         
