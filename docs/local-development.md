@@ -127,16 +127,17 @@ Conventional virtualenv directories and linked Conda prefixes are checked.
 Directory links are otherwise traversed only when selected as application
 include roots, matching application file selection.
 
-With `--include-deps`, detected Conda inputs without a supported selected pip
-requirements file raise an explicit error before pulling the base image, also
-in dry-run. When both are present, the selected pip requirements file wins over
-virtualenv discovery and a warning explains that Conda inputs are ignored.
+With `--include-deps`, detected Conda inputs without a supported selected lock
+or pip requirements file raise an explicit error before pulling the base image,
+also in dry-run. An explicitly selected or auto-detected supported lock takes
+precedence over a virtualenv; otherwise a pip requirements file takes
+precedence. A warning explains that Conda inputs are ignored.
 `--requirements` remains relative to the context and can select an exported
 file excluded from the application layer. Selecting a Conda YAML file as pip
 requirements, including via a file link, is rejected rather than passed to pip.
 Selected source paths inside a host Conda prefix are omitted; with
 `--include-deps` they also produce a Conda diagnostic unless the marker is
-excluded. Selected requirements inside a host prefix are rejected.
+excluded. Selected lockfiles and requirements inside a host prefix are rejected.
 
 Export the pip-compatible portion from your Conda environment, then build from
 your application source directory:
@@ -414,6 +415,11 @@ require the explicit version map. The pulled base metadata, not an application
 environment override, must establish the requested `PYTHON_VERSION` for each
 platform; custom bases also provide `PYTHON_IMPLEMENTATION=CPython`.
 
+With `--include-deps`, each minor and platform resolves its own lockfile
+markers and hash-pinned wheels. Lock staging needs a full base
+`PYTHON_VERSION` such as `3.11.9` and a matching wheel for each selected
+package. Digest-pinned and local bases need explicit Python and libc metadata.
+
 Explicit tags are suffixed `-py3.11`/`-py3.12`; unsuffixed tags and generated
 semver/latest aliases belong only to the default version. Adding `--push`
 builds and validates all layouts first, prepares all remote blobs and
@@ -436,8 +442,7 @@ Python matrices reject vulnerability scanning and Git-derived tags
 (`tag_from_git`) at configuration and again before build or publication;
 set an explicit tag or build each Python version separately.
 
-Hermetic tests do not establish real per-version/per-architecture startup;
-the existing cross-target dependency-marker limitation (#142) still applies.
+Hermetic tests do not establish real per-version/per-architecture startup.
 
 ### Use Case 1: Testing Config Changes
 

@@ -264,7 +264,7 @@ def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     assert config.base_image == "python:3.12-slim"
     assert config.platform == "linux/amd64"
     assert config.include_deps is False
-    assert config.requirements_file == "requirements.txt"
+    assert config.requirements_file is None
     assert config.verbose is False
     assert config.dry_run is False
     assert config.generate_sbom is False

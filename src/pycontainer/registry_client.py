@@ -42,11 +42,17 @@ MAX_REPORTED_ERRORS = 5
 MAX_ERROR_TEXT_CHARS = 200
 LOW_RATE_LIMIT_REMAINING = 10
 QUOTA_STATUSES = {413, 507}
+MAX_TAG_PAGES = 10_000
+MAX_LISTED_TAGS = 100_000
 DOCKER_HUB_ALIASES = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 SENSITIVE_HEADERS = ("Authorization", "Proxy-Authorization", "Cookie")
 
 logger = logging.getLogger(__name__)
 
+_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_NEXT_LINK = re.compile(
+    r'<([^>]*)>\s*;[^,]*?\brel=(?:"next"|next)(?=\s*(?:[;,]|$))', re.IGNORECASE
+)
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _AUTH_SCHEME_VALUE = re.compile(r"(?i)(bearer|basic)\s+[^\s\"',;]+")
 _TEXT_URL = re.compile(r"""(?i)\bhttps?://[^\s"'<>]+""")
@@ -105,6 +111,10 @@ class RegistryQuotaError(RegistryRequestError):
                  *, status: Optional[int] = None):
         super().__init__(message, status=status)
         self.blob_size = blob_size
+
+
+class RegistryDeletionUnsupportedError(RegistryRequestError):
+    """Raised when a registry refuses manifest deletion as unsupported."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -443,6 +453,7 @@ def _registry_error(
     blob_size: Optional[int] = None,
     repository: Optional[str] = None,
     error_class=RegistryRequestError,
+    permission: str = "pull or push",
     username: Optional[str] = None,
     include_response_detail: bool = True,
 ) -> RegistryRequestError:
@@ -536,12 +547,26 @@ def _registry_error(
                 repository, secrets, MAX_ERROR_TEXT_CHARS, username=username
             )
         message += (
-            f" Check that the credentials have pull or push permission{target}; "
+            f" Check that the credentials have {permission} permission{target}; "
             "some registries also report exhausted quotas as DENIED."
         )
     if error_class is RegistryRequestError:
         return RegistryHTTPError(status, message)
     return error_class(message, status=status)
+
+
+def _next_link(header: Optional[str]) -> Optional[str]:
+    """Return the RFC 8288 rel="next" target from a Link header, if any."""
+    if not header:
+        return None
+    match = _NEXT_LINK.search(header)
+    return match.group(1) if match else None
+
+
+def _page_key(url: str) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    return parsed.path, tuple(sorted(query))
 
 
 def _append_digest(url: str, digest: str) -> str:
@@ -590,6 +615,7 @@ class RegistryClient:
                 f"Refusing malformed registry authority: {_safe_url(self.base_url)}."
             )
         self._bearer_token = None
+        self._bearer_scope = None
         self._token_lock = threading.Lock()
         self._rate_limit_warned = False
         if (
@@ -755,7 +781,9 @@ class RegistryClient:
         if headers:
             self._refuse_plain_http_credentials(url)
 
-        request = urllib.request.Request(url, headers=headers)
+        request = urllib.request.Request(url)
+        for name, value in headers.items():
+            request.add_unredirected_header(name, value)
         body = None
         for attempt in range(MAX_REQUEST_RETRIES + 1):
             try:
@@ -831,9 +859,13 @@ class RegistryClient:
         # Callers run this outside the 401 handler so exchange failures cannot
         # chain the original, potentially credential-bearing reason.
         with self._token_lock:
-            if not self._bearer_token:
+            scope = params.get("scope")
+            if not self._bearer_token or (
+                scope != self._bearer_scope and sent_token == self._bearer_token
+            ):
                 error.close()
                 self._bearer_token = self._get_bearer_token(params)
+                self._bearer_scope = scope
                 return True
             return sent_token != self._bearer_token
 
@@ -869,6 +901,11 @@ class RegistryClient:
             request = urllib.request.Request(
                 url, data=data, headers=request_headers, method=method
             )
+            for name in SENSITIVE_HEADERS:
+                value = request.get_header(name)
+                if value is not None:
+                    request.remove_header(name)
+                    request.add_unredirected_header(name, value)
             auth_challenge = None
             try:
                 with self._opener.open(
@@ -1105,12 +1142,133 @@ class RegistryClient:
         digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
             "docker-content-digest"
         )
-        if digest and digest.startswith("sha256:") and digest != body_digest:
+        if not digest:
+            return manifest, body_digest
+        if digest.startswith("sha512:"):
+            expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
+        elif digest.startswith("sha256:"):
+            expected_header = body_digest
+        else:
+            # Unsupported algorithms cannot be verified; return the header opaquely so
+            # callers never treat it, or a sha256 alias, as a verified digest.
+            return manifest, digest
+        if digest != expected_header:
             raise BlobIntegrityError(
                 f"Registry-reported manifest digest does not match its body "
                 f"digest {body_digest}."
             )
-        return manifest, digest or body_digest
+        return manifest, digest
+
+    def delete_manifest(self, digest: str) -> None:
+        """Delete a manifest by digest exactly once; the request is never retried."""
+        try:
+            digest_filename(digest)
+        except ValueError as error:
+            raise ValueError(
+                "Manifest deletion requires a lowercase sha256 digest."
+            ) from error
+        url = f"{self.base_url}/{self.repository}/manifests/{digest}"
+        try:
+            status, body, headers = self._make_request("DELETE", url)
+        except RegistryAuthenticationError:
+            raise
+        except RegistryRequestError as error:
+            raise RegistryRequestError(
+                f"{error} The deletion outcome of {digest} is unknown; verify "
+                "the repository before running the command again."
+            ) from error
+        if status in (200, 202, 204):
+            return
+        error = self._error(
+            "Manifest delete", url, status, body, headers, permission="delete"
+        )
+        codes = {code.upper() for code, _ in (_registry_errors(body or b"") or [])}
+        if status == 405 or "UNSUPPORTED" in codes:
+            raise RegistryDeletionUnsupportedError(
+                f"{error} The registry does not allow manifest deletion for "
+                f"{self.repository}; deletion may be disabled by the registry "
+                "operator or by an immutability or retention policy."
+            )
+        raise error
+
+    def list_tags(self, page_size: Optional[int] = None) -> List[str]:
+        """List every tag, following pagination; any failure aborts the listing."""
+        if page_size is not None and (type(page_size) is not int or page_size < 1):
+            raise ValueError("Tag page size must be a positive integer.")
+        path = f"/v2/{self.repository}/tags/list"
+        url = f"{self.base_url}/{self.repository}/tags/list"
+        if page_size is not None:
+            url += "?" + urllib.parse.urlencode({"n": page_size})
+        tags: List[str] = []
+        seen_tags = set()
+        seen_pages = set()
+        for _ in range(MAX_TAG_PAGES):
+            page_key = _page_key(url)
+            if page_key in seen_pages:
+                raise RegistryRequestError(
+                    "Registry tag pagination repeated a page; refusing to continue."
+                )
+            seen_pages.add(page_key)
+            status, body, headers = self._make_request(
+                "GET", url, headers={"Accept": "application/json"}
+            )
+            if status != 200:
+                raise self._error("Tag list", url, status, body, headers)
+            for tag in self._parse_tag_page(body):
+                if tag not in seen_tags:
+                    seen_tags.add(tag)
+                    tags.append(tag)
+            if len(tags) > MAX_LISTED_TAGS:
+                raise RegistryRequestError(
+                    f"Registry listed more than {MAX_LISTED_TAGS} tags; refusing to continue."
+                )
+            next_url = _next_link(_header(headers, "Link"))
+            if next_url is None:
+                return tags
+            url = self._validated_tag_page_url(url, next_url, path)
+        raise RegistryRequestError(
+            f"Registry tag pagination exceeded {MAX_TAG_PAGES} pages."
+        )
+
+    def _parse_tag_page(self, body: bytes) -> List[str]:
+        try:
+            document = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RegistryRequestError(
+                "Registry returned an invalid tag list response."
+            ) from error
+        if not isinstance(document, dict):
+            raise RegistryRequestError("Registry tag list response was not an object.")
+        name = document.get("name")
+        if name is not None and name != self.repository:
+            raise RegistryRequestError(
+                "Registry tag list response named a different repository."
+            )
+        page = document.get("tags")
+        if page is None:
+            return []
+        if not isinstance(page, list) or not all(
+            isinstance(tag, str) and _TAG.fullmatch(tag) for tag in page
+        ):
+            raise RegistryRequestError(
+                "Registry tag list response contained an invalid tag."
+            )
+        return page
+
+    def _validated_tag_page_url(self, current: str, link: str, path: str) -> str:
+        target = urllib.parse.urljoin(current, link)
+        parsed = urllib.parse.urlsplit(target)
+        if (
+            not self._is_registry_url(target)
+            or parsed.fragment
+            or urllib.parse.unquote(parsed.path) != path
+            or parsed.path != path
+        ):
+            raise RegistryRequestError(
+                "Registry tag pagination link points outside this repository's "
+                "tag list; refusing to follow it."
+            )
+        return target
 
     def _get_blob_opener(self):
         with self._blob_opener_lock:

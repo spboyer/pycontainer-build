@@ -1,5 +1,6 @@
 """Hermetic Python-version matrix and non-atomic publication regressions."""
 import json
+import hashlib
 import tarfile
 import subprocess
 from dataclasses import dataclass, fields, replace
@@ -22,16 +23,21 @@ from pycontainer.security import KUBERNETES_FRAGMENT, SECURITY_DIR
 from test_multi_platform import FakeBaseRegistry, FakePushClient, _digest
 
 
-def matrix(tmp_path, monkeypatch, platform="linux/amd64", **overrides):
+def matrix(
+    tmp_path, monkeypatch, platform="linux/amd64",
+    base_platforms=("amd64", "arm64"), base_env=None, **overrides,
+):
     ctx = tmp_path / "context"
     ctx.mkdir()
     (ctx / "app.py").write_text("print('matrix')\n")
     bases = {}
     for minor in ("3.11", "3.12"):
-        base = FakeBaseRegistry()
+        base = FakeBaseRegistry(platforms=base_platforms, base_env=base_env)
         # Rebuild every manifest and descriptor with distinct Python metadata.
         descriptors = []
-        for old_manifest in list(base.manifests.values())[:2]:
+        original_index = json.loads(base.manifests[base.index_digest])
+        for descriptor in original_index["manifests"]:
+            old_manifest = base.manifests[descriptor["digest"]]
             manifest = json.loads(old_manifest)
             old_config = manifest["config"]["digest"]
             config = base.blobs[old_config].replace(b"3.11.9", f"{minor}.9".encode())
@@ -40,9 +46,7 @@ def matrix(tmp_path, monkeypatch, platform="linux/amd64", **overrides):
             manifest["config"]["size"] = len(config)
             body = json.dumps(manifest).encode()
             base.manifests[_digest(body)] = body
-            arch = json.loads(config)["architecture"]
-            descriptors.append({"mediaType": manifest["mediaType"], "digest": _digest(body),
-                                "size": len(body), "platform": {"os": "linux", "architecture": arch}})
+            descriptors.append({**descriptor, "digest": _digest(body), "size": len(body)})
         index = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
                             "manifests": descriptors}).encode()
         base.index_digest = _digest(index)
@@ -803,6 +807,248 @@ def test_target_wheel_staging_uses_each_minor_and_architecture(tmp_path, monkeyp
     build.build()
     assert targets == [("3.11", "linux", "amd64"), ("3.11", "linux", "arm64"),
                        ("3.12", "linux", "amd64"), ("3.12", "linux", "arm64")]
+
+
+def _write_matrix_lock_project(context):
+    from test_dependency_staging import _write_named_wheel
+    from test_lockfiles import _write_target_marker_uv_project
+
+    _write_target_marker_uv_project(context)
+    for path in (context / "pyproject.toml", context / "uv.lock"):
+        text = path.read_text(encoding="utf-8")
+        for machine, condition in (("x86_64", "< '3.12'"), ("aarch64", ">= '3.12'")):
+            marker = f"platform_machine == '{machine}'"
+            text = text.replace(
+                marker, f"{marker} and python_version {condition}",
+                2 if path.name == "uv.lock" else 1,
+            )
+        path.write_text(text, encoding="utf-8")
+
+    wheelhouse = context / "wheelhouse"
+    original = wheelhouse / "fixture_dep-1.0-py3-none-any.whl"
+    original_hash = hashlib.sha256(original.read_bytes()).hexdigest()
+    requires = [
+        'marker-trans-amd; platform_machine == "x86_64"',
+        'marker-trans-arm; platform_machine == "aarch64"',
+        'marker-trans-armv7; platform_machine == "armv7l"',
+        'marker-trans-win; sys_platform == "win32"',
+    ]
+    wheel_refs = []
+    for minor in ("311", "312"):
+        for machine in ("x86_64", "aarch64", "armv7l"):
+            tag = f"cp{minor}-cp{minor}-manylinux2014_{machine}"
+            _write_named_wheel(wheelhouse, "fixture-dep", requires=requires, tag=tag)
+            wheel = wheelhouse / f"fixture_dep-1.0-{tag}.whl"
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            wheel_refs.append(
+                f'{{ url = "https://example.invalid/{wheel.name}", hash = "sha256:{digest}" }}'
+            )
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8")
+    original_ref = (
+        f'{{ url = "https://example.invalid/{original.name}", '
+        f'hash = "sha256:{original_hash}" }}'
+    )
+    assert original_ref in text
+    lock.write_text(text.replace(original_ref, ", ".join(wheel_refs), 1), encoding="utf-8")
+    original.unlink()
+
+
+def test_locked_matrix_selects_target_markers_wheels_and_override(tmp_path, monkeypatch):
+    build, _, pulls = matrix(
+        tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
+        base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
+        default_python_version="3.12", tags=["stable"],
+    )
+    context = Path(build.config.context_dir)
+    _write_matrix_lock_project(context)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    base_auth = []
+
+    def pull_auth(host, *, include_generic_environment):
+        base_auth.append((host, include_generic_environment))
+        return RegistryAuth(bearer_token="base-token")
+
+    original_client = builder_module.RegistryClient
+    pull_clients = []
+
+    def pull_client(host, repository, **kwargs):
+        pull_clients.append((host, kwargs["auth_token"], kwargs["username"], kwargs["password"]))
+        return original_client(host, repository, **kwargs)
+
+    real_install = builder_module.install_requirements
+    installs = []
+
+    def install(requirements, site, ctx, os_name, arch, version, base, config, **kwargs):
+        installs.append((version, arch, kwargs["variant"], kwargs["locked"],
+                         kwargs["base_image_tag_verified"]))
+        return real_install(requirements, site, ctx, os_name, arch, version, base, config, **kwargs)
+
+    monkeypatch.setattr(builder_module, "get_registry_auth", pull_auth)
+    monkeypatch.setattr(builder_module, "RegistryClient", pull_client)
+    monkeypatch.setattr(builder_module, "install_requirements", install)
+    build.build()
+
+    assert installs == [
+        (version, arch, variant, True, True)
+        for version in ("3.11", "3.12")
+        for arch, variant in (("amd64", None), ("arm64", None), ("arm", "v7"))
+    ]
+    assert base_auth == [("docker.io", False)] * 6
+    assert pull_clients == [("docker.io", "base-token", None, None)] * 6
+    assert {
+        version: sum(minor == version and ref == f"{version}-slim"
+                     for minor, ref in pulls)
+        for version in ("3.11", "3.12")
+    } == {"3.11": 1, "3.12": 1}
+    machines = {"amd64": "x86_64", "arm64": "aarch64", "arm": "armv7l"}
+    suffixes = {"amd64": "amd", "arm64": "arm", "arm": "armv7"}
+    for version, child in build.children.items():
+        for image in child.platform_images:
+            arch = image.platform["architecture"]
+            with tarfile.open(image.layers[-2].tar_path) as archive:
+                names = set(archive.getnames())
+                wheel = archive.extractfile(
+                    "app/.python/site-packages/fixture_dep-1.0.dist-info/WHEEL"
+                ).read().decode()
+            tag = f"cp{version.replace('.', '')}-cp{version.replace('.', '')}-manylinux2014_{machines[arch]}"
+            assert f"Tag: {tag}" in wheel
+            for candidate, suffix in suffixes.items():
+                root = f"app/.python/site-packages/marker_root_{suffix}/__init__.py"
+                transitive = f"app/.python/site-packages/marker_trans_{suffix}/__init__.py"
+                expected_root = candidate == arch and (
+                    candidate == "arm"
+                    or (candidate == "amd64" and version == "3.11")
+                    or (candidate == "arm64" and version == "3.12")
+                )
+                assert (root in names) == expected_root
+                assert (transitive in names) == (candidate == arch)
+            assert not any("marker_trans_win/" in name for name in names)
+
+    push = FakePushClient()
+    push_auth = []
+    push_clients = []
+
+    def destination_auth(host, **kwargs):
+        push_auth.append((host, kwargs))
+        return RegistryAuth(bearer_token="push-token")
+
+    def destination_client(host, repository, **kwargs):
+        push_clients.append((host, repository, kwargs["auth_token"]))
+        return push
+
+    monkeypatch.setattr(matrix_module, "get_registry_auth", destination_auth)
+    monkeypatch.setattr(builder_module, "RegistryClient", destination_client)
+    destination = "mirror.example/team/app:v9"
+    assert build.push(registry_url=destination, auth_token="explicit-token", show_progress=False) == destination
+    assert push_auth == [("mirror.example", {
+        "bearer_token": "explicit-token", "username": None, "password": None,
+    })]
+    assert push_clients == [("mirror.example", "team/app", "push-token")]
+    tag_writes = [
+        call[1] for call in push.calls if call[0] != "blob" and not call[1].startswith("sha256:")
+    ]
+    assert tag_writes == [
+        "v9-py3.11", "stable-py3.11", "v9-py3.12", "stable-py3.12",
+        "v9", "stable", "v1.2", "v1", "latest",
+    ]
+    first_tag = next(i for i, op in enumerate(build.operations) if "@" not in op.reference)
+    assert all("@" in op.reference for op in build.operations[:first_tag])
+
+
+def test_locked_matrix_checks_base_minor_before_resolving_lock(tmp_path, monkeypatch):
+    from test_lockfiles import _write_target_marker_uv_project
+
+    build, _, _ = matrix(tmp_path, monkeypatch, include_deps=True)
+    _write_target_marker_uv_project(Path(build.config.context_dir))
+    original_pull = ImageBuilder._pull_base_image
+
+    def pull(child, *args):
+        layers, config = original_pull(child, *args)
+        config["config"]["Env"] = ["PYTHON_VERSION=3.10.1"]
+        return layers, config
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull)
+    monkeypatch.setattr(
+        builder_module, "load_lockfile",
+        lambda *args: pytest.fail("must reject base before resolving lock"),
+    )
+    with pytest.raises(ValueError, match=r"Python 3\.11.*matching PYTHON_VERSION"):
+        build.build()
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(RuntimeError, match="every Python"):
+        build.push()
+    assert push.calls == []
+
+
+@pytest.mark.parametrize("failure", ["missing", "hash-mismatch"])
+def test_locked_matrix_wheel_failure_prevents_all_publication(tmp_path, monkeypatch, failure):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
+        base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
+    )
+    context = Path(build.config.context_dir)
+    _write_matrix_lock_project(context)
+    wheel = context / "wheelhouse" / "fixture_dep-1.0-cp312-cp312-manylinux2014_armv7l.whl"
+    if failure == "missing":
+        wheel.unlink()
+    else:
+        wheel.write_bytes(b"corrupt")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+
+    with pytest.raises(RuntimeError, match="linux/arm/v7"):
+        build.build()
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(RuntimeError, match="every Python"):
+        build.push()
+    assert push.calls == []
+
+
+@pytest.mark.parametrize("source", ["digest", "unresolved-tag"])
+def test_locked_matrix_rejects_unproven_base_before_pip(tmp_path, monkeypatch, source):
+    from test_lockfiles import _write_target_marker_uv_project
+
+    build, bases, _ = matrix(
+        tmp_path, monkeypatch, include_deps=True, base_env=["PYTHON_VERSION=3.11.9"],
+    )
+    _write_target_marker_uv_project(Path(build.config.context_dir))
+    if source == "digest":
+        mapping = {
+            version: f"python:{version}-slim@{base.index_digest}"
+            for version, base in bases.items()
+        }
+        build = PythonMatrixBuilder(replace(build.config, python_matrix=mapping))
+    else:
+        original_client = builder_module.RegistryClient
+
+        def unresolved_client(*args, **kwargs):
+            client = original_client(*args, **kwargs)
+            pull = client.pull_manifest
+
+            def unresolved_manifest(reference, **expected):
+                manifest, digest = pull(reference, **expected)
+                return manifest, None if reference.endswith("-slim") else digest
+
+            client.pull_manifest = unresolved_manifest
+            return client
+
+        monkeypatch.setattr(builder_module, "RegistryClient", unresolved_client)
+    monkeypatch.setattr(
+        builder_module, "install_requirements",
+        lambda *args, **kwargs: pytest.fail("pip ran without proven base metadata"),
+    )
+
+    with pytest.raises(ValueError, match="unverified or custom base image"):
+        build.build()
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(RuntimeError, match="every Python"):
+        build.push()
+    assert push.calls == []
 
 
 def local_matrix(tmp_path, monkeypatch):

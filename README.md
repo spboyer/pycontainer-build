@@ -76,6 +76,9 @@ pycontainer build --tag myapp:latest --platform linux/amd64
 
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
+
+# Preview pruning old versions (dry run by default; --execute to delete)
+pycontainer registry prune ghcr.io/user/myapp --keep 5
 ```
 
 ### Output
@@ -189,6 +192,9 @@ offline preparation, error behavior and the opt-in acceptance test.
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
+  dry-run-by-default semver `registry prune` that never deletes digests shared
+  with retained tags ([guide](docs/REGISTRY_CLEANUP.md))
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
@@ -412,9 +418,10 @@ pycontainer build \
 
 **Base Image & Dependencies**:
 - `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
-- `--include-deps` — Stage importable dependencies from a venv or install a
-  requirements file as target-compatible binary wheels. Requirements installs
-  are limited to 1 MiB, 300 seconds, 512 MiB of staged files, and 100,000 files;
+- `--include-deps` — Stage importable dependencies from a lockfile or
+  requirements file as target-compatible binary wheels, or copy a verified
+  pure-Python venv. Requirements files, including generated lock selections,
+  are limited to 1 MiB; staging is limited to 300 seconds, 512 MiB, and 100,000 files;
   supported targets are `linux/amd64`, `linux/arm64` and `linux/arm/v7` with
   CPython (`linux/arm/v7` uses `armv7l` wheel tags; `linux/arm` without the
   `v7` variant is rejected). A venv
@@ -422,7 +429,9 @@ pycontainer build \
   packages. Dependencies are placed under `<workdir>/.python`, added to
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
-  distributions, cross-compilation, and lockfile resolution are not supported.
+  distributions and cross-compilation are not supported.
+  Pip runs without the host's `PYTHONPATH`, and pip configuration cannot disable
+  target `Requires-Python` checks.
   Generated Linux console scripts use UTF-8 and LF line endings on every host,
   including Windows, and retain executable mode in the dependency layer.
   Copied application files are not normalized.
@@ -478,14 +487,14 @@ pycontainer build \
   metadata conflicting with a verified tag-only pull.
   Digest and unverified local sources also require explicit
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
-  establish the Python ABI. These metadata checks apply to requirements and
-  virtualenv staging alike.
+  establish the Python ABI. These metadata checks apply to lockfile,
+  requirements and virtualenv staging alike.
 
   Environment markers in the requirements file and in transitive
   `Requires-Dist` metadata are evaluated for the target (`linux`, the target
   machine, CPython and the base image's Python version), not the build host.
   Markers on `platform_release` or `platform_version`, and on
-  `python_full_version` when the base image does not declare a full
+  `python_full_version` or `implementation_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
   cannot be re-resolved, so its closure is verified for each target instead.
   Requirements-file and pyproject roots and installed `Requires-Dist` metadata
@@ -495,13 +504,18 @@ pycontainer build \
   `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
   Virtualenvs do not record selected extras or groups. An extra or group
-  counts as not requested only when it is missing a requirement that any
-  Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
-  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
-  its target requirements are not satisfied, verification fails rather than
-  guessing.
+  counts as not requested only when it is missing a requirement that the
+  venv's creator host provably would have installed. Only facts the venv
+  establishes are used: CPython, the venv's Python minor version when known,
+  and the OS family from the layout (`lib/pythonX.Y/site-packages` with a
+  POSIX `pyvenv.cfg` `home` is non-Windows; MSYS2 CPython is Windows with that
+  layout; `Lib/site-packages` is Windows). Markers on any other host value,
+  such as `platform_machine` or a specific non-Windows `sys_platform`, are
+  unknown rather than assumed, so a requirement like
+  `fast; extra == "speed" and platform_machine != "armv7l"` cannot rule the
+  extra out. Otherwise, if its target requirements are not satisfied,
+  verification fails rather than guessing; install the extra into the venv or
+  use a requirements file instead.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
@@ -518,16 +532,92 @@ pycontainer build \
   could change target selection (for example `PIP_PLATFORM` or
   `PIP_NO_BINARY`) are ignored; see
   [Private package indexes](docs/AUTHENTICATION.md#private-package-indexes).
+- `--requirements FILE` — Install this requirements file (`[build]
+  requirements-file`). A requirements file that is not fully pinned with
+  `==` versions and `--hash` values logs a warning that the dependency layer
+  is not reproducible; generate one with `pip-compile --generate-hashes` or use
+  a lockfile.
+- `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
+  `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
+  (`use-lockfile = false`) ignores auto-detected lockfiles.
 - **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
   `conda-lock.yml`, and `conda-meta/` directories in the context. With
   `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
-  selected pip requirements file takes precedence over a venv, with a warning
-  that Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
+  selected lockfile or pip requirements file is used with a warning that
+  Conda inputs and Conda-only packages are ignored. Without `--include-deps`,
   ordinary Conda projects still build application-only images. Host Conda
   prefixes are never copied, even with explicit includes or
   `--no-default-excludes`; a context inside a Conda prefix requires a source-only
   context instead. See the [export workaround](docs/local-development.md#conda-projects).
   Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+**Lockfiles**: With `--include-deps`, the dependency source is chosen in this
+order: `--lockfile`, then `--requirements`, then a single lockfile at the
+context root, then a venv, then `requirements.txt`. Explicit `--lockfile` and
+`--requirements` are mutually exclusive. More than one root lockfile is an
+error until you choose one. No locking tool is needed at build time, and none
+is added as a dependency:
+
+1. The lock is checked against its manifest (`pyproject.toml` or `Pipfile`):
+   Poetry and PDM content hashes, the Pipfile hash, or uv's recorded
+   requirements. A stale lock fails; run `poetry lock`, `pipenv lock`,
+   `pdm lock`, or `uv lock` and rebuild.
+2. Root and recorded transitive markers are evaluated for each target image,
+   not the build host, so platform and Python forks select the container's
+   dependencies. The base image must expose a full `PYTHON_VERSION=X.Y.Z`.
+3. The exact locked versions and their recorded hashes are installed with
+   `pip --no-deps --require-hashes` as target wheels and included in the SBOM.
+   Pip does not resolve transitive dependencies in this mode: the lock must
+   record the complete target graph and a matching wheel hash for each target.
+
+The build context must be writable: temporary `.pycontainer-lockfile-*`
+directories hold generated requirements, are excluded from images, and are
+removed after staging.
+
+The lockfile's project manifest must resolve inside the build context. Symlinks
+to files within the context are supported; dangling or external links are
+rejected. Path checks do not protect against concurrent filesystem changes.
+
+`--dry-run` checks lockfile selection and locally verifiable freshness
+without pulling the base image. Target markers (including uv marker
+freshness), Python compatibility and wheel availability are checked during
+the build, not the dry run.
+
+Only the default/main dependencies are staged; dev groups and project extras
+are not. Supported formats: Poetry lock-version 2.1+, Pipenv pipfile-spec 6,
+PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
+version 1 for a single project. Git, path, URL, and editable packages, uv
+workspaces, sources, overrides and constraints, and PDM `find_links` fail with
+an explicit error rather than falling back to an unconstrained install.
+PDM and uv projects with dynamic dependencies are unsupported. Poetry dynamic
+dependencies must be declared in `tool.poetry.dependencies`.
+Poetry's Python and dependency ranges support PEP 440 constraints, exact
+versions, wildcards, and single caret or tilde constraints; other
+Poetry-specific combinations are rejected. Applicable Poetry root and
+recorded transitive dependencies, including requested extras, must be present
+at compatible locked versions. uv extras without recorded dependencies are
+treated as empty, consistent with uv.
+Pipenv roots and PDM roots and recorded edges must be present at compatible
+locked versions. For all four formats, staged wheel dependency metadata is
+checked for target-compatible transitive versions, markers and requested
+extras before creating a layer. Each wheel needs valid metadata in its matching
+`.dist-info` directory, limited to 1 MiB. This cannot detect dependencies
+omitted from the wheels' own metadata.
+uv registry URLs must match the current `[[tool.uv.index]]` declarations
+or the implicit PyPI index; settings from `uv.toml` and legacy index options
+are not supported. Limited-resolution uv locks are accepted only when their
+recorded supported markers match the configured environments after supported
+normalization and include the target; unverifiable marker equivalence and
+unknown target marker values fail explicitly. Normalization supports
+`python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
+unrecognized equivalences are rejected even if they are logically equal.
+Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
+PyPI itself is left to your pip configuration so mirrors keep working, and
+pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
+The same pip bootstrap used for ordinary requirements ignores inherited settings
+that can override the wheel target or add requirements.
+Hashes verify the bytes, not which server supplied them. Index credentials
+must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
 
 ### Local base images
 
@@ -575,7 +665,8 @@ pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3
 - OCI annotations and Docker archive tags do not establish an image's Python
   ABI or libc. For `--include-deps`, local images must set
   `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
-  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  `PYTHON_LIBC=glibc-2.N` (N 17-99) or `PYTHON_LIBC=musl-1.N` (N 1-99)
+  in their image config,
   even if their name claims to be an official Python image. These settings are
   not required when dependency staging is disabled.
 
@@ -595,6 +686,19 @@ include-paths = ["src", "pyproject.toml"]
 exclude-paths = ["src/generated", "fixtures/**"]
 exclude-defaults = true
 ```
+
+Context traversal never follows directory symlinks or Windows junctions. A
+linked include root (including auto-detected `src`, `app` or a virtualenv)
+fails the build; nested directory links are skipped. A selected file symlink
+must use a relative target that resolves to an existing file inside the
+context and that is itself selected (exclusions win); it is stored as a link
+with `/` separators. A target may climb with leading `..` components, but not
+above the context root, and may not use `..` after descending into a directory.
+Absolute, dangling, cyclic, out-of-context and unselected-target file links
+fail the build. A context directory that is itself a symlink is still
+supported. These checks are not a defense against the context changing during
+a build, and they do not cover explicitly named inputs such as requirements or
+manifest files.
 
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
@@ -812,8 +916,7 @@ separate output directory or retry after the current build finishes.
 builds **separate images**, not an OCI index combining Python versions. Layouts
 are written to `dist/image/py3.11` and `dist/image/py3.12`; `--output` changes
 their parent directory. Each version can independently contain an architecture
-index with `--platform linux/amd64,linux/arm64` (the existing cross-target
-dependency-marker limitation in #142 still applies).
+index with `--platform linux/amd64,linux/arm64`.
 
 Every explicit tag gets a `-pyX.Y` suffix. Unsuffixed explicit tags and aliases
 from `--latest`/`--semver-tags` belong only to the first requested version, or
@@ -845,7 +948,9 @@ bases must also declare `PYTHON_IMPLEMENTATION=CPython`. This is checked for
 every architecture even without dependencies. Application environment
 overrides and unverified tag names are not proof of the base's Python version.
 Dependency staging retains the existing wheel-only/virtualenv compatibility
-checks; a missing wheel fails that version rather than dropping it.
+checks; a missing wheel fails that version rather than dropping it. Lockfile
+markers and hashed wheels are selected independently for each Python version
+and platform, using the base's full `PYTHON_VERSION`.
 
 With `--push`, **all versions build and validate locally before any registry
 publication**. Blobs and manifests/indexes publish by digest first, then all
@@ -970,18 +1075,27 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 (`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
-platform is built in isolation: it selects its own base manifest (registry
-builds re-select from the first resolved base-index digest), stages its own
+platform is built in isolation: it selects its own base manifest, stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
-Virtualenv closure is verified separately against each target base. Detected
-virtualenvs take precedence; exclude them (for example, `--exclude .venv`) to
-select a requirements file instead.
+Virtualenv closure is verified separately against each target base. Explicit
+dependencies and detected lockfiles take precedence over virtualenvs; otherwise,
+exclude a virtualenv (for example, `--exclude .venv`) to select `requirements.txt`.
 The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
 keep the same layout `index.json` for every platform and until publication;
-a change fails the build instead of mixing base versions. Push uploads blobs, then
+a change fails the build instead of mixing base versions. A registry base tag
+is read once: every platform selects from that first verified base index or
+manifest snapshot and fetches its platform manifest by descriptor digest, so a
+tag that moves mid-build cannot mix snapshots. The snapshot must match a
+`sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
+unrecognized header algorithm cannot be verified: it is kept as an opaque
+value, the first snapshot is still reused for every platform, and the tag is
+not treated as verified provenance for libc or Python version inference. If a pinned
+platform manifest can no longer be fetched, the build fails before the layout
+`index.json` or refs are written (a reused output directory may still contain
+an earlier build's index). Push uploads blobs, then
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.
@@ -990,7 +1104,7 @@ unknown-outcome reference, and references not attempted, even with
 `--no-progress`. `builder.pushed_refs` contains only confirmed successes from
 the current index push; no rollback is attempted.
 SBOM generation is not yet supported for index builds. A local single-platform
-`docker-archive:` base cannot satisfy an index build. Requirements and
+`docker-archive:` base cannot satisfy an index build. Lockfile, requirements and
 transitive dependency markers are evaluated separately for each target, and
 unknown target marker values fail the build. Hermetic layout and protocol
 checks do not prove that images start. The optional
@@ -1060,6 +1174,7 @@ This style is intentional for the experimental phase.
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
+- **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
 
 ### External References
 
