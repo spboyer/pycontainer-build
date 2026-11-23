@@ -292,12 +292,16 @@ def test_build_config_rejects_unsupported_security_requests(security, platform, 
     assert message in str(error.value)
 
 
-def _build(tmp_path, monkeypatch, output_name, security=None, *, dry_run=False):
+def _build(
+    tmp_path, monkeypatch, output_name, security=None, *, dry_run=False, platform="linux/amd64"
+):
     context = _context_with_profile(tmp_path)
     monkeypatch.setattr(
         ImageBuilder,
         "_pull_base_image",
-        lambda self, layers_dir, os_name, arch: ([], BASE_IMAGE_CONFIG),
+        lambda self, layers_dir, os_name, arch: (
+            [], {**BASE_IMAGE_CONFIG, "architecture": arch}
+        ),
     )
     builder = ImageBuilder(
         BuildConfig(
@@ -308,6 +312,7 @@ def _build(tmp_path, monkeypatch, output_name, security=None, *, dry_run=False):
             use_cache=False,
             security=security,
             dry_run=dry_run,
+            platform=platform,
         )
     )
     builder.build()
@@ -357,8 +362,85 @@ def test_rebuild_removes_fragments_that_are_no_longer_requested(tmp_path, monkey
     assert not (tmp_path / "out" / SECURITY_DIR).exists()
 
 
-def test_invalid_seccomp_profile_fails_before_base_image_pull(tmp_path, monkeypatch):
+def test_multi_platform_security_fragments_are_written_without_changing_the_index(
+    tmp_path, monkeypatch
+):
+    platform = "linux/amd64,linux/arm64"
+    plain = _build(tmp_path, monkeypatch, "plain", platform=platform)
+    secured = _build(tmp_path, monkeypatch, "out", FULL_SECURITY, platform=platform)
+
+    assert secured.index_digest == plain.index_digest
+    assert [image.manifest_digest for image in secured.platform_images] == [
+        image.manifest_digest for image in plain.platform_images
+    ]
+    security_dir = tmp_path / "out" / SECURITY_DIR
+    assert json.loads((security_dir / KUBERNETES_FRAGMENT).read_text()) == {
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": True,
+    }
+    assert json.loads((security_dir / OCI_FRAGMENT).read_text()) == {
+        "linux": {"seccomp": SECCOMP_PROFILE},
+        "root": {"readonly": True},
+    }
+
+    _build(tmp_path, monkeypatch, "out", platform=platform)
+    assert not security_dir.exists()
+
+
+def test_multi_platform_security_accepts_spaced_platforms(tmp_path, monkeypatch):
+    builder = _build(
+        tmp_path, monkeypatch, "out", FULL_SECURITY,
+        platform=" linux/amd64, linux/arm64 ",
+    )
+
+    assert [image.platform["architecture"] for image in builder.platform_images] == [
+        "amd64", "arm64"
+    ]
+    assert (tmp_path / "out" / SECURITY_DIR / OCI_FRAGMENT).is_file()
+
+
+def test_failed_platform_preserves_security_fragments_and_index(tmp_path, monkeypatch):
+    context = _context_with_profile(tmp_path)
+    output = tmp_path / "out"
+    refs = output / "refs" / "tags"
+    security_dir = output / SECURITY_DIR
+    refs.mkdir(parents=True)
+    security_dir.mkdir()
+    (output / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    (security_dir / OCI_FRAGMENT).write_text("previous fragment")
+
+    def pull(self, layers_dir, os_name, arch):
+        if arch == "arm64":
+            raise RuntimeError("arm64 base unavailable")
+        return [], BASE_IMAGE_CONFIG
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull)
+    builder = ImageBuilder(BuildConfig(
+        tag="app:v1",
+        context_dir=str(context),
+        output_dir=str(output),
+        include_paths=["app.py"],
+        platform="linux/amd64,linux/arm64",
+        security=FULL_SECURITY,
+        use_cache=False,
+    ))
+
+    with pytest.raises(RuntimeError, match="arm64 base unavailable"):
+        builder.build()
+    assert (output / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
+    assert (security_dir / OCI_FRAGMENT).read_text() == "previous fragment"
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_invalid_seccomp_profile_fails_before_base_image_pull(tmp_path, monkeypatch, platform):
     context = _context_with_profile(tmp_path, {"defaultAction": "SCMP_ACT_NOTIFY"})
+    output = tmp_path / "out"
+    refs = output / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (output / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
 
     def unexpected_pull(*args):
         raise AssertionError("base image must not be pulled")
@@ -367,7 +449,9 @@ def test_invalid_seccomp_profile_fails_before_base_image_pull(tmp_path, monkeypa
     builder = ImageBuilder(
         BuildConfig(
             context_dir=str(context),
-            output_dir=str(tmp_path / "out"),
+            output_dir=str(output),
+            tag="app:v1",
+            platform=platform,
             include_paths=["app.py"],
             use_cache=False,
             security={"oci": {"seccomp_profile": "security/seccomp.json"}},
@@ -375,7 +459,9 @@ def test_invalid_seccomp_profile_fails_before_base_image_pull(tmp_path, monkeypa
     )
     with pytest.raises(ValueError, match="SCMP_ACT_NOTIFY"):
         builder.build()
-    assert not (tmp_path / "out" / SECURITY_DIR).exists()
+    assert not (output / SECURITY_DIR).exists()
+    assert (output / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
 
 
 def test_dry_run_validates_and_reports_fragments_without_writing(tmp_path, monkeypatch, capsys):

@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 from .metadata import REFERENCE_ANNOTATION, merge_image_labels, validate_metadata
 
+OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+
 @dataclass
 class OCILayer:
     media_type: str
@@ -133,3 +136,18 @@ def build_index_json(
         for name in names
     ] or [OCIManifestDescriptor("application/vnd.oci.image.manifest.v1+json",manifest_digest,manifest_size,platform)]
     return OCIIndex(2,descriptors,annotations,reference_name=tag or None).to_json()
+
+def build_image_index_json(manifests: List[OCIManifestDescriptor], *, annotations=None) -> Dict:
+    """Build a multi-platform image index referencing one manifest per platform."""
+    return OCIIndex(2, manifests, annotations).to_json()
+
+def build_layout_index_json(index_digest, index_size, ref_names: List[str], *, annotations=None) -> Dict:
+    """Build an image-layout index.json whose tagged descriptors resolve to an image index."""
+    descriptors = [
+        OCIManifestDescriptor(
+            OCI_INDEX_MEDIA_TYPE, index_digest, index_size,
+            annotations={REFERENCE_ANNOTATION: ref},
+        )
+        for ref in ref_names
+    ]
+    return OCIIndex(2, descriptors, annotations, reference_name=ref_names[0] if ref_names else None).to_json()
