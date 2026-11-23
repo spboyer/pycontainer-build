@@ -242,6 +242,16 @@ Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
 not verified.
+The `_pip_target.py` bootstrap also filters host pip environment variables and config-file keys
+to index, authentication, TLS, proxy and timeout settings (see
+`dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if
+pip's config hook changes. Requirements graphs and shipped pip inputs with
+literal URL credentials (userinfo, secret-like query values, or recognized or
+random-looking URL path tokens; detection is pattern-based) are rejected; pip
+errors are redacted. See
+`docs/AUTHENTICATION.md#private-package-indexes` and
+`tests/test_private_index.py`, which uses a loopback index and synthetic
+secrets only.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).
