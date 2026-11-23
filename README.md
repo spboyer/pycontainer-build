@@ -149,8 +149,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -475,6 +475,8 @@ The cache automatically:
 - Invalidates when file contents, relative paths, permission bits, the
   workdir or reproducibility settings change (mtime is ignored for
   reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
 
 **Saving and restoring the cache (offline export/import):** the `--cache-dir`
@@ -693,9 +695,11 @@ the current index push; no rollback is attempted.
 SBOM generation is not yet supported for index builds. A local single-platform
 `docker-archive:` base cannot satisfy an index build. Requirements and
 transitive dependency markers are evaluated separately for each target, and
-unknown target marker values fail the build. These are hermetic
-layout and protocol checks; they are not evidence that each image starts on
-its architecture, and `scripts/check_runtime_image.py` remains single-platform.
+unknown target marker values fail the build. Hermetic layout and protocol
+checks do not prove that images start. The optional
+`scripts/check_runtime_image.py --multi-platform-index` check builds an index,
+imports its native target with Skopeo, and starts it; see
+[runtime testing](docs/TESTING.md).
 
 ---
 

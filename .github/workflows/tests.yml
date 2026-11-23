@@ -222,6 +222,16 @@ jobs:
       contents: read
       packages: write
 
+  runtime-check:
+    name: Real OCI runtime check
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: tests
+    uses: ./.github/workflows/runtime-check.yml
+    with:
+      check-index: true
+    permissions:
+      contents: read
+
   registry-integration:
     name: Opt-in registry integration tests
     if: github.event_name == 'workflow_dispatch' && inputs['run-registry-integration']
