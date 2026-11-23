@@ -106,6 +106,10 @@ skopeo copy oci:dist/image docker-daemon:myapp:latest
 docker run -p 8000:8000 myapp:latest
 ```
 
+With several tags, select one explicitly, for example
+`skopeo copy oci:dist/image:myapp:stable docker-daemon:myapp:stable`; see
+[Multiple tags](docs/multiple-tags.md#output).
+
 #### Option 2: Use Podman (Native OCI Support)
 
 ```bash
