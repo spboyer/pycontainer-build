@@ -84,11 +84,12 @@ def test_cli_preserves_required_base_image_trust(tmp_path, monkeypatch):
     }
 
 
-def test_cli_accepts_base_image_trust_with_security_and_history(tmp_path, monkeypatch):
+def test_cli_accepts_base_image_trust_with_security_history_and_scan(tmp_path, monkeypatch):
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         '[build]\nbase_image = "registry.example/team/base:v1"\n'
         'record_history = true\nhistory_dir = "history"\n'
+        'scan = true\nscan_threshold = "critical"\n'
         '[build.base_image_trust]\nprovider = "cosign"\n'
         'repository = "registry.example/team/base"\n'
         'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
@@ -100,9 +101,54 @@ def test_cli_accepts_base_image_trust_with_security_and_history(tmp_path, monkey
     assert config.base_image_trust["repository"] == "registry.example/team/base"
     assert config.record_history is True
     assert config.history_dir == "history"
+    assert config.scan is True
+    assert config.scan_threshold == "critical"
     assert render_security_fragments(config.security, str(tmp_path)) == {
         KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
     }
+
+
+def test_scan_config_preserved_and_cli_policy_override(tmp_path, monkeypatch):
+    path = tmp_path / "scan.toml"
+    path.write_text("""
+[build]
+scan = true
+scan-threshold = "critical"
+scan-unknown = "ignore"
+scan-report-format = "sarif"
+scan-offline = true
+scan-db-max-age-hours = 24
+""")
+    config = _capture_config(monkeypatch, ["build", "--config", str(path)])
+    assert config.scan and config.scan_offline
+    assert config.scan_threshold == "critical"
+    assert config.scan_report_format == "sarif"
+    assert config.scan_db_max_age_hours == 24
+    config = _capture_config(monkeypatch, [
+        "build", "--config", str(path), "--scan-threshold", "low", "--scan-unknown", "fail",
+    ])
+    assert config.scan_threshold == "low"
+    assert config.scan_unknown == "fail"
+
+
+@pytest.mark.parametrize("category,exit_code", [("findings", 3), ("scanner", 4), ("database", 4)])
+def test_cli_scan_failure_blocks_push_and_has_distinct_exit(monkeypatch, category, exit_code):
+    from pycontainer.scanning import ScanError
+
+    class FailingBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            raise ScanError(category, "fixture failure")
+
+        def push(self, **kwargs):
+            pytest.fail("push after scan failure")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FailingBuilder)
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--scan", "--push"])
+    assert error.value.code == exit_code
 
 
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
