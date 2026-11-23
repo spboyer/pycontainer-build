@@ -1,9 +1,14 @@
+import re
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
 ARM_V7_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/119"
+_REGISTRY_HOST = re.compile(
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
+)
 
 
 def normalize_platforms(value: str) -> List[str]:
@@ -23,6 +28,28 @@ def normalize_platforms(value: str) -> List[str]:
         if platform not in platforms:
             platforms.append(platform)
     return platforms
+
+
+def validate_insecure_registries(registries: List[str]) -> List[str]:
+    """Normalize per-host plain-HTTP registry opt-ins (``host[:port]``)."""
+    if not isinstance(registries, list):
+        raise ValueError("insecure_registries must be a list of host[:port] strings.")
+    normalized = []
+    for entry in registries:
+        if not isinstance(entry, str) or not _REGISTRY_HOST.fullmatch(entry):
+            raise ValueError(
+                f"Invalid insecure registry {entry!r}: expected host[:port] without "
+                "a scheme, path, or credentials."
+            )
+        try:
+            port = urllib.parse.urlsplit(f"//{entry}").port
+        except ValueError:
+            port = 0
+        if port == 0:
+            raise ValueError(f"Invalid insecure registry port in {entry!r}.")
+        if entry.lower() not in normalized:
+            normalized.append(entry.lower())
+    return normalized
 
 
 @dataclass
@@ -56,12 +83,23 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    insecure_registries: List[str] = field(default_factory=list)
+    registry_ca_file: Optional[str] = None
     security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        self.insecure_registries = validate_insecure_registries(
+            self.insecure_registries
+        )
+        if self.registry_ca_file is not None:
+            from .registry_client import create_registry_ssl_context
+
+            if not isinstance(self.registry_ca_file, str) or not self.registry_ca_file:
+                raise ValueError("registry_ca_file must be a non-empty path string.")
+            create_registry_ssl_context(self.registry_ca_file)
         if self.security is not None:
             from .security import validate_security
 
