@@ -8,10 +8,35 @@ from typing import Dict, List, Optional, Union
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
+ARM_V7_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/119"
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
+MULTI_PLATFORM_SCAN_ERROR = (
+    "Vulnerability scanning is not supported for multi-platform images; "
+    "build and scan each platform separately."
+)
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
+
+
+def normalize_platforms(value: str) -> List[str]:
+    """Split a comma-separated platform list, validating and de-duplicating it."""
+    from .builder import parse_platform
+
+    if not isinstance(value, str):
+        raise ValueError("platform must be a string such as 'linux/amd64'.")
+    platforms: List[str] = []
+    for entry in value.split(","):
+        platform = entry.strip()
+        if not platform:
+            raise ValueError(
+                f"Invalid platform list {value!r}: entries must not be empty."
+            )
+        parse_platform(platform)
+        if platform not in platforms:
+            platforms.append(platform)
+    return platforms
 
 
 def validate_insecure_registries(registries: List[str]) -> List[str]:
@@ -162,7 +187,8 @@ class BuildConfig:
         if self.security is not None:
             from .security import validate_security
 
-            self.security = validate_security(self.security, self.platform)
+            for platform in normalize_platforms(self.platform):
+                self.security = validate_security(self.security, platform)
         if self.stop_signal is not None:
             validate_stop_signal(self.stop_signal)
         if not isinstance(self.volumes, list):
@@ -192,6 +218,27 @@ class BuildConfig:
                     "cache_from and cache_to require reproducible builds; "
                     "non-reproducible layers embed host timestamps and ownership."
                 )
+        platforms = normalize_platforms(self.platform)
+        if len(platforms) > 1:
+            unsupported = [p for p in platforms if p not in MULTI_PLATFORM_TARGETS]
+            if unsupported:
+                raise ValueError(
+                    "Multi-platform builds support only "
+                    f"{', '.join(MULTI_PLATFORM_TARGETS)}; unsupported target(s): "
+                    f"{', '.join(unsupported)}. linux/arm/v7 support is tracked in "
+                    f"{ARM_V7_FOLLOW_UP}."
+                )
+            if self.generate_sbom:
+                raise ValueError(
+                    "SBOM generation is not supported for multi-platform builds; "
+                    "build each platform separately to generate its SBOM."
+                )
+            if self.scan:
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+
+    def target_platforms(self) -> List[str]:
+        """Return the normalized, de-duplicated target platforms in request order."""
+        return normalize_platforms(self.platform)
 
     def validate_metadata(self) -> None:
         from .metadata import validate_metadata

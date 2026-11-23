@@ -14,7 +14,10 @@ from pycontainer.config import BuildConfig
 BASE_CONFIG = {
     "architecture": "amd64",
     "os": "linux",
-    "config": {"Env": [], "WorkingDir": "/"},
+    "config": {
+        "Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8", "PYTHON_LIBC=glibc-2.17"],
+        "WorkingDir": "/",
+    },
     "rootfs": {"type": "layers", "diff_ids": []},
 }
 
@@ -110,7 +113,7 @@ def test_failed_layer_write_cleans_only_its_staging_file(
         if layer_kind == "app":
             builder._create_app_layer(layers_dir, ["app.py"])
         else:
-            builder._create_deps_layer(layers_dir)
+            builder._create_deps_layer(layers_dir, base_config=BASE_CONFIG)
 
     assert sentinel.read_text() == "owned by another build"
     assert list(layers_dir.glob(f".{layer_kind}-layer-*.tmp")) == [sentinel]
