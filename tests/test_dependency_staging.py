@@ -114,7 +114,11 @@ def _builder(tmp_path, monkeypatch, *, context, **options):
     )
 
 
-def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypatch):
+@pytest.mark.parametrize("arch, variant", [("amd64", None), ("arm", "v7")])
+@pytest.mark.parametrize("implementation", [False, True])
+def test_staging_rejects_tag_without_recorded_pull_provenance(
+    tmp_path, monkeypatch, arch, variant, implementation
+):
     context = tmp_path / "context"
     context.mkdir()
     (context / "requirements.txt").write_text("fixture-dep==1.0\n")
@@ -124,12 +128,18 @@ def test_staging_rejects_tag_without_recorded_pull_provenance(tmp_path, monkeypa
     layers.mkdir()
     base_config = {
         "os": "linux",
-        "architecture": "amd64",
-        "config": {"Env": ["PYTHON_VERSION=3.11.8"]},
+        "architecture": arch,
+        **({"variant": variant} if variant else {}),
+        "config": {"Env": [
+            "PYTHON_VERSION=3.11.8",
+            *(["PYTHON_IMPLEMENTATION=CPython"] if implementation else []),
+        ]},
     }
 
     with pytest.raises(ValueError, match="unverified or custom base image"):
-        builder._create_deps_layer(layers, base_config=base_config)
+        builder._create_deps_layer(
+            layers, base_config=base_config, os_name="linux", arch=arch, variant=variant
+        )
 
 
 @pytest.mark.parametrize("signal", [
@@ -180,8 +190,9 @@ def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified):
+    def install(path, destination, *args, base_image_tag_verified, variant=None):
         assert base_image_tag_verified is False
+        assert variant is None
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
@@ -510,8 +521,9 @@ def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, 
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified):
+    def install(path, destination, *args, base_image_tag_verified, variant=None):
         assert base_image_tag_verified is False
+        assert variant is None
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
@@ -1991,9 +2003,7 @@ def test_codename_tag_keeps_dependency_layer_digest_for_same_wheel(
         builder._base_image_tag_verified = True
         layers = tmp_path / "layers" / base_image.replace(":", "_")
         layers.mkdir(parents=True)
-        config = UNPROVEN_BASE_CONFIG
-        if base_image == "python:3.11-slim":
-            config = {**BASE_CONFIG, **_libc_config("PYTHON_LIBC=glibc-2.17")}
+        config = BASE_CONFIG if base_image == "python:3.11-slim" else UNPROVEN_BASE_CONFIG
         digests.append(builder._create_deps_layer(layers, base_config=config).digest)
     assert digests[0] == digests[1]
 
@@ -2145,6 +2155,26 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
     with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
+ARM_V7_CONFIG = {**BASE_CONFIG, "architecture": "arm", "variant": "v7"}
+
+
+def _arm_v7_builder(tmp_path, monkeypatch, context):
+    monkeypatch.setattr(
+        ImageBuilder,
+        "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], ARM_V7_CONFIG),
+    )
+    return ImageBuilder(
+        BuildConfig(
+            context_dir=str(context),
+            output_dir=str(tmp_path / "output"),
+            use_cache=False,
+            include_deps=True,
+            platform="linux/arm/v7",
+        )
+    )
+
+
 def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> None:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     module = name.replace("-", "_")
@@ -2189,6 +2219,7 @@ def _install_marker_fixture(
         python_version,
         f"python:{python_version}-slim",
         {"config": {"Env": [f"PYTHON_VERSION={full_version}", f"PYTHON_LIBC={libc}"]}},
+        variant="v7" if arch == "arm" else None,
         base_image_tag_verified=True,
     )
     return {name for name, _ in staged_packages(destination)}
@@ -2199,6 +2230,7 @@ def _install_marker_fixture(
     [
         ("amd64", {"marker-amd", "marker-root-amd"}),
         ("arm64", {"marker-arm", "marker-feat", "marker-root-arm"}),
+        ("arm", {"marker-armv7", "marker-root-armv7"}),
     ],
 )
 def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
@@ -2214,6 +2246,7 @@ def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
         requires=[
             "marker-plain",
             'marker-arm; platform_machine == "aarch64"',
+            'marker-armv7; platform_machine == "armv7l"',
             'marker-amd; platform_machine == "x86_64"',
             'marker-win; sys_platform == "win32"',
             'marker-oldpy; python_version < "3.10"',
@@ -2225,6 +2258,7 @@ def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
     for name in (
         "marker-plain", "marker-arm", "marker-amd", "marker-win", "marker-oldpy",
         "marker-linux", "marker-feat", "marker-root-arm", "marker-root-amd",
+        "marker-armv7", "marker-root-armv7",
     ):
         _write_named_wheel(wheelhouse, name)
 
@@ -2234,6 +2268,7 @@ def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
             "marker-root[feat]",
             'marker-root-arm; platform_machine == "aarch64"',
             'marker-root-amd; platform_machine == "x86_64"',
+            'marker-root-armv7; platform_machine == "armv7l"',
         ],
         arch,
         "3.9",
@@ -2330,6 +2365,7 @@ def _multi_platform_marker_builder(tmp_path, monkeypatch, context):
         config = {
             **BASE_CONFIG,
             "architecture": arch,
+            **({"variant": "v7"} if arch == "arm" else {}),
             "config": {
                 **BASE_CONFIG["config"],
                 "Env": [
@@ -2348,11 +2384,125 @@ def _multi_platform_marker_builder(tmp_path, monkeypatch, context):
             base_image="example.invalid/custom:latest",
             context_dir=str(context),
             output_dir=str(tmp_path / "output"),
-            platform="linux/amd64,linux/arm64",
+            platform="linux/amd64,linux/arm64,linux/arm/v7",
             include_deps=True,
             use_cache=False,
         )
     )
+
+
+def test_arm_v7_maps_to_armv7l_wheel_tags_and_requires_variant():
+    verified = {"base_image_tag_verified": True, "variant": "v7"}
+    glibc = target_wheel_platforms(
+        "linux", "arm", "python:3.11-slim-bookworm", None, **verified
+    )
+    assert glibc[0] == "manylinux_2_31_armv7l"
+    assert glibc[-2:] == ["manylinux_2_17_armv7l", "manylinux2014_armv7l"]
+    assert target_wheel_platforms(
+        "linux", "arm", "python:3.11-alpine3.20", None, **verified
+    ) == ["musllinux_1_2_armv7l", "musllinux_1_1_armv7l"]
+    custom_config = {"config": {"Env": ["PYTHON_LIBC=glibc-2.17"]}}
+    options = _target_options(
+        "linux", "arm", "3.11", "example/python:custom", custom_config, variant="v7"
+    )
+    assert options[:4] == [
+        "--platform", "manylinux_2_17_armv7l", "--platform", "manylinux2014_armv7l"
+    ]
+    assert "--only-binary=:all:" in options
+    for variant, target in ((None, "linux/arm;"), ("v6", "linux/arm/v6;")):
+        with pytest.raises(ValueError, match=target):
+            _target_options(
+                "linux", "arm", "3.11", base_image_tag_verified=True, variant=variant
+            )
+        with pytest.raises(ValueError, match=target):
+            target_libc_config(
+                "linux", "arm", "python:3.11-slim", None, [],
+                base_image_tag_verified=True, variant=variant,
+            )
+
+
+def test_arm_v7_verified_tag_inspects_libc_from_base_layers(tmp_path):
+    layer = _base_metadata_layer(
+        tmp_path, [("var/lib/dpkg/status", _dpkg_libc("2.28-1", "armhf"))]
+    )
+    config = target_libc_config(
+        "linux", "arm", "python:3.11-slim", UNPROVEN_BASE_CONFIG, [layer],
+        base_image_tag_verified=True, variant="v7",
+    )
+    tags = target_wheel_platforms(
+        "linux", "arm", "python:3.11-slim", config,
+        base_image_tag_verified=True, variant="v7",
+    )
+    assert tags[0] == "manylinux_2_28_armv7l"
+    assert tags[-1] == "manylinux2014_armv7l"
+
+
+def test_arm_v7_verified_alpine_tag_inspects_apk_libc(tmp_path):
+    layer = _base_metadata_layer(
+        tmp_path, [("lib/apk/db/installed", b"P:musl\nV:1.2.5-r0\nA:armv7\n")]
+    )
+    config = target_libc_config(
+        "linux", "arm", "python:3.11-alpine", UNPROVEN_BASE_CONFIG, [layer],
+        base_image_tag_verified=True, variant="v7",
+    )
+    assert target_wheel_platforms(
+        "linux", "arm", "python:3.11-alpine", config,
+        base_image_tag_verified=True, variant="v7",
+    ) == ["musllinux_1_2_armv7l", "musllinux_1_1_armv7l"]
+
+
+def test_arm_v7_requirements_stage_only_armv7l_wheels(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(
+        context / "wheelhouse",
+        tag="cp311-cp311-manylinux2014_armv7l",
+    )
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+    (tmp_path / "layers").mkdir()
+
+    layer = builder._create_deps_layer(
+        tmp_path / "layers", base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+    )
+
+    with tarfile.open(layer.tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+
+
+def test_arm_v7_missing_wheel_fails_without_source_fallback(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(context / "wheelhouse", tag="cp311-cp311-manylinux2014_x86_64")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+
+    with pytest.raises(RuntimeError, match=r"linux/arm/v7.*never used as a fallback.*armv7l"):
+        builder._create_deps_layer(
+            tmp_path / "layers", base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+        )
+
+
+def test_dependency_layer_rejects_conflicting_base_config_variant(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n")
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+
+    with pytest.raises(ValueError, match="does not match the requested target linux/arm/v7"):
+        builder._create_deps_layer(
+            tmp_path / "layers",
+            base_config={**ARM_V7_CONFIG, "variant": "v6"},
+            os_name="linux",
+            arch="arm",
+            variant="v7",
+        )
 
 
 def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, monkeypatch):
@@ -2364,12 +2514,13 @@ def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, mo
         requires=[
             'transitive-amd; platform_machine == "x86_64"',
             'transitive-arm; platform_machine == "aarch64"',
+            'transitive-armv7; platform_machine == "armv7l"',
             'new-patch; python_full_version >= "3.11.9"',
         ],
     )
     for name in (
-        "transitive-amd", "transitive-arm", "new-patch", "root-amd", "root-arm",
-        "injected-dep",
+        "transitive-amd", "transitive-arm", "transitive-armv7",
+        "new-patch", "root-amd", "root-arm", "root-armv7", "injected-dep",
     ):
         _write_named_wheel(wheelhouse, name)
     injected_requirements = tmp_path / "host-requirements.txt"
@@ -2380,6 +2531,7 @@ def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, mo
         "marker-root\n"
         'root-amd; platform_machine == "x86_64"\n'
         'root-arm; platform_machine == "aarch64"\n'
+        'root-armv7; platform_machine == "armv7l"\n'
     )
     (context / "app.py").write_text("print('hello')\n")
     builder = _multi_platform_marker_builder(tmp_path, monkeypatch, context)
@@ -2389,6 +2541,7 @@ def test_multi_platform_build_resolves_markers_for_each_base_config(tmp_path, mo
     expected = {
         "amd64": {"marker_root", "transitive_amd", "root_amd"},
         "arm64": {"marker_root", "transitive_arm", "root_arm", "new_patch"},
+        "arm": {"marker_root", "transitive_armv7", "root_armv7", "new_patch"},
     }
     for image in builder.platform_images:
         with tarfile.open(image.layers[0].tar_path) as layer:
@@ -2704,6 +2857,27 @@ def test_virtualenv_transitive_markers_are_verified_for_each_target(tmp_path, mo
 
     _write_base_venv(context, {"venv-arm-helper": []})
     assert _stage_base_venv(tmp_path, monkeypatch, context, "arm64") is not None
+
+
+def test_arm_v7_virtualenv_checks_target_markers(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {"venv-root": ['Requires-Dist: venv-armv7-helper; platform_machine == "armv7l"']},
+    )
+    builder = _arm_v7_builder(tmp_path, monkeypatch, context)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+
+    with pytest.raises(ValueError, match="linux/arm/v7.*venv-armv7-helper"):
+        builder._create_deps_layer(
+            layers, base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+        )
+
+    _write_base_venv(context, {"venv-armv7-helper": []})
+    assert builder._create_deps_layer(
+        layers, base_config=ARM_V7_CONFIG, os_name="linux", arch="arm", variant="v7"
+    ) is not None
 
 
 def test_virtualenv_root_markers_are_verified_for_the_target(tmp_path, monkeypatch):
