@@ -182,8 +182,10 @@ There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
 and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
-multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
-does not measure external registry throughput. Do not describe suggested tools
+multiple blob sizes with per-sample peak RSS and Python allocation metrics, and
+`registry-network-*` cases that time the real sequential pull/build/push against
+a loopback registry with injected latency and bandwidth (see `docs/TESTING.md`);
+it does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
 
 ## Change discipline
