@@ -954,6 +954,44 @@ def test_cache_rejects_http_token_realm_without_sending_credentials(
 
 
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
+def test_cache_token_realm_never_receives_generic_destination_credentials(
+    tmp_path, registry, monkeypatch, option
+):
+    monkeypatch.setenv("REGISTRY_TOKEN", "synthetic-dest-token")
+    monkeypatch.setenv("REGISTRY_USERNAME", "dest-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "synthetic-dest-password")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(auth_module.Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr(remote_cache, "get_registry_auth", auth_module.get_registry_auth)
+    monkeypatch.setattr(auth_module.AzureCLIAuthProvider, "get_token", lambda self, host: None)
+    requests = []
+
+    def challenged_open(request, timeout=None):
+        requests.append((request.full_url, request.get_header("Authorization")))
+        if urllib.parse.urlsplit(request.full_url).netloc == "auth.cache.example":
+            return _Response(401)
+        raise _http_error(
+            request.full_url,
+            401,
+            {"WWW-Authenticate": 'Bearer realm="https://auth.cache.example/token",service="cache.example"'},
+        )
+
+    monkeypatch.setattr(registry, "open", challenged_open)
+    builder = _builder(tmp_path, "credentials", **{option: CACHE_SPEC})
+    if option == "cache_to":
+        with pytest.raises(RemoteCacheError, match="Failed to export"):
+            _app_layer(builder, tmp_path, "credentials")
+    else:
+        _app_layer(builder, tmp_path, "credentials")
+
+    hosts = {urllib.parse.urlsplit(url).netloc for url, _ in requests}
+    assert "auth.cache.example" in hosts
+    basic = "Basic " + base64.b64encode(b"dest-user:synthetic-dest-password").decode()
+    for _, header in requests:
+        assert header not in {"Bearer synthetic-dest-token", basic}
+        assert "synthetic-dest" not in (header or "")
+
+@pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 @pytest.mark.parametrize(
     ("host", "authorization", "azure_calls", "login_server"),
     [

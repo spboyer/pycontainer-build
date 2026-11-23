@@ -231,8 +231,8 @@ These are known gaps, **not fixed behavior**:
   `custom_build(tag=...)`) and multi-platform dev-loop requests are rejected,
   not emulated.
 
-Dependency staging installs wheel-only requirements for `linux/amd64` and
-`linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
+Dependency staging installs wheel-only requirements for `linux/amd64`,
+`linux/arm64` and `linux/arm/v7` CPython targets (1 MiB requirements file, 300-second timeout,
 512 MiB staged size and 100,000 files); the builder interpreter must provide
 `pip`. Existing virtualenv staging accepts
 pure-Python packages only and rejects native binaries; its Python minor version
@@ -301,8 +301,11 @@ Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
 not verified.
-Comma-separated `platform` values build an OCI image index for exactly
-`linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own
+Comma-separated `platform` values build an OCI image index for a subset of
+`linux/amd64`, `linux/arm64` and `linux/arm/v7`. arm/v7 requires the exact
+`v7` variant, uses `armv7l` wheel tags from the shared `_PIP_PLATFORMS` table
+in `dependencies.py` (keep #143 libc changes in that table), and never falls
+back to source builds; each platform gets its own
 base selection and dependency layer, including its own virtualenv closure check.
 Tags move only after the whole index verifies. A local `oci:` base must keep the
 same layout `index.json` across platforms. Detected virtualenvs take precedence;
