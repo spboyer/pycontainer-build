@@ -20,6 +20,8 @@ daemon without discussing the trade-off first.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `squash.py`, `layer_analysis.py`: opt-in builder-layer squashing with OCI
   whiteout/opaque semantics, and the `layer-analysis.json` report.
+- `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
+  Multi-platform index scanning is rejected; build and scan each target separately.
 - `system_packages.py`: system package declaration, inference and base-image
   verification (warning only). `system_install.py`: fail-closed groundwork for
   #31; it executes no package manager and has no callers until the #22
@@ -93,6 +95,14 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 
+Real scanner checks are separately marked `scanner_integration` and excluded
+by default. They require an explicitly selected Grype executable and controlled
+database digest; see [vulnerability scanning](docs/vulnerability-scanning.md)
+for the opt-in command and coverage limits. Fake-executable tests do not prove
+real Grype compatibility or OS/Python whiteout handling. A real Grype 0.119.0
+`linux/amd64` acceptance run passed on 2026-11-22; native Windows is rejected
+and macOS/arm64 scanner hosts remain unvalidated.
+
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
 3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
 in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`
@@ -112,8 +122,10 @@ record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
 Add `--multi-platform-index` to build both targets, select the native image
 from the index, verify its imported config digest and start it. Index evidence
-is separate from single-platform release evidence. Neither mode is part of
-default pytest.
+is separate from single-platform release evidence.
+To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
+(optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
+These modes are not part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
@@ -151,12 +163,15 @@ Skopeo from a container). The historical Linux-builder workaround for Windows
 CRLF console-script shebangs is tracked in
 [#225](https://github.com/spboyer/pycontainer-build/issues/225); its fix is
 included via [#228](https://github.com/spboyer/pycontainer-build/pull/228).
-Windows-built plain-versus-squashed fixture equivalence passed on commit
+The workaround is no longer required for the fixed Windows-generated entrypoints.
+Before final main integration, Windows-built plain-versus-squashed fixture equivalence passed on commit
 `a4fc1d5a41ff80b2b85f7441ab9c5a62c85294f0` in
 [hosted run 45203932420](https://github.com/spboyer/pycontainer-build/actions/runs/45203932420).
 The opt-in `windows-squash-equivalence` dispatch of `runtime-check.yml`
 builds layouts on a hosted Windows runner and compares their imported Linux
 runtime behavior, recording commit, run, attempt and artifact identity.
+Current integration evidence is recorded in
+[#195's testing section](https://github.com/spboyer/pycontainer-build/pull/195).
 See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 `tests/test_devloop.py` runs the Skaffold and Tilt example commands through
@@ -197,7 +212,10 @@ concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
 redirected storage hosts. Registry blob downloads verify descriptor digest and
 size before publication; only safe reads use bounded retries and explicit
-request timeouts.
+request timeouts. Registry HTTP(S) requests go through the client's openers:
+keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
+explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
+credentials over HTTP to non-loopback hosts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
@@ -212,10 +230,10 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
-- The registry client is HTTPS-only and does not read Docker `credsStore`,
-  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
-  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
-  (#29) are rejected, not emulated.
+- The registry client does not read Docker `credsStore`, `credHelpers` or
+  `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff (`PUSH_IMAGE=false`,
+  `custom_build(tag=...)`) and multi-platform dev-loop requests are rejected,
+  not emulated.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
@@ -224,11 +242,29 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
-registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
-glibc). This inference does not verify the actual libc version and can select
-incompatible wheels for older official images; #191 tracks the safety fix.
-All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` value (`glibc-2.N`, N 17-99, or `musl-1.N`, N 1-99); pip
+receives tags through the selected libc bound, newest first (`manylinux_2_N`..`manylinux_2_17`
+plus `manylinux2014`, or `musllinux_1_N`..`musllinux_1_1`). Official `python`
+tag-only registry pulls derive the libc family from the resolved tag (`alpine`
+means musl, otherwise glibc) and the version from mapped Debian/Alpine
+codename tokens (`docs/libc-codename-mappings.md` pins each row to immutable
+snapshot/commit sources; update it with the code table). Codename-less or unmapped
+official tag-only pulls instead use effective `libc6`/`musl` package metadata
+from digest-checked ordered layers. `base_libc.py` applies whiteouts and fails
+closed on active database links, unknown foreign links, absent/ambiguous
+records, unsupported versions or architecture mismatches. It recognizes the
+foreign root aliases `lib -> usr/lib` and `var -> usr/var` without following
+links and checks their redirected databases for conflicts. Historical links
+may cause conservative rejection. Limits are 8 MiB metadata, 2 GiB decoded
+bytes and 100,000 members per layer, and 300 seconds overall. It never extracts
+base files.
+Core defaults, auto-detection and the Aspire unversioned-tag invocation remain
+supported with this evidence. Missing evidence requires a mapped release or
+explicit base config `PYTHON_LIBC`. Inference uses a staging-only config copy.
+The system-package reporting scanner is not libc proof. Application `--env`
+overrides do not establish base metadata. The shared
+`_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` legacy alias values that
+`target_wheel_platforms` expands. All digest references, including tag-plus-digest, need supported
 `PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
 Local image names/annotations are not provenance either. The shared
 `target_wheel_platform` helper defaults to requiring explicit metadata;
@@ -261,6 +297,10 @@ only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
 `Lib` layout; `python_version` shared only when
 the venv minor is established) would have installed one of its missing
 requirements; otherwise unsatisfied target-active requirements fail closed.
+Extra markers compare canonical names on any vendored `packaging` version;
+`in`/`not in` keep PEP 508 substring semantics (not list membership), never
+name candidate extras or rule one out, and fail closed without
+`Provides-Extra`. Other `extra` operators and evaluation errors fail closed.
 Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
@@ -273,6 +313,17 @@ same layout `index.json` across platforms. Detected virtualenvs take precedence;
 exclude them to select the requirements file. Multi-tag registry pushes are not
 atomic: a later tag failure can leave earlier tags moved. Hermetic index tests do
 not prove per-architecture runtime startup.
+
+The `_pip_target.py` bootstrap also filters host pip environment variables and config-file keys
+to index, authentication, TLS, proxy and timeout settings (see
+`dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if
+pip's config hook changes. Requirements graphs and shipped pip inputs with
+literal URL credentials (userinfo, secret-like query values, or recognized or
+random-looking URL path tokens; detection is pattern-based) are rejected; pip
+errors are redacted. See
+`docs/AUTHENTICATION.md#private-package-indexes` and
+`tests/test_private_index.py`, which uses a loopback index and synthetic
+secrets only.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

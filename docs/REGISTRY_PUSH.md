@@ -129,12 +129,18 @@ docker run -d -p 5000:5000 --name registry registry:2
 
 ### Push to Local Registry
 
+The `registry:2` container serves plain HTTP, so opt that exact host in:
+
 ```bash
 # No authentication needed for local registry
 pycontainer build \
   --tag localhost:5000/myapp:test \
+  --insecure-registry localhost:5000 \
   --push
 ```
+
+Without `--insecure-registry`, pycontainer uses HTTPS and the push fails
+with a TLS/network error.
 
 ### Verify Push
 
@@ -145,6 +151,109 @@ curl http://localhost:5000/v2/_catalog
 # List tags
 curl http://localhost:5000/v2/myapp/tags/list
 ```
+
+## Insecure (HTTP) Registries and Custom CAs
+
+Registry traffic uses HTTPS with certificate verification by default. Two
+explicit settings change how a registry is reached; neither disables
+certificate verification, and there is no skip-verify option.
+
+### Plain HTTP for specific hosts
+
+```bash
+pycontainer build --tag registry.lan:5000/team/app:dev \
+  --insecure-registry registry.lan:5000 --push
+```
+
+```toml
+[build]
+insecure-registries = ["localhost:5000", "registry.lan:5000"]
+```
+
+- Entries are exact `host[:port]` values with no scheme, path, or
+  credentials (IPv6 literals must be bracketed, e.g. `[::1]:5000`). Matching
+  is case-insensitive and must equal the registry in the image reference,
+  including the port. Invalid entries are configuration errors.
+- Listed hosts use HTTP only; there is no HTTPS probe or fallback. Unlisted
+  hosts keep HTTPS and fail with the usual TLS/network error if the server
+  only speaks HTTP.
+- Each build logs `WARNING: using plain HTTP for insecure registry ...` once
+  per insecure host that it contacts (base-image pull or push).
+- **Credentials are never sent over HTTP to non-loopback hosts.** Only
+  `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped loopback literals may
+  receive Basic or bearer credentials over HTTP. For any other HTTP registry,
+  configured credentials (CLI, environment, Docker config, or Azure CLI) cause
+  an explicit `RegistryAuthenticationError`, and a token challenge from that
+  registry is refused before any token request is made. Such registries work
+  only anonymously.
+- HTTP traffic is unencrypted and unauthenticated: anyone on the network path
+  can read or alter image content. Use it only on trusted networks.
+
+`--insecure-registry` on the command line replaces, rather than extends, the
+`[build]` list.
+
+### Additional CA for private HTTPS registries
+
+```bash
+pycontainer build --tag registry.corp:443/team/app:1.0 \
+  --registry-ca-file ./corp-root-ca.pem --push
+```
+
+```toml
+[build]
+registry-ca-file = "corp-root-ca.pem"
+```
+
+- The PEM bundle is added to the system trust store for all registry HTTPS
+  traffic in the build: registry API calls, token realms, and blob storage
+  redirects. Hostname and chain verification remain enabled.
+- Relative paths resolve from the current working directory. A missing,
+  unreadable, or invalid file is a configuration error.
+- There is one bundle per build; per-registry CA mapping and client
+  certificates (mTLS) are not supported.
+
+### Redirect and transport rules
+
+- HTTPS responses may not redirect to HTTP (manifests, blobs, token realms,
+  and upload locations); the downgrade is rejected before the HTTP target is
+  contacted.
+- An HTTPS registry must advertise an HTTPS token realm.
+- Initial requests, token realms, upload locations and redirects reject
+  unsupported schemes, malformed authorities/ports (including port zero),
+  whitespace/control characters, invalid percent escapes, embedded credentials,
+  and fragments. Error URLs omit userinfo, queries and fragments; unparseable
+  URLs are reported with a fixed placeholder.
+- `Authorization`, `Proxy-Authorization`, and `Cookie` are removed when a
+  redirect changes scheme, host, or effective port (an omitted port equals its
+  scheme default). Blob storage redirects are always fetched without credentials.
+- Each client reuses one verifying TLS context and request opener. Its
+  non-redirecting blob opener is created once under a lock on first pull,
+  using that same context; push-only clients never construct it. Concurrent
+  initial bearer challenges share one token acquisition and replay once.
+  Rejection of the current bearer token is reported, not refreshed indefinitely.
+- Manifest responses are read at most to the descriptor's expected size, or
+  16 MiB when the size is unknown (never more than 16 MiB), including after a
+  bearer-challenge replay; larger responses fail with `RegistryRequestError`.
+
+### Proxy policy
+
+Registry connections are direct. Both request openers explicitly disable urllib
+environment and system proxy discovery, so `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and their lowercase variants do not route registry, token or
+storage requests. Proxy URLs and proxy credentials are not supported.
+This applies to both HTTP and HTTPS, including custom-CA connections.
+
+### Limitations
+
+- Tests cover an in-process loopback Registry v2 stub over HTTP and a
+  test-generated CA over HTTPS, including token acquisition and manifest/blob
+  redirect targets succeeding with the CA and failing without it. Regressions
+  cover concurrent first-use, opener reuse and token challenge replay.
+  Compatibility with specific registry products
+  (for example `registry:2`, Harbor, Nexus, or Artifactory) over HTTP or with
+  private CAs has not been verified in CI.
+- The Poetry, Hatch, and VS Code integrations do not expose these options;
+  use the CLI or `pycontainer.toml`.
 
 ## Programmatic Usage
 
@@ -215,12 +324,13 @@ This makes subsequent pushes much faster.
 
 ### Registry errors, rate limits and quotas
 
-Registry failures report the operation, registry host, HTTP status and the
-OCI distribution error codes from the response body, for example:
+Registry failures report the operation, registry host and HTTP status.
+Distribution error codes and messages are used to classify failures, but
+transfer response bodies are omitted because they can echo image metadata:
 
 ```text
-Manifest pull failed with HTTP 429 from registry-1.docker.io: TOOMANYREQUESTS:
-You have reached your pull rate limit. The registry rate limit was exceeded;
+Manifest pull failed with HTTP 429 from registry-1.docker.io: (response details omitted)
+The registry rate limit was exceeded;
 it resets in about 3600 seconds (at 2026-11-20T18:00:00Z). Rate limit: 0 of
 100 remaining. Authenticate to the registry ...
 ```
@@ -247,11 +357,10 @@ Run with `--verbose` to log Docker Hub style `RateLimit-Limit` and
 `RateLimit-Remaining` headers. A warning is printed once per registry client
 when the remaining count drops to 10 (or 10% of a smaller limit) or fewer.
 
-Error bodies are treated as untrusted: at most five errors are shown, each
-message is truncated, control characters are removed, and authorization
-values, tokens and the configured credentials, including URL-encoded forms,
-are replaced with `[REDACTED]`.
-Registry hosts and HTTP(S) URLs in error details omit userinfo and query strings.
+Token-exchange error bodies are treated as untrusted: at most five errors are
+shown, messages are truncated, control characters are removed, and credentials
+are replaced with `[REDACTED]`. Registry hosts and HTTP(S) URLs in error
+details omit userinfo and query strings.
 
 ## Authentication Priority
 

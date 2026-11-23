@@ -158,16 +158,15 @@ Historically, Windows staging produced CRLF console-script shebangs that failed
 in Linux containers, with or without squashing
 ([#225](https://github.com/spboyer/pycontainer-build/issues/225)). The fix
 from [#228](https://github.com/spboyer/pycontainer-build/pull/228) is included.
-The Windows-built fixture passed the hosted Linux comparison on commit
+Before the final main integration, the Windows-built fixture passed the hosted Linux comparison on commit
 `a4fc1d5a41ff80b2b85f7441ab9c5a62c85294f0` in
 [run 45203932420](https://github.com/spboyer/pycontainer-build/actions/runs/45203932420);
-that result applies to this fixture and commit. The prior Linux-builder
-workaround remains an option when using Docker Desktop on Windows:
-
-```powershell
-docker run --rm -v //var/run/docker.sock:/var/run/docker.sock -v "${PWD}:/src:ro" -w /src docker:cli `
-  sh -c "apk add -q python3 py3-pip skopeo && PYTHONPATH=src python3 scripts/check_squash_equivalence.py --timeout 300"
-```
+that result applies to this fixture and commit. The former Linux-builder
+workaround is no longer required for the fixed Windows-generated entrypoints.
+The verifier still requires Linux runtime tools, so use a Linux host or the
+isolated hosted workflow below. Current integration coverage and exact-head
+artifact provenance are recorded in
+[#195's testing section](https://github.com/spboyer/pycontainer-build/pull/195).
 
 For an isolated cross-host check, dispatch the existing runtime workflow from
 the branch to test:

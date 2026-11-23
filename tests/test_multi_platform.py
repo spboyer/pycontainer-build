@@ -26,13 +26,21 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _base_layer(arch: str):
+def _base_layer(arch: str, libc_version=None):
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as tar:
         payload = f"base for {arch}".encode()
         info = tarfile.TarInfo(f"etc/{arch}")
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
+        if libc_version is not None:
+            payload = (
+                "Package: libc6\nStatus: install ok installed\n"
+                f"Version: {libc_version}-1\nArchitecture: {arch}\n\n"
+            ).encode()
+            info = tarfile.TarInfo("var/lib/dpkg/status")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
     uncompressed = raw.getvalue()
     return gzip.compress(uncompressed, mtime=0), _digest(uncompressed)
 
@@ -41,12 +49,14 @@ class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
     def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None,
-                 base_env_by_arch=None):
+                 base_env_by_arch=None, base_runtime_by_arch=None, libc_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
         for arch in platforms:
-            layer, diff_id = _base_layer(arch)
+            layer, diff_id = _base_layer(
+                arch, libc_by_arch[arch] if libc_by_arch is not None else None
+            )
             if arch == wrong_diff_id_arch:
                 diff_id = _digest(b"not the layer content")
             env = base_env_by_arch[arch] if base_env_by_arch is not None else base_env
@@ -55,10 +65,13 @@ class FakeBaseRegistry:
                     "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
                     "PYTHON_LIBC=glibc-2.17",
                 ]
+            runtime = {"Env": env, "WorkingDir": "/"}
+            if base_runtime_by_arch is not None:
+                runtime.update(base_runtime_by_arch[arch])
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
-                "config": {"Env": env, "WorkingDir": "/"},
+                "config": runtime,
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
             manifest = json.dumps({
@@ -221,7 +234,7 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
     def record(name):
         def fake(*args, base_image_tag_verified=False, **kwargs):
             seen.append((name, base_image_tag_verified))
-            return "3.11"
+            return [] if name == "install" else "3.11"
         return fake
 
     monkeypatch.setattr(builder_module, "target_python_version", record("version"))
@@ -241,12 +254,15 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
 def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     tmp_path, monkeypatch, by_digest
 ):
-    registry = FakeBaseRegistry(base_env=[])
+    registry = FakeBaseRegistry(
+        base_env=[], libc_by_arch={"amd64": "2.28", "arm64": "2.36"}
+    )
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
                      base_image, base_config, *, base_image_tag_verified):
         installs.append((arch, version, base_image_tag_verified))
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     base_image = "python:3.11-slim"
@@ -267,6 +283,65 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
         assert installs == [("amd64", "3.11", True), ("arm64", "3.11", True)]
 
 
+@pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
+def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
+    tmp_path, monkeypatch, source
+):
+    registry = FakeBaseRegistry(
+        base_env=["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"],
+        libc_by_arch={"amd64": "2.28", "arm64": "2.36"},
+    )
+    if source == "unresolved-tag":
+        client_factory = registry.client
+
+        def unresolved_client(*args, **kwargs):
+            client = client_factory(*args, **kwargs)
+            pull = client.pull_manifest
+
+            def pull_manifest(reference, **expected):
+                manifest, digest = pull(reference, **expected)
+                return manifest, None if reference == "3.11-slim" else digest
+
+            client.pull_manifest = pull_manifest
+            return client
+
+        registry.client = unresolved_client
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, *, base_image_tag_verified):
+        installs.append((arch, base_config["config"]["Env"], base_image_tag_verified))
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    base_image = "python:3.11-slim"
+    if source == "digest":
+        base_image += "@" + registry.index_digest
+    builder = _builder(
+        tmp_path, monkeypatch, registry, include_deps=True,
+        ctx=_context(tmp_path, requirements=True), base_image=base_image,
+    )
+
+    if source != "verified-tag":
+        with pytest.raises(ValueError, match="unverified or custom"):
+            builder.build()
+        assert installs == []
+        assert not (tmp_path / "out" / "index.json").exists()
+        return
+
+    builder.build()
+    assert [
+        (arch, next(item for item in env if item.startswith("PYTHON_LIBC=")), verified)
+        for arch, env, verified in installs
+    ] == [
+        ("amd64", "PYTHON_LIBC=glibc-2.28", True),
+        ("arm64", "PYTHON_LIBC=glibc-2.36", True),
+    ]
+    for image in builder.platform_images:
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert not any(item.startswith("PYTHON_LIBC=") for item in config["config"]["Env"])
+
+
 def test_normalize_platforms_strips_and_dedupes():
     assert normalize_platforms(" linux/amd64 , linux/arm64,linux/amd64") == [
         "linux/amd64",
@@ -276,6 +351,73 @@ def test_normalize_platforms_strips_and_dedupes():
         normalize_platforms("linux/amd64,,linux/arm64")
 
 
+def test_scanning_multi_platform_config_is_rejected():
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        BuildConfig(platform=MULTI, scan=True)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_enabling_scanning_after_configuration_rejects_index_build(
+    tmp_path, monkeypatch, dry_run
+):
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, dry_run=dry_run)
+    builder.config.scan = True
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.build()
+    assert registry.manifest_calls == []
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_enabling_scanning_after_index_build_rejects_push_before_auth(
+    tmp_path, monkeypatch
+):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry())
+    builder.build()
+    original_index = (tmp_path / "out" / "index.json").read_bytes()
+    builder.config.scan = True
+    builder.config.platform = "linux/amd64"
+    monkeypatch.setattr(
+        builder_module, "get_registry_auth", lambda *args, **kwargs: pytest.fail("auth before gate")
+    )
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.push(show_progress=False)
+    assert (tmp_path / "out" / "index.json").read_bytes() == original_index
+
+
+@pytest.mark.parametrize(
+    "entrypoint,cmd,expected_entrypoint,expected_cmd",
+    [
+        (None, ["/bin/sh", "-c", 'echo "$NAME"'], "inherited", ["/bin/sh", "-c", 'echo "$NAME"']),
+        (None, ["python", "app.py"], "inherited", ["python", "app.py"]),
+        (None, [], "inherited", None),
+        ([], None, None, "inherited"),
+        ([], [], None, None),
+    ],
+    ids=["shell-cmd", "exec-cmd", "clear-cmd", "clear-entrypoint", "clear-both"],
+)
+def test_platform_commands_inherit_and_clear_independently(
+    tmp_path, monkeypatch, entrypoint, cmd, expected_entrypoint, expected_cmd
+):
+    runtime = {
+        arch: {"Entrypoint": [f"{arch}-entrypoint"], "Cmd": [f"{arch}-base-cmd"]}
+        for arch in ("amd64", "arm64")
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=runtime),
+        entrypoint=entrypoint, cmd=cmd,
+    )
+    builder.build()
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        assert config.get("Entrypoint") == (
+            runtime[arch]["Entrypoint"] if expected_entrypoint == "inherited"
+            else expected_entrypoint
+        )
+        assert config.get("Cmd") == (
+            runtime[arch]["Cmd"] if expected_cmd == "inherited" else expected_cmd
+        )
 @pytest.mark.parametrize("platform", ["linux/amd64,linux/arm/v7", "linux/amd64,linux/arm64/v8"])
 def test_multi_platform_rejects_unsupported_targets(platform):
     with pytest.raises(ValueError, match="issues/119"):
@@ -331,6 +473,184 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
     ]
 
 
+def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
+    tmp_path, monkeypatch
+):
+    bases = {
+        arch: {
+            "Entrypoint": [f"{arch}-entrypoint"],
+            "StopSignal": signal,
+            "Volumes": {f"/{arch}": {}},
+            "Labels": {"base": arch},
+        }
+        for arch, signal in (("amd64", "SIGQUIT"), ("arm64", "SIGINT"))
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases),
+        tags=["stable"], cmd=["python", "app.py"],
+        labels={"example.label": "explicit"},
+        manifest_annotations={"example.manifest": "manifest-value"},
+        index_annotations={"example.index": "index-value"},
+    )
+    builder.build()
+    out = tmp_path / "out"
+    layout = json.loads((out / "index.json").read_bytes())
+    assert layout["annotations"] == {
+        "example.index": "index-value",
+        "org.opencontainers.image.ref.name": "registry.example/team/app:v1",
+    }
+    assert {
+        descriptor["annotations"]["org.opencontainers.image.ref.name"]
+        for descriptor in layout["manifests"]
+    } == {"registry.example/team/app:v1", "registry.example/team/app:stable"}
+    index_bytes = _blob(out, builder.index_digest)
+    assert _digest(index_bytes) == builder.index_digest
+    for descriptor in layout["manifests"]:
+        assert descriptor["digest"] == builder.index_digest
+        assert descriptor["size"] == len(index_bytes)
+    index = json.loads(index_bytes)
+    assert index["annotations"] == {"example.index": "index-value"}
+    for descriptor in index["manifests"]:
+        arch = descriptor["platform"]["architecture"]
+        manifest_bytes = _blob(out, descriptor["digest"])
+        assert _digest(manifest_bytes) == descriptor["digest"]
+        assert len(manifest_bytes) == descriptor["size"]
+        manifest = json.loads(manifest_bytes)
+        assert manifest["annotations"] == {"example.manifest": "manifest-value"}
+        config_descriptor = manifest["config"]
+        config_bytes = _blob(out, config_descriptor["digest"])
+        assert _digest(config_bytes) == config_descriptor["digest"]
+        assert len(config_bytes) == config_descriptor["size"]
+        config = json.loads(config_bytes)["config"]
+        assert config["Labels"] == {"base": arch, "example.label": "explicit"}
+        assert config["Entrypoint"] == [f"{arch}-entrypoint"]
+        assert config["Cmd"] == ["python", "app.py"]
+        assert config["StopSignal"] == bases[arch]["StopSignal"]
+        assert config["Volumes"] == bases[arch]["Volumes"]
+
+    client = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    builder.push(show_progress=False)
+    assert [call for call in client.calls if call[0] == "index"] == [
+        ("index", builder.index_digest, builder.index_digest),
+        ("index", "v1", builder.index_digest),
+        ("index", "stable", builder.index_digest),
+    ]
+
+
+def test_multi_platform_annotation_changes_recompute_only_dependent_digests(
+    tmp_path, monkeypatch
+):
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(),
+        manifest_annotations={"example.z": "two", "example.manifest": "one"},
+        index_annotations={"example.z": "two", "example.index": "one"},
+    )
+    builder.build()
+    original_index = builder.index_digest
+    original_manifests = [image.manifest_digest for image in builder.platform_images]
+    original_configs = [image.config_digest for image in builder.platform_images]
+
+    builder.config.manifest_annotations = dict(reversed(list(builder.config.manifest_annotations.items())))
+    builder.config.index_annotations = dict(reversed(list(builder.config.index_annotations.items())))
+    builder.build()
+    assert builder.index_digest == original_index
+    assert [image.manifest_digest for image in builder.platform_images] == original_manifests
+
+    builder.config.index_annotations["example.index"] = "two"
+    builder.build()
+    assert builder.index_digest != original_index
+    assert [image.manifest_digest for image in builder.platform_images] == original_manifests
+    index_with_new_annotation = builder.index_digest
+
+    builder.config.manifest_annotations["example.manifest"] = "two"
+    builder.build()
+    assert builder.index_digest != index_with_new_annotation
+    assert all(
+        image.manifest_digest != previous
+        for image, previous in zip(builder.platform_images, original_manifests)
+    )
+    assert [image.config_digest for image in builder.platform_images] == original_configs
+
+
+@pytest.mark.parametrize("release_key", ["example.notes", "framework"])
+def test_multi_platform_release_notes_respect_label_precedence(
+    tmp_path, monkeypatch, release_key
+):
+    ctx = _context(tmp_path)
+    (ctx / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    (ctx / "notes.md").write_bytes(b"release notes\r\n")
+    bases = {
+        arch: {"Labels": {release_key: f"base-{arch}", "shared": "base"}}
+        for arch in ("amd64", "arm64")
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), ctx=ctx,
+        release_notes_file="notes.md", release_notes_label=release_key,
+        labels={"shared": "explicit"},
+        manifest_annotations={"example.manifest": "one"},
+        index_annotations={"example.index": "one"},
+    )
+    builder.build()
+    for image in builder.platform_images:
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        assert config["Labels"][release_key] == "release notes\n"
+        assert config["Labels"]["shared"] == "explicit"
+
+
+@pytest.mark.parametrize("release_key", ["example.notes", "framework"])
+def test_multi_platform_release_notes_reject_explicit_label_collisions_before_pull(
+    tmp_path, monkeypatch, release_key
+):
+    from pycontainer.release_notes import ReleaseNotesError
+
+    ctx = _context(tmp_path)
+    (ctx / "notes.md").write_text("notes")
+    registry = FakeBaseRegistry()
+    with pytest.raises(ReleaseNotesError, match="conflict"):
+        _builder(
+            tmp_path, monkeypatch, registry, ctx=ctx,
+            release_notes_file="notes.md", release_notes_label=release_key,
+            labels={release_key: "explicit"},
+        )
+    assert registry.manifest_calls == []
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
+    tmp_path, monkeypatch, override
+):
+    bases = {
+        "amd64": {"StopSignal": "SIGQUIT", "Volumes": {"/amd64": {}}},
+        "arm64": {"StopSignal": "SIGINT", "Volumes": {"/arm64": {}}},
+    }
+    options = {"stop_signal": "SIGTERM", "volumes": ["/shared"]} if override else {}
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), **options
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+
+    for descriptor in index["manifests"]:
+        arch = descriptor["platform"]["architecture"]
+        manifest_bytes = _blob(out, descriptor["digest"])
+        assert _digest(manifest_bytes) == descriptor["digest"]
+        assert len(manifest_bytes) == descriptor["size"]
+        manifest = json.loads(manifest_bytes)
+        config_descriptor = manifest["config"]
+        config_bytes = _blob(out, config_descriptor["digest"])
+        assert _digest(config_bytes) == config_descriptor["digest"]
+        assert len(config_bytes) == config_descriptor["size"]
+        config = json.loads(config_bytes)["config"]
+        assert config["StopSignal"] == ("SIGTERM" if override else bases[arch]["StopSignal"])
+        volumes = {f"/{arch}": {}}
+        if override:
+            volumes["/shared"] = {}
+        assert config["Volumes"] == volumes
+
+
 def test_repeated_reproducible_builds_have_same_index_digest(tmp_path, monkeypatch):
     registry = FakeBaseRegistry()
     first = _builder(tmp_path, monkeypatch, registry)
@@ -338,6 +658,30 @@ def test_repeated_reproducible_builds_have_same_index_digest(tmp_path, monkeypat
     second = ImageBuilder(first.config)
     second.build()
     assert second.index_digest == first.index_digest
+
+
+def test_multi_platform_history_records_each_base_and_one_shared_app(tmp_path, monkeypatch):
+    from pycontainer.history import BuildHistory, BuildTiming
+
+    phases = []
+    original_phase = BuildTiming.phase
+
+    def record_phase(self, name):
+        phases.append(name)
+        return original_phase(self, name)
+
+    monkeypatch.setattr(BuildTiming, "phase", record_phase)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), record_history=True,
+        history_dir=str(tmp_path / "history"),
+    )
+    phases.clear()
+    builder.build()
+
+    assert phases == ["base_image", "application", "base_image"]
+    record = BuildHistory(tmp_path / "history").list()[0]
+    assert record["status"] == "success"
+    assert set(record["phases_ns"]) == {"base_image", "application"}
 
 
 def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
@@ -349,6 +693,7 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(f"ARCH = {arch!r}\n")
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     builder = _builder(
@@ -368,6 +713,70 @@ def test_dependency_layers_are_isolated_per_platform(tmp_path, monkeypatch):
         assert not any("native_" in name and arch not in name for name in names)
 
 
+def test_multi_platform_pull_and_push_use_registry_transport_settings(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry()
+    pull_client = registry.client
+    clients = []
+
+    def record_pull(host, repo, **kwargs):
+        clients.append((host, repo, kwargs["insecure"], kwargs["ca_file"]))
+        return pull_client(host, repo, **kwargs)
+
+    registry.client = record_pull
+    monkeypatch.setattr(
+        "pycontainer.registry_client.create_registry_ssl_context", lambda _path: None
+    )
+    builder = _builder(
+        tmp_path, monkeypatch, registry,
+        insecure_registries=["registry.example"],
+        registry_ca_file="synthetic-ca.pem",
+    )
+    builder.build()
+    push_client = FakePushClient()
+
+    def record_push(host, repo, **kwargs):
+        clients.append((host, repo, kwargs["insecure"], kwargs["ca_file"]))
+        return push_client(host, repo, **kwargs)
+
+    monkeypatch.setattr(builder_module, "RegistryClient", record_push)
+    builder.push(show_progress=False)
+
+    assert clients == [
+        ("registry.example", "library/python", True, "synthetic-ca.pem"),
+        ("registry.example", "library/python", True, "synthetic-ca.pem"),
+        ("registry.example", "team/app", True, "synthetic-ca.pem"),
+    ]
+    assert any(call[0] == "index" and call[1] == "v1" for call in push_client.calls)
+
+
+def test_multi_platform_rejects_shipped_credentials_before_cache_and_publication(
+    tmp_path, monkeypatch
+):
+    ctx = _context(tmp_path, requirements=True)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), ctx=ctx,
+        use_cache=True, cache_dir=str(tmp_path / "cache"),
+    )
+    builder.build()
+    out = tmp_path / "out"
+    previous_index = (out / "index.json").read_bytes()
+    previous_tag = (out / "refs" / "tags" / "v1").read_bytes()
+    (ctx / "requirements.txt").write_text(
+        "--index-url https://synthetic-user:synthetic-secret@example.invalid/simple\n"
+    )
+
+    def unexpected_cache_lookup(*args, **kwargs):
+        pytest.fail("credential check must run before cache lookup")
+
+    monkeypatch.setattr(builder.cache, "get_layer", unexpected_cache_lookup)
+    with pytest.raises(ValueError, match="literal credentials") as error:
+        builder.build()
+
+    assert "synthetic-secret" not in str(error.value)
+    assert (out / "index.json").read_bytes() == previous_index
+    assert (out / "refs" / "tags" / "v1").read_bytes() == previous_tag
+
+
 def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, monkeypatch):
     ctx = _context(tmp_path, requirements=True)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
@@ -377,12 +786,51 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
 
     def fake_install(requirements, site_packages, context, os_name, arch, version, base_image, base_config, **kwargs):
         installs.append(arch)
+        return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     builder = _builder(
         tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True,
         ctx=ctx, exclude_paths=[".venv"],
     )
+    builder.build()
+    assert installs == ["amd64", "arm64"]
+
+
+def test_multi_platform_rejects_conda_only_before_pulling_or_publication(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    (ctx / "environment.yml").write_text("name: example\n")
+    out = tmp_path / "out"
+    refs = out / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (out / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, include_deps=True, ctx=ctx)
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+    assert registry.manifest_calls == []
+    assert (out / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
+
+
+def test_multi_platform_conda_with_requirements_stages_each_target(tmp_path, monkeypatch):
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "environment.yml").write_text("name: example\n")
+    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "demo.py").write_text("X = 1\n")
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, **kwargs):
+        installs.append(arch)
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
     builder.build()
     assert installs == ["amd64", "arm64"]
 
@@ -657,6 +1105,7 @@ def _install_fake_deps(monkeypatch):
         package = site_packages / f"native_{arch}"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(f"ARCH = {arch!r}\n")
+        return [requirements]
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
 
@@ -722,6 +1171,60 @@ def test_squash_and_security_fragments_can_be_combined(tmp_path, monkeypatch):
     assert (tmp_path / "secured" / "layer-analysis.json").is_file()
     fragment = tmp_path / "secured" / "security" / "kubernetes-security-context.json"
     assert json.loads(fragment.read_text()) == {"capabilities": {"drop": ["ALL"]}}
+
+
+@pytest.mark.parametrize("platform", [MULTI, "linux/amd64"])
+def test_squash_preserves_runtime_metadata_and_local_history(tmp_path, monkeypatch, platform):
+    from pycontainer.history import BuildHistory
+
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "notes.md").write_bytes(b"Release notes\r\n")
+    registry = FakeBaseRegistry(base_runtime_by_arch={
+        arch: {"Labels": {"base-label": arch}, "Volumes": {"/data": {}}}
+        for arch in ("amd64", "arm64")
+    })
+    builder = _builder(
+        tmp_path, monkeypatch, registry, ctx=ctx, platform=platform,
+        include_deps=True, squash=True, analyze_layers=True,
+        labels={"app-label": "value"},
+        manifest_annotations={"example.manifest": "value"},
+        index_annotations={"example.index": "value"},
+        stop_signal="SIGTERM", volumes=["/cache"],
+        release_notes_file="notes.md", release_notes_label="example.notes",
+        record_history=True, history_dir=str(tmp_path / "history"),
+    )
+    builder.build()
+    original_digest = builder.manifest_digest
+    builder.build()
+
+    assert builder.manifest_digest == original_digest
+    output = tmp_path / "out"
+    layout = json.loads((output / "index.json").read_bytes())
+    assert layout["annotations"]["example.index"] == "value"
+    if platform == MULTI:
+        image_index = json.loads(_blob(output, builder.index_digest))
+        assert image_index["annotations"] == {"example.index": "value"}
+    for image in builder.platform_images:
+        manifest = json.loads(_blob(output, image.manifest_digest))
+        config = json.loads(_blob(output, image.config_digest))
+        assert manifest["annotations"] == {"example.manifest": "value"}
+        assert len(image.layers) == 2
+        assert config["config"]["Labels"] == {
+            "base-label": image.platform["architecture"],
+            "app-label": "value", "example.notes": "Release notes\n",
+        }
+        assert config["config"]["StopSignal"] == "SIGTERM"
+        assert config["config"]["Volumes"] == {"/cache": {}, "/data": {}}
+        assert config["rootfs"]["diff_ids"][-1] == image.layers[-1].digest
+        builder_module._verify_platform_image(output / "blobs" / "sha256", image, True)
+    reports = json.loads((output / "layer-analysis.json").read_bytes())["platforms"]
+    assert len(reports) == len(builder.platform_images)
+    records = BuildHistory(tmp_path / "history").list()
+    assert len(records) == 2
+    for record in records:
+        assert record["status"] == "success"
+        assert {"base_image", "dependencies", "application"} <= record["phases_ns"].keys()
 
 
 def test_repeated_squashed_builds_are_reproducible(tmp_path, monkeypatch):
