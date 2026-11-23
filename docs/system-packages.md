@@ -15,9 +15,13 @@ correctly with zero runtime dependencies, so this feature is a validated
 declaration plus a verification report:
 
 1. Declare packages explicitly or let common ones be detected.
-2. The pulled base image layers are inspected (`/var/lib/dpkg/status` for
-   Debian/Ubuntu, `/lib/apk/db/installed` for Alpine; distro from `os-release`).
-3. A warning is logged for each required package the base image lacks.
+2. The pulled base image layers are applied in order, honoring OCI whiteouts
+   and opaque directories, and the effective package database is inspected
+   (`/var/lib/dpkg/status` and `/var/lib/dpkg/status.d/*` for Debian/Ubuntu,
+   `/lib/apk/db/installed` for Alpine; distro from `os-release`).
+3. A warning is logged for each required package the base image lacks, or
+   lists every required package as unverified when the effective database
+   cannot be established.
 
 The build is never failed and the image is never modified. To obtain a missing
 package, use a base image that already contains it (for example a custom image
@@ -67,3 +71,26 @@ mapped. Detection needs a recognized base distro and is skipped otherwise.
   `Provides` is reported missing.
 - If the base distro cannot be determined, requirements are listed as
   unverified in a warning.
+- Verification never reports a package present from stale or partial data.
+  Requirements are unverified when a base layer is unreadable, corrupt, or
+  uses a compression this Python cannot read (for example zstd before Python
+  3.14); when an entry path contains `..`; when the package database, or a
+  directory above it, is a symlink, hard link or other non-regular entry;
+  when metadata exceeds inspection limits (16 MiB per file, 64 MiB total,
+  10,000 `status.d` records); or when the distro's package database is
+  absent. Debian packages count as installed only with an `ok installed`
+  status in every record that lists them.
+
+## Planned installation (not available)
+
+Installing packages with the distro's own `apt` or `apk` is planned in #31.
+It must run inside the opt-in isolated execution backend from #22, never on
+the host, and that backend does not exist yet. No configuration option enables
+installation, and detected packages will never be installed implicitly.
+
+`pycontainer.system_install` contains only fail-closed groundwork that runs no
+package manager: checks for apt settings that weaken signature verification,
+and parsers for offline resolution output. It does not download packages or
+repository metadata. See the
+[installation design](plans/2026-11-22-system-package-installation.md) for
+the planned flow, the trust boundaries and the remaining blockers.

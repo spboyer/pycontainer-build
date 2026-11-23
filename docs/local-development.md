@@ -107,6 +107,52 @@ pycontainer build \
 # 4. Combine everything into a complete image
 ```
 
+### Conda Projects
+
+Conda staging is unsupported. Detection checks names only: `environment.yml`,
+`environment.yaml`, `conda-lock.yml`, and `conda-meta/` directories anywhere in
+the selected build context. It does not parse YAML, run Conda, or inspect the
+active host environment. Ordinary directories are checked independently of
+application include paths; excluded tests, fixtures, generated output/cache
+directories, and explicitly excluded descendants do not trigger it.
+Conventional virtualenv directories and linked Conda prefixes are checked.
+Directory links are otherwise traversed only when selected as application
+include roots, matching application file selection.
+
+With `--include-deps`, detected Conda inputs without a supported selected pip
+requirements file raise an explicit error before pulling the base image, also
+in dry-run. When both are present, the selected pip requirements file wins over
+virtualenv discovery and a warning explains that Conda inputs are ignored.
+`--requirements` remains relative to the context and can select an exported
+file excluded from the application layer. Selecting a Conda YAML file as pip
+requirements, including via a file link, is rejected rather than passed to pip.
+Selected source paths inside a host Conda prefix are omitted; with
+`--include-deps` they also produce a Conda diagnostic unless the marker is
+excluded. Selected requirements inside a host prefix are rejected.
+
+Export the pip-compatible portion from your Conda environment, then build from
+your application source directory:
+
+```bash
+python -m pip freeze > requirements.txt
+python -m pycontainer.cli build --tag myapp:latest --include-deps --requirements requirements.txt
+```
+
+Review the export: remove host-local paths and ensure requirements resolve to
+target-compatible wheels. `pip freeze` is not a conversion of Conda-only
+packages or native/system libraries; provide those in a compatible base image.
+No YAML resolution or full Conda staging is implemented; that work is tracked
+in [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+Without `--include-deps`, a source project containing Conda descriptors still
+builds application-only, without dependency warnings or installation. Nested
+host Conda prefixes (directories containing `conda-meta/`) are always omitted
+from application and virtualenv dependency selection, including explicit
+includes and `--no-default-excludes`. A context that is itself a host Conda
+prefix or is inside one is rejected: choose a source-only context instead of
+the environment directory. This protects against copying host binaries, not a
+guarantee that an application-only image has all dependencies needed to run.
+
 ### Preview Before Building
 
 ```bash
@@ -569,6 +615,21 @@ az acr login --name myregistry
 # Then build
 pycontainer build --tag myapp:latest --base-image python:3.11-slim
 ```
+
+For offline or air-gapped builds, load the base image from disk instead of a
+registry; no credentials or daemon are used:
+
+```bash
+skopeo copy docker://python:3.11-slim oci:./base:3.11-slim   # or: docker save python:3.11-slim -o python.tar
+pycontainer build --tag myapp:latest --base-image oci:./base:3.11-slim
+pycontainer build --tag myapp:latest --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+For `--include-deps`, the local image config must explicitly declare
+`PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
+`PYTHON_LIBC`, even when its tag claims an official Python image.
+See [Local base images](../README.md#local-base-images) for selection rules,
+verification, and limitations.
 
 #### Issue: "Dependencies not found in image"
 
