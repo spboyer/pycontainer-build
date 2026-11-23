@@ -478,6 +478,44 @@ def test_multi_platform_uses_requirements_when_virtualenv_is_excluded(tmp_path, 
     assert installs == ["amd64", "arm64"]
 
 
+def test_multi_platform_rejects_conda_only_before_pulling_or_publication(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    (ctx / "environment.yml").write_text("name: example\n")
+    out = tmp_path / "out"
+    refs = out / "refs" / "tags"
+    refs.mkdir(parents=True)
+    (out / "index.json").write_text("previous index")
+    (refs / "v1").write_text("previous tag")
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, include_deps=True, ctx=ctx)
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+    assert registry.manifest_calls == []
+    assert (out / "index.json").read_text() == "previous index"
+    assert (refs / "v1").read_text() == "previous tag"
+
+
+def test_multi_platform_conda_with_requirements_stages_each_target(tmp_path, monkeypatch):
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "environment.yml").write_text("name: example\n")
+    site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "demo.py").write_text("X = 1\n")
+    installs = []
+
+    def fake_install(requirements, site_packages, context, os_name, arch, version,
+                     base_image, base_config, **kwargs):
+        installs.append(arch)
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx)
+    builder.build()
+    assert installs == ["amd64", "arm64"]
+
+
 @pytest.mark.parametrize("include_target_dependency", [False, True])
 def test_multi_platform_virtualenv_validates_each_target_base(
     tmp_path, monkeypatch, include_target_dependency
