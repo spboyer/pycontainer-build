@@ -219,7 +219,8 @@ separate.
   (`-r` and `-c` includes, comments included) is scanned before pip runs. URLs
   with a password, a bare username or token (other than `git@`), or a query
   parameter named like `token`, `key`, `secret`, `password`, `auth`, `sig` or
-  `credential` fail the build. URL path segments are also checked: known token
+  `credential` fail the build unless the value is only `${VAR}`
+  placeholders. URL path segments are also checked: known token
   formats (GitHub `ghp_`/`github_pat_`, GitLab `glpat-`, PyPI `pypi-AgE…`,
   Hugging Face `hf_`), the first path segment on `dl.cloudsmith.io` other than
   `public` or `basic`, and, except on public source hosts such as `github.com`

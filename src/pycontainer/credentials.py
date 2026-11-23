@@ -108,7 +108,7 @@ def _secret_query(url: str) -> bool:
     except ValueError:
         return False
     return any(
-        value and _SECRET_QUERY_NAME.search(unquote(name))
+        PLACEHOLDER.sub("", value) and _SECRET_QUERY_NAME.search(unquote(name))
         for name, value in parse_qsl(query, keep_blank_values=True)
     )
 

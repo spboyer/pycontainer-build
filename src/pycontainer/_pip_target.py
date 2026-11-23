@@ -54,16 +54,21 @@ def _pin_pip_configuration(allowed_keys):
     parser.ConfigOptionParser._get_ordered_configuration_items = configuration_items
 
     probes = {"PIP_PLATFORM": "pycontainer-self-test", "PIP_TIMEOUT": "123"}
-    saved = {name: os.environ.get(name) for name in probes}
+    # Hide other host PIP_* values (aliases such as PIP_DEFAULT_TIMEOUT) during the probe.
+    saved = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper().startswith(("PIP_", "_PIP_")) and name.upper() != "PIP_CONFIG_FILE"
+    }
+    for name in saved:
+        del os.environ[name]
     os.environ.update(probes)
     try:
         options, _ = create_command("install").parse_args([])
     finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        for name in probes:
+            os.environ.pop(name, None)
+        os.environ.update(saved)
     if options.platforms or options.timeout != 123:
         raise TargetMarkerError("pip configuration pinning self-test failed")
 

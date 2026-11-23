@@ -624,10 +624,33 @@ def test_installed_direct_url_credentials_are_rejected(tmp_path, url):
             False,
         ),
         ("https://example.invalid/550e8400-e29b-41d4-a716-446655440000/simple/", False),
+        ("https://packages.example/simple?token=${TOKEN}", False),
+        ("https://packages.example/simple?token=%24%7BTOKEN%7D", False),
+        ("https://packages.example/simple?token=x${TOKEN}", True),
     ],
 )
 def test_url_credential_detection(url, expected):
     assert url_has_credentials(url) is expected
+
+
+def test_pip_pinning_self_test_ignores_allowed_host_aliases(monkeypatch):
+    pytest.importorskip("pip")
+    from pycontainer import _pip_target
+
+    monkeypatch.setenv("PIP_TIMEOUT", "10")
+    monkeypatch.setenv("PIP_DEFAULT_TIMEOUT", "20")
+    before = dict(os.environ)
+    import pip._internal.cli.parser as parser
+
+    monkeypatch.setattr(
+        parser.ConfigOptionParser,
+        "_get_ordered_configuration_items",
+        parser.ConfigOptionParser._get_ordered_configuration_items,
+    )
+
+    _pip_target._pin_pip_configuration({"timeout", "default-timeout"})
+
+    assert dict(os.environ) == before
 
 
 def test_redaction_removes_userinfo_query_tokens_and_known_values():
