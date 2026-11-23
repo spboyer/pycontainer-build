@@ -163,6 +163,17 @@ def _context(tmp_path, requirements="fixture-dep==1.0\n"):
 
 def _install(tmp_path, context):
     destination = tmp_path / "stage" / "site-packages"
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [
+                *BASE_CONFIG["config"]["Env"],
+                "PYTHON_IMPLEMENTATION=CPython",
+                "PYTHON_LIBC=glibc-2.17",
+            ],
+        },
+    }
     install_requirements(
         context / "requirements.txt",
         destination,
@@ -171,7 +182,7 @@ def _install(tmp_path, context):
         "amd64",
         "3.11",
         "python:3.11-slim",
-        BASE_CONFIG,
+        base_config,
     )
     return {name for name, _ in staged_packages(destination)}
 

@@ -147,7 +147,19 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value. Staged packages are importable under `<workdir>/.python`;
+`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
+registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
+glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
+Local image names/annotations are not provenance either. The shared
+`target_wheel_platform` helper defaults to requiring explicit metadata;
+`base_image_tag_verified=True` permits tag inference only for tag-only registry
+pulls. Local sources must leave it false. Unsupported metadata and metadata
+conflicting with a verified tag-only pull fail before pip runs.
+`target_python_version` uses the same default-false keyword; digest and
+unverified local sources require explicit `PYTHON_IMPLEMENTATION=CPython` and
+`PYTHON_VERSION`. Both helpers validate before requirements or venv staging.
+Staged packages are importable under `<workdir>/.python`;
 source distributions, lockfiles and cross-compilation are not supported.
 `dependencies.install_requirements` runs pip through `_pip_target.py`, which
 forces every `pip._vendor.packaging` marker evaluation (requirement-file roots,
@@ -161,8 +173,9 @@ dependencies, dependency groups) and installed `Requires-Dist`/egg-info
 `requires.txt` are re-evaluated for each target, failing on missing,
 unknown-marker, or possibly-requested extra/group requirements. An extra is
 ruled out only if every Windows/Linux/macOS CPython host of the venv minor
-(narrowed to posix or Windows by the `lib/pythonX.Y` or `Lib` site-packages
-layout) would have installed one of its missing requirements; `python_version` is
+(narrowed to posix by a `lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`,
+or to Windows by a `Lib` site-packages layout) would have installed one of its
+missing requirements; `python_version` is
 shared only when the venv minor is established (`python3.X` path or
 `pyvenv.cfg` `version`/`version_info`). Presence only, not versions; unparsed
 root sources (`setup.py`, `setup.cfg`, `Pipfile`, setuptools/Hatch dynamic

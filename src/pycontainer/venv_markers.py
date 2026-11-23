@@ -35,18 +35,21 @@ _VENV_HOSTS = (
 )
 
 _POSIX_LIB_DIR = re.compile(r"python\d+\.\d+t?")
+_VENV_HOME = re.compile(r"(?im)^\s*home\s*=\s*(\S.*?)\s*$")
 
 RootGroup = Tuple[str, bool, List[str]]
 
 
-def venv_layout_os(site_root: Tuple[str, ...]) -> Optional[str]:
+def venv_layout_os(site_root: Tuple[str, ...], venv_config: Optional[str] = None) -> Optional[str]:
     """Infer the creating host's os_name from the site-packages layout, if recognizable."""
     if (
         len(site_root) >= 3
         and _POSIX_LIB_DIR.fullmatch(site_root[-2])
         and site_root[-3] in ("lib", "lib64")
     ):
-        return "posix"
+        # MSYS2 CPython is os.name "nt" with a POSIX layout; require a POSIX interpreter home.
+        home = _VENV_HOME.search(venv_config or "")
+        return "posix" if home and home.group(1).startswith("/") else None
     if len(site_root) >= 2 and site_root[-2] == "Lib":
         return "nt"
     return None
