@@ -12,7 +12,7 @@ from .config import BuildConfig
 from .dependencies import _base_environment, _base_image_parts, _is_official_python_image
 from .fs_utils import context_exclude_paths, output_directory_lock
 from .local_image import _paths_overlap, parse_local_image_reference
-from .registry_client import RegistryClient, RegistryHTTPError, parse_image_reference
+from .registry_client import RegistryClient, RegistryRequestError, parse_image_reference
 from .tags import resolve_tags
 
 
@@ -238,7 +238,8 @@ class PythonMatrixBuilder:
                         client.push_manifest(reference, operation.path.read_bytes())
                 except (RuntimeError, OSError, ValueError) as error:
                     operation.outcome = (
-                        "failed" if isinstance(error, RegistryHTTPError)
+                        "failed" if isinstance(error, RegistryRequestError)
+                        and error.status is not None
                         and 400 <= error.status < 500 and error.status != 408
                         else "unknown"
                     )

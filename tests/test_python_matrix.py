@@ -15,7 +15,7 @@ from pycontainer.fs_utils import output_directory_lock
 from pycontainer.local_image import LocalImageError
 from pycontainer.python_matrix import MatrixPublicationError, PythonMatrixBuilder, matrix_targets
 from pycontainer.python_matrix import verify_python_version
-from pycontainer.registry_client import RegistryHTTPError, RegistryRequestError
+from pycontainer.registry_client import RegistryClient, RegistryHTTPError, RegistryRequestError
 from test_multi_platform import FakeBaseRegistry, FakePushClient, _digest
 
 
@@ -216,7 +216,10 @@ def test_all_content_before_tags_and_aliases_last(tmp_path, monkeypatch):
     assert all(op.outcome == "confirmed" for op in build.operations)
 
 
-@pytest.mark.parametrize("failure_kind", ["blob", "manifest", "index", "tag", "unknown", "server-error"])
+@pytest.mark.parametrize("failure_kind", [
+    "blob", "manifest", "index", "tag", "unknown", "server-error",
+    "rate-limit", "quota", "server-quota", "timeout-quota",
+])
 def test_failure_report_and_no_retry_or_rollback(tmp_path, monkeypatch, failure_kind):
     build, _, _ = matrix(tmp_path, monkeypatch, platform="linux/amd64,linux/arm64")
     build.build()
@@ -230,7 +233,10 @@ def test_failure_report_and_no_retry_or_rollback(tmp_path, monkeypatch, failure_
                 failure_kind == "blob" and call[0] == "blob"
                 or failure_kind == "manifest" and call[0] == "manifest" and not is_tag
                 or failure_kind == "index" and call[0] == "index" and not is_tag
-                or failure_kind in ("tag", "unknown", "server-error") and is_tag and call[1] == "v1.2"
+                or failure_kind in (
+                    "tag", "unknown", "server-error", "rate-limit", "quota",
+                    "server-quota", "timeout-quota",
+                ) and is_tag and call[1] == "v1.2"
             )
             if fail:
                 if failure_kind == "unknown":
@@ -239,6 +245,16 @@ def test_failure_report_and_no_retry_or_rollback(tmp_path, monkeypatch, failure_
                     raise RegistryRequestError("timeout after PUT")
                 if failure_kind == "server-error":
                     raise RegistryHTTPError(503, "server response may follow a committed write")
+                if failure_kind in ("rate-limit", "quota", "server-quota", "timeout-quota"):
+                    status = {"rate-limit": 429, "quota": 413,
+                              "server-quota": 503, "timeout-quota": 408}[failure_kind]
+                    body = b"" if failure_kind == "rate-limit" else (
+                        b'{"errors":[{"code":"QUOTA_EXCEEDED","message":"quota"}]}'
+                    )
+                    raise RegistryClient("registry.example", "team/app")._error(
+                        "Index push", "https://registry.example/v2/team/app/manifests/v1.2",
+                        status, body, {},
+                    )
                 raise RegistryHTTPError(403, "rejected")
             if is_tag:
                 remote_tags[call[1]] = call[2]
@@ -246,7 +262,9 @@ def test_failure_report_and_no_retry_or_rollback(tmp_path, monkeypatch, failure_
     with pytest.raises(MatrixPublicationError) as caught:
         build.push(show_progress=False)
     error = caught.value
-    outcome = "unknown" if failure_kind in ("unknown", "server-error") else "failed"
+    outcome = "unknown" if failure_kind in (
+        "unknown", "server-error", "server-quota", "timeout-quota"
+    ) else "failed"
     affected = [op for op in error.operations if op.outcome == outcome]
     assert len(affected) == 1
     assert error.operations[-1].outcome == "unattempted"
