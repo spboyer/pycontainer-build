@@ -47,8 +47,10 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         cfg['config']['WorkingDir']=working_dir or base_config.get('config',{}).get('WorkingDir','/app')
         
         base_entrypoint=base_config.get('config',{}).get('Entrypoint')
-        if entrypoint:
-            if is_distroless(base_config) and entrypoint and entrypoint[0] in ['/bin/sh','/bin/bash','sh','bash']:
+        if entrypoint == []:
+            cfg['config'].pop('Entrypoint', None)
+        elif entrypoint:
+            if cmd is None and is_distroless(base_config) and entrypoint[0] in ['/bin/sh','/bin/bash','sh','bash']:
                 cfg['config']['Cmd']=entrypoint
                 if base_entrypoint: cfg['config']['Entrypoint']=base_entrypoint
             else:
@@ -57,6 +59,7 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
             cfg['config']['Entrypoint']=base_entrypoint
         
         if cmd: cfg['config']['Cmd']=cmd
+        elif cmd == []: cfg['config'].pop('Cmd', None)
         elif 'Cmd' in base_config.get('config',{}): cfg['config']['Cmd']=base_config['config']['Cmd']
         if user: cfg['config']['User']=user
         elif 'User' in base_config.get('config',{}): cfg['config']['User']=base_config['config']['User']
@@ -64,7 +67,8 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
         if labels: cfg['config']['Labels']={**base_labels, **labels}
         elif base_labels: cfg['config']['Labels']=base_labels
     else:
-        cfg={"architecture":architecture,"os":os_name,"config":{"Env":[f"{k}={v}" for k,v in env.items()],"WorkingDir":working_dir,"Entrypoint":entrypoint}}
+        cfg={"architecture":architecture,"os":os_name,"config":{"Env":[f"{k}={v}" for k,v in env.items()],"WorkingDir":working_dir}}
+        if entrypoint: cfg['config']['Entrypoint']=entrypoint
         if labels: cfg['config']['Labels']=labels
         if user: cfg['config']['User']=user
         if cmd: cfg['config']['Cmd']=cmd
