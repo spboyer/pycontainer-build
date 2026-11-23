@@ -140,10 +140,11 @@ class _RegistrySource:
         return self.client.pull_blob(digest, dest_path, expected_size)
 
 
-def _registry_client(registry: str, repository: str) -> RegistryClient:
+def _registry_client(registry: str, repository: str, config: BuildConfig) -> RegistryClient:
     auth = get_registry_auth(registry)
     return RegistryClient(
         registry, repository, auth_token=auth.bearer_token, username=auth.username, password=auth.password,
+        insecure=registry.lower() in config.insecure_registries, ca_file=config.registry_ca_file,
     )
 
 
@@ -195,10 +196,10 @@ def _parse_baseline(baseline: str):
 
 
 @contextlib.contextmanager
-def _open_source(local, remote, blobs: Path, platform: str):
+def _open_source(local, remote, blobs: Path, platform: str, config: BuildConfig):
     if remote is not None:
         registry, repository, reference = remote
-        yield _RegistrySource(_registry_client(registry, repository), reference,
+        yield _RegistrySource(_registry_client(registry, repository, config), reference,
                               f"{registry}/{repository}{'@' if reference.startswith('sha256:') else ':'}{reference}")
         return
     os_name, arch = parse_platform(platform)
@@ -207,7 +208,7 @@ def _open_source(local, remote, blobs: Path, platform: str):
         yield source
 
 
-def _resolve_base(base_image: str, remote_allowed: bool, blobs: Path, platform: str):
+def _resolve_base(base_image: str, remote_allowed: bool, blobs: Path, platform: str, config: BuildConfig):
     """Return (base config, reason) for the planned base, or (None, reason) when it is not resolved."""
     local = parse_local_image_reference(base_image)
     if local is None and not remote_allowed:
@@ -215,7 +216,7 @@ def _resolve_base(base_image: str, remote_allowed: bool, blobs: Path, platform: 
                       "the base was not resolved.")
     remote = None if local else parse_image_reference(base_image)
     blobs.mkdir()
-    with _open_source(local, remote, blobs, platform) as source:
+    with _open_source(local, remote, blobs, platform, config) as source:
         manifest, _, variant = _select_manifest(source, platform)
         config = _load_config(source, manifest, blobs, platform, variant)[1]
     return config, None
@@ -361,7 +362,7 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
         root = Path(temporary)
         baseline_blobs = root / "baseline"
         baseline_blobs.mkdir()
-        with _open_source(local, remote, baseline_blobs, plan.platform) as source:
+        with _open_source(local, remote, baseline_blobs, plan.platform, plan) as source:
             manifest, manifest_digest, variant = _select_manifest(source, plan.platform)
             config_ref, config, platform_text, layers, diff_ids, _ = _load_config(
                 source, manifest, baseline_blobs, plan.platform, variant
@@ -370,7 +371,7 @@ def preview_image(cfg: BuildConfig, baseline: str) -> Dict:
                 raise PreviewError("The baseline image has no layers.")
             records = _final_layer(source, layers, diff_ids, baseline_blobs)
             source_name = getattr(source, "source_name", str(getattr(local, "path", baseline)))
-        base_config, base_reason = _resolve_base(plan.base_image, remote is not None, root / "base", plan.platform)
+        base_config, base_reason = _resolve_base(plan.base_image, remote is not None, root / "base", plan.platform, plan)
 
     base_ids = None
     if base_config is not None:

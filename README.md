@@ -90,6 +90,20 @@ dist/image/
       └── <tag-name>              # Tag reference
 ```
 
+### Generate Deployment Artifacts
+
+After publishing an image, generate Kubernetes resources and a matching Helm
+chart, or a Compose service that references that image:
+
+```bash
+pycontainer generate kubernetes --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --service-port 80 -o deploy
+pycontainer generate compose --image ghcr.io/example/myapp:v1 --port 8000 --name myapp --host-port 8080 -o compose.yaml
+```
+
+Generation does not run a daemon or apply resources, and refuses existing
+output. See the [deployment artifact guide](docs/deployment-artifacts.md) for
+supported fields, output safety, versions, and optional validation.
+
 ### Testing Locally
 
 **Important**: `pycontainer` creates OCI-compliant image layouts, not Docker-specific images. To test locally:
@@ -105,6 +119,10 @@ brew install skopeo  # macOS
 skopeo copy oci:dist/image docker-daemon:myapp:latest
 docker run -p 8000:8000 myapp:latest
 ```
+
+With several tags, select one explicitly, for example
+`skopeo copy oci:dist/image:myapp:stable docker-daemon:myapp:stable`; see
+[Multiple tags](docs/multiple-tags.md#output).
 
 #### Option 2: Use Podman (Native OCI Support)
 
@@ -176,6 +194,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **Dry-run mode** — Preview builds with `--dry-run`
 - ✅ **Layer inspection** — `pycontainer inspect` reports local image layer sizes, contents, and diffs without a daemon
 - ✅ **Build preview** — `pycontainer preview` compares a planned build with a local or registry image before building
+- ✅ **Deployment artifacts** — Generate Kubernetes, Helm, and Compose
+  configuration for an existing image without applying it
 
 ### Coming Soon
 
@@ -229,6 +249,7 @@ builder.build()  # Creates dist/image/
 Perfect for integration with:
 - **Azure Developer CLI (azd)** — Custom build strategies ([docs](docs/azd-integration.md))
 - **GitHub Actions** — Automated CI/CD workflows ([docs](docs/github-actions.md))
+- **GitLab CI, Jenkins, CircleCI** — Standalone pipeline examples ([GitLab](docs/ci/gitlab.md), [Jenkins](docs/ci/jenkins.md), [CircleCI](docs/ci/circleci.md))
 - **Poetry/Hatch** — Build plugins ([plugins](plugins/))
 - **VS Code** — Extension for container builds ([plugin](plugins/vscode-pycontainer/))
 - **AI agents** — Copilot, MCP servers, automated scaffolding
@@ -287,6 +308,27 @@ hooks:
 
 [See full documentation →](docs/azd-integration.md)
 
+### Skaffold and Tilt
+
+Use pycontainer as a custom builder for the Kubernetes inner loop. It builds
+without a Docker daemon and pushes to a registry the cluster pulls from:
+
+```yaml
+# skaffold.yaml (build.local.push: true is required)
+custom:
+  buildCommand: python -m pycontainer.cli skaffold-build --no-progress
+```
+
+```python
+# Tiltfile
+custom_build('app', ['python', '-m', 'pycontainer.cli', 'tilt-build'],
+             deps=['app'], skips_local_docker=True)
+```
+
+Local-daemon handoff (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and
+multi-platform requests are rejected. Plain HTTP requires per-host opt-in.
+[See full documentation →](docs/skaffold-tilt.md)
+
 ### VS Code Extension
 
 Install from VS Code Marketplace or command palette:
@@ -294,6 +336,11 @@ Install from VS Code Marketplace or command palette:
 - "Build and Push Container Image"
 
 [See full documentation →](plugins/vscode-pycontainer/)
+
+### Other editors and task runners
+
+Project-scoped PyCharm, Vim, Emacs, GNU Make, and Go Task examples are
+available in the [integration examples](examples/editor-task-runners/).
 
 ---
 
@@ -358,23 +405,28 @@ pycontainer build \
   Markers on `platform_release` or `platform_version`, and on
   `python_full_version` when the base image does not declare a full
   `PYTHON_VERSION`, cannot be known in advance and fail the build. A virtualenv
-  cannot be re-resolved, so it is verified instead: root requirements (the
-  requirements file and pyproject `[project]` dependencies, optional
-  dependencies and dependency groups) and every installed `Requires-Dist` are
-  re-evaluated for each target, and the build fails if a requirement the
-  target needs is missing, uses an unknown marker value, or belongs to an extra
-  or group whose request cannot be ruled out. An extra or group counts as not
-  requested only when it is missing a requirement that any Windows, Linux or
-  macOS CPython host of the venv's Python version would have installed; a
-  `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home` is a POSIX
-  path limits the hosts to Linux and macOS (MSYS2 CPython is Windows with that
-  layout), and `Lib/site-packages` to Windows. Only
-  package presence is checked, not versions; extra host-only packages are
-  kept. `setup.py`, `setup.cfg`, `Pipfile`, file-based dynamic dependencies,
-  and Poetry, PDM, Hatch, setuptools or Flit tables that mention host markers
-  also fail the build, as do dynamic dependencies that cannot be read. Use a
-  requirements file, which pip resolves for the target, when verification
-  fails.
+  cannot be re-resolved, so its closure is verified for each target instead.
+  Requirements-file and pyproject roots and installed `Requires-Dist` metadata
+  are checked for missing packages, version mismatches, and requested extras;
+  `Requires-Python` and requirements constraint files are also checked. Every
+  installed `.dist-info` needs valid `METADATA` with a supported
+  `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
+  patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
+  Virtualenvs do not record selected extras or groups. An extra or group
+  counts as not requested only when it is missing a requirement that any
+  Windows, Linux or macOS CPython host of the venv's Python version would have
+  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
+  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
+  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
+  its target requirements are not satisfied, verification fails rather than
+  guessing.
+  Direct URL installation metadata is rejected because it can contain
+  credentials. Host-only packages remain in the image, and loose modules
+  without package metadata are copied unverified. `setup.py`, `setup.cfg`,
+  `Pipfile`, file-based dynamic dependencies, and Poetry, PDM, Hatch,
+  setuptools or Flit tables mentioning host markers fail, as do unreadable
+  dynamic dependencies. Unmarked declarations in those unparsed sources are
+  not verified. Use a requirements file when a virtualenv cannot be verified.
   Official `python` tag-only registry pulls derive libc from the resolved tag
   (`alpine` tags use musl, others glibc). All digest references, including
   `python:3.11-slim@sha256:...`, require supported `PYTHON_LIBC` metadata:
@@ -518,6 +570,19 @@ exclude-defaults = true
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+
+**Registry Transport** (see [docs/REGISTRY_PUSH.md](docs/REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas)):
+- `--insecure-registry HOST[:PORT]` — Use plain HTTP for exactly this registry
+  (repeatable; `[build] insecure-registries = [...]`). Each build that uses
+  one logs a warning. Credentials are sent over HTTP only to loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); any other HTTP registry must be
+  anonymous.
+- `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
+  HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
+  there is no option to skip it.
+Registry connections are direct: environment/system proxy settings are ignored.
+URLs containing embedded credentials are rejected; use the credential providers
+or authentication flags instead.
 
 SBOMs are sidecar files: their UTC timestamps and UUID document identifiers are
 new for each generation, even when the OCI image build is reproducible. They do
@@ -721,6 +786,9 @@ Known limitations and future enhancements:
 
 - **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
+- **System packages** — Verification is advisory; installing apt/apk packages
+  is not available. See [system packages](docs/system-packages.md).
+- **Registry access** — HTTPS by default; plain HTTP requires per-host opt-in. Docker `credsStore`/`credHelpers` are not read
 
 Multi-platform base images select an exact OS/architecture/variant match.
 If the platform omits a variant, the image must have one unambiguous match;
@@ -790,6 +858,7 @@ This style is intentional for the experimental phase.
 - **[Build preview](docs/preview.md)** — Compare a planned build with an existing image before building
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References

@@ -1,4 +1,5 @@
 """Build and smoke-test wheel and sdist installs in temporary virtual environments."""
+import json
 import os
 import subprocess
 import sys
@@ -100,6 +101,28 @@ def main() -> None:
                 env=_isolated_environment(),
             )
             package_type = "wheel" if artifact.suffix == ".whl" else "sdist"
+            for kind in ("kubernetes", "compose"):
+                output = temp / f"{package_type}-{kind}"
+                subprocess.run(
+                    [
+                        str(executable), "generate", kind,
+                        "--image", "example/app:v1", "--port", "8000",
+                        "--output", str(output),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    env=_isolated_environment(),
+                )
+                document = output / "service.yaml" if kind == "kubernetes" else output
+                data = json.loads(document.read_text(encoding="utf-8"))
+                if kind == "kubernetes":
+                    valid = data["spec"]["ports"][0]["targetPort"] == 8000
+                else:
+                    valid = data["services"]["app"]["image"] == "example/app:v1"
+                if not valid:
+                    raise RuntimeError(f"{package_type} {kind} generation produced invalid output")
+            print(f"PASS: deployment generators in isolated {package_type} install")
+
             sbom_output = temp / f"{package_type}-sbom.json"
             subprocess.run(
                 [

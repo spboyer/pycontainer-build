@@ -24,12 +24,14 @@ A bare name such as `app:v1` is rejected; prefix registry images with
 (default `linux/amd64`); a missing, duplicated, or mismatched platform is an
 error.
 
-Registry baselines use the same credential providers as `build --push`.
+Registry baselines use the same credential providers and registry transport
+settings as builds, including `--registry-ca-file` and `--insecure-registry`.
 Credentials are sent only to the registry origin: a redirect keeps them only
 when it stays on the same scheme, host and port, and they are dropped on any
-cross-origin, port-changing or HTTPS-to-HTTP redirect. Blob-storage redirects
-are always followed without credentials. Manifests are capped at 16 MiB and blobs are verified against their
-descriptor digest and size.
+cross-origin or port-changing redirect. HTTPS-to-HTTP redirects are rejected.
+Blob-storage redirects are always followed without credentials. Manifests are
+capped at 16 MiB (or their descriptor size, if smaller) and blobs are verified
+against their descriptor digest and size.
 
 ## What is read and written
 

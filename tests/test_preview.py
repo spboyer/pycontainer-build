@@ -352,9 +352,9 @@ def registry(monkeypatch, layout, **options):
     server = FakeRegistry(layout, **options)
     clients = []
 
-    def factory(host, repository):
-        client = RegistryClient(host, repository, username="user", password="pass")
-        client.base_url = f"{server.url}/v2"
+    def factory(host, repository, config):
+        authority = server.url.removeprefix("http://")
+        client = RegistryClient(authority, repository, username="user", password="pass", insecure=True)
         clients.append(client)
         return client
 
@@ -378,6 +378,43 @@ def test_remote_baseline_uses_registry_and_resolves_base(built, tmp_path, monkey
     assert result["provenance"]["level"] == "positional"
     assert changes(result)["/app/src/new.py"]["change"] == "added"
     assert any(path.endswith("/manifests/v1") for path, _ in server.seen)
+
+
+def test_remote_client_uses_build_transport_config(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(registry_client, "create_registry_ssl_context", lambda _: None)
+    cfg = config(tmp_path, insecure_registries=["registry.example:5000"], registry_ca_file="ca.pem")
+    monkeypatch.setattr(preview, "get_registry_auth", lambda _: SimpleNamespace(
+        bearer_token="token", username=None, password=None
+    ))
+    captured = {}
+    monkeypatch.setattr(preview, "RegistryClient", lambda *args, **kwargs: captured.update(
+        args=args, kwargs=kwargs
+    ))
+    preview._registry_client("registry.example:5000", "team/app", cfg)
+    assert captured["args"] == ("registry.example:5000", "team/app")
+    assert captured["kwargs"]["insecure"] is True
+    assert captured["kwargs"]["ca_file"] == "ca.pem"
+
+
+def test_preview_cli_passes_registry_transport_flags(tmp_path, monkeypatch, capsys):
+    captured = []
+    monkeypatch.setattr(registry_client, "create_registry_ssl_context", lambda _: None)
+    monkeypatch.setattr(preview, "run_preview", lambda cfg, baseline, json_output: (
+        captured.append((cfg, baseline)) or "ok", 0
+    ))
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", "preview", "--baseline", "docker://registry.example:5000/team/app:v1",
+        "--context", str(tmp_path), "--base-image", "python:3.11-slim",
+        "--insecure-registry", "registry.example:5000", "--registry-ca-file", "ca.pem",
+    ])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 0
+    assert captured[0][0].insecure_registries == ["registry.example:5000"]
+    assert captured[0][0].registry_ca_file == "ca.pem"
+    assert "ok" in capsys.readouterr().out
 
 
 def test_remote_failures_are_reported_without_partial_output(built, tmp_path, monkeypatch):
