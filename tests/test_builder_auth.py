@@ -285,6 +285,8 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
                 "auth_token": None,
                 "username": "docker-user",
                 "password": "docker-password",
+                "insecure": False,
+                "ca_file": None,
             },
         )
     ]
@@ -338,6 +340,8 @@ def test_image_push_passes_resolved_basic_credentials(tmp_path, monkeypatch):
                 "auth_token": None,
                 "username": "docker-user",
                 "password": "docker-password",
+                "insecure": False,
+                "ca_file": None,
             },
         )
     ]
