@@ -184,6 +184,15 @@ def test_in_context_symlink_to_selected_file_is_preserved(tmp_path):
     ]
 
 
+def test_selected_symlink_chain_is_preserved(tmp_path):
+    context = _context(tmp_path)
+    _link(context / "src" / "alias.py", "main.py")
+    _link(context / "src" / "chain.py", "alias.py")
+
+    _, members, _ = _app_layer(context, tmp_path, use_cache=False)
+
+    assert ("app/src/chain.py", tarfile.SYMTYPE, "alias.py") in members
+
 @pytest.mark.parametrize(
     "overrides",
     [

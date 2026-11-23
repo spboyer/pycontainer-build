@@ -285,7 +285,11 @@ def select_context_files(base, include_paths, excludes):
     # Lexical membership keeps the link valid inside the image; resolved
     # membership stops ``..`` after an in-context link from naming other files.
     lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
-    resolved_paths = {os.path.normcase(os.path.realpath(path)) for path, _ in files}
+    resolved_paths = {
+        os.path.normcase(os.path.realpath(path))
+        for path, _ in files
+        if not path.is_symlink()
+    }
     for path, relative in files:
         if path.is_symlink():
             target = path.parent / os.readlink(path)
