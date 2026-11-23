@@ -390,6 +390,27 @@ class ImageBuilder:
         
         return self.config.tag
     
+    def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
+        """Create a registry client honoring insecure-host and CA settings."""
+        insecure=registry.lower() in self.config.insecure_registries
+        client=RegistryClient(
+            registry,
+            repo,
+            auth_token=auth.bearer_token,
+            username=auth.username,
+            password=auth.password,
+            insecure=insecure,
+            ca_file=self.config.registry_ca_file,
+        )
+        warned=self.__dict__.setdefault('_warned_insecure_registries', set())
+        if insecure and registry.lower() not in warned:
+            warned.add(registry.lower())
+            logger.warning(
+                f"WARNING: using plain HTTP for insecure registry {registry}; "
+                "traffic is unencrypted and unauthenticated by TLS."
+            )
+        return client
+
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
         self._base_image_name=self.config.base_image
@@ -398,13 +419,7 @@ class ImageBuilder:
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
             auth=get_registry_auth(registry)
-            client=RegistryClient(
-                registry,
-                repo,
-                auth_token=auth.bearer_token,
-                username=auth.username,
-                password=auth.password,
-            )
+            client=self._registry_client(registry, repo, auth)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 
         target = f"{os_name}/{arch}" + (
@@ -568,13 +583,7 @@ class ImageBuilder:
             username=username,
             password=password,
         )
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
-        )
+        client=self._registry_client(registry, repo, auth)
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         
