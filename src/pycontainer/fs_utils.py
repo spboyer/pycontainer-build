@@ -285,7 +285,8 @@ def select_context_files(base, include_paths, excludes):
     )
     # Lexical membership keeps the link valid inside the image. A ``..`` after
     # a descending component could climb out of a pruned directory link that
-    # the image lacks, so targets may only climb first and then descend.
+    # the image lacks, so targets may only climb first and then descend, and
+    # never above the context root, which the image root mirrors.
     lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
     resolved_paths = {
         os.path.normcase(os.path.realpath(path))
@@ -304,6 +305,7 @@ def select_context_files(base, include_paths, excludes):
             target = path.parent / text
             if (
                 ".." in parts[climbs:]
+                or climbs >= len(relative.parts)
                 or os.path.normcase(os.path.abspath(target)) not in lexical_paths
                 or os.path.normcase(os.path.realpath(target)) not in resolved_paths
             ):

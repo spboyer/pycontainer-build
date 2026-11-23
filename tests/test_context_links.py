@@ -1,4 +1,5 @@
 import os
+import posixpath
 import tarfile
 
 import pytest
@@ -208,6 +209,41 @@ def test_nested_symlink_target_uses_posix_separators(tmp_path):
 
     assert ("app/src/data.py", tarfile.SYMTYPE, "../shared/data.py") in members
     assert ("app/direct.py", tarfile.SYMTYPE, "shared/data.py") in members
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_symlink_leaving_then_reentering_context_is_rejected(tmp_path, depth):
+    context = _context(tmp_path)
+    (context / "data.py").write_text("value = 1\n")
+    parent = context.joinpath(*(["nested"] * depth))
+    parent.mkdir(exist_ok=True)
+    target = os.path.join(*([".."] * (depth + 1)), context.name, "data.py")
+    _link(parent / "link.py", target)
+
+    with pytest.raises(ValueError, match="another selected file"):
+        _app_layer(context, tmp_path, use_cache=False, include_paths=["."])
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("reproducible", [False, True])
+def test_leading_parent_links_resolve_inside_app_tar(tmp_path, depth, reproducible):
+    context = _context(tmp_path)
+    (context / "data.py").write_text("value = 1\n")
+    parent = context.joinpath(*(["nested"] * depth))
+    parent.mkdir(parents=True)
+    _link(parent / "link.py", os.path.join(*([".."] * depth), "data.py"))
+
+    _, members, _ = _app_layer(
+        context, tmp_path, use_cache=False, include_paths=["."],
+        reproducible=reproducible,
+    )
+
+    name, kind, target = next(member for member in members if member[1] == tarfile.SYMTYPE)
+    assert kind == tarfile.SYMTYPE
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+    assert resolved == "app/data.py"
+    assert (resolved, tarfile.REGTYPE, "") in members
+
 
 @pytest.mark.parametrize(
     "overrides",
