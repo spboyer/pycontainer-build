@@ -19,6 +19,7 @@ daemon without discussing the trade-off first.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
+  Multi-platform index scanning is rejected; build and scan each target separately.
 - `system_packages.py`: system package declaration, inference and base-image
   verification (warning only). `system_install.py`: fail-closed groundwork for
   #31; it executes no package manager and has no callers until the #22
@@ -117,9 +118,12 @@ starts a container. `--platform` must match the daemon; emulated runs fail
 rather than count as evidence. `--evidence` writes a passed or failed JSON
 record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+Add `--multi-platform-index` to build both targets, select the native image
+from the index, verify its imported config digest and start it. Index evidence
+is separate from single-platform release evidence.
 To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
 (optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
-Neither mode is part of default pytest.
+These modes are not part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
@@ -133,6 +137,9 @@ and is listed separately as not validated. Re-run all jobs, not just failed
 jobs, to produce fresh evidence for every target. The release job depends on
 this gate, re-verifies evidence for its own attempt and appends the summary to
 the release notes. Only targets listed as validated have runtime evidence.
+The tests workflow also runs the multi-platform index check on both native
+targets and uploads separate `index-runtime-evidence-*` artifacts; the release
+workflow continues to use only the single-platform release evidence.
 
 Runtime security fragments (`security.py`) are deployment artifacts written
 beside the layout, never image config. Verify them with the opt-in Linux
@@ -204,10 +211,10 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
-- The registry client is HTTPS-only and does not read Docker `credsStore`,
-  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
-  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
-  (#29) are rejected, not emulated.
+- The registry client does not read Docker `credsStore`, `credHelpers` or
+  `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff (`PUSH_IMAGE=false`,
+  `custom_build(tag=...)`) and multi-platform dev-loop requests are rejected,
+  not emulated.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
@@ -279,6 +286,15 @@ Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are
 not verified.
+Comma-separated `platform` values build an OCI image index for exactly
+`linux/amd64` and `linux/arm64` (arm/v7 is #119); each platform gets its own
+base selection and dependency layer, including its own virtualenv closure check.
+Tags move only after the whole index verifies. A local `oci:` base must keep the
+same layout `index.json` across platforms. Detected virtualenvs take precedence;
+exclude them to select the requirements file. Multi-tag registry pushes are not
+atomic: a later tag failure can leave earlier tags moved. Hermetic index tests do
+not prove per-architecture runtime startup.
+
 The `_pip_target.py` bootstrap also filters host pip environment variables and config-file keys
 to index, authentication, TLS, proxy and timeout settings (see
 `dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if

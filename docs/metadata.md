@@ -6,14 +6,16 @@ Labels and annotations are separate string-to-string maps:
 |---|---|---|
 | `labels` | Image config `config.Labels` | Yes |
 | `manifest_annotations` | Image manifest `annotations` | No |
-| `index_annotations` | Local layout `index.json` `annotations` | No |
+| `index_annotations` | Local layout `index.json` and multi-platform image index `annotations` | No |
 
 Annotations describe the newly built object, so base manifest, index, and
 descriptor annotations are not copied. The builder retains its own
 `org.opencontainers.image.ref.name` in the local index independently of user
 annotations. On the existing single-image path, a registry push sends the image
 manifest and config, not the local layout index. Manifest annotations therefore
-travel with that push; index annotations remain in the local layout.
+travel with that push; index annotations remain in the local layout. A
+multi-platform push sends the annotated image index as well as each annotated
+platform manifest; the layout wrapper keeps the same user index annotations.
 
 ## Configuration and precedence
 
@@ -57,6 +59,39 @@ overwrite them.
 the builder owns reference metadata, so even supplying the same value is an
 error. This restriction does not apply to a config label with that key.
 
+## Release notes label
+
+Release notes are opt-in. Set `release_notes_file` (`release-notes-file` in TOML,
+`--release-notes FILE` on the CLI) to embed a file's text as one image-config
+label. The key defaults to `io.github.spboyer.pycontainer.release-notes`, a
+stable reverse-DNS key in this project's namespace; set `release_notes_label`
+(`--release-notes-label KEY`) to use another. CLI options override the
+configuration-file settings. Without a notes file, no label is added and the
+key setting has no effect.
+
+- A relative path is resolved against `context_dir`, like `requirements_file`;
+  absolute paths are accepted. A file inside the context is still selected for
+  the application layer by the normal include and exclude rules.
+- The file must be UTF-8. One leading UTF-8 byte-order mark is removed. CRLF and
+  lone CR line endings are converted to LF; no other whitespace changes.
+- After normalization, the UTF-8 value may be at most 8 KiB (8,192 bytes);
+  8,193 bytes is an error. Content is never truncated. An empty file produces
+  an empty label value.
+- A missing, unreadable, non-UTF-8 or oversized file is a configuration error.
+  So is an explicit CLI or file label with the same key, checked through the
+  generated-label guard below rather than resolved by precedence.
+- The release-notes label overrides a base-image label with the same key. When
+  the key is `framework`, it replaces the detected framework default unless
+  `framework` is explicitly labeled, which is a collision error.
+- The file is read once when the builder is created; repeated `build()` calls
+  on that builder reuse the same text. Line-ending normalization makes CRLF and
+  LF copies produce identical config and manifest digests.
+
+Read errors report the path; dry-run plans report only the key and normalized
+byte count. Neither errors nor logs include the contents. Like all labels, the
+release notes are visible to anyone who can pull
+the image or read registry metadata: **never put secrets in release notes**.
+
 ## Visibility and reproducibility
 
 Metadata is distributed with images or layouts and may be visible through
@@ -76,17 +111,15 @@ digests. On the single-image path, changing only an index annotation changes
 
 ## Integration touchpoints
 
-- [#140](https://github.com/spboyer/pycontainer-build/issues/140) owns release
-  notes. Before framework defaults are applied, use
+- [#140](https://github.com/spboyer/pycontainer-build/issues/140) adds the
+  release-notes label above. Before framework defaults are applied, it uses
   `merge_image_labels(labels=explicit, generated_labels=generated)` to reject
   generated keys that collide with explicit CLI or file labels; do not silently
-  resolve those collisions by precedence.
-- [#150](https://github.com/spboyer/pycontainer-build/pull/150) creates both a
-  content-addressed image index for registry pushes and a layout-index wrapper.
-  Apply manifest annotations to each platform manifest and index annotations to
-  both index objects. Serialize the annotated image index before calculating its
-  digest and size for the wrapper descriptors and push. Preserve each platform
-  descriptor and the existing verification and publication ordering.
+  resolve those collisions by precedence. Reuse this guard for other generated
+  labels.
+- Multi-platform builds serialize the annotated image index before calculating
+  its digest and size for the layout descriptors and push. Each platform
+  manifest carries the configured manifest annotations independently.
 - [#185](https://github.com/spboyer/pycontainer-build/pull/185) adds one layout
   descriptor per tag. Keep user index annotations on the index, preserve each
   descriptor's independent internal reference annotation, and use the final

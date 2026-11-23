@@ -45,7 +45,7 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 
 ## Validation
 
-- Tags must match the OCI tag syntax (`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`).
+- Tags must match the registry tag syntax (`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`).
 - Every full reference must target the same registry and repository as the
   primary tag; otherwise the build fails with a message naming both.
 - Digest references are rejected.
@@ -53,14 +53,16 @@ On the command line, any `--tag` replaces both `tag` and `tags` from the file.
 
 ## Output
 
-The layout's `index.json` has one manifest descriptor per tag. Every
-descriptor has the same manifest digest, size and platform, and its
+The layout's `index.json` has one descriptor per tag, pointing to a manifest
+for single-platform builds or an image index for multi-platform builds. Every
+descriptor has the same digest and size, and its
 `org.opencontainers.image.ref.name` annotation is the reference to select.
 Names use the primary's repository spelling. For example,
 `--tag myapp:v1.2.3 --tag stable` produces
 `myapp:v1.2.3` and `myapp:stable`, and `--tag ghcr.io/me/app:v1.2.3
 --semver-tags` produces `ghcr.io/me/app:v1.2.3`, `ghcr.io/me/app:v1.2` and
-`ghcr.io/me/app:v1`. The index-level annotation names the primary descriptor.
+`ghcr.io/me/app:v1`. Single-platform layouts also name the primary descriptor
+at the index level.
 
 Standard OCI tools select an image by that annotation:
 
@@ -88,6 +90,8 @@ In the unlikely event an encoded name collides with another descriptor name,
 reference. Registry tags and `refs/tags` filenames retain their original values.
 
 The layout also gets one `refs/tags/<tag>` file per tag, all pointing at the
-same manifest digest; standard tools do not read these files. After a push,
+same manifest or index digest; standard tools do not read these files. After a push,
 `builder.pushed_refs` lists every pushed reference. Registry pushes publish
-each tag separately and are unaffected by the layout index.
+each tag separately and are unaffected by the layout index. For multi-platform
+pushes, a later tag failure reports confirmed, failed or unknown-outcome, and
+unattempted references; previously pushed tags are not rolled back.
