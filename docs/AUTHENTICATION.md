@@ -139,6 +139,13 @@ The client:
 4. Extracts token from response
 5. Retries original request with bearer token
 
+Bearer-token exchanges, authenticated request replays and blob redirects run
+after leaving the original `HTTPError` handler, so subsequent failures do not
+retain its potentially credential-bearing reason in their exception chain.
+Token responses that are not valid UTF-8 JSON raise an authentication error.
+Upload replays restore the body's original stream offset before retrying;
+rewind failures propagate outside that handler too.
+
 #### Auth Methods
 - **Bearer Token**: `Authorization: Bearer <token>`
 - **Basic Auth**: `Authorization: Basic <base64(username:password)>`

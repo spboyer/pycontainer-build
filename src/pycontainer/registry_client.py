@@ -315,6 +315,14 @@ def _should_retry(status: int, headers, attempt: int) -> bool:
     return True
 
 
+def _http_error_result(error, headers) -> Tuple[int, bytes, Dict]:
+    try:
+        body = error.read(MAX_ERROR_BODY_BYTES)
+    except OSError:
+        body = b""
+    return error.code, body, headers
+
+
 def _rate_limit_value(value: Optional[str]) -> Optional[int]:
     if not value:
         return None
@@ -771,7 +779,7 @@ class RegistryClient:
             )
         try:
             data = json.loads(body)
-        except json.JSONDecodeError as error:
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise RegistryAuthenticationError(
                 "Registry bearer-token response was not valid JSON."
             ) from error
@@ -787,20 +795,18 @@ class RegistryClient:
             )
         return token
 
-    def _retry_bearer_challenge(self, request, error, sent_token) -> bool:
+    def _bearer_challenge(self, request, error) -> Optional[Dict[str, str]]:
         if error.code != 401 or not self._is_registry_url(request.full_url):
-            return False
-        params = self._parse_www_authenticate(error.headers.get("Www-Authenticate"))
-        if not params:
-            return False
+            return None
+        return self._parse_www_authenticate(error.headers.get("Www-Authenticate"))
+
+    def _refresh_bearer_token(self, params, error, sent_token) -> bool:
+        # Callers run this outside the 401 handler so exchange failures cannot
+        # chain the original, potentially credential-bearing reason.
         with self._token_lock:
             if not self._bearer_token:
                 error.close()
-                try:
-                    self._bearer_token = self._get_bearer_token(params)
-                except RegistryRequestError as token_error:
-                    # Do not expose the original 401 reason in a traceback.
-                    raise token_error from None
+                self._bearer_token = self._get_bearer_token(params)
                 return True
             return sent_token != self._bearer_token
 
@@ -836,6 +842,7 @@ class RegistryClient:
             request = urllib.request.Request(
                 url, data=data, headers=request_headers, method=method
             )
+            auth_challenge = None
             try:
                 with self._opener.open(
                     request, timeout=self.timeout
@@ -854,26 +861,14 @@ class RegistryClient:
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 self._observe_rate_limit(response_headers, url)
-                if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
-                    error.close()
-                    if body_position is not None:
-                        data.seek(body_position)
-                    return self._make_request(
-                        method,
-                        url,
-                        data,
-                        headers,
-                        retry_auth=False,
-                        max_response_bytes=max_response_bytes,
-                    )
-                if retry_safe and _should_retry(error.code, error.headers, attempt):
-                    time.sleep(_retry_delay(error.headers, attempt))
-                    continue
-                try:
-                    body = error.read(MAX_ERROR_BODY_BYTES)
-                except OSError:
-                    body = b""
-                return error.code, body, response_headers
+                if retry_auth:
+                    auth_challenge = self._bearer_challenge(request, error)
+                if auth_challenge is None:
+                    if retry_safe and _should_retry(error.code, error.headers, attempt):
+                        time.sleep(_retry_delay(error.headers, attempt))
+                        continue
+                    return _http_error_result(error, response_headers)
+                auth_error = error
             except (
                 urllib.error.URLError,
                 TimeoutError,
@@ -888,8 +883,30 @@ class RegistryClient:
                     f"{attempt + 1} attempt(s): {type(error).__name__}."
                 ) from None
 
-        raise RegistryRequestError(
-            f"{method} request to {self._safe_request_url(url)} failed."
+            # Exchange tokens after leaving the 401 handler to avoid leaking its context.
+            if self._refresh_bearer_token(auth_challenge, auth_error, sent_token):
+                auth_error.close()
+                break
+            if retry_safe and _should_retry(auth_error.code, auth_error.headers, attempt):
+                time.sleep(_retry_delay(auth_error.headers, attempt))
+                continue
+            return _http_error_result(auth_error, response_headers)
+
+        else:
+            raise RegistryRequestError(
+                f"{method} request to {self._safe_request_url(url)} failed."
+            )
+
+        # Leave the 401 handler before rewinding or replaying to avoid leaking its context.
+        if body_position is not None:
+            data.seek(body_position)
+        return self._make_request(
+            method,
+            url,
+            data,
+            headers,
+            retry_auth=False,
+            max_response_bytes=max_response_bytes,
         )
 
     def blob_exists(self, digest: str) -> bool:
@@ -1092,28 +1109,44 @@ class RegistryClient:
             request = urllib.request.Request(
                 url, headers=self._authorization_headers(url)
             )
+        auth_challenge = None
+        http_error = None
         try:
             response = self._get_blob_opener().open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             self._observe_rate_limit(error.headers, url)
-            if retry_auth and self._retry_bearer_challenge(request, error, sent_token):
-                error.close()
-                return self._open_blob_response(url, retry_auth=False)
-            if error.code not in REDIRECT_STATUSES:
+            if retry_auth:
+                auth_challenge = self._bearer_challenge(request, error)
+            if auth_challenge is None and error.code not in REDIRECT_STATUSES:
                 raise
-            location = error.headers.get("Location")
-            error.close()
-        else:
-            self._observe_rate_limit(response.headers, url)
-            if response.status not in REDIRECT_STATUSES:
-                return response
+            http_error = error
+
+        # Exchange tokens and follow redirects after leaving the HTTPError
+        # handler so later failures cannot chain its credential-bearing reason.
+        if auth_challenge is not None:
+            if self._refresh_bearer_token(auth_challenge, http_error, sent_token):
+                http_error.close()
+                return self._open_blob_response(url, retry_auth=False)
+            raise http_error
+        if http_error is not None:
+            location = http_error.headers.get("Location")
+            http_error.close()
+            if not location:
+                raise RegistryRequestError(
+                    "Registry blob redirect did not include a Location."
+                )
+            return self._open_blob_redirect(url, location)
+
+        self._observe_rate_limit(response.headers, url)
+        if response.status in REDIRECT_STATUSES:
             location = response.headers.get("Location")
             response.close()
-        if not location:
-            raise RegistryRequestError(
-                "Registry blob redirect did not include a Location."
-            )
-        return self._open_blob_redirect(url, location)
+            if not location:
+                raise RegistryRequestError(
+                    "Registry blob redirect did not include a Location."
+                )
+            return self._open_blob_redirect(url, location)
+        return response
 
     def _open_blob_redirect(self, url: str, location: str):
         target = _join_url(url, location, self.insecure)
