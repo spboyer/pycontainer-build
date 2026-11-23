@@ -30,7 +30,9 @@ The separately opt-in signing tests publish unique tags and signatures to a
 disposable real registry and independently verify them with Cosign or
 Notation. They require explicit registry, key, OIDC identity and trust-policy
 configuration; see [image signing](image-signing.md#real-registry-tests).
-They do not run in the default suite or CI.
+They do not run in the default suite or CI. The opt-in provenance test
+attests and independently verifies a cosign SLSA attestation, and checks that a
+wrong key is rejected; see [provenance](provenance.md#real-registry-test).
 
 The opt-in generic artifact test, `tests/test_artifact_integration.py`, pushes
 a subject and a referring OCI 1.1 artifact to the repository named in

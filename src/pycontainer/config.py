@@ -70,6 +70,12 @@ class BuildConfig:
     sign_verify_key: Optional[str] = None
     sign_certificate_identity: Optional[str] = None
     sign_certificate_oidc_issuer: Optional[str] = None
+    provenance: bool = False
+    provenance_require_complete: bool = False
+    attest_provenance: bool = False
+    provenance_verify_key: Optional[str] = None
+    provenance_certificate_identity: Optional[str] = None
+    provenance_certificate_oidc_issuer: Optional[str] = None
     security: Optional[dict] = None
 
     def __post_init__(self):
@@ -77,6 +83,7 @@ class BuildConfig:
 
         self.system_packages = validate_system_packages(self.system_packages)
         self.validate_signing()
+        self.validate_provenance()
         if self.security is not None:
             from .security import validate_security
 
@@ -119,32 +126,11 @@ class BuildConfig:
             return
         if self.sign_provider is None:
             raise ValueError("Signing requires an explicit sign_provider.")
-        for name in (
+        self._validate_references(
             "sign_key", "sign_plugin", "sign_key_id",
             "sign_timestamp_url", "sign_timestamp_root_cert", "sign_signature_format",
             "sign_verify_key", "sign_certificate_identity", "sign_certificate_oidc_issuer",
-        ):
-            value = getattr(self, name)
-            if value is None:
-                continue
-            if (
-                not isinstance(value, str)
-                or not value
-                or value != value.strip()
-                or any(character in value for character in "\0\r\n")
-                or "PRIVATE KEY" in value.upper()
-            ):
-                raise ValueError(f"{name} must be a non-empty reference, not secret material.")
-            if value.lower().startswith("pkcs11:"):
-                decoded = unquote(value).lower()
-                if "pin-value=" in decoded or "pin-source=" in decoded:
-                    raise ValueError(
-                        f"{name} must not contain a PKCS#11 PIN; use COSIGN_PKCS11_PIN."
-                    )
-            if "://" in value:
-                parsed = urlsplit(value)
-                if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                    raise ValueError(f"{name} must not contain credentials or URL parameters.")
+        )
         if self.sign_provider == "cosign":
             if any(
                 value is not None
@@ -196,6 +182,65 @@ class BuildConfig:
             and self.sign_signature_format not in NOTATION_SIGNATURE_FORMATS
         ):
             raise ValueError("sign_signature_format must be jws or cose.")
+
+    def _validate_references(self, *names: str) -> None:
+        for name in names:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or any(character in value for character in "\0\r\n")
+                or "PRIVATE KEY" in value.upper()
+            ):
+                raise ValueError(f"{name} must be a non-empty reference, not secret material.")
+            if value.lower().startswith("pkcs11:"):
+                decoded = unquote(value).lower()
+                if "pin-value=" in decoded or "pin-source=" in decoded:
+                    raise ValueError(
+                        f"{name} must not contain a PKCS#11 PIN; use COSIGN_PKCS11_PIN."
+                    )
+            if "://" in value:
+                parsed = urlsplit(value)
+                if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    raise ValueError(f"{name} must not contain credentials or URL parameters.")
+
+    def validate_provenance(self) -> None:
+        for name in ("provenance", "provenance_require_complete", "attest_provenance"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
+        if self.provenance_require_complete or self.attest_provenance:
+            self.provenance = True
+        verifier_names = (
+            "provenance_verify_key", "provenance_certificate_identity",
+            "provenance_certificate_oidc_issuer",
+        )
+        self._validate_references(*verifier_names)
+        if not self.attest_provenance:
+            if any(getattr(self, name) is not None for name in verifier_names):
+                raise ValueError("Provenance verification options require attest_provenance.")
+            return
+        if not self.sign or self.sign_provider != "cosign":
+            raise ValueError(
+                "attest_provenance requires sign = true with sign_provider = cosign; "
+                "Notation has no in-toto attestation path."
+            )
+        if all(getattr(self, name) is None for name in verifier_names):
+            # Default to the signature trust policy so the same key is not configured twice.
+            self.provenance_verify_key = self.sign_verify_key
+            self.provenance_certificate_identity = self.sign_certificate_identity
+            self.provenance_certificate_oidc_issuer = self.sign_certificate_oidc_issuer
+        identity = self.provenance_certificate_identity
+        issuer = self.provenance_certificate_oidc_issuer
+        if (self.provenance_verify_key is None) == (identity is None and issuer is None) or (
+            (identity is None) != (issuer is None)
+        ):
+            raise ValueError(
+                "attest_provenance requires either provenance_verify_key or both "
+                "provenance_certificate_identity and provenance_certificate_oidc_issuer."
+            )
 
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""

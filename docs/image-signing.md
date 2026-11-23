@@ -200,6 +200,9 @@ skip, audit, permissive or overridden trust policies. Unconfigured modes skip.
 This check is not part of the default suite or automatic CI and should be run
 with an external timeout.
 
+Cosign SLSA provenance attestation (`--attest-provenance`) and its separate
+real-registry test are described in the [provenance guide](provenance.md).
+
 For both Cosign modes, `test_real_provider_wrong_trust_fails_before_tags`
 configures the build with untrusted verification material (the wrong public
 key, or the expected identity with an `.invalid` suffix). It requires that the

@@ -152,6 +152,24 @@ def test_cli_platform_override_is_used_for_security_validation(tmp_path, monkeyp
     assert "Linux targets only" in capsys.readouterr().err
 
 
+def test_cli_preserves_or_overrides_provenance_with_security_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[build]\nprovenance = true\n"
+        "[build.security.kubernetes]\nread-only-root-filesystem = true\n"
+    )
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+    assert config.provenance is True
+    assert render_security_fragments(config.security, str(tmp_path)) == {
+        KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
+    }
+
+    config = _capture_config(
+        monkeypatch, ["build", "--config", str(config_path), "--no-provenance"]
+    )
+    assert config.provenance is False
+
+
 def test_cli_build_config_ignores_unrelated_scalar_tool_key(tmp_path, monkeypatch):
     config_path = tmp_path / "config.toml"
     config_path.write_text('tool = "standalone"\n[build]\nbase_image = "python:3.12"\n')

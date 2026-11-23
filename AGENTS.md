@@ -96,6 +96,7 @@ dependencies. The excluded tests are:
 - `tests/test_oci_layout.py::test_oci_layout_structure`
 - `tests/test_oci_layout.py::test_tag_extraction`
 - `tests/test_signing_integration.py::test_real_provider_signs_and_independently_verifies` (eight provider/platform combinations)
+- `tests/test_provenance_integration.py::test_real_cosign_attests_and_independently_verifies_provenance` (manifest and index subjects)
 - `tests/test_signing_integration.py::test_real_provider_wrong_trust_fails_before_tags` (four Cosign mode/platform combinations)
 - `tests/test_artifact_integration.py::test_real_registry_artifact_round_trip_and_referrers` (set `PYCONTAINER_ARTIFACT_TEST_REPOSITORY`; optional ORAS check)
 

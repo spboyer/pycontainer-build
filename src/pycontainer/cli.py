@@ -46,8 +46,14 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--sign-verify-key",help="Cosign public key reference used to verify a key-signed image before tagging")
         b.add_argument("--sign-certificate-identity",help="Expected Cosign keyless certificate identity, verified before tagging")
         b.add_argument("--sign-certificate-oidc-issuer",help="Expected Cosign keyless OIDC issuer, verified before tagging")
+        b.add_argument("--attest-provenance",action="store_true",default=None,help="Attach and verify a cosign provenance attestation before moving tags (requires --sign --push)")
+        b.add_argument("--provenance-verify-key",help="Cosign public key used to verify the provenance attestation (defaults to --sign-verify-key)")
+        b.add_argument("--provenance-certificate-identity",help="Expected keyless signer identity for provenance verification")
+        b.add_argument("--provenance-certificate-oidc-issuer",help="Expected keyless OIDC issuer for provenance verification")
         b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
         b.add_argument("--password",help="Registry password/token (or use env vars)")
+    b.add_argument("--provenance",action=argparse.BooleanOptionalAction,default=None,help="Write an unsigned SLSA provenance statement (dist/image/provenance.intoto.json)")
+    b.add_argument("--provenance-require-complete",action="store_true",default=None,help="Fail before writing tags if any provenance evidence is unavailable")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
@@ -98,6 +104,12 @@ def main():
     imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     # --- end import subcommand ---
+    vp=sub.add_parser("verify-provenance",help="Verify a cosign SLSA provenance attestation for an image digest")
+    vp.add_argument("image",help="Immutable image reference: registry/repository@sha256:<digest>")
+    vp.add_argument("--key",help="Trusted cosign public key")
+    vp.add_argument("--certificate-identity",help="Expected keyless signer identity")
+    vp.add_argument("--certificate-oidc-issuer",help="Expected keyless OIDC issuer")
+    vp.add_argument("--require-complete",action="store_true",help="Reject attestations that record incomplete evidence")
     args=parser.parse_args()
 
     if args.cmd=="import":
@@ -109,6 +121,23 @@ def main():
             parser.error(str(exc))
         print(message)
         raise SystemExit(code)
+
+    if args.cmd=="verify-provenance":
+        from .provenance import ProvenanceError, create_verifier
+        try:
+            verifier=create_verifier(args.key,args.certificate_identity,args.certificate_oidc_issuer)
+            statements=verifier.verify(args.image,require_complete_evidence=args.require_complete)
+        except ValueError as exc:
+            parser.error(str(exc))
+        except ProvenanceError as exc:
+            print(f"Provenance verification failed: {exc}",file=sys.stderr)
+            raise SystemExit(1)
+        complete=sum(
+            1 for statement in statements
+            if statement["predicate"]["buildDefinition"]["internalParameters"]["evidence"]["complete"]
+        )
+        print(f"Verified {len(statements)} provenance attestation(s) for {args.image}; {complete} record complete evidence.")
+        return
 
     devloop=args.cmd in ("skaffold-build","tilt-build")
     push=devloop or args.push
@@ -139,6 +168,12 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'provenance': args.provenance,
+        'provenance_require_complete': args.provenance_require_complete,
+        'attest_provenance': getattr(args,"attest_provenance",None),
+        'provenance_verify_key': getattr(args,"provenance_verify_key",None),
+        'provenance_certificate_identity': getattr(args,"provenance_certificate_identity",None),
+        'provenance_certificate_oidc_issuer': getattr(args,"provenance_certificate_oidc_issuer",None),
         'sign': getattr(args,"sign",None),
         'sign_provider': getattr(args,"sign_provider",None),
         'sign_key': getattr(args,"sign_key",None),
@@ -192,6 +227,10 @@ def main():
         parser.error("--sign requires --push; local-only image signing is not supported.")
     if cfg.sign and cfg.dry_run:
         parser.error("--sign cannot be used with --dry-run.")
+    if cfg.provenance and cfg.dry_run:
+        parser.error("--provenance cannot be used with --dry-run.")
+    if cfg.attest_provenance and not push:
+        parser.error("--attest-provenance requires --push.")
 
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
