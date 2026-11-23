@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pycontainer-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pycontainer-demo
+  template:
+    metadata:
+      labels:
+        app: pycontainer-demo
+    spec:
+      containers:
+        - name: app
+          image: pycontainer-demo
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000

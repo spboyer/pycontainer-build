@@ -207,6 +207,7 @@ from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app
 from .sbom import generate_sbom
 from .squash import SquashError, squash_layers
 from .layer_analysis import analyze_platform, shared_blobs
+from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
@@ -221,7 +222,6 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
-VIRTUALENV_TARGET_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/180"
 SQUASH_HISTORY_CREATOR = "pycontainer-build --squash"
 
 
@@ -449,13 +449,15 @@ class ImageBuilder:
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
 
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             image.manifest_digest,
             image.manifest_size,
-            self.config.tag,
+            ref_names[0],
             image.platform["architecture"],
             image.platform["os"],
             variant=image.platform.get("variant"),
+            ref_names=ref_names,
         )
         _atomic_write_bytes(
             output/'index.json',
@@ -506,7 +508,8 @@ class ImageBuilder:
             output/'oci-layout',
             json.dumps(build_oci_layout(),separators=(',',':')).encode(),
         )
-        layout_index=build_layout_index_json(index_digest, index_size, self.config.all_tags())
+        ref_names=local_reference_names(self.config.tag, self.config.all_tags())
+        layout_index=build_layout_index_json(index_digest, index_size, ref_names)
         _atomic_write_bytes(
             output/'index.json',
             json.dumps(layout_index,separators=(',',':')).encode(),
@@ -1041,15 +1044,6 @@ class ImageBuilder:
             raise FileNotFoundError(
                 "Dependency staging was requested, but no supported virtualenv "
                 f"site-packages or {self.config.requirements_file!r} was found."
-            )
-        if not is_requirements and len(self.config.target_platforms()) > 1:
-            raise ValueError(
-                "Multi-platform builds cannot stage dependencies from a copied "
-                "virtualenv: its packages were resolved for the host, so "
-                "target-specific dependencies may be missing. Exclude any "
-                "virtualenvs (for example, --exclude .venv) and provide "
-                f"{self.config.requirements_file!r} for wheel resolution. "
-                f"See {VIRTUALENV_TARGET_FOLLOW_UP}."
             )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
