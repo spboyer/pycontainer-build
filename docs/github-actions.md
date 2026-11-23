@@ -227,6 +227,50 @@ jobs:
           docker run ghcr.io/${{ github.repository }}:${{ github.sha }} python -c "import myapp; print('OK')"
 ```
 
+## Caching Application Layers
+
+The `--cache-dir` directory is the supported offline cache export/import path:
+save it with `actions/cache` (or any archive tool) and restore it in a later
+job. No separate export command or archive format is involved.
+
+```yaml
+    env:
+      # The pycontainer-build commit or release tag installed by this job.
+      PYCONTAINER_REF: d3ee7e0f5a1f342a42f9a43ad4efd335ec0497b7
+    steps:
+      # ... check out, set up Python and install pycontainer-build at PYCONTAINER_REF ...
+      - name: Restore the pycontainer layer cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pycontainer-cache
+          # Caches are not portable across operating systems, and the cache key
+          # format may change between pycontainer-build versions.
+          key: pycontainer-${{ runner.os }}-${{ env.PYCONTAINER_REF }}-${{ hashFiles('**/*.py', 'pyproject.toml', 'requirements.txt') }}
+          restore-keys: |
+            pycontainer-${{ runner.os }}-${{ env.PYCONTAINER_REF }}-
+
+      - name: Build container
+        run: pycontainer build --tag myapp:${{ github.sha }} --cache-dir "${{ runner.temp }}/pycontainer-cache"
+```
+
+What to expect after a restore:
+
+- The cache stores relative source paths only, so a different runner
+  workspace or cache path still hits and produces an identical OCI manifest,
+  config and layers.
+- A restore with blobs but no `index.json` is a clean miss. Entries whose
+  blobs are missing or corrupt are discarded and rebuilt.
+- A malformed `index.json` fails the build with `CacheIndexError`. Delete the
+  reported file (the cached layers are rebuilt) or rerun with `--no-cache`.
+- Parallel builds can share a restored directory; index updates are locked.
+- Linux and Windows caches are not interchangeable. Source permission bits are
+  part of the cache key and the layer (Windows reports `0o666`, Linux usually
+  `0o644`), and Windows checkouts with `core.autocrlf` change file content, so
+  a cross-OS restore misses and rebuilds. Keep `runner.os` in the key.
+- A partial restore key (`restore-keys`) reuses unchanged layers; stale blobs
+  that no longer have an index entry are not evicted, so let the cache key roll
+  over periodically to keep the saved directory small.
+
 ## Authentication
 
 ### GitHub Container Registry (ghcr.io)
