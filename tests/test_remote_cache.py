@@ -1106,7 +1106,8 @@ def test_blob_redirect_rejects_embedded_credentials(monkeypatch, location):
         ("https://user:secret@storage.example/final", False),
     ],
 )
-def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
+@pytest.mark.parametrize("redirect_host", [CACHE_HOST, STORAGE_HOST])
+def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed, redirect_host):
     requests = []
 
     class StorageHandler(urllib.request.BaseHandler):
@@ -1140,23 +1141,24 @@ def test_blob_redirect_checks_every_hop(monkeypatch, location, allowed):
         ),
     )
     client = RegistryClient(CACHE_HOST, CACHE_REPO, auth_token="registry-secret")
+    initial_location = f"https://{redirect_host}/first"
     if allowed:
         with client._open_blob_redirect(
-            f"https://{CACHE_HOST}/blob", "https://storage.example/first"
+            f"https://{CACHE_HOST}/blob", initial_location
         ) as response:
             assert response.read() == b"blob"
         assert len(requests) == 2
-        assert all(
-            request.get_header(header) is None
-            for request in requests
-            for header in ("Authorization", "Proxy-authorization", "Cookie")
-        )
     else:
         with pytest.raises(RegistryRequestError):
             client._open_blob_redirect(
-                f"https://{CACHE_HOST}/blob", "https://storage.example/first"
+                f"https://{CACHE_HOST}/blob", initial_location
             )
         assert len(requests) == 1
+    assert all(
+        request.get_header(header) is None
+        for request in requests
+        for header in ("Authorization", "Proxy-authorization", "Cookie")
+    )
 
 
 @pytest.mark.parametrize(
