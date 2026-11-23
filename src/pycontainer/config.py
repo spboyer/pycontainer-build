@@ -11,8 +11,7 @@ from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 SBOM_FORMATS = ("spdx", "cyclonedx")
 SIGNING_PROVIDERS = ("cosign", "notation")
 NOTATION_SIGNATURE_FORMATS = ("jws", "cose")
-MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
-ARM_V7_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/119"
+MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 MULTI_PLATFORM_SCAN_ERROR = (
     "Vulnerability scanning is not supported for multi-platform images; "
@@ -226,8 +225,7 @@ class BuildConfig:
                 raise ValueError(
                     "Multi-platform builds support only "
                     f"{', '.join(MULTI_PLATFORM_TARGETS)}; unsupported target(s): "
-                    f"{', '.join(unsupported)}. linux/arm/v7 support is tracked in "
-                    f"{ARM_V7_FOLLOW_UP}."
+                    f"{', '.join(unsupported)}."
                 )
             if self.generate_sbom:
                 raise ValueError(

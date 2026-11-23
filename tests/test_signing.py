@@ -145,7 +145,10 @@ def _use_registry(monkeypatch, registry, *, fail=False, race=False, fail_verify=
     )
 
 
-@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+@pytest.mark.parametrize(
+    "platform",
+    ["linux/amd64", "linux/amd64,linux/arm64", "linux/amd64,linux/arm64,linux/arm/v7"],
+)
 def test_signed_push_verifies_and_signs_immutable_top_level_before_tags(
     tmp_path, monkeypatch, platform
 ):
