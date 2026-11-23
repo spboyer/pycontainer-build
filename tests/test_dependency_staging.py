@@ -148,6 +148,7 @@ def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
+        return [path]
 
     monkeypatch.setattr("pycontainer.builder.install_requirements", install)
     monkeypatch.setattr(
@@ -477,6 +478,7 @@ def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, 
         installed.append(path)
         destination.mkdir(parents=True)
         (destination / "pip_dep.py").write_text("value = 1\n")
+        return [path]
 
     monkeypatch.setattr("pycontainer.builder.install_requirements", install)
     monkeypatch.setattr(
