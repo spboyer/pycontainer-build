@@ -213,6 +213,59 @@ def test_parse_rejects_malformed_local_references(value):
 # --- OCI layouts ---------------------------------------------------------
 
 
+def test_oci_layout_metadata_combines_base_labels_and_new_annotations(tmp_path, offline):
+    layout = Layout(tmp_path / "base")
+    descriptor, platform, _ = layout.image(b"base")
+    blobs = layout.root / "blobs" / "sha256"
+    base_manifest = json.loads((blobs / descriptor["digest"].split(":")[1]).read_bytes())
+    base_config = json.loads((blobs / base_manifest["config"]["digest"].split(":")[1]).read_bytes())
+    base_config["config"].update({
+        "Labels": {"base": "kept", "shared": "base"},
+        "StopSignal": "SIGQUIT",
+        "Volumes": {"/data": {}},
+    })
+    base_manifest["config"] = layout.blob(
+        json.dumps(base_config).encode(), "application/vnd.oci.image.config.v1+json"
+    )
+    base_manifest["annotations"] = {"base.manifest": "not inherited"}
+    descriptor = layout.blob(
+        json.dumps(base_manifest).encode(), "application/vnd.oci.image.manifest.v1+json"
+    )
+    layout.add(descriptor, ref="base", platform=platform)
+    layout.write_index({"base.index": "not inherited"})
+
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    output = tmp_path / "out"
+    config = BuildConfig(
+        tag="app:v1", base_image=f"oci:{layout.root}:base",
+        context_dir=str(context), output_dir=str(output), use_cache=False,
+        labels={"shared": "override"}, manifest_annotations={"new.manifest": "value"},
+        index_annotations={"new.index": "value"},
+    )
+    ImageBuilder(config).build()
+    index = json.loads((output / "index.json").read_bytes())
+    blobs = output / "blobs" / "sha256"
+    manifest_desc = index["manifests"][0]
+    manifest_bytes = (blobs / manifest_desc["digest"].split(":")[1]).read_bytes()
+    manifest = json.loads(manifest_bytes)
+    config_desc = manifest["config"]
+    config_bytes = (blobs / config_desc["digest"].split(":")[1]).read_bytes()
+    image = json.loads(config_bytes)
+
+    assert manifest_desc["digest"] == sha(manifest_bytes)
+    assert manifest_desc["size"] == len(manifest_bytes)
+    assert config_desc["digest"] == sha(config_bytes)
+    assert config_desc["size"] == len(config_bytes)
+    assert image["config"]["Labels"] == {"base": "kept", "shared": "override"}
+    assert image["config"]["StopSignal"] == "SIGQUIT"
+    assert image["config"]["Volumes"] == {"/data": {}}
+    assert manifest["annotations"] == {"new.manifest": "value"}
+    assert index["annotations"]["new.index"] == "value"
+    assert "base.index" not in index["annotations"]
+
+
 def test_oci_layout_build_preserves_base_offline(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     descriptor, platform, layer = layout.image(b"one", gzip_layer=True)

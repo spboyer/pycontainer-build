@@ -106,6 +106,35 @@ def test_bases_tags_default_and_independent_layouts(tmp_path, monkeypatch):
     assert not (root / "index.json").exists()
 
 
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_matrix_preserves_image_metadata_for_every_version(tmp_path, monkeypatch, platform):
+    labels = {"example.label": "configured"}
+    manifest_annotations = {"example.manifest": "manifest-value"}
+    index_annotations = {"example.index": "index-value"}
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, platform=platform, labels=labels,
+        manifest_annotations=manifest_annotations, index_annotations=index_annotations,
+    )
+    build.build()
+    for child in build.children.values():
+        root = Path(child.config.output_dir)
+        blobs = root / "blobs" / "sha256"
+        layout = json.loads((root / "index.json").read_text())
+        assert layout["annotations"]["example.index"] == "index-value"
+        if child.index_digest:
+            index = json.loads((blobs / child.index_digest.split(":")[1]).read_text())
+            assert index["annotations"] == index_annotations
+        for image in child.platform_images:
+            manifest = json.loads((blobs / image.manifest_digest.split(":")[1]).read_text())
+            config = json.loads((blobs / image.config_digest.split(":")[1]).read_text())
+            assert manifest["annotations"] == manifest_annotations
+            assert config["config"]["Labels"]["example.label"] == "configured"
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    build.push(show_progress=False)
+    assert all(operation.outcome == "confirmed" for operation in build.operations)
+
+
 def test_matrix_history_records_one_run_with_all_child_phases(tmp_path, monkeypatch):
     history_dir = tmp_path / "history"
     matrix_build, _, _ = matrix(
