@@ -99,7 +99,7 @@ def main():
     allowed = set(environment) | {"extra"}
 
     try:
-        from pip._vendor.packaging.markers import Marker
+        from pip._vendor.packaging.markers import Marker, UndefinedComparison
         from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
         from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
         from pip._vendor.packaging.utils import canonicalize_name
@@ -162,7 +162,7 @@ def main():
         # same spellings; `in` keeps its PEP 508 substring semantics.
         try:
             return requirement.normalized.evaluate(dict(env, extra=extra))
-        except Exception:
+        except (InvalidSpecifier, InvalidVersion, UndefinedComparison):
             return None
 
     def active(requirement, extra, label):

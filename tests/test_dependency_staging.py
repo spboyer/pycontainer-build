@@ -1482,20 +1482,37 @@ def test_virtualenv_substring_extras_cannot_prove_unrequested(
         _stage_base_venv(tmp_path, monkeypatch, context)
 
 
+_INJECT_INVALID_VERSION = (
+    "import pip._vendor.packaging.markers as _markers\n"
+    "from pip._vendor.packaging.version import InvalidVersion\n"
+    "_eval_op = _markers._eval_op\n"
+    "def _raising_eval_op(lhs, op, rhs):\n"
+    "    if '1-0-0' in (lhs, rhs):\n"
+    "        raise InvalidVersion('injected')\n"
+    "    return _eval_op(lhs, op, rhs)\n"
+    "_markers._eval_op = _raising_eval_op\n"
+)
+
+
 def test_virtualenv_version_like_extra_evaluation_errors_fail_closed(
     tmp_path, monkeypatch
 ):
-    # packaging 22+ can raise InvalidVersion comparing "1-0-0" with "==1-0".
+    # packaging 22+ raises InvalidVersion comparing "1-0-0" with "==1-0";
+    # inject it so every vendored packaging version takes the error path.
+    script = tmp_path / "_venv_closure.py"
+    script.write_text(
+        _INJECT_INVALID_VERSION
+        + dependencies._VENV_CLOSURE_SCRIPT.read_text(encoding="utf-8")
+    )
+    monkeypatch.setattr(dependencies, "_VENV_CLOSURE_SCRIPT", script)
     context = tmp_path / "context"
     _write_base_venv(context, {"marker-root": [
         "Provides-Extra: 1.0.0",
         'Requires-Dist: missing-child; extra == "1.0"',
     ]})
     (context / "requirements.txt").write_text("marker-root[1.0.0]\n")
-    try:
+    with pytest.raises(ValueError, match=r"marker-root 1.0 \[1-0-0\] requires .*missing-child.*not installed"):
         _stage_base_venv(tmp_path, monkeypatch, context)
-    except ValueError as exc:
-        assert re.search("missing-child.*not installed", str(exc))
 
 
 def test_virtualenv_substring_extras_without_provides_extra_fail_closed(
