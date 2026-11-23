@@ -108,7 +108,9 @@ starts a container. `--platform` must match the daemon; emulated runs fail
 rather than count as evidence. `--evidence` writes a passed or failed JSON
 record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
-It is not part of default pytest.
+To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
+(optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
+Neither mode is part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
@@ -241,6 +243,10 @@ only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
 `Lib` layout; `python_version` shared only when
 the venv minor is established) would have installed one of its missing
 requirements; otherwise unsatisfied target-active requirements fail closed.
+Extra markers compare canonical names on any vendored `packaging` version;
+`in`/`not in` keep PEP 508 substring semantics (not list membership), never
+name candidate extras or rule one out, and fail closed without
+`Provides-Extra`. Other `extra` operators and evaluation errors fail closed.
 Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are

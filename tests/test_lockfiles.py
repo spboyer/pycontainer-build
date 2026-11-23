@@ -921,6 +921,34 @@ def test_extra_marker_normalization_does_not_change_platform_values():
     )
 
 
+@pytest.mark.parametrize(
+    ("marker", "extra", "expected"),
+    [
+        ('extra in "other,Speed_Ups"', "speed-ups", True),
+        ('"Speed" in extra', "speed-ups", True),
+        ('extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra in "a,b"', "", True),
+    ],
+)
+def test_locked_extra_markers_keep_substring_semantics(marker, extra, expected):
+    assert lockfile_module._marker_applies(marker, PY311, "wheel metadata", extra) is expected
+
+
+def test_locked_extra_marker_evaluation_failure_is_explicit(monkeypatch):
+    marker_type = lockfile_module.Marker
+
+    class InvalidVersionMarker:
+        def __init__(self, expression):
+            self._markers = marker_type(expression)._markers
+
+        def evaluate(self, values):
+            raise lockfile_module.InvalidVersion("synthetic invalid version")
+
+    monkeypatch.setattr(lockfile_module, "Marker", InvalidVersionMarker)
+    with pytest.raises(LockfileError, match="Cannot evaluate environment marker"):
+        lockfile_module._marker_applies('extra == "1.0"', PY311, "wheel metadata", "1.0")
+
+
 def test_staged_wheel_closure_checks_normalized_requested_extras(tmp_path):
     context = _write_pipenv_project(tmp_path / "context", extras=["speed-ups"])
     selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
@@ -1594,6 +1622,54 @@ def test_locked_build_requires_a_matching_wheel_hash_for_each_target(tmp_path, m
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
     layer = builder._create_deps_layer(layers, base_config=base, os_name="linux", arch="arm64")
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_lock_stages_wheels_without_copying_conda_prefix(tmp_path, monkeypatch, caplog, explicit):
+    from pycontainer.history import BuildHistory
+
+    context = tmp_path / "context"
+    wheel = _offline_wheelhouse(monkeypatch, context)
+    _write_uv_project(context, wheel)
+    (context / "environment.yml").write_text("name: host-env\n")
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "host-package.txt").write_text("host-only\n")
+    (context / "requirements.txt").write_text("unrelated-package==9.9\n")
+    history = tmp_path / "history"
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile="uv.lock" if explicit else None,
+        include_paths=["app.py", "environment.yml", ".venv"],
+        exclude_defaults=False,
+        record_history=True, history_dir=str(history),
+    )
+
+    builder.build()
+
+    assert "Conda inputs ignored" in caplog.text
+    names = [name for layer in builder.layers for name in _layer_names(layer)]
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("host-package.txt" in name or "conda-meta" in name for name in names)
+    record = BuildHistory(history).list()[0]
+    assert record["status"] == "success"
+    assert {"base_image", "dependencies", "application"} <= record["phases_ns"].keys()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_explicit_lock_inside_conda_prefix_fails_before_pull(tmp_path, monkeypatch, dry_run):
+    context = tmp_path / "context"
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "uv.lock").write_text("not a supported source\n")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile=".venv/uv.lock", dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base image pulled"))
+
+    with pytest.raises(ValueError, match="Conda"):
+        builder.build()
 
 
 def _host_pip_setting(monkeypatch, tmp_path, source, key, value, *, bypass):

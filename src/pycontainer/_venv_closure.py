@@ -9,6 +9,7 @@ requirements, versions and markers; it never imports staged packages. Markers
 that reference a variable without a known target value are rejected instead of
 being evaluated with host values.
 """
+import copy
 import json
 import sys
 
@@ -16,14 +17,42 @@ PATCH_ERROR_EXIT = 87
 MAX_PROBLEMS = 20
 
 
+EXTRA_OPS = {"==", "!=", "in", "not in"}
+CONTAINMENT_OPS = {"in", "not in"}
+
+
 class ClosureError(Exception):
     pass
 
 
-def _walk(markers, variables, extras, normalize_extra=None):
+class UnsupportedExtra(ClosureError):
+    pass
+
+
+def _extra_operand(item):
+    """Return (op, literal) for a comparison involving `extra`, else None."""
+    if not any(
+        type(node).__name__ == "Variable" and node.value == "extra" for node in item
+    ):
+        return None
+    lhs, op, rhs = item
+    kinds = (type(lhs).__name__, type(rhs).__name__)
+    if (
+        type(op).__name__ != "Op"
+        or str(op.value) not in EXTRA_OPS
+        or kinds not in {("Variable", "Value"), ("Value", "Variable")}
+    ):
+        raise UnsupportedExtra(
+            "only extra ==, !=, in and not in comparisons with a literal value "
+            "can be verified"
+        )
+    return str(op.value), (rhs if kinds[1] == "Value" else lhs)
+
+
+def _walk(markers, variables, extras, containment):
     for item in markers:
         if isinstance(item, list):
-            _walk(item, variables, extras, normalize_extra)
+            _walk(item, variables, extras, containment)
         elif isinstance(item, tuple) and len(item) == 3:
             names = {type(node).__name__ for node in item}
             if not names <= {"Variable", "Value", "Op"}:
@@ -31,14 +60,34 @@ def _walk(markers, variables, extras, normalize_extra=None):
             for node in item:
                 if type(node).__name__ == "Variable":
                     variables.add(node.value)
-                    if node.value == "extra":
-                        for other in item:
-                            if type(other).__name__ == "Value":
-                                extras.add(other.value)
-                                if normalize_extra is not None:
-                                    other.value = normalize_extra(other.value)
+            operand = _extra_operand(item)
+            if operand is None:
+                continue
+            op, literal = operand
+            if op in CONTAINMENT_OPS:
+                # PEP 508 `in` is a substring test, not list membership, so
+                # its literal does not name candidate extras.
+                containment.add(op)
+            else:
+                extras.add(literal.value)
         elif item not in {"and", "or"}:
             raise ClosureError("unrecognized marker structure")
+
+
+def _canonical_extras(markers, canonical):
+    """Copy `markers` with only the literal operands of extra comparisons canonicalized."""
+    rewritten = []
+    for item in markers:
+        if isinstance(item, list):
+            rewritten.append(_canonical_extras(item, canonical))
+        elif isinstance(item, tuple) and _extra_operand(item) is not None:
+            rewritten.append(tuple(
+                type(node)(canonical(node.value)) if type(node).__name__ == "Value" else node
+                for node in item
+            ))
+        else:
+            rewritten.append(item)
+    return rewritten
 
 
 def main():
@@ -51,17 +100,26 @@ def main():
     allowed = set(environment) | {"extra"}
 
     try:
-        from pip._vendor.packaging.markers import Marker
+        from pip._vendor.packaging.markers import Marker, UndefinedComparison
         from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
         from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
         from pip._vendor.packaging.utils import canonicalize_name
         from pip._vendor.packaging.version import InvalidVersion, Version
 
         def marker_info(marker):
-            variables, extras = set(), set()
+            variables, extras, containment = set(), set(), set()
             if marker is not None:
-                _walk(marker._markers, variables, extras)
-            return variables, {canonicalize_name(extra) for extra in extras}, extras
+                _walk(marker._markers, variables, extras, containment)
+            canonical = {canonicalize_name(extra) for extra in extras} - {""}
+            return variables, canonical, containment
+
+        def normalized(marker):
+            form = copy.copy(marker)
+            form._markers = _canonical_extras(marker._markers, canonicalize_name)
+            return form
+
+        def check(text, extra):
+            return normalized(Marker(text)).evaluate(dict(probe, extra=extra))
 
         machine = environment["platform_machine"]
         other = "aarch64" if machine == "x86_64" else "x86_64"
@@ -69,14 +127,22 @@ def main():
         matching = Marker(f'platform_machine == "{machine}" and sys_platform == "linux"')
         opposite = Marker(f'platform_machine == "{other}"')
         unknown_variables = marker_info(Marker('platform_release >= "1"'))[0]
+        listed = 'extra != "" and extra in "other,Speed_Ups"'
         if (
             not matching.evaluate(probe)
             or opposite.evaluate(probe)
             or unknown_variables != {"platform_release"}
-            or marker_info(Marker('extra == "Foo_Bar"'))[1] != {"foo-bar"}
-            or len(marker_info(Marker('extra == "Foo_Bar"'))[2]) != 1
-            or not Marker('extra == "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
-            or Marker('extra != "Foo_Bar"').evaluate(dict(probe, extra="Foo_Bar"))
+            or marker_info(Marker('"Foo_Bar" == extra'))[1:] != ({"foo-bar"}, set())
+            or marker_info(Marker(listed))[1:] != (set(), {"in"})
+            or not check('extra == "Foo_Bar"', "foo-bar")
+            or check('extra != "Foo_Bar"', "foo-bar")
+            or not check('"Foo_Bar" == extra', "foo-bar")
+            or not check(listed, "speed-ups")
+            or not check(listed, "e")
+            or check(listed, "")
+            or not check('extra in "a,b"', "")
+            or not check('"Speed" in extra', "speed-ups")
+            or check('extra not in "other,Speed_Ups"', "peed-ups")
         ):
             raise ClosureError("target marker self-test failed")
     except Exception as exc:
@@ -89,34 +155,32 @@ def main():
         if message not in problems:
             problems.append(message)
 
-    def evaluate(requirement, extra, env, label):
-        if extra:
-            # Older vendored packaging compares extra spellings literally, so
-            # evaluate with the marker's own spelling of the canonical extra.
-            spellings = {
-                raw for raw in requirement.info[2] if canonicalize_name(raw) == extra
-            }
-            if len(spellings) > 1:
-                raise ClosureError(
-                    f"{label} requires {requirement.text!r}, whose marker spells "
-                    f"extra [{extra}] inconsistently"
-                )
-            extra = next(iter(spellings), extra)
-        return requirement.parsed.marker.evaluate(dict(env, extra=extra))
+    def evaluate(requirement, extra, env):
+        """Evaluate with canonical extras; None when packaging cannot evaluate it."""
+        if "extra" not in requirement.info[0]:
+            return requirement.parsed.marker.evaluate(dict(env, extra=extra))
+        # Canonical operands make every vendored packaging version compare the
+        # same spellings; `in` keeps its PEP 508 substring semantics.
+        try:
+            return requirement.normalized.evaluate(dict(env, extra=extra))
+        except (InvalidSpecifier, InvalidVersion, UndefinedComparison):
+            return None
 
     def active(requirement, extra, label):
         if requirement.parsed.marker is None:
             return extra == ""
-        return evaluate(requirement, extra, environment, label)
+        return evaluate(requirement, extra, environment) is not False
 
     hosts = request.get("hosts", [])
 
     def host_state(requirement, extra, host, label):
         if requirement.parsed.marker is None:
             return extra == ""
-        if not requirement.info[0] <= set(host) | {"extra"}:
+        if requirement.info[2] or not requirement.info[0] <= set(host) | {"extra"}:
+            # Legacy and current packaging disagree on substring matches of
+            # differently spelled extras, so containment cannot prove a host.
             return None
-        return evaluate(requirement, extra, host, label)
+        return evaluate(requirement, extra, host)
 
     def unrequested(missing, extra, label):
         """Whether every plausible venv host would have installed one of `missing` for it."""
@@ -179,8 +243,12 @@ def main():
             try:
                 self.parsed = Requirement(text)
                 self.info = marker_info(self.parsed.marker)
+            except UnsupportedExtra as exc:
+                raise ClosureError(f"{label} requires {text!r}, but {exc}") from exc
             except (InvalidRequirement, ClosureError) as exc:
                 raise ClosureError(f"{label} has malformed Requires-Dist") from exc
+            if "extra" in self.info[0]:
+                self.normalized = normalized(self.parsed.marker)
             if self.parsed.url:
                 raise ClosureError(
                     f"{label} declares direct URL dependency {self.parsed.name!r}"
@@ -258,6 +326,7 @@ def main():
                 "label": label,
                 "requirements": requirements,
                 "extras": extras,
+                "provides": bool(record["headers"].get("Provides-Extra")),
             }
 
         for text in request.get("constraints", []):
@@ -328,6 +397,16 @@ def main():
                             f"{dist['name']} was selected when the virtualenv was "
                             f"created; on the target it requires {requirement.text!r}, "
                             "which is not satisfied"
+                        )
+                        break
+            if not dist["provides"]:
+                for requirement in dist["requirements"]:
+                    if requirement.info[2] and unsatisfied(requirement, dist["label"]):
+                        problem(
+                            f"Cannot determine which extras of {dist['name']} were "
+                            f"selected; {requirement.text!r} matches extras by "
+                            "substring, it is not satisfied, and the distribution "
+                            "declares no Provides-Extra"
                         )
                         break
     except ClosureError as exc:
