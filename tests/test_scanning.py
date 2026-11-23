@@ -263,6 +263,58 @@ def test_successful_scan_preserves_security_fragment_generation(tmp_path, monkey
     assert json.loads(fragment.read_text()) == {"readOnlyRootFilesystem": True}
 
 
+def test_scanning_and_push_accept_multiple_tags_for_same_manifest(tmp_path, monkeypatch, scanner):
+    builder = make_builder(tmp_path, monkeypatch, scanner, tags=["stable"])
+    builder.build()
+    pushed = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def push_blob(self, digest, path, **kwargs):
+            return True
+
+        def push_manifest(self, tag, data):
+            assert "sha256:" + hashlib.sha256(data).hexdigest() == builder.manifest_digest
+            pushed.append(tag)
+
+    monkeypatch.setattr("pycontainer.builder.RegistryClient", Client)
+    monkeypatch.setattr(
+        "pycontainer.builder.get_registry_auth",
+        lambda *args, **kwargs: SimpleNamespace(bearer_token=None, username=None, password=None),
+    )
+    builder.push(show_progress=False)
+    assert pushed == ["latest", "stable"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("size", 0),
+        ("mediaType", "application/vnd.oci.image.index.v1+json"),
+        ("platform", {"os": "linux", "architecture": "arm64"}),
+    ],
+)
+def test_scanning_rejects_conflicting_same_digest_descriptors_before_auth(
+    tmp_path, monkeypatch, scanner, field, value
+):
+    from pycontainer.scanning import ScanError
+
+    builder = make_builder(tmp_path, monkeypatch, scanner, tags=["stable"])
+    builder.build()
+    path = tmp_path / "output" / "index.json"
+    index = json.loads(path.read_text())
+    index["manifests"][1][field] = value
+    path.write_text(json.dumps(index))
+    monkeypatch.setattr(
+        "pycontainer.builder.get_registry_auth",
+        lambda *args, **kwargs: pytest.fail("auth before gate"),
+    )
+    with pytest.raises(ScanError, match="ambiguous"):
+        builder.push(show_progress=False)
+
+
 def test_changed_layer_blocks_push_before_auth(tmp_path, monkeypatch, scanner):
     from pycontainer.scanning import ScanError
     builder = make_builder(tmp_path, monkeypatch, scanner)
