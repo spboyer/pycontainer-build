@@ -36,7 +36,8 @@ def _base_layer(arch: str, libc_version=None):
         if libc_version is not None:
             payload = (
                 "Package: libc6\nStatus: install ok installed\n"
-                f"Version: {libc_version}-1\nArchitecture: {arch}\n\n"
+                f"Version: {libc_version}-1\n"
+                f"Architecture: {'armhf' if arch.startswith('arm-') else arch}\n\n"
             ).encode()
             info = tarfile.TarInfo("var/lib/dpkg/status")
             info.size = len(payload)
@@ -48,17 +49,24 @@ def _base_layer(arch: str, libc_version=None):
 class FakeBaseRegistry:
     """Serves a two-platform base index; records pulls for assertions."""
 
-    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, base_env=None,
-                 base_env_by_arch=None, base_runtime_by_arch=None, libc_by_arch=None):
+    def __init__(self, platforms=("amd64", "arm64"), wrong_diff_id_arch=None, config_variants=None,
+                 base_env=None, base_env_by_arch=None, base_runtime_by_arch=None,
+                 libc_by_arch=None):
         self.blobs = {}
         self.manifests = {}
         descriptors = []
-        for arch in platforms:
+        for entry in platforms:
+            arch, _, variant = entry.partition("/")
             layer, diff_id = _base_layer(
-                arch, libc_by_arch[arch] if libc_by_arch is not None else None
+                entry.replace("/", "-"), libc_by_arch[arch] if libc_by_arch is not None else None
             )
-            if arch == wrong_diff_id_arch:
+            if entry == wrong_diff_id_arch:
                 diff_id = _digest(b"not the layer content")
+            platform = {"os": "linux", "architecture": arch}
+            if variant:
+                platform["variant"] = variant
+            # Real configs may omit the variant; the index descriptor is authoritative.
+            config_variant = (config_variants or {}).get(entry)
             env = base_env_by_arch[arch] if base_env_by_arch is not None else base_env
             if env is None:
                 env = [
@@ -71,6 +79,7 @@ class FakeBaseRegistry:
             config = json.dumps({
                 "os": "linux",
                 "architecture": arch,
+                **({"variant": config_variant} if config_variant else {}),
                 "config": runtime,
                 "rootfs": {"type": "layers", "diff_ids": [diff_id]},
             }).encode()
@@ -91,7 +100,7 @@ class FakeBaseRegistry:
                 "mediaType": MANIFEST_TYPE,
                 "digest": _digest(manifest),
                 "size": len(manifest),
-                "platform": {"os": "linux", "architecture": arch},
+                "platform": platform,
             })
         index = json.dumps({"schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": descriptors}).encode()
         self.index_digest = _digest(index)
@@ -191,17 +200,18 @@ def _record_tag_provenance(monkeypatch):
 def test_tag_provenance_survives_digest_pinning_only_for_tag_pulls(
     tmp_path, monkeypatch, reference, verified
 ):
-    registry = FakeBaseRegistry()
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"))
     seen = _record_tag_provenance(monkeypatch)
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_image=reference.format(digest=registry.index_digest),
     )
     builder.build()
 
     top_level = [ref for ref, _ in registry.manifest_calls if ref in ("3.11-slim", registry.index_digest)]
-    assert top_level[1] == registry.index_digest
-    assert seen == [("amd64", verified), ("arm64", verified)]
+    assert top_level[1:] == [registry.index_digest] * 2
+    assert seen == [("amd64", verified), ("arm64", verified), ("arm", verified)]
 
 
 @pytest.mark.parametrize("reference, resolve_tag, verified", [
@@ -212,7 +222,7 @@ def test_tag_provenance_survives_digest_pinning_only_for_tag_pulls(
 def test_staging_abi_checks_receive_per_platform_tag_provenance(
     tmp_path, monkeypatch, reference, resolve_tag, verified
 ):
-    registry = FakeBaseRegistry()
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6", "arm/v7"))
     if not resolve_tag:
         # The registry did not vouch for the tag with a digest.
         client_factory = registry.client
@@ -232,8 +242,8 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
     seen = []
 
     def record(name):
-        def fake(*args, base_image_tag_verified=False, **kwargs):
-            seen.append((name, base_image_tag_verified))
+        def fake(*args, base_image_tag_verified=False, variant=None, **kwargs):
+            seen.append((name, base_image_tag_verified, variant))
             return [] if name == "install" else "3.11"
         return fake
 
@@ -243,34 +253,45 @@ def test_staging_abi_checks_receive_per_platform_tag_provenance(
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
         ctx=_context(tmp_path, requirements=True),
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_image=reference.format(digest=registry.index_digest),
     )
     builder.build()
 
-    assert seen == [("version", verified), ("wheel", verified), ("install", verified)] * 2
+    assert seen == [
+        (name, verified, None if name == "version" else variant)
+        for variant in (None, None, "v7")
+        for name in ("version", "wheel", "install")
+    ]
 
 
 @pytest.mark.parametrize("by_digest", [False, True])
+@pytest.mark.parametrize("arm_first", [False, True])
 def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
-    tmp_path, monkeypatch, by_digest
+    tmp_path, monkeypatch, by_digest, arm_first
 ):
     registry = FakeBaseRegistry(
-        base_env=[], libc_by_arch={"amd64": "2.28", "arm64": "2.36"}
+        platforms=("amd64", "arm64", "arm/v6", "arm/v7"),
+        base_env=[], libc_by_arch={"amd64": "2.28", "arm64": "2.36", "arm": "2.31"},
     )
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, *, base_image_tag_verified):
-        installs.append((arch, version, base_image_tag_verified))
+                     base_image, base_config, variant=None, *, base_image_tag_verified):
+        installs.append((arch, variant, version, base_image_tag_verified))
         return []
 
     monkeypatch.setattr(builder_module, "install_requirements", fake_install)
     base_image = "python:3.11-slim"
     if by_digest:
         base_image += "@" + registry.index_digest
+    platforms = ["linux/amd64", "linux/arm64", "linux/arm/v7"]
+    if arm_first:
+        platforms = ["linux/arm/v7", "linux/amd64", "linux/arm64"]
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
         ctx=_context(tmp_path, requirements=True), base_image=base_image,
+        platform=",".join(platforms),
     )
 
     if by_digest:
@@ -280,7 +301,14 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
         assert not (tmp_path / "out" / "index.json").exists()
     else:
         builder.build()
-        assert installs == [("amd64", "3.11", True), ("arm64", "3.11", True)]
+        expected = [
+            ("amd64", None, "3.11", True),
+            ("arm64", None, "3.11", True),
+            ("arm", "v7", "3.11", True),
+        ]
+        if arm_first:
+            expected = expected[-1:] + expected[:-1]
+        assert installs == expected
 
 
 @pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
@@ -288,8 +316,9 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     tmp_path, monkeypatch, source
 ):
     registry = FakeBaseRegistry(
+        platforms=("amd64", "arm64", "arm/v7"),
         base_env=["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"],
-        libc_by_arch={"amd64": "2.28", "arm64": "2.36"},
+        libc_by_arch={"amd64": "2.28", "arm64": "2.36", "arm": "2.31"},
     )
     if source == "unresolved-tag":
         client_factory = registry.client
@@ -309,7 +338,7 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, *, base_image_tag_verified):
+                     base_image, base_config, *, base_image_tag_verified, variant=None):
         installs.append((arch, base_config["config"]["Env"], base_image_tag_verified))
         return []
 
@@ -320,6 +349,7 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     builder = _builder(
         tmp_path, monkeypatch, registry, include_deps=True,
         ctx=_context(tmp_path, requirements=True), base_image=base_image,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
     )
 
     if source != "verified-tag":
@@ -336,6 +366,7 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     ] == [
         ("amd64", "PYTHON_LIBC=glibc-2.28", True),
         ("arm64", "PYTHON_LIBC=glibc-2.36", True),
+        ("arm", "PYTHON_LIBC=glibc-2.31", True),
     ]
     for image in builder.platform_images:
         config = json.loads(_blob(tmp_path / "out", image.config_digest))
@@ -436,12 +467,15 @@ def test_platform_commands_inherit_and_clear_independently(
 
 
 @pytest.mark.parametrize("explicit_label", [None, "custom"])
-def test_streamlit_defaults_resolve_per_platform_base(tmp_path, monkeypatch, explicit_label):
+@pytest.mark.parametrize("second_platform,second_arch", [("arm64", "arm64"), ("arm/v7", "arm")])
+def test_streamlit_defaults_resolve_per_platform_base(
+    tmp_path, monkeypatch, explicit_label, second_platform, second_arch
+):
     ctx = _context(tmp_path)
     (ctx / "app.py").write_text("import streamlit\n")
     (ctx / "requirements.txt").write_text("streamlit\n")
-    ports = {"amd64": 9101, "arm64": 9102}
-    addresses = {"amd64": "127.0.0.1", "arm64": "0.0.0.0"}
+    ports = {"amd64": 9101, second_arch: 9102}
+    addresses = {"amd64": "127.0.0.1", second_arch: "0.0.0.0"}
     env = {
         arch: [
             f"STREAMLIT_SERVER_PORT={ports[arch]}",
@@ -455,8 +489,12 @@ def test_streamlit_defaults_resolve_per_platform_base(tmp_path, monkeypatch, exp
     }
     labels = {"framework": explicit_label} if explicit_label is not None else None
     builder = _builder(
-        tmp_path, monkeypatch, FakeBaseRegistry(base_env_by_arch=env, base_runtime_by_arch=runtime),
-        ctx=ctx, labels=labels,
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(
+            platforms=("amd64", second_platform), base_env_by_arch=env,
+            base_runtime_by_arch=runtime,
+        ),
+        ctx=ctx, labels=labels, platform=f"linux/amd64,linux/{second_platform}",
     )
     builder.build()
     for image in builder.platform_images:
@@ -469,6 +507,8 @@ def test_streamlit_defaults_resolve_per_platform_base(tmp_path, monkeypatch, exp
         assert "Cmd" not in config
         assert config["ExposedPorts"] == {f"{ports[arch]}/tcp": {}}
         assert config["Labels"]["framework"] == (explicit_label or "streamlit")
+        if arch == "arm":
+            assert image.platform["variant"] == "v7"
 
 
 def test_jupyter_generated_command_uses_each_base_user(tmp_path, monkeypatch):
@@ -494,9 +534,11 @@ def test_jupyter_generated_command_uses_each_base_user(tmp_path, monkeypatch):
         assert config["Labels"]["framework"] == "jupyter"
 
 
-@pytest.mark.parametrize("platform", ["linux/amd64,linux/arm/v7", "linux/amd64,linux/arm64/v8"])
+@pytest.mark.parametrize(
+    "platform", ["linux/amd64,linux/arm64/v8", "linux/amd64,linux/arm", "linux/amd64,linux/arm/v6"]
+)
 def test_multi_platform_rejects_unsupported_targets(platform):
-    with pytest.raises(ValueError, match="issues/119"):
+    with pytest.raises(ValueError, match="unsupported target"):
         BuildConfig(tag="app:v1", platform=platform)
 
 
@@ -559,10 +601,12 @@ def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
             "Volumes": {f"/{arch}": {}},
             "Labels": {"base": arch},
         }
-        for arch, signal in (("amd64", "SIGQUIT"), ("arm64", "SIGINT"))
+        for arch, signal in (("amd64", "SIGQUIT"), ("arm64", "SIGINT"), ("arm", "SIGTERM"))
     }
     builder = _builder(
-        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases),
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_runtime_by_arch=bases),
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
         tags=["stable"], cmd=["python", "app.py"],
         labels={"example.label": "explicit"},
         manifest_annotations={"example.manifest": "manifest-value"},
@@ -597,7 +641,10 @@ def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
         config_bytes = _blob(out, config_descriptor["digest"])
         assert _digest(config_bytes) == config_descriptor["digest"]
         assert len(config_bytes) == config_descriptor["size"]
-        config = json.loads(config_bytes)["config"]
+        image_config = json.loads(config_bytes)
+        if arch == "arm":
+            assert descriptor["platform"]["variant"] == image_config["variant"] == "v7"
+        config = image_config["config"]
         assert config["Labels"] == {"base": arch, "example.label": "explicit"}
         assert config["Entrypoint"] == [f"{arch}-entrypoint"]
         assert config["Cmd"] == ["python", "app.py"]
@@ -658,10 +705,12 @@ def test_multi_platform_release_notes_respect_label_precedence(
     (ctx / "notes.md").write_bytes(b"release notes\r\n")
     bases = {
         arch: {"Labels": {release_key: f"base-{arch}", "shared": "base"}}
-        for arch in ("amd64", "arm64")
+        for arch in ("amd64", "arm64", "arm")
     }
     builder = _builder(
-        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), ctx=ctx,
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_runtime_by_arch=bases),
+        ctx=ctx, platform="linux/amd64,linux/arm64,linux/arm/v7",
         release_notes_file="notes.md", release_notes_label=release_key,
         labels={"shared": "explicit"},
         manifest_annotations={"example.manifest": "one"},
@@ -669,7 +718,10 @@ def test_multi_platform_release_notes_respect_label_precedence(
     )
     builder.build()
     for image in builder.platform_images:
-        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        image_config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        if image.platform["architecture"] == "arm":
+            assert image.platform["variant"] == image_config["variant"] == "v7"
+        config = image_config["config"]
         assert config["Labels"][release_key] == "release notes\n"
         assert config["Labels"]["shared"] == "explicit"
 
@@ -700,10 +752,14 @@ def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
     bases = {
         "amd64": {"StopSignal": "SIGQUIT", "Volumes": {"/amd64": {}}},
         "arm64": {"StopSignal": "SIGINT", "Volumes": {"/arm64": {}}},
+        "arm": {"StopSignal": "SIGTERM", "Volumes": {"/arm": {}}},
     }
     options = {"stop_signal": "SIGTERM", "volumes": ["/shared"]} if override else {}
     builder = _builder(
-        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=bases), **options
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_runtime_by_arch=bases),
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+        **options,
     )
     builder.build()
     out = tmp_path / "out"
@@ -719,7 +775,10 @@ def test_multi_platform_runtime_config_inherits_and_overrides_per_base(
         config_bytes = _blob(out, config_descriptor["digest"])
         assert _digest(config_bytes) == config_descriptor["digest"]
         assert len(config_bytes) == config_descriptor["size"]
-        config = json.loads(config_bytes)["config"]
+        image_config = json.loads(config_bytes)
+        if arch == "arm":
+            assert descriptor["platform"]["variant"] == image_config["variant"] == "v7"
+        config = image_config["config"]
         assert config["StopSignal"] == ("SIGTERM" if override else bases[arch]["StopSignal"])
         volumes = {f"/{arch}": {}}
         if override:
@@ -912,8 +971,12 @@ def test_multi_platform_conda_with_requirements_stages_each_target(tmp_path, mon
 
 
 @pytest.mark.parametrize("include_target_dependency", [False, True])
+@pytest.mark.parametrize(
+    ("target", "machine"),
+    [("arm64", "aarch64"), ("arm/v7", "armv7l")],
+)
 def test_multi_platform_virtualenv_validates_each_target_base(
-    tmp_path, monkeypatch, include_target_dependency
+    tmp_path, monkeypatch, include_target_dependency, target, machine
 ):
     ctx = _context(tmp_path)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
@@ -934,14 +997,14 @@ def test_multi_platform_virtualenv_validates_each_target_base(
 
     add_distribution(
         "app-lib",
-        'Requires-Dist: arm-only; platform_machine == "aarch64" and python_full_version >= "3.11.9"\n',
+        f'Requires-Dist: arm-only; platform_machine == "{machine}" and python_full_version >= "3.11.9"\n',
     )
     if include_target_dependency:
         add_distribution("arm-only")
 
     envs = {
         arch: ["PYTHON_IMPLEMENTATION=CPython", f"PYTHON_VERSION=3.11.{patch}", "PYTHON_LIBC=glibc-2.17"]
-        for arch, patch in (("amd64", 8), ("arm64", 9))
+        for arch, patch in (("amd64", 8), (target.split("/")[0], 9))
     }
     out = tmp_path / "out"
     refs = out / "refs" / "tags"
@@ -949,17 +1012,20 @@ def test_multi_platform_virtualenv_validates_each_target_base(
     (out / "index.json").write_text("previous index")
     (refs / "v1").write_text("previous tag")
     builder = _builder(
-        tmp_path, monkeypatch, FakeBaseRegistry(base_env_by_arch=envs),
-        include_deps=True, ctx=ctx,
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(platforms=("amd64", target), base_env_by_arch=envs),
+        include_deps=True, ctx=ctx, platform=f"linux/amd64,linux/{target}",
     )
 
     if include_target_dependency:
         builder.build()
         assert [image.platform["architecture"] for image in builder.platform_images] == [
-            "amd64", "arm64"
+            "amd64", target.split("/")[0]
         ]
+        if target == "arm/v7":
+            assert builder.platform_images[1].platform["variant"] == "v7"
     else:
-        with pytest.raises(ValueError, match=r"linux/arm64.*arm-only.*not installed"):
+        with pytest.raises(ValueError, match=rf"linux/{target}.*arm-only.*not installed"):
             builder.build()
         assert (out / "index.json").read_text() == "previous index"
         assert (refs / "v1").read_text() == "previous tag"
@@ -1160,6 +1226,91 @@ def test_push_rejects_layout_mutated_after_build(tmp_path, monkeypatch):
     arm64 = builder.platform_images[1]
     config_path = tmp_path / "out" / "blobs" / "sha256" / arm64.config_digest.split(":", 1)[1]
     config_path.write_bytes(config_path.read_bytes().replace(b'"arm64"', b'"amd64"'))
+    client = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+
+    with pytest.raises(LayerIntegrityError):
+        builder.push(show_progress=False)
+    assert client.calls == []
+
+
+ARM_SET = ("amd64", "arm64", "arm/v5", "arm/v6", "arm/v7")
+WITH_ARM = "linux/amd64,linux/arm64,linux/arm/v7"
+
+
+def test_arm_v7_index_selects_exact_variant_and_round_trips_it(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=ARM_SET)
+    installs = []
+
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
+        installs.append((arch, kwargs.get("variant"), base_config.get("variant")))
+        (site_packages / f"native_{arch}").mkdir(parents=True)
+        return []
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+    builder = _builder(
+        tmp_path, monkeypatch, registry, platform=WITH_ARM, include_deps=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+    builder.build()
+    out = tmp_path / "out"
+
+    assert installs == [("amd64", None, None), ("arm64", None, None), ("arm", "v7", "v7")]
+    index = json.loads(_blob(out, builder.index_digest))
+    assert [m["platform"] for m in index["manifests"]] == [
+        {"architecture": "amd64", "os": "linux"},
+        {"architecture": "arm64", "os": "linux"},
+        {"architecture": "arm", "os": "linux", "variant": "v7"},
+    ]
+    arm_layer, _ = _base_layer("arm-v7")
+    descriptor = index["manifests"][2]
+    manifest = json.loads(_blob(out, descriptor["digest"]))
+    config = json.loads(_blob(out, manifest["config"]["digest"]))
+    assert (config["os"], config["architecture"], config["variant"]) == ("linux", "arm", "v7")
+    assert manifest["layers"][0]["digest"] == _digest(arm_layer)
+    assert {m["layers"][-1]["digest"] for m in (
+        json.loads(_blob(out, d["digest"])) for d in index["manifests"]
+    )} == {builder.platform_images[0].layers[-1].digest}
+    top_level = [call[0] for call in registry.manifest_calls if call[0] in ("3.11-slim", registry.index_digest)]
+    assert top_level == ["3.11-slim", registry.index_digest, registry.index_digest]
+
+
+def test_arm_v7_base_config_variant_conflict_fails_before_publication(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=ARM_SET, config_variants={"arm/v7": "v6"})
+    builder = _builder(tmp_path, monkeypatch, registry, platform=WITH_ARM)
+
+    with pytest.raises(UnsupportedPlatformError, match="does not match index variant"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_arm_v7_missing_from_base_fails_without_fallback(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v6"))
+    builder = _builder(tmp_path, monkeypatch, registry, platform=WITH_ARM)
+
+    with pytest.raises(UnsupportedPlatformError, match="no exact manifest for linux/arm/v7"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_arm_without_v7_variant_rejects_dependency_staging_before_pull(tmp_path, monkeypatch):
+    registry = FakeBaseRegistry(platforms=("arm/v6",))
+    builder = _builder(
+        tmp_path, monkeypatch, registry, platform="linux/arm/v6", include_deps=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+
+    with pytest.raises(ValueError, match="linux/arm/v6; supported targets"):
+        builder.build()
+    assert registry.manifest_calls == []
+
+
+def test_push_rejects_arm_v7_config_variant_mutated_after_build(tmp_path, monkeypatch):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(platforms=ARM_SET), platform=WITH_ARM)
+    builder.build()
+    arm = builder.platform_images[2]
+    config_path = tmp_path / "out" / "blobs" / "sha256" / arm.config_digest.split(":", 1)[1]
+    config_path.write_bytes(config_path.read_bytes().replace(b'"variant":"v7"', b'"variant":"v6"'))
     client = FakePushClient()
     monkeypatch.setattr(builder_module, "RegistryClient", client)
 
