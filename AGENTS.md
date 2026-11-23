@@ -157,6 +157,11 @@ markers for the target (never the host) and installs the selection through
 index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
 ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
+Poetry checks locked and legacy Python ranges and recorded applicable root,
+transitive and extra dependencies; Poetry and uv cannot reconstruct dependency
+metadata omitted from a lock. uv limited environments must match the recorded
+supported markers and include the target; unverifiable marker normalization
+and unknown target values fail closed.
 Plain requirements keep ambient pip configuration.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`. Non-registry sources fail; never add an

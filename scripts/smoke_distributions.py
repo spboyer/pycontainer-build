@@ -32,6 +32,26 @@ def _metadata(artifact: Path) -> str:
         return member.read().decode("utf-8")
 
 
+def _check_lockfile_fixtures(sdist: Path) -> None:
+    fixtures = {
+        "pdm": ("pdm.lock", "pyproject.toml"),
+        "pipenv": ("Pipfile.lock", "Pipfile"),
+        "poetry": ("poetry.lock", "pyproject.toml"),
+        "uv": ("uv.lock", "pyproject.toml"),
+    }
+    prefix = f"{sdist.name.removesuffix('.tar.gz')}/tests/fixtures/lockfiles"
+    with tarfile.open(sdist, "r:gz") as source:
+        names = set(source.getnames())
+    missing = [
+        f"{kind}/{name}"
+        for kind, files in fixtures.items()
+        for name in files
+        if f"{prefix}/{kind}/{name}" not in names
+    ]
+    if missing:
+        raise RuntimeError(f"Source distribution is missing lockfile test fixtures: {', '.join(missing)}")
+
+
 def _isolated_environment():
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
@@ -61,6 +81,8 @@ def main() -> None:
         artifacts = sorted(distributions.iterdir())
         wheel = next(path for path in artifacts if path.suffix == ".whl")
         sdist = next(path for path in artifacts if path.name.endswith(".tar.gz"))
+
+        _check_lockfile_fixtures(sdist)
 
         for artifact in (wheel, sdist):
             if any(line.startswith("Requires-Dist:") for line in _metadata(artifact).splitlines()):

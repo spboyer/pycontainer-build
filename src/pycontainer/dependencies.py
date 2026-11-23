@@ -338,11 +338,13 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
+    counted_files = set()
     total_bytes = 0
     hash_pinned = True
     while pending:
         path, is_constraint = pending.pop()
-        if path in visited:
+        visit = (path, is_constraint)
+        if visit in visited:
             continue
         try:
             path.relative_to(context_root)
@@ -350,14 +352,15 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
             raise ValueError(
                 f"Requirements include must stay inside the build context: {path}"
             ) from exc
-        visited.add(path)
-        size = path.stat().st_size
-        total_bytes += size
-        if total_bytes > MAX_REQUIREMENTS_BYTES:
-            raise ValueError(
-                "Requirements files exceed the combined "
-                f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-            )
+        visited.add(visit)
+        if path not in counted_files:
+            counted_files.add(path)
+            total_bytes += path.stat().st_size
+            if total_bytes > MAX_REQUIREMENTS_BYTES:
+                raise ValueError(
+                    "Requirements files exceed the combined "
+                    f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+                )
 
         logical_lines = []
         continuation = ""
@@ -380,7 +383,7 @@ def validate_requirements(requirements: Path, context_dir: Path) -> bool:
             if not options[0].startswith("-"):
                 if not is_constraint:
                     hash_pinned = hash_pinned and _is_hash_pinned(options)
-            elif options[0] in {"-e", "--editable"} or options[0].startswith("--editable="):
+            elif options[0] == "--editable" or options[0].startswith(("-e", "--editable=")):
                 hash_pinned = False
             for option in options:
                 name = option.split("=", 1)[0]
