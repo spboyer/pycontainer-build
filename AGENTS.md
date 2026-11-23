@@ -17,6 +17,10 @@ daemon without discussing the trade-off first.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
+- `registry_cleanup.py`: `registry delete`/`prune` planning and confirmation.
+  Deletion is by manifest digest and removes every aliased tag; never select a
+  digest shared with a retained tag, and never retry `DELETE`. Tests use the
+  in-process fake registry in `tests/test_registry_cleanup.py`, never a real one.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
   Multi-platform index scanning is rejected; build and scan each target separately.
