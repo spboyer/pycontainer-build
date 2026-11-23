@@ -151,7 +151,9 @@ Skopeo from a container). The historical Linux-builder workaround for Windows
 CRLF console-script shebangs is tracked in
 [#225](https://github.com/spboyer/pycontainer-build/issues/225); its fix is
 included via [#228](https://github.com/spboyer/pycontainer-build/pull/228).
-Windows-built plain-versus-squashed runtime equivalence still needs validation.
+Windows-built plain-versus-squashed fixture equivalence passed on commit
+`a4fc1d5a41ff80b2b85f7441ab9c5a62c85294f0` in
+[hosted run 45203932420](https://github.com/spboyer/pycontainer-build/actions/runs/45203932420).
 The opt-in `windows-squash-equivalence` dispatch of `runtime-check.yml`
 builds layouts on a hosted Windows runner and compares their imported Linux
 runtime behavior, recording commit, run, attempt and artifact identity.

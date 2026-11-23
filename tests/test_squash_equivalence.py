@@ -1,6 +1,8 @@
 import hashlib
 import importlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -198,7 +200,16 @@ def test_comparison_imports_and_runs_both_transferred_layouts(checker, tmp_path,
     monkeypatch.setattr(checker, "validate_import", lambda docker, ref, image, timeout: inspected.append(image))
     monkeypatch.setattr(checker, "run", fake_run)
     monkeypatch.setattr(checker, "command_output", fake_command)
-    monkeypatch.setattr(checker.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        checker.platform, "platform",
+        lambda: subprocess.check_output(
+            [sys.executable, "-c", "print('fixture-os')"], text=True
+        ).strip(),
+    )
+    monkeypatch.setattr(
+        checker, "subprocess",
+        SimpleNamespace(run=lambda *args, **kwargs: SimpleNamespace(returncode=0)),
+    )
 
     result = checker.compare_layouts(
         tmp_path, {"images": images}, "docker", "skopeo", None, 30, "/app"
@@ -210,6 +221,7 @@ def test_comparison_imports_and_runs_both_transferred_layouts(checker, tmp_path,
     ]
     assert len(observations) == 4
     assert result["status"] == "passed"
+    assert result["runtime_os_version"] == "fixture-os"
     assert result["listing_sha256"] == hashlib.sha256(b"same listing").hexdigest()
 
 

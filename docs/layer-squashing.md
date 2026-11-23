@@ -157,10 +157,12 @@ test suite or CI.
 Historically, Windows staging produced CRLF console-script shebangs that failed
 in Linux containers, with or without squashing
 ([#225](https://github.com/spboyer/pycontainer-build/issues/225)). The fix
-from [#228](https://github.com/spboyer/pycontainer-build/pull/228) is included,
-but Windows-built plain-versus-squashed runtime equivalence still needs
-validation. The prior Linux-builder workaround remains an option when using
-Docker Desktop on Windows:
+from [#228](https://github.com/spboyer/pycontainer-build/pull/228) is included.
+The Windows-built fixture passed the hosted Linux comparison on commit
+`a4fc1d5a41ff80b2b85f7441ab9c5a62c85294f0` in
+[run 45203932420](https://github.com/spboyer/pycontainer-build/actions/runs/45203932420);
+that result applies to this fixture and commit. The prior Linux-builder
+workaround remains an option when using Docker Desktop on Windows:
 
 ```powershell
 docker run --rm -v //var/run/docker.sock:/var/run/docker.sock -v "${PWD}:/src:ro" -w /src docker:cli `
