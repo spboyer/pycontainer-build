@@ -416,6 +416,37 @@ def test_excluded_pyproject_is_not_used_for_entrypoint(tmp_path, monkeypatch):
     assert manifest["config"]["Entrypoint"] == ["python", "-m", "app"]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_excluded_local_script_module_is_not_used_for_entrypoint(tmp_path, monkeypatch, dry_run):
+    context = _context(tmp_path)
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "app"\n[project.scripts]\nrun = "secret_module"\n'
+    )
+    (context / "secret_module.py").write_text("print('secret')\n")
+    rule = {"when": 'BUILD_MODE == "production"', "exclude": "secret_module.py"}
+    builder = ImageBuilder(_config(
+        context, tmp_path, [rule], dry_run=dry_run,
+        include_paths=["app.py", "pyproject.toml", "secret_module.py"],
+    ))
+    monkeypatch.setattr(
+        builder, "_pull_base_image",
+        lambda *args: pytest.fail("invalid local entrypoint reached base-image pull"),
+    )
+    with pytest.raises(ValueError, match="secret_module.*not selected"):
+        builder.build()
+
+
+def test_selected_or_external_script_module_can_be_used(tmp_path):
+    context = _context(tmp_path)
+    project = context / "pyproject.toml"
+    project.write_text('[project.scripts]\nrun = "app"\n')
+    builder = ImageBuilder(_config(context, tmp_path, [],
+                                   include_paths=["app.py", "pyproject.toml"]))
+    assert builder._entrypoint() == ["python", "-m", "app"]
+    project.write_text('[project.scripts]\nrun = "external_package"\n')
+    assert builder._entrypoint() == ["python", "-m", "external_package"]
+
+
 def test_conda_environments_never_selected_by_conditional_rules(tmp_path, capsys):
     context = _context(tmp_path)
     for name, text in {

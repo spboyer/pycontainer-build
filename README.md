@@ -561,7 +561,9 @@ of the cache identity. Selected file symlinks must use a relative target and
 resolve to another selected file inside the context; dangling, cyclic, absolute,
 escaping or unselected targets are rejected. Directory links and Windows
 junctions are never traversed; an include root through one is rejected unless
-the root is already excluded.
+the root is already excluded. Automatic entrypoint discovery only reads a
+selected `pyproject.toml` and rejects an excluded local script module; use an
+explicit entrypoint if the intended module comes from elsewhere.
 
 ---
 

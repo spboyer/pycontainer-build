@@ -29,6 +29,17 @@ def detect_entrypoint(context_dir, *, files=None):
         if scripts:
             name,target=next(iter(scripts.items()))
             if isinstance(target,str) and ":" not in target:
+                parts=target.split(".")
+                if files is not None and all(part.isidentifier() for part in parts):
+                    module=Path(*parts)
+                    candidates=(module.with_suffix(".py"), module/"__main__.py")
+                    existing=[path for path in candidates if (ctx/path).is_file()]
+                    selected={path.as_posix() for path in files}
+                    if existing and not any(path.as_posix() in selected for path in existing):
+                        raise ValueError(
+                            f"Entrypoint module {target!r} exists in the build context "
+                            "but is not selected; include it or specify an explicit entrypoint."
+                        )
                 return ["python","-m",target]
     return ["python","-m","app"]
 

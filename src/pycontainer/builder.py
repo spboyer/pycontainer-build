@@ -289,6 +289,7 @@ class ImageBuilder:
             return self._build_image()
 
     def _build_image(self):
+        entry = self._entrypoint()
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -301,7 +302,6 @@ class ImageBuilder:
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
         
-        entry = self._entrypoint()
         include = self.context_include_paths
 
         app_layers=[]
