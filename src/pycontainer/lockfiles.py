@@ -17,23 +17,27 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from .credentials import url_has_credentials
-from ._venv_closure import ClosureError as _MarkerStructureError, _walk as _walk_marker
+from ._venv_closure import (
+    ClosureError as _MarkerStructureError,
+    _canonical_extras,
+    _walk as _walk_marker,
+)
 from .dependencies import _read_staged_distributions
 
 try:
-    from packaging.markers import InvalidMarker, Marker
+    from packaging.markers import InvalidMarker, Marker, UndefinedComparison
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
     from packaging.version import InvalidVersion, Version
 except ImportError:  # pragma: no cover - exercised when only pip is installed
     try:
-        from pip._vendor.packaging.markers import InvalidMarker, Marker
+        from pip._vendor.packaging.markers import InvalidMarker, Marker, UndefinedComparison
         from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
         from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
         from pip._vendor.packaging.version import InvalidVersion, Version
     except ImportError:
         Marker = Requirement = SpecifierSet = Version = None
-        InvalidMarker = InvalidRequirement = InvalidSpecifier = InvalidVersion = ValueError
+        InvalidMarker = InvalidRequirement = InvalidSpecifier = InvalidVersion = UndefinedComparison = ValueError
 
 
 LOCKFILE_KINDS = {
@@ -244,7 +248,8 @@ def _marker_applies(
         raise LockfileError(f"Invalid environment marker in {source}: {marker!r}") from exc
     names = set()
     try:
-        _walk_marker(parsed._markers, names, set(), canonical_name)
+        _walk_marker(parsed._markers, names, set(), set())
+        parsed._markers = _canonical_extras(parsed._markers, canonical_name)
     except (AttributeError, TypeError, _MarkerStructureError) as exc:
         raise LockfileError(f"Cannot inspect environment marker in {source}: {marker!r}") from exc
     unknown = names - set(environment) - {"extra"}
@@ -261,7 +266,10 @@ def _marker_applies(
             )
     values = {key: value or "" for key, value in environment.items()}
     values["extra"] = canonical_name(extra)
-    return parsed.evaluate(values)
+    try:
+        return parsed.evaluate(values)
+    except (InvalidSpecifier, InvalidVersion, UndefinedComparison) as exc:
+        raise LockfileError(f"Cannot evaluate environment marker in {source}: {marker!r}") from exc
 
 
 def _require_python(specifier: Optional[str], environment: Dict[str, Optional[str]], source: str) -> None:

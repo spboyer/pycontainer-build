@@ -108,7 +108,9 @@ starts a container. `--platform` must match the daemon; emulated runs fail
 rather than count as evidence. `--evidence` writes a passed or failed JSON
 record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
-It is not part of default pytest.
+To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
+(optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
+Neither mode is part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
@@ -203,9 +205,29 @@ Dependency staging installs wheel-only requirements for `linux/amd64` and
 pure-Python packages only and rejects native binaries; its Python minor version
 must match the target base image. Custom images provide
 `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and a supported
-`PYTHON_LIBC` value (`glibc-2.17` or `musl-1.2`). Official `python` tag-only
-registry pulls derive libc from the resolved tag (`alpine` means musl, otherwise
-glibc). All digest references, including tag-plus-digest, need supported
+`PYTHON_LIBC` value (`glibc-2.N`, N 17-99, or `musl-1.N`, N 1-99); pip
+receives tags through the selected libc bound, newest first (`manylinux_2_N`..`manylinux_2_17`
+plus `manylinux2014`, or `musllinux_1_N`..`musllinux_1_1`). Official `python`
+tag-only registry pulls derive the libc family from the resolved tag (`alpine`
+means musl, otherwise glibc) and the version from mapped Debian/Alpine
+codename tokens (`docs/libc-codename-mappings.md` pins each row to immutable
+snapshot/commit sources; update it with the code table). Codename-less or unmapped
+official tag-only pulls instead use effective `libc6`/`musl` package metadata
+from digest-checked ordered layers. `base_libc.py` applies whiteouts and fails
+closed on active database links, unknown foreign links, absent/ambiguous
+records, unsupported versions or architecture mismatches. It recognizes the
+foreign root aliases `lib -> usr/lib` and `var -> usr/var` without following
+links and checks their redirected databases for conflicts. Historical links
+may cause conservative rejection. Limits are 8 MiB metadata, 2 GiB decoded
+bytes and 100,000 members per layer, and 300 seconds overall. It never extracts
+base files.
+Core defaults, auto-detection and the Aspire unversioned-tag invocation remain
+supported with this evidence. Missing evidence requires a mapped release or
+explicit base config `PYTHON_LIBC`. Inference uses a staging-only config copy.
+The system-package reporting scanner is not libc proof. Application `--env`
+overrides do not establish base metadata. The shared
+`_PIP_PLATFORMS` table keeps `manylinux2014_<machine>` legacy alias values that
+`target_wheel_platforms` expands. All digest references, including tag-plus-digest, need supported
 `PYTHON_LIBC` metadata: the supplied tag is not verified against the digest.
 Local image names/annotations are not provenance either. The shared
 `target_wheel_platform` helper defaults to requiring explicit metadata;
@@ -241,6 +263,10 @@ only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
 `Lib` layout; `python_version` shared only when
 the venv minor is established) would have installed one of its missing
 requirements; otherwise unsatisfied target-active requirements fail closed.
+Extra markers compare canonical names on any vendored `packaging` version;
+`in`/`not in` keep PEP 508 substring semantics (not list membership), never
+name candidate extras or rule one out, and fail closed without
+`Provides-Extra`. Other `extra` operators and evaluation errors fail closed.
 Loose modules without metadata remain unverified; host-only packages remain
 staged. Unparsed root sources with host markers and unreadable dynamic
 dependencies fail closed. Unmarked declarations in those unparsed sources are

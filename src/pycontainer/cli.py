@@ -1,8 +1,9 @@
-import argparse, os, logging, sys
+import argparse, json, os, logging, sys
 from pathlib import Path
 from .config import BuildConfig, SBOM_FORMATS
 from .builder import ImageBuilder
 from .config_loader import config_from_file
+from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
 from .devloop import (
     DevLoopError,
@@ -45,6 +46,10 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
+    history_options=b.add_mutually_exclusive_group()
+    history_options.add_argument("--record-history",dest="record_history",action="store_true",default=None,help="Record private local build timing history")
+    history_options.add_argument("--no-record-history",dest="record_history",action="store_false",default=None,help="Disable local build history")
+    b.add_argument("--history-dir",help="Local history directory (default: ~/.pycontainer/history; does not enable recording)")
     b.add_argument(
         "--include-deps",
         action="store_true",
@@ -71,6 +76,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     )
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
+    b.add_argument("--stop-signal",help="OCI StopSignal, e.g. SIGTERM or SIGRTMIN+3 (overrides the base image value)")
+    b.add_argument("--volume",dest="volumes",action="append",help="Declare an absolute container path as an OCI volume (repeatable; merged with base volumes; metadata only, no mount is created)")
 
 def main():
     _tolerate_unencodable_output()
@@ -90,7 +97,13 @@ def main():
     imp.add_argument("--output","-o",help="Write settings to this pyproject.toml (default: print to stdout)")
     imp.add_argument("--force",action="store_true",help="Merge into an existing output file")
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
+    imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    history=sub.add_parser("history",help="Inspect or delete local build history")
+    history_actions=history.add_subparsers(dest="history_action",required=True)
+    for action in ("list", "clear"):
+        command=history_actions.add_parser(action)
+        command.add_argument("--history-dir",help="Local history directory (default: ~/.pycontainer/history)")
     gen=sub.add_parser("generate",help="Generate deployment artifacts for an existing image")
     targets=gen.add_subparsers(dest="target",required=True)
     kubernetes=targets.add_parser("kubernetes",help="Generate Kubernetes resources and a Helm chart")
@@ -104,11 +117,24 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="history":
+        try:
+            store=BuildHistory(args.history_dir)
+            if args.history_action=="list":
+                print(json.dumps(store.list(),indent=2))
+            else:
+                store.clear()
+                print("Build history cleared.")
+        except HistoryStorageError as exc:
+            parser.exit(1,f"Build history error: {exc}\n")
+        return
+
     if args.cmd=="import":
-        from .dockerfile_import import run_import
+        from .dockerfile_import import parse_shell_option, run_import
         build_args=dict(a.partition("=")[::2] for a in args.build_arg)
         try:
-            message,code=run_import(Path(args.dockerfile),Path(args.output) if args.output else None,args.force,build_args)
+            shell=parse_shell_option(args.shell) if args.shell is not None else None
+            message,code=run_import(Path(args.dockerfile),Path(args.output) if args.output else None,args.force,build_args,shell)
         except (FileNotFoundError,ValueError) as exc:
             parser.error(str(exc))
         print(message)
@@ -150,6 +176,8 @@ def main():
         'exclude_defaults': args.exclude_defaults,
         'use_cache': args.use_cache,
         'cache_dir': args.cache_dir,
+        'record_history': args.record_history,
+        'history_dir': args.history_dir,
         'include_deps': args.include_deps,
         'requirements_file': args.requirements_file,
         'lockfile': args.lockfile,
@@ -161,6 +189,8 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'stop_signal': args.stop_signal,
+        'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
         'registry_ca_file': args.registry_ca_file,
     }
@@ -206,8 +236,11 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    builder=ImageBuilder(cfg)
-    out=builder.build()
+    try:
+        builder=ImageBuilder(cfg)
+        out=builder.build()
+    except HistoryStorageError as exc:
+        parser.exit(1,f"Build history error: {exc}\n")
     print("Built:", out)
     
     if push:

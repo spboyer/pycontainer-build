@@ -14,7 +14,7 @@ import pytest
 from pycontainer.blob_store import BlobIntegrityError
 from pycontainer.builder import ImageBuilder, UnsupportedPlatformError
 from pycontainer.config import BuildConfig
-from pycontainer.dependencies import install_requirements, target_python_version
+from pycontainer.dependencies import install_requirements, target_libc_config, target_python_version
 from pycontainer.local_image import (
     LocalImageError,
     OCI_GZIP_LAYER,
@@ -915,7 +915,10 @@ def test_local_source_name_does_not_determine_libc(
             use_cache=False,
         )
     )
-    with patch("pycontainer.dependencies.subprocess.Popen") as pip:
+    with (
+        patch("pycontainer.dependencies.subprocess.Popen") as pip,
+        patch("pycontainer.builder.target_libc_config", wraps=target_libc_config) as libc_config,
+    ):
         pip.return_value.wait.return_value = 0
         if platform is None:
             with pytest.raises(ValueError, match="(?i)libc|digest-only"):
@@ -929,6 +932,7 @@ def test_local_source_name_does_not_determine_libc(
             else:
                 pip.assert_not_called()
                 assert builder._dependency_site_packages
+        assert libc_config.call_args.kwargs["base_image_tag_verified"] is False
 
 
 @pytest.mark.parametrize(("arch", "machine"), [("amd64", "x86_64"), ("arm64", "aarch64")])

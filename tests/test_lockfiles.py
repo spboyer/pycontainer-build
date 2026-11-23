@@ -41,7 +41,9 @@ from pycontainer.lockfiles import (
     target_environment,
     verify_locked_installation,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
+from test_dependency_staging import (
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _write_named_wheel, _write_wheel,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
 FORMATS = {
@@ -1215,6 +1217,34 @@ def test_extra_marker_normalization_does_not_change_platform_values():
     )
 
 
+@pytest.mark.parametrize(
+    ("marker", "extra", "expected"),
+    [
+        ('extra in "other,Speed_Ups"', "speed-ups", True),
+        ('"Speed" in extra', "speed-ups", True),
+        ('extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra in "a,b"', "", True),
+    ],
+)
+def test_locked_extra_markers_keep_substring_semantics(marker, extra, expected):
+    assert lockfile_module._marker_applies(marker, PY311, "wheel metadata", extra) is expected
+
+
+def test_locked_extra_marker_evaluation_failure_is_explicit(monkeypatch):
+    marker_type = lockfile_module.Marker
+
+    class InvalidVersionMarker:
+        def __init__(self, expression):
+            self._markers = marker_type(expression)._markers
+
+        def evaluate(self, values):
+            raise lockfile_module.InvalidVersion("synthetic invalid version")
+
+    monkeypatch.setattr(lockfile_module, "Marker", InvalidVersionMarker)
+    with pytest.raises(LockfileError, match="Cannot evaluate environment marker"):
+        lockfile_module._marker_applies('extra == "1.0"', PY311, "wheel metadata", "1.0")
+
+
 def test_staged_wheel_closure_checks_normalized_requested_extras(tmp_path):
     context = _write_pipenv_project(tmp_path / "context", extras=["speed-ups"])
     selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
@@ -1622,7 +1652,7 @@ def test_locked_requirements_use_target_marker_bootstrap(tmp_path, arch, expecte
     destination = tmp_path / "stage" / "site-packages"
 
     install_requirements(
-        requirements, destination, context, "linux", arch, "3.11", "python:3.11-slim",
+        requirements, destination, context, "linux", arch, "3.11", "python:3.11-slim-bookworm",
         BASE_CONFIG, locked=True, base_image_tag_verified=True,
     )
 
@@ -1645,7 +1675,7 @@ def test_locked_requirements_fail_closed_for_unknown_target_marker(tmp_path):
     with pytest.raises(ValueError, match="refusing to stage.*platform_release"):
         install_requirements(
             requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
-            "3.11", "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1669,7 +1699,7 @@ def test_generated_locked_requirements_validate_options_before_pip(tmp_path, mon
     with pytest.raises(ValueError, match=message):
         install_requirements(
             requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
-            "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1696,7 +1726,7 @@ def test_generated_locked_requirements_enforce_size_and_location(tmp_path, monke
     with pytest.raises(ValueError, match=message):
         install_requirements(
             requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
-            "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
 
 
@@ -1753,8 +1783,8 @@ def test_locked_build_keeps_generated_requirements_inside_context_and_cleans_up(
 @pytest.mark.parametrize(
     ("base_image", "environment", "wheel_tag"),
     [
-        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
-        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        ("python:3.11-slim-bookworm", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine3.20", [], "cp311-cp311-musllinux_1_2_x86_64"),
         (
             "python:3.11-slim@sha256:" + "a" * 64,
             ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
@@ -1787,6 +1817,56 @@ def test_locked_build_uses_verified_base_abi_and_libc(
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
     assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
     assert not rogue.requests
+
+
+@pytest.mark.parametrize(
+    ("base_image", "version", "family"),
+    [
+        ("python:3.11-slim", "3.11", "glibc"),
+        ("python:3.8.0-alpine", "3.8", "musl"),
+        ("python:3.4-wheezy", "3.4", "glibc"),
+    ],
+)
+def test_locked_requirements_reject_unproven_base_libc_before_pip(
+    tmp_path, monkeypatch, base_image, version, family
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0 --hash=sha256:" + "a" * 64)
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran without validated target libc"),
+    )
+
+    with pytest.raises(ValueError, match=f"Cannot validate target {family}"):
+        install_requirements(
+            requirements, tmp_path / "stage", tmp_path, "linux", "amd64", version,
+            base_image, {"config": {"Env": [f"PYTHON_VERSION={version}.0"]}},
+            locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize(("wheel_minor", "success"), [(28, True), (31, False)])
+def test_locked_build_uses_libc_derived_from_verified_base_layers(
+    tmp_path, monkeypatch, indexes, wheel_minor, success
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(
+        context / "wheelhouse", tag=f"cp311-cp311-manylinux_2_{wheel_minor}_x86_64"
+    )
+    _write_uv_project(context, wheel, registry=indexes(wheel).url)
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc("2.28-1"))])
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:3.11-slim"
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([layer], BASE_CONFIG))
+
+    if not success:
+        with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+            builder.build()
+        return
+
+    builder.build()
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[1])
 
 
 @pytest.mark.parametrize(
@@ -1899,8 +1979,8 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     site_packages.parent.mkdir()
 
     install_locked_requirements(
-        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None,
-        base_image_tag_verified=True,
+        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim",
+        {"config": {"Env": ["PYTHON_LIBC=glibc-2.36"]}}, base_image_tag_verified=True,
     )
 
     assert {path.name for path in site_packages.iterdir()} >= {"fixture_dep", "other_dep"}
@@ -1948,7 +2028,7 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
 
     install_locked_requirements(
         requirements, site_packages, tmp_path, "linux", "arm64", "3.9",
-        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18"]}},
+        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18", "PYTHON_LIBC=glibc-2.36"]}},
         base_image_tag_verified=True,
     )
 
@@ -2167,6 +2247,55 @@ def _bypass_locked_pip_isolation(monkeypatch, key):
 def _locked_index_project(context, indexes):
     wheel = _write_wheel(context / "wheelhouse")
     _write_uv_project(context, wheel, registry=indexes(wheel).url)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_lock_stages_wheels_without_copying_conda_prefix(
+    tmp_path, monkeypatch, indexes, caplog, explicit
+):
+    from pycontainer.history import BuildHistory
+
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    (context / "environment.yml").write_text("name: host-env\n")
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "host-package.txt").write_text("host-only\n")
+    (context / "requirements.txt").write_text("unrelated-package==9.9\n")
+    history = tmp_path / "history"
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile="uv.lock" if explicit else None,
+        include_paths=["app.py", "environment.yml", ".venv"],
+        exclude_defaults=False,
+        record_history=True, history_dir=str(history),
+    )
+
+    builder.build()
+
+    assert "Conda inputs ignored" in caplog.text
+    names = [name for layer in builder.layers for name in _layer_names(layer)]
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("host-package.txt" in name or "conda-meta" in name for name in names)
+    record = BuildHistory(history).list()[0]
+    assert record["status"] == "success"
+    assert {"base_image", "dependencies", "application"} <= record["phases_ns"].keys()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_explicit_lock_inside_conda_prefix_fails_before_pull(tmp_path, monkeypatch, dry_run):
+    context = tmp_path / "context"
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "uv.lock").write_text("not a supported source\n")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile=".venv/uv.lock", dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base image pulled"))
+
+    with pytest.raises(ValueError, match="Conda"):
+        builder.build()
 
 
 def _host_pip_setting(monkeypatch, tmp_path, source, key, value, *, bypass):
