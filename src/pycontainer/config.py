@@ -89,6 +89,8 @@ class BuildConfig:
     _git_tag_snapshot: Optional[Tuple[str, str, str, bool]] = field(
         init=False, default=None, repr=False, compare=False
     )
+    record_history: bool = False
+    history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
     security: Optional[dict] = None

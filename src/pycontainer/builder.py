@@ -1,5 +1,7 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
 from dataclasses import dataclass
+from contextlib import nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -206,6 +208,7 @@ from .local_image import (
     verify_layer_diff_ids,
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
@@ -346,8 +349,30 @@ def _verify_image_index(
         _verify_platform_image(layers_dir, image, check_diff_ids)
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): 
+    def __init__(self, config: BuildConfig):
         self._base_config_blobs=set()
+        self._history = (
+            BuildHistory(config.history_dir)
+            if config.record_history and not config.dry_run
+            else None
+        )
+        self._history_timer = (
+            ContextVar("pycontainer_build_history", default=None)
+            if self._history else None
+        )
+        if self._history:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            timing = BuildTiming()
+            try:
+                with timing.phase("initialization"):
+                    self._initialize(config)
+            except BaseException:
+                self._record_failed_history(timing, config)
+                raise
+        else:
+            self._initialize(config)
+
+    def _initialize(self, config: BuildConfig):
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -394,6 +419,18 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _record_failed_history(self, timing, config):
+        try:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            self._history.append(timing.record("failed"))
+        except BaseException as error:
+            # Recording must never replace the original build failure.
+            logger.error("Build history could not be saved or confirmed: %s", error)
+
+    def _time_history_phase(self, name):
+        timing = self._history_timer.get() if self._history_timer else None
+        return timing.phase(name) if timing else nullcontext()
+
     def build(self):
         self.config.validate_git_tag()
         if self.dry_run:
@@ -401,16 +438,37 @@ class ImageBuilder:
             self._show_build_plan()
             return self.config.tag
 
-        with output_directory_lock(self.config.output_dir):
-            security_fragments=render_security_fragments(
-                self.config.security, self.config.context_dir
-            )
-            result=self._build_image()
-            for fragment_path in write_security_fragments(
-                Path(self.config.output_dir), security_fragments
-            ):
-                logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
+        timing = BuildTiming() if self._history else None
+        token = self._history_timer.set(timing) if timing else None
+        try:
+            try:
+                if self._history:
+                    self._history.validate_location(
+                        self.config.context_dir, self.config.output_dir
+                    )
+                with output_directory_lock(self.config.output_dir):
+                    security_fragments=render_security_fragments(
+                        self.config.security, self.config.context_dir
+                    )
+                    result = self._build_image()
+                    for fragment_path in write_security_fragments(
+                        Path(self.config.output_dir), security_fragments
+                    ):
+                        logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
+            except BaseException:
+                if timing:
+                    self._record_failed_history(timing, self.config)
+                raise
+
+            if timing:
+                self._history.validate_location(
+                    self.config.context_dir, self.config.output_dir
+                )
+                self._history.append(timing.record("success"))
             return result
+        finally:
+            if timing:
+                self._history_timer.reset(token)
 
     def _build_image(self):
         output=ensure_dir(self.config.output_dir)
@@ -438,7 +496,6 @@ class ImageBuilder:
             output/'oci-layout',
             json.dumps(oci_layout,separators=(',',':')).encode(),
         )
-
         ref_names=local_reference_names(self.config.tag, self.config.all_tags())
         index=build_index_json(
             image.manifest_digest,
@@ -467,16 +524,17 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(
-                Path(self.config.context_dir),
-                sbom_path,
-                format=(
-                    self.config.generate_sbom
-                    if isinstance(self.config.generate_sbom, str)
-                    else "spdx"
-                ),
-                package_inventory=getattr(self, "_staged_packages", []),
-            )
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
             logger.info(f"✓ SBOM saved to {sbom_path}")
         
         return self.config.tag
@@ -551,7 +609,8 @@ class ImageBuilder:
         self._dependency_site_packages=False
         self._base_image_tag_verified=False
         os_name, arch = parse_platform(platform)
-        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        with self._time_history_phase("base_image"):
+            base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers)
         variant = (
             base_config.get("variant") if base_config else None
@@ -562,14 +621,16 @@ class ImageBuilder:
 
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
+            with self._time_history_phase("dependencies"):
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                )
             if deps_layer: app_layers.append(deps_layer)
         
         # The application tar is byte-identical for every target, so build it once.
         if self._app_layer is None:
-            self._app_layer=self._create_app_layer(layers_dir, include)
+            with self._time_history_phase("application"):
+                self._app_layer=self._create_app_layer(layers_dir, include)
         app_layers.append(self._app_layer)
         
         all_layers=base_layers+app_layers

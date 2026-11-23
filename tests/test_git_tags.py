@@ -11,6 +11,7 @@ from pycontainer import cli, tags as tags_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
+from pycontainer.history import BuildHistory
 
 
 def _git_env():
@@ -484,6 +485,22 @@ def test_git_state_is_rechecked_before_build_and_does_not_replace_old_refs(
     assert ref.read_text() == old_digest
     assert config.tag.endswith(":v0.1.0")
     assert _git(release_repo, "show-ref", "--tags") == original_tags
+
+
+def test_git_tagged_build_records_history_and_rechecks_worktree(release_repo, tmp_path, monkeypatch):
+    history_dir = tmp_path / "history"
+    config = _config(
+        release_repo, output_dir=str(tmp_path / "out"), use_cache=False,
+        record_history=True, history_dir=str(history_dir),
+    )
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(builder, "_pull_base_image", lambda layers_dir, os_name, arch: ([], None))
+    builder.build()
+    assert BuildHistory(history_dir).list()[0]["status"] == "success"
+
+    (release_repo / "README.md").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="(?i)dirty"):
+        builder.build()
 
 
 def test_git_head_change_after_configuration_fails_before_build(release_repo, tmp_path):
