@@ -167,6 +167,22 @@ docker run --rm -v //var/run/docker.sock:/var/run/docker.sock -v "${PWD}:/src:ro
   sh -c "apk add -q python3 py3-pip skopeo && PYTHONPATH=src python3 scripts/check_squash_equivalence.py --timeout 300"
 ```
 
+For an isolated cross-host check, dispatch the existing runtime workflow from
+the branch to test:
+
+```powershell
+gh workflow run runtime-check.yml --ref <branch> -f windows-squash-equivalence=true
+```
+
+The opt-in jobs build both layouts on Windows, upload them as a run- and
+attempt-specific artifact, and import and compare those exact layouts on a
+Linux runner. The verifier checks the recorded commit, run, artifact identity,
+OCI digests and imported image identities before comparing runtime output,
+filesystem contents and layer counts. The separate evidence artifact records
+the artifact ID and digest, runner details and result. A queued, skipped or
+failed job is not evidence of equivalence. Rerun all jobs, rather than only
+failed jobs, so the build and comparison share the same attempt.
+
 ## Related work
 
 - #33 splits dependencies into multiple layers to improve cache reuse; it goes

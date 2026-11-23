@@ -143,6 +143,9 @@ CRLF console-script shebangs is tracked in
 [#225](https://github.com/spboyer/pycontainer-build/issues/225); its fix is
 included via [#228](https://github.com/spboyer/pycontainer-build/pull/228).
 Windows-built plain-versus-squashed runtime equivalence still needs validation.
+The opt-in `windows-squash-equivalence` dispatch of `runtime-check.yml`
+builds layouts on a hosted Windows runner and compares their imported Linux
+runtime behavior, recording commit, run, attempt and artifact identity.
 See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 There is no configured root formatter, linter, type checker, or timing gate.
