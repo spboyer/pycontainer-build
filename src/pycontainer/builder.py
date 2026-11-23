@@ -203,7 +203,7 @@ from .local_image import (
     parse_local_image_reference,
     verify_layer_diff_ids,
 )
-from .cache import LayerCache
+from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
 from .sbom import generate_sbom
 from .dependencies import (
     create_console_entrypoints,
@@ -1012,7 +1012,15 @@ class ImageBuilder:
                 )
             else:
                 stage_virtualenv(
-                    deps_paths, site_packages, version, os_name, arch, variant=variant
+                    deps_paths,
+                    site_packages,
+                    version,
+                    os_name,
+                    arch,
+                    base_config,
+                    ctx,
+                    ctx / requirements_relative,
+                    variant=variant,
                 )
 
             create_console_entrypoints(site_packages, stage_root / "bin")
@@ -1107,11 +1115,11 @@ class ImageBuilder:
                     tmp.unlink(missing_ok=True)
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
-        files_sorted=sorted(files, key=lambda x: x[1].as_posix()) if self.config.reproducible else files
+        files_sorted=ordered_app_files(files, self.config.reproducible)
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
-                    arc=f"{self.config.workdir.lstrip('/')}/{rel.as_posix()}"
+                    arc=app_layer_arcname(self.config.workdir, rel)
                     if self.config.reproducible:
                         tarinfo=tar.gettarinfo(abs_path, arcname=arc)
                         tarinfo.mtime=0
@@ -1126,6 +1134,7 @@ class ImageBuilder:
                             tar.addfile(tarinfo)
                     else:
                         tar.add(abs_path,arcname=arc)
+                hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -1137,6 +1146,7 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    hardlinks=hardlinks,
                 )
 
             return OCILayer(
