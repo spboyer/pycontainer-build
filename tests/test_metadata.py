@@ -177,6 +177,47 @@ def test_single_image_metadata_inheritance_serialization_and_digests(
         assert value not in output_text.out + output_text.err
 
 
+def test_configured_stop_signal_and_volumes_coexist_with_metadata(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    _mock_base_image(monkeypatch, {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Env": [],
+            "Labels": {"shared": "base", "base-only": "base"},
+            "StopSignal": "SIGQUIT",
+            "Volumes": {"/data": {}},
+        },
+        "rootfs": {"type": "layers", "diff_ids": []},
+    })
+    builder = ImageBuilder(BuildConfig(
+        tag="example:v1",
+        context_dir=str(context),
+        output_dir=str(tmp_path / "output"),
+        use_cache=False,
+        labels={"shared": "explicit"},
+        manifest_annotations={"example.manifest": "one"},
+        stop_signal="SIGTERM",
+        volumes=["/cache"],
+    ))
+    builder.build()
+
+    blobs = tmp_path / "output" / "blobs" / "sha256"
+    manifest_bytes = (blobs / builder.manifest_digest.split(":", 1)[1]).read_bytes()
+    manifest = json.loads(manifest_bytes)
+    config_bytes = (blobs / builder.config_digest.split(":", 1)[1]).read_bytes()
+    image_config = json.loads(config_bytes)["config"]
+
+    assert manifest["config"]["digest"] == _digest(config_bytes)
+    assert manifest["config"]["size"] == len(config_bytes)
+    assert manifest["annotations"] == {"example.manifest": "one"}
+    assert image_config["Labels"] == {"shared": "explicit", "base-only": "base"}
+    assert image_config["StopSignal"] == "SIGTERM"
+    assert image_config["Volumes"] == {"/cache": {}, "/data": {}}
+
+
 def test_metadata_targets_change_only_their_content_addressed_objects(tmp_path, monkeypatch):
     context = tmp_path / "context"
     context.mkdir()
