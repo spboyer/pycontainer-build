@@ -9,9 +9,14 @@ roots, extras and transitive ``Requires-Dist``) is forced through the target
 environment here. Markers that reference a variable whose target value is
 unknown fail the install instead of falling back to host values.
 """
+import sys
+
+if __name__ == "__main__" and sys.path and sys.path[0] == "":
+    # Keep build-context modules from shadowing the installer's imports.
+    del sys.path[0]
+
 import json
 import runpy
-import sys
 
 MARKER_ERROR_EXIT = 86
 PATCH_ERROR_EXIT = 87
@@ -38,9 +43,6 @@ def _variables(markers):
 
 
 def main():
-    if sys.path and sys.path[0] == "":
-        # Keep a pip package in the build context from shadowing the builder's pip.
-        del sys.path[0]
     config = json.loads(sys.argv[1])
     pip_args = sys.argv[2:]
     environment = config["environment"]

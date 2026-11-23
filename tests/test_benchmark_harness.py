@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 
 
@@ -12,6 +13,7 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, m
     pip_config.write_text("[install]\nno-deps = true\n", encoding="utf-8")
     monkeypatch.setenv("PIP_CONFIG_FILE", str(pip_config))
     monkeypatch.setenv("PIP_NO_DEPS", "1")
+    monkeypatch.setenv("PYTHONPATH", str(ROOT / "src"))
     output = tmp_path / "benchmark.json"
     subprocess.run(
         [
@@ -36,6 +38,7 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, m
     )
 
     results = json.loads(output.read_text(encoding="utf-8"))
+    assert results["environment"]["pip"] == metadata.version("pip")
     cases = {case["name"]: case for case in results["cases"]}
     assert set(cases) == {
         "app-only",
