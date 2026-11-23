@@ -134,7 +134,6 @@ from real end-to-end builds. Do not promise speedups from synthetic results.
 
 These are known gaps, **not fixed behavior**:
 
-- CLI defaults can overwrite TOML settings.
 - PyPI installation of this project returned HTTP 404 during the 2026-11-19
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
