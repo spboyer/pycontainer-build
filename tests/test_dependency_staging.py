@@ -43,12 +43,14 @@ BASE_CONFIG = {
 }
 
 
-def _write_wheel(wheelhouse: Path, tag: str = "py3-none-any") -> Path:
+def _write_wheel(
+    wheelhouse: Path, tag: str = "py3-none-any", function: str = "main"
+) -> Path:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     wheel_path = wheelhouse / f"fixture_dep-1.0-{tag}.whl"
     files = {
         "fixture_dep/__init__.py": (
-            "def main():\n"
+            f"def {function}():\n"
             "    print('fixture-dependency-import-ok')\n"
             "    return 0\n"
         ).encode(),
@@ -59,7 +61,7 @@ def _write_wheel(wheelhouse: Path, tag: str = "py3-none-any") -> Path:
             f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
         ).encode(),
         "fixture_dep-1.0.dist-info/entry_points.txt": (
-            "[console_scripts]\nfixture-dep = fixture_dep:main\n"
+            f"[console_scripts]\nfixture-dep = fixture_dep:{function}\n"
         ).encode(),
     }
     record = io.StringIO()
@@ -101,13 +103,14 @@ def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):
         staged_packages(tmp_path, strict=True)
 
 
+@pytest.mark.parametrize("function", ["main", "ma\u00efn"])
 def test_requirements_install_stages_importable_target_wheel_and_sbom(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, function
 ):
     context = tmp_path / "context"
     context.mkdir()
     (context / "app.py").write_text("print('app')\n")
-    _write_wheel(context / "wheelhouse")
+    _write_wheel(context / "wheelhouse", function=function)
     (context / "requirements.txt").write_text(
         "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
     )
@@ -131,8 +134,18 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
             in names
         )
         script = archive.getmember("app/.python/bin/fixture-dep")
-        assert script.mode & 0o111
+        assert script.isfile()
+        assert script.mode == 0o755
         assert script.mtime == script.uid == script.gid == 0
+        script_file = archive.extractfile(script)
+        assert script_file is not None
+        script_bytes = script_file.read()
+        assert script_bytes.partition(b"\n")[0] == b"#!/usr/bin/env python"
+        assert b"\r" not in script_bytes
+        assert script_bytes.endswith(b"\n")
+        script_text = script_bytes.decode("utf-8")
+        assert f"for _part in {[function]!r}:\n" in script_text
+        assert "sys.exit(_value())\n" in script_text
         extracted = tmp_path / "extracted"
         extracted.mkdir()
         for member in archive.getmembers():
@@ -155,6 +168,21 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         env=environment,
     )
     assert result.stdout.strip() == "fixture-dependency-import-ok"
+    repeated = _builder(
+        tmp_path / "repeated",
+        monkeypatch,
+        context=context,
+        include_deps=True,
+        generate_sbom=True,
+        entrypoint=["fixture-dep"],
+    )
+    repeated.build()
+    assert dependency_layer.digest == repeated.layers[0].digest
+    assert builder.manifest_digest == repeated.manifest_digest
+    with tarfile.open(repeated.layers[0].tar_path) as archive:
+        repeated_script = archive.extractfile("app/.python/bin/fixture-dep")
+        assert repeated_script is not None
+        assert repeated_script.read() == script_bytes
     record = (
         staged / "site-packages" / "fixture_dep-1.0.dist-info" / "RECORD"
     ).read_text()

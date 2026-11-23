@@ -815,7 +815,7 @@ def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
             "sys.exit(_value())\n"
         )
         script = scripts_dir / name
-        script.write_text(content)
+        script.write_text(content, encoding="utf-8", newline="\n")
         script.chmod(0o755)
     _check_stage_limits(scripts_dir.parent)
 
