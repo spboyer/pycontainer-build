@@ -547,8 +547,18 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -711,6 +721,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 
