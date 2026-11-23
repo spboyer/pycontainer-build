@@ -553,14 +553,17 @@ def test_in_context_file_symlink_is_kept_as_link(tmp_path, reproducible):
         assert "\\" not in link.linkname
 
 
-@pytest.mark.parametrize("kind", ["absolute", "excluded"])
+@pytest.mark.parametrize("kind", ["absolute", "excluded", "different-case"])
 def test_selected_link_must_target_selected_image_file(tmp_path, kind):
     context = _context(tmp_path)
     target = context / "app.py"
-    link_target = target if kind == "absolute" else Path("..") / "app.py"
+    link_target = (
+        target if kind == "absolute"
+        else Path("..") / ("APP.py" if kind == "different-case" else "app.py")
+    )
     _symlink(context / "debug_tools" / "alias.py", link_target)
     rules = [DEV_TOOLS]
-    include = ["app.py"] if kind == "absolute" else []
+    include = [] if kind == "excluded" else ["app.py"]
     with pytest.raises(ValueError, match="symlink"):
         _selected(_config(context, tmp_path, rules, include_paths=include,
                           build_args={"BUILD_MODE": "dev"}))

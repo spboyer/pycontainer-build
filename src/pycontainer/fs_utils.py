@@ -302,11 +302,11 @@ def select_context_files(base, include_paths, excludes, conditional_includes=())
             if relative.as_posix() not in seen
         ]
         files.extend(sorted(added, key=lambda item: item[1].as_posix()))
-    selected_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
+    selected_paths = {os.path.abspath(path) for path, _ in files}
     for path, relative in files:
         if path.is_symlink():
             _check_selected_link(base, path, relative)
-            target = os.path.normcase(os.path.abspath(path.parent / os.readlink(path)))
+            target = os.path.abspath(path.parent / os.readlink(path))
             if target not in selected_paths:
                 raise ValueError(
                     f"Selected symlink {relative.as_posix()!r} must target "
