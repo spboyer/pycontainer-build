@@ -133,6 +133,11 @@ uses the standard library only and has no callers yet:
   recheck redirects, avoid inherited credentials and proxies, and remove
   partial files. Proxy support would need explicit, credential-free
   configuration.
+- **Effective base package state.** The existing base-layer verification is
+  advisory. It does not yet account for whiteouts, opaque directories or
+  unreadable later layers, so it is not evidence that a package or libc is
+  present in the final image. Installation planning must not rely on it
+  until bounded effective-layer metadata handling is available.
 - **Upgrades of base packages.** apk upgrades currently fail closed. The
   equivalent apt check, parsing `apt-get -s` `Inst` lines, is not implemented.
 - **Reproducibility.** apt can pin `snapshot.debian.org` or

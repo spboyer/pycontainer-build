@@ -77,7 +77,7 @@ installation, and detected packages will never be installed implicitly.
 
 `pycontainer.system_install` contains only fail-closed groundwork that runs no
 package manager: checks for apt settings that weaken signature verification,
-parsers for offline resolution output, and a bounded HTTPS fetch limited to
-allowed hosts. See the
+and parsers for offline resolution output. It does not download packages or
+repository metadata. See the
 [installation design](plans/2026-11-22-system-package-installation.md) for
 the planned flow, the trust boundaries and the remaining blockers.
