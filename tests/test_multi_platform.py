@@ -1021,9 +1021,12 @@ def _real_client_builder(tmp_path):
     ))
 
 
-@pytest.mark.parametrize("tag_header", [_sha512_header, lambda body: "blake3:" + "0" * 64])
+@pytest.mark.parametrize(("tag_header", "verified"), [
+    (_sha512_header, True),
+    (lambda body: "blake3:" + "0" * 64, False),
+])
 def test_moving_tag_with_non_sha256_digest_binds_every_platform_to_first_snapshot(
-    tmp_path, monkeypatch, tag_header
+    tmp_path, monkeypatch, tag_header, verified
 ):
     first, requests = _moving_tag_registry(monkeypatch, tag_header)
     builder = _real_client_builder(tmp_path)
@@ -1038,7 +1041,8 @@ def test_moving_tag_with_non_sha256_digest_binds_every_platform_to_first_snapsho
         config = json.loads(_blob(tmp_path / "out", manifest["config"]["digest"]))
         assert "SNAPSHOT=A" in config["config"]["Env"]
         assert manifest["layers"][:-1] == json.loads(first.manifests[base["digest"]])["layers"]
-    assert builder._resolved_base_from_tag is True
+    assert builder._resolved_base_from_tag is verified
+    assert builder._base_image_tag_verified is verified
 
 
 def test_forged_sha512_tag_digest_fails_before_publication(tmp_path, monkeypatch):

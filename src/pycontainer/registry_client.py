@@ -1142,9 +1142,9 @@ class RegistryClient:
         elif digest.startswith("sha256:"):
             expected_header = body_digest
         else:
-            # Unsupported algorithms cannot be verified; report the locally computed
-            # sha256 instead and never assume the registry serves it as an alias.
-            return manifest, body_digest
+            # Unsupported algorithms cannot be verified; return the header opaquely so
+            # callers never treat it, or a sha256 alias, as a verified digest.
+            return manifest, digest
         if digest != expected_header:
             raise BlobIntegrityError(
                 f"Registry-reported manifest digest does not match its body "

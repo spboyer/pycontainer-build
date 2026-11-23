@@ -215,10 +215,10 @@ def test_pull_manifest_verifies_sha512_digest_header(monkeypatch):
     assert forged not in str(error.value)
 
 
-def test_pull_manifest_reports_local_sha256_for_unsupported_digest_header(monkeypatch):
+def test_pull_manifest_returns_unsupported_digest_header_opaquely(monkeypatch):
     client, body = _manifest_with_header(monkeypatch, lambda body: "blake3:" + "0" * 64)
     _, digest = client.pull_manifest("latest")
-    assert digest == "sha256:" + hashlib.sha256(body).hexdigest()
+    assert digest == "blake3:" + "0" * 64
 
 def test_registry_client_construction():
     """Test RegistryClient initialization."""

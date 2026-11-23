@@ -69,6 +69,7 @@ class FakeRegistry:
         self.requests = []
         self.faults = []
         self.link_override = None
+        self.digest_header = None
 
     def add_manifest(self, name, media_type=MANIFEST, children=()):
         if media_type == INDEX:
@@ -152,7 +153,7 @@ class FakeRegistry:
         if digest not in self.manifests:
             raise _error(url, 404, body=_errors("MANIFEST_UNKNOWN", "manifest unknown"))
         return _Response(self.manifests[digest], headers={
-            "Docker-Content-Digest": digest,
+            "Docker-Content-Digest": self.digest_header or digest,
             "Content-Type": self.media_types[digest],
         })
 
@@ -550,6 +551,25 @@ def test_failed_delete_stops_remaining_deletions(monkeypatch, registry, capsys):
     assert _run(monkeypatch, "prune", f"{HOST}/{REPO}", "--keep", "1", "--execute", "--yes") == 1
     assert len(registry.methods("DELETE")) == 1
     assert "Deleted 0 of 3" in capsys.readouterr().err
+
+
+UNSUPPORTED_DIGEST = "blake3:" + "0" * 64
+
+
+def test_unsupported_digest_header_is_never_deleted_by_tag(monkeypatch, registry, capsys):
+    registry.tag(registry.add_manifest("one"), "v1.0.0")
+    registry.digest_header = UNSUPPORTED_DIGEST
+
+    assert _run(monkeypatch, "delete", f"{HOST}/{REPO}:v1.0.0", "--yes") != 0
+    assert registry.methods("DELETE") == []
+
+
+def test_unsupported_digest_header_aborts_prune_before_any_delete(monkeypatch, registry, capsys):
+    _repo_tags(registry, "v3.0.0", "v2.0.0", "v1.0.0")
+    registry.digest_header = UNSUPPORTED_DIGEST
+
+    assert _run(monkeypatch, "prune", f"{HOST}/{REPO}", "--keep", "1", "--execute", "--yes") == 1
+    assert registry.methods("DELETE") == []
 
 
 def test_prune_rejects_tagged_repository_and_invalid_keep(monkeypatch, registry, capsys):

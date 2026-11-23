@@ -938,8 +938,9 @@ is read once: every platform selects from that first verified base index or
 manifest snapshot and fetches its platform manifest by descriptor digest, so a
 tag that moves mid-build cannot mix snapshots. The snapshot must match a
 `sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
-unrecognized header algorithm is recorded as the locally computed `sha256` of
-the received bytes, never assumed to be served by the registry. If a pinned
+unrecognized header algorithm cannot be verified: it is kept as an opaque
+value, the first snapshot is still reused for every platform, and the tag is
+not treated as verified provenance for libc or Python version inference. If a pinned
 platform manifest can no longer be fetched, the build fails before the layout
 `index.json` or refs are written (a reused output directory may still contain
 an earlier build's index). Push uploads blobs, then
