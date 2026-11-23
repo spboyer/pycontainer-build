@@ -34,10 +34,14 @@ v2.25.0 (`skaffold/v4beta14` schema) and Tilt v0.37.9.
 - **Explicit registries.** References must be tagged, carry no digest, and name
   their registry host (`localhost:5000/app:tag`, `example.azurecr.io/app:tag`).
   Bare names are rejected instead of being pushed to Docker Hub implicitly.
-- **HTTPS registries.** The registry client speaks HTTPS only. A plain-HTTP
-  local registry such as `localhost:5001` from the kind registry recipe cannot
-  be used. Serve the local registry over TLS (and trust its CA with
-  `SSL_CERT_FILE`), or use a hosted registry.
+- **Registry transport.** HTTPS is the default. To use plain HTTP, opt in to
+  the exact host and port with `--insecure-registry HOST[:PORT]` or the
+  `[build] insecure-registries` setting. pycontainer warns and refuses HTTP
+  credentials to non-loopback hosts. For private HTTPS CAs, use
+  `--registry-ca-file PATH` or `[build] registry-ca-file`; certificate and
+  hostname verification remain enabled. Configure Skaffold, Tilt and the
+  cluster separately to access the registry. See
+  [registry transport](REGISTRY_PUSH.md#insecure-http-registries-and-custom-cas).
 - **The tool owns the tag.** `--tag`, `tags`, `semver_tags`, `latest_tag`,
   `dry_run`, `--push`, `--registry`, `--context` (Skaffold) and credentials are
   not accepted or are overridden; all other `pycontainer.toml` / CLI build

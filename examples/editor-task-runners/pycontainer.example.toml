@@ -1,0 +1,10 @@
+[build]
+tag = "example:local"
+base-image = "python:3.11-slim"
+output-dir = "dist/pycontainer-example"
+
+[build.env]
+APP_MODE = "example"
+
+[build.labels]
+"example.project" = "synthetic"

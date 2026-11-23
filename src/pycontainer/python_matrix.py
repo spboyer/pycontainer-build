@@ -13,7 +13,7 @@ from .config import BuildConfig
 from .dependencies import _base_environment, _base_image_parts, _is_official_python_image
 from .fs_utils import context_exclude_paths, output_directory_lock
 from .local_image import _paths_overlap, parse_local_image_reference
-from .registry_client import RegistryClient, RegistryRequestError, parse_image_reference
+from .registry_client import RegistryRequestError, parse_image_reference
 from .security import render_security_fragments, write_security_fragments
 from .tags import resolve_tags
 
@@ -229,8 +229,7 @@ class PythonMatrixBuilder:
             self.operations = blobs + manifests + indexes + version_tags + aliases
             try:
                 auth = get_registry_auth(registry, bearer_token=auth_token, username=username, password=password)
-                client = RegistryClient(registry, repo, auth_token=auth.bearer_token,
-                                        username=auth.username, password=auth.password)
+                client = self.children[self.default]._registry_client(registry, repo, auth)
             except (RuntimeError, OSError, ValueError) as error:
                 self.operations.insert(0, PublicationOperation(
                     "authentication", repository, Path(self.config.output_dir), "failed"

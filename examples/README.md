@@ -4,6 +4,11 @@ This directory contains example applications demonstrating pycontainer-build int
 
 ## Available Examples
 
+### [Editor and Task Runners](./editor-task-runners/)
+
+Project-scoped PyCharm, Vim, and Emacs commands, plus reusable GNU Make and
+Go Task templates for builds and dry-runs.
+
 ### [FastAPI Application](./fastapi-app/)
 
 A complete FastAPI web application showcasing all integration methods:

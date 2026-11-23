@@ -191,7 +191,10 @@ concurrent writers. Hash and transfer large blobs incrementally, publish
 verified files atomically, and do not forward registry authorization to
 redirected storage hosts. Registry blob downloads verify descriptor digest and
 size before publication; only safe reads use bounded retries and explicit
-request timeouts.
+request timeouts. Registry HTTP(S) requests go through the client's openers:
+keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
+explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
+credentials over HTTP to non-loopback hosts.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
@@ -206,10 +209,10 @@ These are known gaps, **not fixed behavior**:
   audit; publication remains pending in #79. The plugins now declare the core
   package dependency, so source installs must place the core and plugin in the
   same host environment until publication.
-- The registry client is HTTPS-only and does not read Docker `credsStore`,
-  `credHelpers` or `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff
-  (`PUSH_IMAGE=false`, `custom_build(tag=...)`) and multi-platform requests
-  (#29) are rejected, not emulated.
+- The registry client does not read Docker `credsStore`, `credHelpers` or
+  `DOCKER_CONFIG`. Skaffold/Tilt local-daemon handoff (`PUSH_IMAGE=false`,
+  `custom_build(tag=...)`) and multi-platform dev-loop requests are rejected,
+  not emulated.
 
 Dependency staging installs wheel-only requirements for `linux/amd64` and
 `linux/arm64` CPython targets (1 MiB requirements file, 300-second timeout,
@@ -267,6 +270,17 @@ same layout `index.json` across platforms. Detected virtualenvs take precedence;
 exclude them to select the requirements file. Multi-tag registry pushes are not
 atomic: a later tag failure can leave earlier tags moved. Hermetic index tests do
 not prove per-architecture runtime startup.
+
+The `_pip_target.py` bootstrap also filters host pip environment variables and config-file keys
+to index, authentication, TLS, proxy and timeout settings (see
+`dependencies._PIP_ENVIRONMENT_ALLOWED`), with a self-test that fails closed if
+pip's config hook changes. Requirements graphs and shipped pip inputs with
+literal URL credentials (userinfo, secret-like query values, or recognized or
+random-looking URL path tokens; detection is pattern-based) are rejected; pip
+errors are redacted. See
+`docs/AUTHENTICATION.md#private-package-indexes` and
+`tests/test_private_index.py`, which uses a loopback index and synthetic
+secrets only.
 
 Read [the evidence and design](docs/plans/2026-11-19-performance-maintenance-design.md)
 and [the dependency-ordered plan](docs/plans/2026-11-19-maintenance-plan.md).

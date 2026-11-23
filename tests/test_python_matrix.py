@@ -267,9 +267,9 @@ def test_minor_validation_even_without_dependencies(tmp_path, monkeypatch, envir
         return layers, config
     monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull)
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
     with pytest.raises(ValueError, match="Python 3.12"):
         build.build()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     with pytest.raises(RuntimeError, match="every Python"):
         build.push()
     assert push.calls == []
@@ -279,7 +279,7 @@ def test_all_content_before_tags_and_aliases_last(tmp_path, monkeypatch):
     build, _, _ = matrix(tmp_path, monkeypatch, platform="linux/amd64,linux/arm64")
     build.build()
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     build.push(show_progress=False)
     tags = [i for i, call in enumerate(push.calls) if call[0] != "blob" and not call[1].startswith("sha256:")]
     assert all(call[0] == "blob" or call[1].startswith("sha256:") for call in push.calls[:tags[0]])
@@ -287,6 +287,36 @@ def test_all_content_before_tags_and_aliases_last(tmp_path, monkeypatch):
         "v1.2.3-py3.11", "v1.2.3-py3.12", "v1.2.3", "v1.2", "v1", "latest"
     ]
     assert all(op.outcome == "confirmed" for op in build.operations)
+
+
+@pytest.mark.parametrize("destination, insecure", [
+    ("registry.example/team/app:v1", True),
+    ("other.example/team/app:v1", False),
+])
+def test_matrix_publication_uses_registry_transport_settings(
+    tmp_path, monkeypatch, caplog, destination, insecure
+):
+    monkeypatch.setattr("pycontainer.registry_client.create_registry_ssl_context", lambda path: None)
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, insecure_registries=["registry.example"],
+        registry_ca_file="example-ca.pem",
+    )
+    build.build()
+    push = FakePushClient()
+    calls = []
+
+    def client(registry, repository, **kwargs):
+        calls.append((registry, repository, kwargs))
+        return push
+
+    monkeypatch.setattr(builder_module, "RegistryClient", client)
+    build.push(registry_url=destination, show_progress=False)
+    assert calls == [(destination.split("/")[0], "team/app", {
+        "auth_token": None, "username": None, "password": None,
+        "insecure": insecure, "ca_file": "example-ca.pem",
+    })]
+    assert ("using plain HTTP" in caplog.text) is insecure
+    assert push.calls
 
 
 @pytest.mark.parametrize("failure_kind", [
@@ -331,7 +361,7 @@ def test_failure_report_and_no_retry_or_rollback(tmp_path, monkeypatch, failure_
                 raise RegistryHTTPError(403, "rejected")
             if is_tag:
                 remote_tags[call[1]] = call[2]
-    monkeypatch.setattr(matrix_module, "RegistryClient", Client())
+    monkeypatch.setattr(builder_module, "RegistryClient", Client())
     with pytest.raises(MatrixPublicationError) as caught:
         build.push(show_progress=False)
     error = caught.value
@@ -359,7 +389,7 @@ def test_corrupt_later_layout_prevents_any_publication(tmp_path, monkeypatch):
     path = Path(child.config.output_dir) / "blobs" / "sha256" / child.manifest_digest.split(":")[1]
     path.write_bytes(b"corrupt")
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     with pytest.raises(LayerIntegrityError):
         build.push()
     assert push.calls == []
@@ -369,7 +399,7 @@ def test_matrix_and_child_output_locks_exclude_concurrent_builds(tmp_path, monke
     build, _, _ = matrix(tmp_path, monkeypatch)
     build.build()
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     for output in (build.config.output_dir, build.children["3.12"].config.output_dir):
         with output_directory_lock(output):
             with pytest.raises(RuntimeError, match="Another build"):
@@ -389,7 +419,7 @@ def test_locks_remain_held_during_remote_writes(tmp_path, monkeypatch):
                         pytest.fail("publication released its lock")
             super()._record(call)
     push = Client()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     build.push(show_progress=False)
     assert push.calls
 
@@ -402,7 +432,7 @@ def test_authentication_failure_reports_all_unattempted_content(tmp_path, monkey
         raise ValueError("credentials unavailable")
     monkeypatch.setattr(matrix_module, "get_registry_auth", auth)
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     with pytest.raises(MatrixPublicationError) as caught:
         build.push()
     assert caught.value.operations[0].kind == "authentication"
@@ -433,6 +463,7 @@ def test_target_wheel_staging_uses_each_minor_and_architecture(tmp_path, monkeyp
         targets.append((version, os_name, arch))
         site.mkdir()
         (site / "synthetic.py").write_text(f"TARGET = '{version}/{arch}'\n")
+        return [requirements]
     monkeypatch.setattr(builder_module, "install_requirements", install)
     build.build()
     assert targets == [("3.11", "linux", "amd64"), ("3.11", "linux", "arm64"),
@@ -506,7 +537,7 @@ def test_local_base_change_prevents_matrix_publication(tmp_path, monkeypatch, du
         index.write_bytes(index.read_bytes() + b"\n")
 
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     if during_build:
         child = build.children["3.12"]
         original = child._build_image
@@ -544,11 +575,12 @@ def test_dependency_failure_on_later_minor_starts_no_push(tmp_path, monkeypatch)
             raise RuntimeError("No compatible wheels for Python 3.12")
         site.mkdir()
         (site / "synthetic.py").write_text("VALUE = 1\n")
+        return [requirements]
     monkeypatch.setattr(builder_module, "install_requirements", install)
     push = FakePushClient()
-    monkeypatch.setattr(matrix_module, "RegistryClient", push)
     with pytest.raises(RuntimeError, match="3.12"):
         build.build()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
     with pytest.raises(RuntimeError, match="every Python"):
         build.push()
     assert push.calls == []
