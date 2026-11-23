@@ -404,6 +404,54 @@ def test_repeated_real_builds_refresh_selection_and_cache(tmp_path, monkeypatch)
     assert builder.layers[-1].digest == updated.digest
 
 
+def test_conditional_selection_with_build_history_and_credential_checks(tmp_path, monkeypatch):
+    from pycontainer.history import BuildHistory
+
+    context = _context(tmp_path)
+    config = _config(context, tmp_path, [DEV_TOOLS], build_args={"BUILD_MODE": "dev"},
+                     record_history=True, history_dir=str(tmp_path / "history"))
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(
+        builder, "_pull_base_image",
+        lambda *args: ([], {"config": {}, "rootfs": {"type": "layers", "diff_ids": []}}),
+    )
+    builder.build()
+    (context / "debug_tools" / "new.py").write_text("value = 1\n")
+    builder.build()
+    with tarfile.open(builder.layers[-1].tar_path) as archive:
+        assert "app/debug_tools/new.py" in archive.getnames()
+    history = BuildHistory(config.history_dir)
+    assert [record["status"] for record in history.list()] == ["success", "success"]
+    assert all("application" in record["phases_ns"] for record in history.list())
+
+    (context / "debug_tools" / "requirements.txt").write_text(
+        "--index-url https://user:synthetic-secret@example.invalid/simple\n"
+    )
+    with pytest.raises(ValueError, match="literal credentials") as error:
+        builder.build()
+    assert "synthetic-secret" not in str(error.value)
+    assert history.list()[-1]["status"] == "failed"
+    assert "application" in history.list()[-1]["phases_ns"]
+
+
+def test_selection_refresh_failure_is_recorded_in_build_history(tmp_path, monkeypatch):
+    from pycontainer.history import BuildHistory
+
+    context = _context(tmp_path)
+    config = _config(context, tmp_path, [], record_history=True,
+                     history_dir=str(tmp_path / "history"))
+    builder = ImageBuilder(config)
+
+    def fail_selection():
+        raise ValueError("selection failed")
+
+    monkeypatch.setattr(builder, "_refresh_context_selection", fail_selection)
+    with pytest.raises(ValueError, match="selection failed"):
+        builder.build()
+    record = BuildHistory(config.history_dir).list()[0]
+    assert record["status"] == "failed"
+
+
 def test_excluded_pyproject_is_not_used_for_entrypoint(tmp_path, monkeypatch):
     context = _context(tmp_path)
     (context / "pyproject.toml").write_text(

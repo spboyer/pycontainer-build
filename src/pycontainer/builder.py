@@ -1,5 +1,7 @@
 import hashlib, json, os, shutil, tarfile, tempfile, logging
 from copy import deepcopy
+from contextlib import nullcontext
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig
@@ -178,12 +180,15 @@ from .local_image import (
     verify_layer_diff_ids,
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     create_console_entrypoints,
     install_requirements,
+    reject_credentialed_direct_urls,
+    reject_shipped_credentials,
     staged_packages,
     stage_virtualenv,
     target_python_version,
@@ -194,7 +199,29 @@ from .dependencies import (
 logger=logging.getLogger(__name__)
 
 class ImageBuilder:
-    def __init__(self, config: BuildConfig): 
+    def __init__(self, config: BuildConfig):
+        self._history = (
+            BuildHistory(config.history_dir)
+            if config.record_history and not config.dry_run
+            else None
+        )
+        self._history_timer = (
+            ContextVar("pycontainer_build_history", default=None)
+            if self._history else None
+        )
+        if self._history:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            timing = BuildTiming()
+            try:
+                with timing.phase("initialization"):
+                    self._initialize(config)
+            except BaseException:
+                self._record_failed_history(timing, config)
+                raise
+        else:
+            self._initialize(config)
+
+    def _initialize(self, config: BuildConfig):
         context_dir=Path(config.context_dir)
         default_cache_dir=Path.home()/".pycontainer"/"cache"
         cache_dir=(
@@ -286,16 +313,50 @@ class ImageBuilder:
             self.config.context_dir,
             files={relative for _, relative in self.context_files},
         )
+    def _record_failed_history(self, timing, config):
+        try:
+            self._history.validate_location(config.context_dir, config.output_dir)
+            self._history.append(timing.record("failed"))
+        except BaseException as error:
+            # Recording must never replace the original build failure.
+            logger.error("Build history could not be saved or confirmed: %s", config.redact(str(error)))
+
+    def _time_history_phase(self, name):
+        timing = self._history_timer.get() if self._history_timer else None
+        return timing.phase(name) if timing else nullcontext()
 
     def build(self):
-        self._refresh_context_selection()
         if self.dry_run:
+            self._refresh_context_selection()
             logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
             self._show_build_plan()
             return self.config.tag
 
-        with output_directory_lock(self.config.output_dir):
-            return self._build_image()
+        timing = BuildTiming() if self._history else None
+        token = self._history_timer.set(timing) if timing else None
+        try:
+            try:
+                if self._history:
+                    self._history.validate_location(
+                        self.config.context_dir, self.config.output_dir
+                    )
+                self._refresh_context_selection()
+                with output_directory_lock(self.config.output_dir):
+                    result = self._build_image()
+            except BaseException:
+                if timing:
+                    self._record_failed_history(timing, self.config)
+                raise
+
+            if timing:
+                self._history.validate_location(
+                    self.config.context_dir, self.config.output_dir
+                )
+                self._history.append(timing.record("success"))
+            return result
+        finally:
+            if timing:
+                self._history_timer.reset(token)
 
     def _build_image(self):
         entry = self._entrypoint()
@@ -308,22 +369,23 @@ class ImageBuilder:
         security_fragments=render_security_fragments(
             self.config.security, self.config.context_dir
         )
-        base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        with self._time_history_phase("base_image"):
+            base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
         report_system_packages(self.config, base_layers, redact=self.config.redact)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(self.config.platform)
         
-        include = self.context_include_paths
-
         app_layers=[]
         if self.config.include_deps:
-            deps_layer=self._create_deps_layer(
-                layers_dir, base_config=base_config, os_name=os_name, arch=arch
-            )
+            with self._time_history_phase("dependencies"):
+                deps_layer=self._create_deps_layer(
+                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                )
             if deps_layer: app_layers.append(deps_layer)
         
-        app_layer=self._create_app_layer(layers_dir)
+        with self._time_history_phase("application"):
+            app_layer=self._create_app_layer(layers_dir)
         app_layers.append(app_layer)
         
         all_layers=base_layers+app_layers
@@ -398,16 +460,17 @@ class ImageBuilder:
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
-            generate_sbom(
-                Path(self.config.context_dir),
-                sbom_path,
-                format=(
-                    self.config.generate_sbom
-                    if isinstance(self.config.generate_sbom, str)
-                    else "spdx"
-                ),
-                package_inventory=getattr(self, "_staged_packages", []),
-            )
+            with self._time_history_phase("sbom"):
+                generate_sbom(
+                    Path(self.config.context_dir),
+                    sbom_path,
+                    format=(
+                        self.config.generate_sbom
+                        if isinstance(self.config.generate_sbom, str)
+                        else "spdx"
+                    ),
+                    package_inventory=getattr(self, "_staged_packages", []),
+                )
             logger.info(self.config.redact(f"✓ SBOM saved to {sbom_path}"))
 
         for fragment_path in write_security_fragments(output, security_fragments):
@@ -415,6 +478,29 @@ class ImageBuilder:
         
         return self.config.tag
     
+    def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
+        """Create a registry client honoring insecure-host and CA settings."""
+        insecure=registry.lower() in self.config.insecure_registries
+        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        client=RegistryClient(
+            registry,
+            repo,
+            auth_token=auth.bearer_token,
+            username=auth.username,
+            password=auth.password,
+            insecure=insecure,
+            ca_file=self.config.registry_ca_file,
+            **log_options,
+        )
+        warned=self.__dict__.setdefault('_warned_insecure_registries', set())
+        if insecure and registry.lower() not in warned:
+            warned.add(registry.lower())
+            logger.warning(self.config.redact(
+                f"WARNING: using plain HTTP for insecure registry {registry}; "
+                "traffic is unencrypted and unauthenticated by TLS."
+            ))
+        return client
+
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
         self._base_image_name=self.config.base_image
@@ -424,14 +510,7 @@ class ImageBuilder:
             registry, repo, reference=parse_image_reference(self.config.base_image)
             log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
             auth=get_registry_auth(registry, **log_options)
-            client=RegistryClient(
-                registry,
-                repo,
-                auth_token=auth.bearer_token,
-                username=auth.username,
-                password=auth.password,
-                **log_options,
-            )
+            client=self._registry_client(registry, repo, auth)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 
         target = f"{os_name}/{arch}" + (
@@ -598,14 +677,7 @@ class ImageBuilder:
             password=password,
             **log_options,
         )
-        client=RegistryClient(
-            registry,
-            repo,
-            auth_token=auth.bearer_token,
-            username=auth.username,
-            password=auth.password,
-            **log_options,
-        )
+        client=self._registry_client(registry, repo, auth)
         output=Path(self.config.output_dir)
         layers_dir=output/'blobs'/'sha256'
         
@@ -718,7 +790,7 @@ class ImageBuilder:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
             if is_requirements:
-                install_requirements(
+                self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,
                     ctx,
@@ -740,6 +812,7 @@ class ImageBuilder:
                     ctx,
                     ctx / requirements_relative,
                 )
+                reject_credentialed_direct_urls(site_packages)
 
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
@@ -747,7 +820,13 @@ class ImageBuilder:
                 strict=bool(self.config.generate_sbom),
             )
             files = sorted(
-                (path for path in stage_root.rglob("*") if path.is_file()),
+                (
+                    path
+                    for directory in (site_packages, stage_root / "bin")
+                    if directory.is_dir()
+                    for path in directory.rglob("*")
+                    if path.is_file()
+                ),
                 key=lambda path: path.relative_to(stage_root).as_posix(),
             )
             self._dependency_site_packages = bool(files)
@@ -792,15 +871,25 @@ class ImageBuilder:
                 tmp.unlink(missing_ok=True)
 
     def _create_app_layer(self, layers_dir, include_paths=None):
+        ctx=Path(self.config.context_dir)
         files=(
             list(self.context_files)
             if include_paths is None
             else select_context_files(
-                self.config.context_dir,
+                ctx,
                 include_paths,
                 self.context_excludes,
                 self.config._conditional_includes,
             )
+        )
+        configured_requirements = ctx / self.config.requirements_file
+        reject_shipped_credentials(
+            files,
+            ctx,
+            [
+                *getattr(self, "_requirement_files", ()),
+                configured_requirements,
+            ],
         )
 
         if self.cache:
