@@ -76,6 +76,9 @@ pycontainer build --tag myapp:latest --platform linux/amd64
 
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
+
+# Preview pruning old versions (dry run by default; --execute to delete)
+pycontainer registry prune ghcr.io/user/myapp --keep 5
 ```
 
 ### Output
@@ -189,6 +192,9 @@ offline preparation, error behavior and the opt-in acceptance test.
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
+  dry-run-by-default semver `registry prune` that never deletes digests shared
+  with retained tags ([guide](docs/REGISTRY_CLEANUP.md))
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
@@ -498,13 +504,18 @@ pycontainer build \
   `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
   Virtualenvs do not record selected extras or groups. An extra or group
-  counts as not requested only when it is missing a requirement that any
-  Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
-  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
-  its target requirements are not satisfied, verification fails rather than
-  guessing.
+  counts as not requested only when it is missing a requirement that the
+  venv's creator host provably would have installed. Only facts the venv
+  establishes are used: CPython, the venv's Python minor version when known,
+  and the OS family from the layout (`lib/pythonX.Y/site-packages` with a
+  POSIX `pyvenv.cfg` `home` is non-Windows; MSYS2 CPython is Windows with that
+  layout; `Lib/site-packages` is Windows). Markers on any other host value,
+  such as `platform_machine` or a specific non-Windows `sys_platform`, are
+  unknown rather than assumed, so a requirement like
+  `fast; extra == "speed" and platform_machine != "armv7l"` cannot rule the
+  extra out. Otherwise, if its target requirements are not satisfied,
+  verification fails rather than guessing; install the extra into the venv or
+  use a requirements file instead.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
@@ -686,6 +697,19 @@ exclude-paths = ["src/generated", "fixtures/**"]
 exclude-defaults = true
 ```
 
+Context traversal never follows directory symlinks or Windows junctions. A
+linked include root (including auto-detected `src`, `app` or a virtualenv)
+fails the build; nested directory links are skipped. A selected file symlink
+must use a relative target that resolves to an existing file inside the
+context and that is itself selected (exclusions win); it is stored as a link
+with `/` separators. A target may climb with leading `..` components, but not
+above the context root, and may not use `..` after descending into a directory.
+Absolute, dangling, cyclic, out-of-context and unselected-target file links
+fail the build. A context directory that is itself a symlink is still
+supported. These checks are not a defense against the context changing during
+a build, and they do not cover explicitly named inputs such as requirements or
+manifest files.
+
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
@@ -742,6 +766,11 @@ See [metadata configuration and integration details](docs/metadata.md).
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+- `--registry-mirror UPSTREAM=MIRROR` — Pull base images through `MIRROR`
+  before `UPSTREAM` (repeatable, tried in order; `[build.registry_mirrors]`).
+  Pushes never use mirrors, and mirrors never receive upstream credentials.
+  See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
+
 Registry connections are direct: environment/system proxy settings are ignored.
 URLs containing embedded credentials are rejected; use the credential providers
 or authentication flags instead.
@@ -1002,8 +1031,7 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 (`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
-platform is built in isolation: it selects its own base manifest (registry
-builds re-select from the first resolved base-index digest), stages its own
+platform is built in isolation: it selects its own base manifest, stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
 Virtualenv closure is verified separately against each target base. Explicit
@@ -1013,7 +1041,17 @@ The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
 keep the same layout `index.json` for every platform and until publication;
-a change fails the build instead of mixing base versions. Push uploads blobs, then
+a change fails the build instead of mixing base versions. A registry base tag
+is read once: every platform selects from that first verified base index or
+manifest snapshot and fetches its platform manifest by descriptor digest, so a
+tag that moves mid-build cannot mix snapshots. The snapshot must match a
+`sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
+unrecognized header algorithm cannot be verified: it is kept as an opaque
+value, the first snapshot is still reused for every platform, and the tag is
+not treated as verified provenance for libc or Python version inference. If a pinned
+platform manifest can no longer be fetched, the build fails before the layout
+`index.json` or refs are written (a reused output directory may still contain
+an earlier build's index). Push uploads blobs, then
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.
@@ -1092,6 +1130,7 @@ This style is intentional for the experimental phase.
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
+- **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
 
 ### External References
 
