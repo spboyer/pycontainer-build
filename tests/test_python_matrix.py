@@ -175,6 +175,44 @@ def test_matrix_dry_run_does_not_record_history(tmp_path, monkeypatch):
     assert not history_dir.exists()
 
 
+def test_matrix_scan_is_rejected_before_builder_or_push(tmp_path, monkeypatch, capsys):
+    from pycontainer import cli
+
+    def fail(*args, **kwargs):
+        pytest.fail("matrix scan reached builder or registry")
+
+    monkeypatch.setattr(cli, "ImageBuilder", fail)
+    monkeypatch.setattr("sys.argv", [
+        "pycontainer", "build", "--python-version", "3.11,3.12", "--scan", "--push",
+    ])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "scanning is not supported for Python version matrices" in capsys.readouterr().err
+
+
+def test_enabling_scan_after_matrix_build_prevents_publication(tmp_path, monkeypatch):
+    build, _, _ = matrix(tmp_path, monkeypatch)
+    build.build()
+    build.config.scan = True
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(ValueError, match="scanning is not supported for Python version matrices"):
+        build.push()
+    assert push.calls == []
+
+
+def test_rejected_matrix_scan_build_invalidates_previous_build(tmp_path, monkeypatch):
+    build, _, _ = matrix(tmp_path, monkeypatch)
+    build.build()
+    build.config.scan = True
+    with pytest.raises(ValueError, match="scanning is not supported for Python version matrices"):
+        build.build()
+    build.config.scan = False
+    with pytest.raises(RuntimeError, match="every Python"):
+        build.push()
+
+
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_matrix_layout_references_encode_tags_invalid_in_oci(tmp_path, monkeypatch, platform):
     build, _, _ = matrix(

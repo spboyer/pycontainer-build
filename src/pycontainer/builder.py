@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -190,7 +190,11 @@ from .oci import (
     build_manifest_json,
     build_oci_layout,
 )
-from .project import detect_entrypoint, default_include_paths, find_dependencies
+from .project import (
+    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    default_include_paths, find_dependencies,
+)
+from .fs_utils import conda_prefix, relative_context_path
 from .framework import apply_framework_defaults
 from .registry_client import (
     RegistryClient,
@@ -218,6 +222,7 @@ from .dependencies import (
     staged_packages,
     stage_virtualenv,
     target_python_version,
+    target_libc_config,
     target_wheel_platform,
     validate_target_platform,
 )
@@ -429,6 +434,19 @@ class ImageBuilder:
         return timing.phase(name) if timing else nullcontext()
 
     def build(self):
+        self._conda_warning_emitted = False
+        if self.config.scan and len(self.config.target_platforms()) > 1:
+            raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+        if conda_prefix(self.config.context_dir, ".") is not None:
+            raise ValueError(
+                "The build context is inside a host Conda environment; use a "
+                "source-only build context to avoid copying host environment files. "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` and select that "
+                "file with --requirements and --include-deps."
+            )
+        if self.config.include_deps:
+            self._check_conda_dependencies()
         if self.dry_run:
             if self.config.python_versions:
                 from .python_matrix import PythonMatrixBuilder
@@ -460,6 +478,13 @@ class ImageBuilder:
                             self.config.security, self.config.context_dir
                         )
                         result = self._build_image()
+                        if self.config.scan:
+                            from .scanning import scanned_image
+
+                            with scanned_image(
+                                Path(self.config.output_dir), self.manifest_digest, self.config
+                            ):
+                                logger.info("Vulnerability gate passed for %s", self.manifest_digest)
                         for fragment_path in write_security_fragments(
                             Path(self.config.output_dir), security_fragments
                         ):
@@ -615,8 +640,16 @@ class ImageBuilder:
         app_layers=[]
         if self.config.include_deps:
             with self._time_history_phase("dependencies"):
+                staging_config = target_libc_config(
+                    os_name, arch, self.config.base_image, base_config, base_layers,
+                    base_image_tag_verified=(
+                        parse_local_image_reference(self.config.base_image) is None
+                        and "@" not in self.config.base_image
+                        and getattr(self, "_base_image_tag_verified", False)
+                    ),
+                )
                 deps_layer=self._create_deps_layer(
-                    layers_dir, base_config=base_config, os_name=os_name, arch=arch
+                    layers_dir, base_config=staging_config, os_name=os_name, arch=arch
                 )
             if deps_layer: app_layers.append(deps_layer)
         
@@ -654,7 +687,8 @@ class ImageBuilder:
 
         cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
-                                layer_diff_ids=[layer.digest for layer in app_layers])
+                                layer_diff_ids=[layer.digest for layer in app_layers],
+                                stop_signal=self.config.stop_signal,volumes=self.config.volumes)
         cfg_bytes=json.dumps(cfg,separators=(',',':')).encode()
         cfg_digest="sha256:"+hashlib.sha256(cfg_bytes).hexdigest()
         cfg_path=layers_dir/cfg_digest.split(":",1)[1]
@@ -917,7 +951,31 @@ class ImageBuilder:
             )
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
-        
+        if self.config.scan:
+            if getattr(self, "index_digest", None):
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+            from .scanning import scanned_image
+
+            with output_directory_lock(self.config.output_dir):
+                with scanned_image(
+                    Path(self.config.output_dir), self.manifest_digest, self.config
+                ) as (snapshot, descriptor):
+                    return self._push_image(registry_url, auth_token, username, password, show_progress, snapshot, descriptor)
+        return self._push_image(registry_url, auth_token, username, password, show_progress)
+
+    def _push_image(self, registry_url, auth_token, username, password, show_progress, output=None, descriptor=None):
+        output=output or Path(self.config.output_dir)
+        layers_dir=output/'blobs'/'sha256'
+        manifest_digest=descriptor["digest"] if descriptor else self.manifest_digest
+        manifest_path=layers_dir/manifest_digest.split(":",1)[1]
+        manifest_data=manifest_path.read_bytes()
+        if descriptor:
+            manifest=json.loads(manifest_data)
+            layers=manifest["layers"]
+            config_digest=manifest["config"]["digest"]
+        else:
+            layers=[layer.to_descriptor() for layer in self.layers]
+            config_digest=self.config_digest
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         push_tags=[tag]
@@ -935,8 +993,6 @@ class ImageBuilder:
             password=password,
         )
         client=self._registry_client(registry, repo, auth)
-        output=Path(self.config.output_dir)
-        layers_dir=output/'blobs'/'sha256'
         
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
 
@@ -944,19 +1000,18 @@ class ImageBuilder:
             self._push_image_index(client, layers_dir, push_tags, f"{registry}/{repo}", show_progress)
             return f"{registry}/{repo}:{tag}"
         
-        for i, layer in enumerate(self.layers, 1):
-            if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
-            blob_path=layers_dir/layer.digest.split(":",1)[1]
-            skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
+        for i, layer in enumerate(layers, 1):
+            digest=layer["digest"]
+            if show_progress: print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
+            blob_path=layers_dir/digest.split(":",1)[1]
+            skipped=not client.push_blob(digest, blob_path, check_exists=True)
             if show_progress and skipped: print(f"    Layer exists, skipped")
         
-        if show_progress: print(f"  Pushing config ({self.config_digest[:19]}...)")
-        cfg_path=layers_dir/self.config_digest.split(":",1)[1]
-        client.push_blob(self.config_digest, cfg_path, check_exists=True)
+        if show_progress: print(f"  Pushing config ({config_digest[:19]}...)")
+        cfg_path=layers_dir/config_digest.split(":",1)[1]
+        client.push_blob(config_digest, cfg_path, check_exists=True)
         
-        if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
-        manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
-        manifest_data=manifest_path.read_bytes()
+        if show_progress: print(f"  Pushing manifest ({manifest_digest[:19]}...)")
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
             if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
@@ -1018,12 +1073,61 @@ class ImageBuilder:
             print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
             print(f"  Labels: {', '.join(f'{k}={v}' for k,v in self.config.labels.items())}")
+        if self.config.stop_signal:
+            print(f"  Stop Signal: {self.config.stop_signal}")
+        if self.config.volumes:
+            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         for name in render_security_fragments(self.config.security, self.config.context_dir):
             print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         print(f"  Use Cache: {self.config.use_cache}")
+
+    def _check_conda_dependencies(self):
+        ctx = Path(self.config.context_dir)
+        relative = relative_context_path(self.config.requirements_file)
+        signals = detect_conda_inputs(
+            ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
+            selected_paths=self.context_include_paths,
+        )
+        requirements = ctx / relative
+        requirements_exist = requirements.is_file()
+        conda_requirements = requirements_exist and (
+            relative.name in CONDA_FILES
+            or requirements.resolve().name in CONDA_FILES
+        )
+        requirements_prefix = (
+            conda_prefix(ctx, relative) if requirements_exist else None
+        )
+        if conda_requirements or requirements_prefix is not None:
+            if relative not in signals:
+                signals.append(relative)
+        if not signals:
+            return False
+        if (
+            conda_requirements
+            or not requirements_exist
+            or requirements_prefix is not None
+        ):
+            raise ValueError(
+                f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "
+                "Conda staging is unsupported. Export pip-compatible requirements "
+                "with `python -m pip freeze > requirements.txt` in your Conda "
+                "environment, then select that file with --requirements and "
+                "--include-deps. Conda-only packages must be provided by the base "
+                "image; host Conda environments are never copied."
+            )
+        if not requirements.resolve().is_relative_to(ctx.resolve()):
+            raise ValueError("Requirements file must stay inside the build context.")
+        if not getattr(self, "_conda_warning_emitted", False):
+            logger.warning(
+                "Conda inputs ignored (%s); installing only pip requirements from %s. "
+                "Conda-only packages are not staged.",
+                ", ".join(path.as_posix() for path in signals), relative.as_posix(),
+            )
+            self._conda_warning_emitted = True
+        return True
 
     def _create_deps_layer(
         self,
@@ -1035,15 +1139,15 @@ class ImageBuilder:
     ) -> Optional[OCILayer]:
         """Create a target-compatible dependency layer from a venv or requirements."""
         ctx=Path(self.config.context_dir)
+        prefer_requirements = self._check_conda_dependencies()
         deps_paths=find_dependencies(
             ctx,
             self.config.requirements_file,
             exclude_paths=self.dependency_excludes,
             exclude_defaults=False,
+            prefer_requirements=prefer_requirements,
         )
-        requirements_relative = Path(self.config.requirements_file)
-        if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
-            raise ValueError("Requirements path must be relative and stay inside the build context.")
+        requirements_relative = relative_context_path(self.config.requirements_file)
         is_requirements = any(
             relative == requirements_relative for _, relative in deps_paths
         )

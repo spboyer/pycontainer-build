@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from .auth import get_registry_auth
 from .blob_store import digest_filename
 from .builder import ImageBuilder, _verify_image_index, _verify_platform_image
-from .config import BuildConfig
+from .config import BuildConfig, MATRIX_SCAN_ERROR
 from .dependencies import _base_environment, _base_image_parts, _is_official_python_image
 from .fs_utils import context_exclude_paths, output_directory_lock
 from .local_image import _paths_overlap, parse_local_image_reference
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def matrix_targets(config: BuildConfig) -> Dict[str, str]:
+    if config.scan:
+        raise ValueError(MATRIX_SCAN_ERROR)
     versions = config.python_versions
     if not isinstance(versions, list) or not versions:
         raise ValueError("python_matrix/default_python_version requires python_versions.")
@@ -151,6 +153,8 @@ class PythonMatrixBuilder:
 
     def build(self):
         self.built = False
+        if self.config.scan:
+            raise ValueError(MATRIX_SCAN_ERROR)
         if self.config.dry_run:
             for version, child in self.children.items():
                 print(f"Python {version}: base={child.config.base_image}, output={child.config.output_dir}")
@@ -201,6 +205,8 @@ class PythonMatrixBuilder:
             child._verify_local_base_unchanged(layers)
 
     def push(self, registry_url=None, auth_token=None, username=None, password=None, show_progress=True):
+        if self.config.scan:
+            raise ValueError(MATRIX_SCAN_ERROR)
         self.operations = []
         if not self.built:
             raise RuntimeError("Must successfully build and validate every Python version before push().")
