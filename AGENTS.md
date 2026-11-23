@@ -110,7 +110,9 @@ Neither mode is part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
-same-repository PRs, pushes to main and release tags.
+same-repository PRs, pushes to main and release tags. Each target first runs
+`tests/test_skopeo_tag_refs.py`, which requires Skopeo to select every
+configured tag through its `index.json` descriptor reference.
 `scripts/verify_runtime_evidence.py` then requires exactly one passing full
 record per target for the current commit, workflow run and attempt; missing,
 skipped, failed, emulated, partial, stale or duplicate evidence fails the gate
