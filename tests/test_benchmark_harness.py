@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,8 +20,17 @@ def _load_benchmarks():
     return module
 
 
+@pytest.mark.parametrize(
+    ("many_timings", "saving", "repeat_saving"),
+    [
+        # Equal probes: the product-vs-probe 5s gap is overhead, not a saving.
+        ((3.0, 4.0, 1.0), 0.0, 0.0),
+        # N workers save 2s of transfer and 0.5s of repeat push.
+        ((2.0, 3.0, 0.5), 2.0, 0.5),
+    ],
+)
 def test_network_savings_come_from_matched_probes_with_identical_bases(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, many_timings, saving, repeat_saving
 ):
     benchmarks = _load_benchmarks()
     seeds = []
@@ -39,8 +49,7 @@ def test_network_savings_come_from_matched_probes_with_identical_bases(
             "push_requests": 3,
         }
         if spec["mode"] == "network-build":
-            # Product pull + push is 12s; the probes are equal at 7s, so the
-            # 5s difference is probe overhead, not a concurrency saving.
+            # Product pull + push is 12s against a 1-worker probe of 7s.
             return {
                 **timings,
                 "pull_seconds": 2.0,
@@ -49,12 +58,13 @@ def test_network_savings_come_from_matched_probes_with_identical_bases(
                 "repeat_push_seconds": 4.0,
                 "image": {},
             }
+        pull, push, repeat = (3.0, 4.0, 1.0) if spec["workers"] == 1 else many_timings
         return {
             **timings,
             "workers": spec["workers"],
-            "pull_seconds": 3.0,
-            "push_seconds": 4.0,
-            "repeat_push_seconds": 1.0,
+            "pull_seconds": pull,
+            "push_seconds": push,
+            "repeat_push_seconds": repeat,
         }
 
     monkeypatch.setattr(benchmarks, "_network_registry", fake_registry)
@@ -72,10 +82,11 @@ def test_network_savings_come_from_matched_probes_with_identical_bases(
     [case] = benchmarks._network_transfer_cases(args, tmp_path, tmp_path)
 
     summary = case["summary"]
-    assert summary["projected_saving_seconds"] == 0
-    assert summary["projected_saving_share"] == 0
-    assert summary["projected_saving_range_seconds"] == [0, 0]
-    assert summary["repeat_push_projected_saving_seconds"] == 0
+    assert summary["projected_saving_seconds"] == pytest.approx(saving)
+    # Share is relative to the 15s product pull + local build + push.
+    assert summary["projected_saving_share"] == pytest.approx(saving / 15.0)
+    assert summary["projected_saving_range_seconds"] == pytest.approx([saving, saving])
+    assert summary["repeat_push_projected_saving_seconds"] == pytest.approx(repeat_saving)
     for sample in ("s0", "s1"):
         sample_seeds = {seed for repository, seed in seeds if f"-{sample}-" in repository}
         assert len(sample_seeds) == 1
