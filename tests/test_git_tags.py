@@ -1122,6 +1122,8 @@ def test_git_tags_preserve_multi_platform_layout_and_partial_push_accounting(
         tags=["stable"],
         semver_tags=True,
         latest_tag=True,
+        manifest_annotations={"example.manifest": "manifest-value"},
+        index_annotations={"example.index": "index-value"},
     )
     builder = ImageBuilder(config)
     monkeypatch.setattr(
@@ -1131,6 +1133,11 @@ def test_git_tags_preserve_multi_platform_layout_and_partial_push_accounting(
 
     references = config.all_tags()
     layout = json.loads((tmp_path / "out" / "index.json").read_text())
+    index = json.loads((tmp_path / "out" / "blobs" / "sha256" / builder.index_digest.split(":")[1]).read_text())
+    assert index["annotations"]["example.index"] == "index-value"
+    for image in builder.platform_images:
+        manifest = json.loads((tmp_path / "out" / "blobs" / "sha256" / image.manifest_digest.split(":")[1]).read_text())
+        assert manifest["annotations"]["example.manifest"] == "manifest-value"
     assert [
         item["annotations"]["org.opencontainers.image.ref.name"]
         for item in layout["manifests"]
