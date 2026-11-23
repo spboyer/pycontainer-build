@@ -291,6 +291,10 @@ def _partial(record):
     record["mode"] = "dependency-layer-only"
 
 
+def _index_only(record):
+    record["mode"] = "oci-index-import-startup"
+
+
 def _emulated(record):
     record["daemon_platform"] = "linux/amd64"
 
@@ -340,6 +344,7 @@ def _reversed_time(record):
     [
         (_failed, "check failed: RuntimeError: startup failed"),
         (_partial, "is not a full OCI import and startup"),
+        (_index_only, "is not a full OCI import and startup"),
         (_emulated, "daemon_platform 'linux/amd64' does not match linux/arm64"),
         (_stale, "expected " + COMMIT),
         (_no_digest, "image digest"),
@@ -466,6 +471,119 @@ def test_runtime_check_refuses_emulated_daemon(tmp_path, monkeypatch, extra_args
     assert record["mode"] == ("shell-command" if extra_args else "oci-import-startup")
 
 
+def _mock_index_runtime(monkeypatch, target, *, fail_copy=False, wrong_config=False):
+    commands = []
+    configs = []
+    images = [
+        SimpleNamespace(
+            platform={"os": "linux", "architecture": arch},
+            manifest_digest="sha256:" + digest * 64,
+            config_digest="sha256:" + digest * 64,
+            layers=[SimpleNamespace(digest="sha256:" + digest * 64)],
+        )
+        for arch, digest in (("amd64", "a"), ("arm64", "b"))
+    ]
+
+    class Builder:
+        def __init__(self, config):
+            configs.append(config)
+            self.config = config
+            self.index_digest = "sha256:" + "c" * 64
+            self.platform_images = images
+
+        def build(self):
+            pass
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[0] == "skopeo" and fail_copy:
+            raise runtime_check.subprocess.CalledProcessError(1, command)
+        stdout = runtime_check.RUNTIME_MARKER if command[:2] == ["docker", "run"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    def output(command, timeout=30):
+        if command[:2] == ["docker", "version"]:
+            return target if ".Server.Os" in command[-1] else "28.0"
+        if command[:3] == ["docker", "image", "inspect"]:
+            if command[-2] == "{{.Id}}":
+                digest = "d" if wrong_config else ("a" if target == "linux/amd64" else "b")
+                return "sha256:" + digest * 64
+            return target
+        if command == ["skopeo", "--version"]:
+            return "skopeo version test"
+        raise AssertionError(command)
+
+    monkeypatch.setattr(runtime_check, "ImageBuilder", Builder)
+    monkeypatch.setattr(runtime_check, "require_executable", lambda name: name)
+    monkeypatch.setattr(runtime_check.subprocess, "run", run)
+    monkeypatch.setattr(runtime_check, "command_output", output)
+    return commands, configs
+
+
+@pytest.mark.parametrize(("target", "digest"), [("linux/amd64", "a"), ("linux/arm64", "b")])
+def test_index_runtime_check_imports_native_platform(tmp_path, monkeypatch, target, digest):
+    commands, configs = _mock_index_runtime(monkeypatch, target)
+    evidence = tmp_path / "index-evidence.json"
+
+    runtime_check.main(
+        ["--platform", target, "--multi-platform-index", "--evidence", str(evidence)]
+    )
+
+    assert configs[0].platform == "linux/amd64,linux/arm64"
+    assert not configs[0].generate_sbom
+    copy = next(command for command in commands if command[0] == "skopeo")
+    assert copy[:5] == ["skopeo", "--override-os", "linux", "--override-arch", target.split("/")[1]]
+    assert any(part.endswith(":runtime.example/check:v1") for part in copy)
+    assert ["docker", "run"] in [command[:2] for command in commands]
+    record = json.loads(evidence.read_text())
+    assert record["status"] == "passed"
+    assert record["mode"] == "oci-index-import-startup"
+    assert record["image_platform"] == target
+    assert record["imported_config_digest"] == "sha256:" + digest * 64
+    assert record["image"]["index_digest"] == "sha256:" + "c" * 64
+    assert record["image"]["manifest_digest"] == "sha256:" + digest * 64
+
+
+def test_index_runtime_copy_failure_records_failure(tmp_path, monkeypatch):
+    _mock_index_runtime(monkeypatch, "linux/amd64", fail_copy=True)
+    evidence = tmp_path / "index-evidence.json"
+
+    with pytest.raises(runtime_check.subprocess.CalledProcessError):
+        runtime_check.main(
+            ["--platform", "linux/amd64", "--multi-platform-index", "--evidence", str(evidence)]
+        )
+
+    record = json.loads(evidence.read_text())
+    assert record["status"] == "failed"
+    assert record["mode"] == "oci-index-import-startup"
+
+
+def test_index_runtime_rejects_wrong_imported_config(tmp_path, monkeypatch):
+    commands, _ = _mock_index_runtime(monkeypatch, "linux/arm64", wrong_config=True)
+    evidence = tmp_path / "index-evidence.json"
+
+    with pytest.raises(RuntimeError, match="config digest"):
+        runtime_check.main(
+            ["--platform", "linux/arm64", "--multi-platform-index", "--evidence", str(evidence)]
+        )
+
+    assert not any(command[:2] == ["docker", "run"] for command in commands)
+    assert json.loads(evidence.read_text())["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--platform", "linux/arm/v7"], "index check supports"),
+        (["--dependency-layer-only"], "cannot be combined"),
+    ],
+)
+def test_index_runtime_rejects_unsupported_modes(arguments, message, capsys):
+    with pytest.raises(SystemExit):
+        runtime_check.main(["--multi-platform-index", *arguments])
+    assert message in capsys.readouterr().err
+
+
 def job_block(workflow, job):
     text = (WORKFLOWS / workflow).read_text()
     match = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  \S|\Z)", text, re.M | re.S)
@@ -522,3 +640,14 @@ def test_pull_request_ci_runs_the_real_runtime_check():
     job = job_block("tests.yml", "runtime-check")
 
     assert "uses: ./.github/workflows/runtime-check.yml" in job
+    assert "check-index: true" in job
+
+
+def test_index_runtime_evidence_is_separate_from_release_evidence():
+    startup = job_block("runtime-check.yml", "startup")
+    gate = job_block("runtime-check.yml", "gate")
+
+    assert "inputs['check-index']" in startup
+    assert "--multi-platform-index" in startup
+    assert "name: index-runtime-evidence-${{ matrix.slug }}" in startup
+    assert "pattern: runtime-evidence-linux-*" in gate

@@ -4,6 +4,11 @@ name: Runtime image check
 # produce passing evidence; a missing, skipped or failed target fails the gate.
 on:
   workflow_call:
+    inputs:
+      check-index:
+        description: Check a multi-platform OCI index on each native target
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       dependency_fixture:
@@ -13,6 +18,10 @@ on:
           - requirements
           - lockfile
         default: requirements
+      check-index:
+        description: Check a multi-platform OCI index on each native target
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,7 +30,7 @@ jobs:
   startup:
     name: OCI import and startup (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs['check-index'] && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -67,12 +76,32 @@ jobs:
           --timeout 300
           --dependency-fixture "$DEPENDENCY_FIXTURE"
           --evidence runtime-evidence/${{ matrix.slug }}.json
+      - name: Build, import and start a multi-platform image index
+        if: ${{ inputs['check-index'] }}
+        env:
+          PYTHONPATH: src
+        run: >-
+          timeout 600 python scripts/check_runtime_image.py
+          --base-image python:3.11-slim
+          --platform ${{ matrix.platform }}
+          --multi-platform-index
+          --timeout 300
+          --evidence index-runtime-evidence/${{ matrix.slug }}.json
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-evidence-${{ matrix.slug }}
           path: runtime-evidence/${{ matrix.slug }}.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Upload index evidence
+        if: ${{ always() && inputs['check-index'] }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: index-runtime-evidence-${{ matrix.slug }}
+          path: index-runtime-evidence/${{ matrix.slug }}.json
           if-no-files-found: error
           overwrite: true
           retention-days: 90

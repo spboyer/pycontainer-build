@@ -264,6 +264,9 @@ def test_lock_option_builds_offline_and_records_verified_fixture(script, tmp_pat
 
     monkeypatch.setattr(script, "ImageBuilder", FakeBuilder)
     monkeypatch.setattr(script, "require_executable", lambda name: name)
+    monkeypatch.setattr(script.platform_module, "system", lambda: "Linux")
+    monkeypatch.setattr(script.platform_module, "machine", lambda: "test-machine")
+    monkeypatch.setattr(script.platform_module, "python_version", lambda: "3.11.0")
     monkeypatch.setattr(script.subprocess, "run", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(
         script, "command_output",
@@ -303,7 +306,9 @@ def test_lock_option_builds_offline_and_records_verified_fixture(script, tmp_pat
     assert "PIP_NO_INDEX" not in os.environ
 
 
-@pytest.mark.parametrize("option", ["--shell-command", "--dependency-layer-only", "--cmd-only"])
+@pytest.mark.parametrize("option", [
+    "--shell-command", "--dependency-layer-only", "--cmd-only", "--multi-platform-index",
+])
 def test_lock_option_rejects_partial_modes(script, option):
     with pytest.raises(SystemExit):
         script.main(["--dependency-fixture", "lockfile", option])
@@ -362,3 +367,49 @@ def test_real_offline_lock_staging_checks_wheel_hashes(script, tmp_path, monkeyp
     assert {(item["name"], item["versionInfo"]) for item in sbom["packages"]} == {
         ("runtime-pure", "1.0"), ("runtime-platform", "2.0"),
     }
+
+
+@pytest.mark.parametrize("matches", [False, True])
+def test_index_layout_selects_platform_and_verifies_config_before_start(
+    script, monkeypatch, matches
+):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout="container output\n", stderr="", returncode=0)
+
+    def inspect(command):
+        return "linux/arm64" if command[-2] == "{{.Os}}/{{.Architecture}}" else (
+            "sha256:expected" if matches else "sha256:wrong"
+        )
+
+    monkeypatch.setattr(script.subprocess, "run", run)
+    monkeypatch.setattr(script, "command_output", inspect)
+    evidence = {}
+    kwargs = {
+        "source_reference": "runtime.example/check:v1",
+        "expected_config_digest": "sha256:expected",
+    }
+    if matches:
+        assert script.run_layout(
+            "docker", "skopeo", Path("layout"), "img:tag", 5, "linux/arm64",
+            evidence, **kwargs,
+        ) == "container output\n"
+    else:
+        with pytest.raises(RuntimeError, match="config digest"):
+            script.run_layout(
+                "docker", "skopeo", Path("layout"), "img:tag", 5, "linux/arm64",
+                evidence, **kwargs,
+            )
+    assert calls[0][:6] == ["skopeo", "--override-os", "linux", "--override-arch", "arm64", "copy"]
+    assert calls[0][6].endswith(":runtime.example/check:v1")
+    assert any(command[:2] == ["docker", "run"] for command in calls) is matches
+    assert calls[-1] == ["docker", "image", "rm", "--force", "img:tag"]
+
+
+@pytest.mark.parametrize("other_mode", ["--shell-command", "--cmd-only", "--dependency-layer-only"])
+def test_index_mode_cannot_be_combined_with_other_modes(script, other_mode):
+    with pytest.raises(SystemExit) as exc:
+        script.main([other_mode, "--multi-platform-index"])
+    assert exc.value.code == 2
