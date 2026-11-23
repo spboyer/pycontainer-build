@@ -45,6 +45,7 @@ class BuildConfig:
     scan_offline: bool = False
     scan_db_dir: Optional[str] = None
     scan_db_max_age_hours: int = 120
+    security: Optional[dict] = None
 
     def __post_init__(self):
         from .system_packages import validate_system_packages
@@ -60,6 +61,10 @@ class BuildConfig:
             raise ValueError("scan_db_max_age_hours must be a positive integer")
         if not isinstance(self.scan_executable, str) or not self.scan_executable.strip():
             raise ValueError("scan_executable must be a nonempty executable path or name")
+        if self.security is not None:
+            from .security import validate_security
+
+            self.security = validate_security(self.security, self.platform)
         if not isinstance(self.generate_sbom, (bool, str)):
             raise ValueError(
                 "generate_sbom must be a boolean or one of: spdx, cyclonedx"
