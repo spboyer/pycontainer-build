@@ -26,7 +26,7 @@ from pycontainer.dependencies import (
     staged_packages,
     validate_requirements,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_wheel
+from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
 
 
 USER = "synthetic-user"
@@ -524,6 +524,39 @@ def test_host_pip_overrides_do_not_change_target_install(
     output = capsys.readouterr().out
     assert all(name in output for name in overrides)
     assert str(tmp_path / "prefix") not in output
+
+
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_host_requirement_injection_cannot_add_hash_pinned_packages(
+    tmp_path, monkeypatch, capsys, home, source
+):
+    wheelhouse = tmp_path / "wheelhouse"
+    fixture = _write_wheel(wheelhouse)
+    _write_named_wheel(wheelhouse, "injected-dep")
+    injected = wheelhouse / "injected_dep-1.0-py3-none-any.whl"
+
+    def pin(name, wheel):
+        return f"{name}==1.0 --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n"
+
+    context = _context(
+        tmp_path,
+        f"--no-index\n--find-links {wheelhouse.as_uri()}\n--require-hashes\n"
+        + pin("fixture-dep", fixture),
+    )
+    extra = home / "extra.txt"
+    extra.write_text(
+        f"--no-index\n--find-links {wheelhouse.as_uri()}\n" + pin("injected-dep", injected)
+    )
+    if source == "environment":
+        monkeypatch.setenv("PIP_REQUIREMENT", str(extra))
+    else:
+        config = home / "pip.ini"
+        config.write_text(f"[install]\nrequirement = {extra}\n")
+        monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+
+    assert _install(tmp_path, context) == {"fixture-dep"}
+    if source == "environment":
+        assert "PIP_REQUIREMENT" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
