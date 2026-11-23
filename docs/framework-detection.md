@@ -26,7 +26,10 @@ listener port. When no listener is specified by the build, an inherited
 `STREAMLIT_SERVER_PORT` is honored even if exposed-port metadata is explicitly
 cleared. An explicit command's `--server.port` before `--` takes precedence.
 Conflicting explicit values for a generated command are rejected. JupyterLab
-wins when both Jupyter dependencies are declared.
+wins when both Jupyter dependencies are declared. For configured Jupyter
+commands, `--port` and `--ServerApp.port`, `--NotebookApp.port`, or
+`--LabApp.port` set the inferred exposed port; invalid or conflicting values
+require explicit exposed ports.
 
 ## Precedence and ambiguity
 
@@ -99,6 +102,9 @@ An empty list explicitly clears a value. A command without an entrypoint
 suppresses the generated framework entrypoint and retains any base-image
 entrypoint; set `entrypoint = []` to clear it. Generated framework entrypoints
 clear the base image's default command so it is not appended to the invocation.
+When either command field is explicitly cleared, framework defaults are applied
+only if the remaining configured command identifies a detected application;
+otherwise base-image port metadata is inherited unless ports are configured.
 For API callers, `BuildConfig.exposed_ports` remains a mutable list. Leaving its
 default untouched permits detection and base-image inheritance; passing `[]`
 or explicitly clearing the list clears exposed ports.

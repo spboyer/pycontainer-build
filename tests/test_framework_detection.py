@@ -1695,6 +1695,8 @@ def test_unknown_gradio_listener_port_requires_explicit_ports(tmp_path):
     )
     with pytest.raises(ValueError, match="exposed ports"):
         detect_framework(tmp_path)
+    with pytest.raises(ValueError, match="exposed ports"):
+        apply_framework_defaults(BuildConfig(env={"GRADIO_SERVER_PORT": "9876"}), tmp_path)
     config = BuildConfig(exposed_ports=[8124])
     apply_framework_defaults(config, tmp_path)
     assert config.exposed_ports == [8124]
@@ -1737,6 +1739,146 @@ def test_configured_jupyter_command_selects_jupyter_over_fastapi(tmp_path):
     assert config.entrypoint == ["jupyter", "lab"]
     assert config.labels["framework"] == "jupyter"
     assert config.exposed_ports == [8888]
+
+
+@pytest.mark.parametrize(
+    "port_arguments",
+    [
+        ["--port=9999"], ["--port", "9999"],
+        ["--ServerApp.port=9999"], ["--ServerApp.port", "9999"],
+        ["--NotebookApp.port=9999"], ["--LabApp.port=9999"],
+    ],
+)
+def test_configured_jupyter_listener_port_is_exposed(tmp_path, monkeypatch, port_arguments):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "jupyterlab\n")
+    write_file(context, "analysis.ipynb", "{}")
+    command = ["jupyter", "lab", *port_arguments]
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=command, cmd=[],
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert image["Entrypoint"] == command
+    assert "Cmd" not in image
+    assert image["ExposedPorts"] == {"9999/tcp": {}}
+    assert image["Labels"]["framework"] == "jupyter"
+
+
+def test_split_jupyter_command_listener_port_is_exposed(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "jupyterlab\n")
+    write_file(context, "analysis.ipynb", "{}")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=["jupyter"], cmd=["lab", "--port", "9999"],
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert image["Entrypoint"] == ["jupyter"]
+    assert image["Cmd"] == ["lab", "--port", "9999"]
+    assert image["ExposedPorts"] == {"9999/tcp": {}}
+
+
+def test_jupyter_explicit_empty_ports_override_command_listener(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "jupyterlab\n")
+    write_file(context, "analysis.ipynb", "{}")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=["jupyter", "lab", "--port=9999"], exposed_ports=[],
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert image["Entrypoint"] == ["jupyter", "lab", "--port=9999"]
+    assert image["ExposedPorts"] == {}
+
+
+@pytest.mark.parametrize("port_arguments", [
+    ["--port=invalid"], ["--port"], ["--port=9999", "--ServerApp.port=9000"],
+])
+def test_unresolvable_jupyter_command_port_requires_explicit_ports(tmp_path, port_arguments):
+    write_file(tmp_path, "requirements.txt", "jupyterlab\n")
+    write_file(tmp_path, "analysis.ipynb", "{}")
+    command = ["jupyter", "lab", *port_arguments]
+    with pytest.raises(ValueError):
+        apply_framework_defaults(BuildConfig(entrypoint=command), tmp_path)
+    config = apply_framework_defaults(
+        BuildConfig(entrypoint=command, exposed_ports=[8123]), tmp_path
+    )
+    assert config.entrypoint == command
+    assert config.exposed_ports == [8123]
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "cmd"),
+    [([], None), (None, []), ([], []), (["python"], []), ([], ["python3"])],
+)
+@pytest.mark.parametrize(
+    ("dependency", "source"),
+    [
+        ("streamlit", "import streamlit\n"),
+        ("gradio", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n"),
+        ("jupyterlab", None),
+    ],
+)
+def test_explicit_clears_do_not_infer_unselected_framework(
+    tmp_path, monkeypatch, entrypoint, cmd, dependency, source
+):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", dependency + "\n")
+    if source is None:
+        write_file(context, "analysis.ipynb", "{}")
+    else:
+        write_file(context, "app.py", source)
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=entrypoint, cmd=cmd,
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert image.get("Entrypoint") == (
+        ["base-entrypoint"] if entrypoint is None else entrypoint or None
+    )
+    assert image.get("Cmd") == (["python3"] if cmd is None else cmd or None)
+    assert image["ExposedPorts"] == {"9999/tcp": {}}
+    assert "framework" not in image.get("Labels", {})
+
+
+def test_clearing_generated_entrypoint_removes_framework_defaults(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "streamlit\n")
+    write_file(context, "app.py", "import streamlit\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+    )
+    apply_framework_defaults(config, context)
+    config.entrypoint = []
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert "Entrypoint" not in image
+    assert image["ExposedPorts"] == {"9999/tcp": {}}
+    assert "framework" not in image.get("Labels", {})
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "cmd"),
+    [
+        ([], ["streamlit", "run", "app.py"]),
+        (["streamlit", "run", "app.py"], []),
+    ],
+)
+def test_explicit_clear_keeps_defaults_for_selected_framework(
+    tmp_path, monkeypatch, entrypoint, cmd
+):
+    context = tmp_path / "context"
+    write_file(context, "requirements.txt", "streamlit\n")
+    write_file(context, "app.py", "import streamlit\n")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "image"), use_cache=False,
+        entrypoint=entrypoint, cmd=cmd,
+    )
+    image = image_config_from_build(tmp_path, monkeypatch, config)
+    assert image.get("Entrypoint") == (entrypoint or None)
+    assert image.get("Cmd") == (cmd or None)
+    assert image["ExposedPorts"] == {"8501/tcp": {}}
+    assert image["Labels"]["framework"] == "streamlit"
 
 
 def test_configured_celery_module_selects_worker_over_fastapi(tmp_path, monkeypatch):

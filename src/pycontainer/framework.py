@@ -346,6 +346,15 @@ def _detect_framework(
         if matches and len({candidate.name for candidate in matches}) == 1:
             selected_match = matches[0]
             chosen = selected_match.name
+        if (
+            (configured_entrypoint == [] or configured_cmd == [])
+            and selected_match is None
+        ):
+            logger.warning(
+                "The configured command clears an image command field and does not "
+                "identify a detected application; no framework defaults applied."
+            )
+            return None
     if len(present) > 1:
         logger.warning(
             "Multiple frameworks detected (%s); %s %s. "
@@ -869,6 +878,30 @@ def _environment_port(value, name):
     return port
 
 
+def _configured_jupyter_port(arguments):
+    normalized = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+    _, command_arguments, _, _ = _configured_command(normalized)
+    options = {"--port", "--ServerApp.port", "--NotebookApp.port", "--LabApp.port"}
+    ports = set()
+    index = 0
+    while index < len(command_arguments):
+        argument = command_arguments[index]
+        if argument == "--":
+            break
+        option, separator, value = argument.partition("=")
+        if option in options:
+            if not separator:
+                index += 1
+                value = command_arguments[index] if index < len(command_arguments) else None
+            ports.add(_environment_port(value, option))
+        index += 1
+    if len(ports) > 1:
+        raise FrameworkPortDetectionError(
+            "Conflicting Jupyter listener ports were specified; configure exposed ports explicitly."
+        )
+    return next(iter(ports), None)
+
+
 def apply_framework_defaults(
     config,
     context_dir: Path,
@@ -955,6 +988,15 @@ def apply_framework_defaults(
         env_port = config.env.get("GRADIO_SERVER_PORT")
         if env_port is not None:
             ports = [_environment_port(env_port, "GRADIO_SERVER_PORT")]
+    elif (
+        framework == "Jupyter" and (generated_ports or not config.has_exposed_ports())
+        and (configured_entrypoint is not None or configured_cmd is not None)
+    ):
+        arguments = [*(configured_entrypoint or []), *(configured_cmd or [])]
+        if _matches_configured_command(detection, arguments, config.workdir):
+            command_port = _configured_jupyter_port(arguments)
+            if command_port is not None:
+                ports = [command_port]
 
     if generated_entrypoint or (config.entrypoint is None and configured_cmd is None):
         config.entrypoint = _GeneratedList(entrypoint, generated=True)

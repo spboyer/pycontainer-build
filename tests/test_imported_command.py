@@ -157,11 +157,13 @@ def test_imported_command_is_not_replaced_by_detected_streamlit(
 
     image = _built_config(tmp_path, monkeypatch, ENTRYPOINT_BASE, config)["config"]
 
-    assert image["Labels"]["framework"] == "streamlit"
     if clear_entrypoint:
         assert "Entrypoint" not in image
+        assert "framework" not in image.get("Labels", {})
+        assert "ExposedPorts" not in image
     else:
         assert image["Entrypoint"] == ENTRYPOINT_BASE["config"]["Entrypoint"]
+        assert image["Labels"]["framework"] == "streamlit"
     assert image["Cmd"] == result.config["cmd"] == ["python", "main.py"]
 
 
