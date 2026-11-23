@@ -105,7 +105,7 @@ def _format_type(expected_type: Any) -> str:
 
 
 def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
-    valid_fields = {field.name for field in fields(BuildConfig)}
+    valid_fields = {field.name for field in fields(BuildConfig) if field.init}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))
@@ -157,6 +157,8 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
 def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
     table, file_config = _load_config_table(path)
+    if "allow_dirty" in _normalize_config_keys(file_config, "Config file"):
+        raise ValueError(f"{table}.allow_dirty is not supported; pass --allow-dirty explicitly.")
     config = merge_configs(file_config, cli_overrides or {})
     _validate_config(config, table)
     return BuildConfig(**config)

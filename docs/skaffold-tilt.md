@@ -43,7 +43,8 @@ v2.25.0 (`skaffold/v4beta14` schema) and Tilt v0.37.9.
 - **The tool owns the tag.** `--tag`, `tags`, `semver_tags`, `latest_tag`,
   `dry_run`, `--push`, `--registry`, `--context` (Skaffold) and credentials are
   not accepted or are overridden; all other `pycontainer.toml` / CLI build
-  settings apply.
+  settings apply. Git-derived tags are incompatible with these commands;
+  configuration files must not enable `tag_from_git`.
 
 Failures to build, authenticate or push exit non-zero, so Skaffold and Tilt
 report the build as failed. In output-ref mode the reference file is written

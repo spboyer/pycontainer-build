@@ -5,6 +5,7 @@ from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .tags import GitTagError
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -37,6 +38,9 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
         b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
         b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
+        b.add_argument("--tag-from-git",action="store_true",default=None,help="Use the exact Git tag on HEAD as the primary image tag")
+        b.add_argument("--git-fallback",choices=("sha",),help="Use sha-<12 chars> if HEAD has no exact Git tag")
+        b.add_argument("--allow-dirty",action="store_true",default=None,help="Allow Git-derived tags with a dirty worktree")
     b.add_argument("--base-image",help="Base image to layer on: a registry reference, oci:<path>[:<ref>|@sha256:<digest>], or docker-archive:<path>[:<repo-tag>] (auto-detected from requires-python if not specified)")
     if context:
         b.add_argument("--context",dest="context_dir")
@@ -188,6 +192,9 @@ def main():
         'tags': tag_args[1:] if tag_args else None,
         'semver_tags': getattr(args,"semver_tags",None),
         'latest_tag': getattr(args,"latest_tag",None),
+        'tag_from_git': getattr(args,"tag_from_git",None),
+        'git_fallback': getattr(args,"git_fallback",None),
+        'allow_dirty': getattr(args,"allow_dirty",None),
         'base_image': args.base_image,
         'context_dir': getattr(args,"context_dir",None),
         'include_paths': args.include_paths,
@@ -256,6 +263,8 @@ def main():
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"
         if devloop:
+            if cfg.tag_from_git:
+                raise DevLoopError("Git-derived tags cannot be used with Skaffold or Tilt; the tool supplies the image reference.")
             platform=single_platform(cfg.platform,"platform")
             if not platform: raise DevLoopError("platform must specify a single target platform.")
             cfg.platform=platform
@@ -271,7 +280,7 @@ def main():
     try:
         builder=ImageBuilder(cfg)
         out=builder.build()
-    except ReleaseNotesError as exc:
+    except (GitTagError, ReleaseNotesError) as exc:
         parser.error(str(exc))
     except HistoryStorageError as exc:
         parser.exit(1,f"Build history error: {exc}\n")
@@ -291,6 +300,8 @@ def main():
                 password=password,
                 show_progress=not args.no_progress,
             )
+        except GitTagError as exc:
+            parser.error(str(exc))
         except ScanError as exc:
             parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
         if getattr(args,"output_ref",None):
