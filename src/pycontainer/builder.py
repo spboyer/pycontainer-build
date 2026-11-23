@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -435,6 +435,8 @@ class ImageBuilder:
 
     def build(self):
         self._conda_warning_emitted = False
+        if self.config.scan and len(self.config.target_platforms()) > 1:
+            raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
         if conda_prefix(self.config.context_dir, ".") is not None:
             raise ValueError(
                 "The build context is inside a host Conda environment; use a "
@@ -463,6 +465,13 @@ class ImageBuilder:
                         self.config.security, self.config.context_dir
                     )
                     result = self._build_image()
+                    if self.config.scan:
+                        from .scanning import scanned_image
+
+                        with scanned_image(
+                            Path(self.config.output_dir), self.manifest_digest, self.config
+                        ):
+                            logger.info("Vulnerability gate passed for %s", self.manifest_digest)
                     for fragment_path in write_security_fragments(
                         Path(self.config.output_dir), security_fragments
                     ):
@@ -919,7 +928,31 @@ class ImageBuilder:
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
-        
+        if self.config.scan:
+            if getattr(self, "index_digest", None):
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+            from .scanning import scanned_image
+
+            with output_directory_lock(self.config.output_dir):
+                with scanned_image(
+                    Path(self.config.output_dir), self.manifest_digest, self.config
+                ) as (snapshot, descriptor):
+                    return self._push_image(registry_url, auth_token, username, password, show_progress, snapshot, descriptor)
+        return self._push_image(registry_url, auth_token, username, password, show_progress)
+
+    def _push_image(self, registry_url, auth_token, username, password, show_progress, output=None, descriptor=None):
+        output=output or Path(self.config.output_dir)
+        layers_dir=output/'blobs'/'sha256'
+        manifest_digest=descriptor["digest"] if descriptor else self.manifest_digest
+        manifest_path=layers_dir/manifest_digest.split(":",1)[1]
+        manifest_data=manifest_path.read_bytes()
+        if descriptor:
+            manifest=json.loads(manifest_data)
+            layers=manifest["layers"]
+            config_digest=manifest["config"]["digest"]
+        else:
+            layers=[layer.to_descriptor() for layer in self.layers]
+            config_digest=self.config_digest
         target=registry_url or self.config.tag
         registry, repo, tag=parse_image_reference(target)
         push_tags=[tag]
@@ -937,8 +970,6 @@ class ImageBuilder:
             password=password,
         )
         client=self._registry_client(registry, repo, auth)
-        output=Path(self.config.output_dir)
-        layers_dir=output/'blobs'/'sha256'
         
         if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
 
@@ -946,19 +977,18 @@ class ImageBuilder:
             self._push_image_index(client, layers_dir, push_tags, f"{registry}/{repo}", show_progress)
             return f"{registry}/{repo}:{tag}"
         
-        for i, layer in enumerate(self.layers, 1):
-            if show_progress: print(f"  Pushing layer {i}/{len(self.layers)} ({layer.digest[:19]}...)")
-            blob_path=layers_dir/layer.digest.split(":",1)[1]
-            skipped=not client.push_blob(layer.digest, blob_path, check_exists=True)
+        for i, layer in enumerate(layers, 1):
+            digest=layer["digest"]
+            if show_progress: print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
+            blob_path=layers_dir/digest.split(":",1)[1]
+            skipped=not client.push_blob(digest, blob_path, check_exists=True)
             if show_progress and skipped: print(f"    Layer exists, skipped")
         
-        if show_progress: print(f"  Pushing config ({self.config_digest[:19]}...)")
-        cfg_path=layers_dir/self.config_digest.split(":",1)[1]
-        client.push_blob(self.config_digest, cfg_path, check_exists=True)
+        if show_progress: print(f"  Pushing config ({config_digest[:19]}...)")
+        cfg_path=layers_dir/config_digest.split(":",1)[1]
+        client.push_blob(config_digest, cfg_path, check_exists=True)
         
-        if show_progress: print(f"  Pushing manifest ({self.manifest_digest[:19]}...)")
-        manifest_path=layers_dir/self.manifest_digest.split(":",1)[1]
-        manifest_data=manifest_path.read_bytes()
+        if show_progress: print(f"  Pushing manifest ({manifest_digest[:19]}...)")
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
             if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")

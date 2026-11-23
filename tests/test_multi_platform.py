@@ -347,6 +347,40 @@ def test_normalize_platforms_strips_and_dedupes():
         "linux/amd64",
         "linux/arm64",
     ]
+
+
+def test_scanning_multi_platform_config_is_rejected():
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        BuildConfig(platform=MULTI, scan=True)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_enabling_scanning_after_configuration_rejects_index_build(
+    tmp_path, monkeypatch, dry_run
+):
+    registry = FakeBaseRegistry()
+    builder = _builder(tmp_path, monkeypatch, registry, dry_run=dry_run)
+    builder.config.scan = True
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.build()
+    assert registry.manifest_calls == []
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
+def test_enabling_scanning_after_index_build_rejects_push_before_auth(
+    tmp_path, monkeypatch
+):
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry())
+    builder.build()
+    original_index = (tmp_path / "out" / "index.json").read_bytes()
+    builder.config.scan = True
+    builder.config.platform = "linux/amd64"
+    monkeypatch.setattr(
+        builder_module, "get_registry_auth", lambda *args, **kwargs: pytest.fail("auth before gate")
+    )
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.push(show_progress=False)
+    assert (tmp_path / "out" / "index.json").read_bytes() == original_index
     with pytest.raises(ValueError):
         normalize_platforms("linux/amd64,,linux/arm64")
 

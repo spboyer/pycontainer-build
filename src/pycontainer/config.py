@@ -8,6 +8,11 @@ from typing import Dict, List, Optional, Union
 SBOM_FORMATS = ("spdx", "cyclonedx")
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64")
 ARM_V7_FOLLOW_UP = "https://github.com/spboyer/pycontainer-build/issues/119"
+SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
+MULTI_PLATFORM_SCAN_ERROR = (
+    "Vulnerability scanning is not supported for multi-platform images; "
+    "build and scan each platform separately."
+)
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
@@ -128,6 +133,15 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    scan: bool = False
+    scan_executable: str = "grype"
+    scan_threshold: str = "high"
+    scan_unknown: str = "fail"
+    scan_report_format: str = "json"
+    scan_report: Optional[str] = None
+    scan_offline: bool = False
+    scan_db_dir: Optional[str] = None
+    scan_db_max_age_hours: int = 120
     record_history: bool = False
     history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
@@ -140,6 +154,16 @@ class BuildConfig:
         from .system_packages import validate_system_packages
 
         self.system_packages = validate_system_packages(self.system_packages)
+        if self.scan_threshold not in SCAN_SEVERITIES:
+            raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
+        if self.scan_unknown not in ("fail", "ignore"):
+            raise ValueError("scan_unknown must be fail or ignore")
+        if self.scan_report_format not in ("json", "sarif"):
+            raise ValueError("scan_report_format must be json or sarif")
+        if type(self.scan_db_max_age_hours) is not int or self.scan_db_max_age_hours <= 0:
+            raise ValueError("scan_db_max_age_hours must be a positive integer")
+        if not isinstance(self.scan_executable, str) or not self.scan_executable.strip():
+            raise ValueError("scan_executable must be a nonempty executable path or name")
         self.insecure_registries = validate_insecure_registries(
             self.insecure_registries
         )
@@ -186,6 +210,8 @@ class BuildConfig:
                     "SBOM generation is not supported for multi-platform builds; "
                     "build each platform separately to generate its SBOM."
                 )
+            if self.scan:
+                raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
 
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
