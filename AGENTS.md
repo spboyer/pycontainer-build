@@ -32,7 +32,9 @@ currently has no `__main__.py`.
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings.
+content, normalized relative paths, workdir, and reproducibility settings, plus
+the context-relative hardlink targets `tarfile` emits (never inode numbers or
+absolute paths); key version 3 invalidated earlier keys that lacked them.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -89,18 +91,36 @@ a pass/fail gate. A passing layout assertion is not evidence that an image
 starts in a container runtime. Do not silently remove, mock away, or claim
 success for unrun integration tests.
 
-An opt-in real OCI import/startup check is available on Linux/WSL with Skopeo
-and a running Docker daemon:
-`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim`.
+A real OCI import/startup check runs on Linux/WSL with Skopeo and a running
+Docker daemon:
+`PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json`.
 It pulls the selected base image, imports the generated layout into Docker, and
-starts a container. To test only dependency importability in the real target
-base image, without Skopeo, add `--dependency-layer-only`. These checks are not
-part of the default test suite or CI.
+starts a container. `--platform` must match the daemon; emulated runs fail
+rather than count as evidence. `--evidence` writes a passed or failed JSON
+record. To test only dependency importability in the real target base image,
+without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
+It is not part of default pytest.
+
+`.github/workflows/runtime-check.yml` runs the full check natively on
+`linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
+same-repository PRs, pushes to main and release tags.
+`scripts/verify_runtime_evidence.py` then requires exactly one passing full
+record per target for the current commit, workflow run and attempt; missing,
+skipped, failed, emulated, partial, stale or duplicate evidence fails the gate
+and is listed separately as not validated. Re-run all jobs, not just failed
+jobs, to produce fresh evidence for every target. The release job depends on
+this gate, re-verifies evidence for its own attempt and appends the summary to
+the release notes. Only targets listed as validated have runtime evidence.
+
+`.github/workflows/execution-backend-probe.yml` records isolated-execution host
+prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
+runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
+gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
 
 There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
-and 3.15. The benchmark includes synthetic loopback registry transfers at
+and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
 multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
 does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
@@ -193,13 +213,19 @@ Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
 markers for the target (never the host) and installs the selection through
 `install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+Generated requirements live temporarily inside the writable build context;
+`.pycontainer-lockfile-*` staging directories are always excluded from images.
 Poetry checks locked and legacy Python ranges and recorded applicable root,
-transitive and extra dependencies; Poetry and uv cannot reconstruct dependency
-metadata omitted from a lock. uv limited environments must match the recorded
-supported markers and include the target; unverifiable marker normalization
-and unknown target values fail closed.
+transitive and extra dependencies. uv limited environments must match the
+recorded supported markers and include the target; unverifiable marker
+normalization and unknown target values fail closed. Pipenv roots and PDM
+roots and recorded edges must match the selection. After installation, all
+four formats' wheel metadata is checked for target-compatible transitive
+versions, markers and requested extras; this cannot recover dependencies
+missing from the wheels' own metadata.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
-venv, `requirements.txt`. Non-registry sources fail; never add an
+venv, `requirements.txt`; explicit `lockfile` and `requirements_file` are
+mutually exclusive. Non-registry sources fail; never add an
 unconstrained fallback. Real lock fixtures live in `tests/fixtures/lockfiles`
 and are validated with `poetry check --lock`, `pipenv verify`,
 `pdm lock --check` and `uv lock --check`.

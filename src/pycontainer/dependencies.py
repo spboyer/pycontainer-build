@@ -105,10 +105,20 @@ def target_python_version(
         raise ValueError("Dependency staging supports CPython targets only.")
 
     value = environment.get("PYTHON_VERSION")
+    match = re.match(r"(\d+\.\d+)(?:\.(\d+))?(?:-|$)", image_tag)
     if value and re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value):
+        if official_python and match:
+            version_parts = tuple(int(part) for part in value.split("."))
+            tag_parts = tuple(int(part) for part in match.group(1).split("."))
+            if match.group(2) is not None:
+                tag_parts += (int(match.group(2)),)
+            if version_parts[:len(tag_parts)] != tag_parts[:len(version_parts)]:
+                raise ValueError(
+                    f"Verified base image tag {image_tag!r} conflicts with "
+                    f"PYTHON_VERSION={value} in its image config."
+                )
         return ".".join(value.split(".")[:2])
 
-    match = re.match(r"(\d+\.\d+)(?:\.\d+)?(?:-|$)", image_tag)
     if official_python and match:
         return match.group(1)
     raise ValueError(
@@ -255,20 +265,7 @@ def install_requirements(
     base_image_tag_verified: bool = False,
 ) -> None:
     """Install requirements for the target; ``locked`` files are generated, hashed and complete."""
-    validation_root = context_dir
-    allow_includes = True
-    if locked:
-        requirement_path = requirements.resolve(strict=True)
-        if not requirement_path.is_relative_to(context_dir.resolve()):
-            validation_root = destination.parent.resolve()
-            if requirement_path.parent != validation_root:
-                raise ValueError(
-                    "Locked requirements must be inside the build context or dependency staging directory."
-                )
-            allow_includes = False
-    _, hash_pinned = _analyze_requirements(
-        requirements, validation_root, allow_includes=allow_includes
-    )
+    _, hash_pinned = _analyze_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
         logger.warning(
             "%s is not fully pinned with ==versions and --hash values, so the "
@@ -288,6 +285,8 @@ def install_requirements(
     }
     command = [
         sys.executable,
+        "-E",
+        "-P",
         "-c",
         _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
         json.dumps(marker_config),
@@ -314,6 +313,7 @@ def install_requirements(
             "TMP": str(destination.parent),
             "TEMP": str(destination.parent),
             "TMPDIR": str(destination.parent),
+            "PIP_IGNORE_REQUIRES_PYTHON": "0",
         }
     )
     with open(os.devnull, "wb") as null_output:
@@ -423,8 +423,6 @@ def _analyze_requirements(
     requirements: Path,
     context_dir: Path,
     check_overrides: bool = True,
-    *,
-    allow_includes: bool = True,
 ) -> Tuple[List[str], bool]:
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
@@ -507,8 +505,6 @@ def _analyze_requirements(
                 roots.append(re.split(r"\s+--?[A-Za-z]", requirement, maxsplit=1)[0].strip())
 
             if include is not None:
-                if not allow_includes:
-                    raise ValueError("Generated locked requirements cannot include other files.")
                 if include.startswith(("http://", "https://", "file://")):
                     raise ValueError(
                         "Remote and file-URL requirements includes are unsupported; "

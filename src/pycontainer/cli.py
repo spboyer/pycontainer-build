@@ -23,7 +23,7 @@ def main():
     b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
     b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
     b.add_argument("--latest",dest="latest_tag",action="store_true",default=None,help="Also tag the image as latest")
-    b.add_argument("--base-image",help="Base image to layer on (auto-detected from requires-python if not specified)")
+    b.add_argument("--base-image",help="Base image to layer on: a registry reference, oci:<path>[:<ref>|@sha256:<digest>], or docker-archive:<path>[:<repo-tag>] (auto-detected from requires-python if not specified)")
     b.add_argument("--context",dest="context_dir")
     b.add_argument("--push",action="store_true",help="Push image to registry after build")
     b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
@@ -39,9 +39,9 @@ def main():
         "--include-deps",
         action="store_true",
         default=None,
-        help="Stage target-compatible dependencies from a venv or requirements file",
+        help="Stage target-compatible dependencies from a lockfile, requirements file, or venv",
     )
-    b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over lockfiles and venvs)")
+    b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over auto-detected lockfiles and venvs)")
     b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
     b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")

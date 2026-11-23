@@ -11,6 +11,7 @@ import re
 import tokenize
 import tomllib
 from dataclasses import dataclass
+from email.parser import Parser
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -19,15 +20,15 @@ try:
     from packaging.markers import InvalidMarker, Marker
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
-    from packaging.version import InvalidVersion
+    from packaging.version import InvalidVersion, Version
 except ImportError:  # pragma: no cover - exercised when only pip is installed
     try:
         from pip._vendor.packaging.markers import InvalidMarker, Marker
         from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
         from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
-        from pip._vendor.packaging.version import InvalidVersion
+        from pip._vendor.packaging.version import InvalidVersion, Version
     except ImportError:
-        Marker = Requirement = SpecifierSet = None
+        Marker = Requirement = SpecifierSet = Version = None
         InvalidMarker = InvalidRequirement = InvalidSpecifier = InvalidVersion = ValueError
 
 
@@ -45,6 +46,11 @@ _HASH_LENGTHS = {"sha256": 64, "sha384": 96, "sha512": 128}
 _UNKNOWN_MARKER_VARIABLES = ("platform_release", "platform_version")
 _PLACEHOLDER = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 _MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+_PIPFILE_MARKERS = {
+    "implementation_name", "implementation_version", "os_name", "platform_machine",
+    "platform_python_implementation", "platform_release", "platform_system", "platform_version",
+    "python_full_version", "python_version", "sys_platform",
+}
 
 
 class LockfileError(ValueError):
@@ -266,11 +272,15 @@ def _index_url(url: str, source: str) -> Optional[str]:
             f"Package index URL for {source} contains literal credentials or query values; use "
             "${VARIABLE} placeholders or pip configuration instead."
         )
+    if parts.scheme == "http" and (userinfo or query_values or _PLACEHOLDER.search(url)):
+        raise LockfileError(f"Package index credentials for {source} require HTTPS.")
     normalized = url.rstrip("/")
     return None if normalized.lower() in _PYPI_INDEXES else normalized
 
 
 def _package(name: str, version, hashes, source: str) -> LockedPackage:
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name):
+        raise LockfileError(f"{source} has an invalid package name: {name!r}.")
     if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9.!+_-]+", version):
         raise LockfileError(f"{source} has no exact registry version for {name}.")
     return LockedPackage(canonical_name(name), version, _hashes(hashes, f"{name} {version}"))
@@ -354,6 +364,33 @@ def _poetry_dependency_options(value, source: str):
             raise LockfileError(f"Invalid Poetry dependency in {source}.")
 
 
+def _poetry_option_applies(option: dict, environment, source: str, extra: str = "") -> bool:
+    marker = option.get("markers")
+    if option.get("optional") and (not extra or not marker):
+        return False
+    if not _marker_applies(marker, environment, source, extra):
+        return False
+    if option.get("optional"):
+        names = {
+            token.string for token in _marker_tokens(str(Marker(str(marker))), source)
+            if token.type == tokenize.NAME
+        }
+        if "extra" not in names:
+            return False
+    python = option.get("python")
+    if python is not None and not SpecifierSet(_poetry_specifier(python, "Python")).contains(
+        environment["python_full_version"], prereleases=True
+    ):
+        return False
+    platform = option.get("platform")
+    if platform is not None:
+        if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", platform):
+            raise LockfileError(f"Unsupported Poetry platform constraint in {source}: {platform!r}.")
+        if platform != environment["sys_platform"]:
+            return False
+    return True
+
+
 def _check_poetry_complete(pyproject: dict, entries: List[dict], environment) -> None:
     by_name: Dict[str, List[Tuple[int, dict]]] = {}
     for index, entry in enumerate(entries):
@@ -395,29 +432,8 @@ def _check_poetry_complete(pyproject: dict, entries: List[dict], environment) ->
         require(requirement.name, requirement.specifier, requirement.extras, source)
 
     def require_poetry(name, option, source, extra=""):
-        marker = option.get("markers")
-        if option.get("optional") and (not extra or not marker):
+        if not _poetry_option_applies(option, environment, source, extra):
             return
-        if not _marker_applies(marker, environment, source, extra):
-            return
-        if option.get("optional"):
-            names = {
-                token.string for token in _marker_tokens(str(Marker(str(marker))), source)
-                if token.type == tokenize.NAME
-            }
-            if "extra" not in names:
-                return
-        python = option.get("python")
-        if python is not None and not SpecifierSet(_poetry_specifier(python, "Python")).contains(
-            environment["python_full_version"], prereleases=True
-        ):
-            return
-        platform = option.get("platform")
-        if platform is not None:
-            if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", platform):
-                raise LockfileError(f"Unsupported Poetry platform constraint in {source}: {platform!r}.")
-            if platform != environment["sys_platform"]:
-                return
         unsupported = set(option) - {
             "version", "markers", "python", "platform", "optional", "extras", "source", "allow-prereleases"
         }
@@ -531,6 +547,118 @@ def _load_poetry(path: Path, environment):
 
 # --- Pipenv ---------------------------------------------------------------
 
+def _parse_requirement(text: str, source: str, *, allow_url: bool = False):
+    try:
+        requirement = Requirement(text)
+    except (InvalidRequirement, TypeError) as exc:
+        raise LockfileError(f"Invalid requirement in {source}: {text!r}.") from exc
+    if requirement.url and not allow_url:
+        raise LockfileError(f"Direct URL requirement {requirement.name} in {source} is unsupported.")
+    return requirement
+
+
+def _pipfile_requirements(pipfile: dict) -> List:
+    declarations = pipfile.get("packages", {})
+    if not isinstance(declarations, dict):
+        raise LockfileError("Invalid [packages] in Pipfile.")
+    roots = []
+    for name, declaration in declarations.items():
+        if isinstance(declaration, str):
+            version, extras, markers = declaration, [], []
+        elif isinstance(declaration, dict):
+            unsupported = set(declaration) - {"version", "extras", "markers", "index"} - _PIPFILE_MARKERS
+            if unsupported:
+                raise LockfileError(
+                    f"Unsupported Pipfile dependency option {sorted(unsupported)[0]!r} for {name}."
+                )
+            version = declaration.get("version", "*")
+            extras = declaration.get("extras", [])
+            markers = []
+            if declaration.get("markers"):
+                markers.append(f"({declaration['markers']})")
+            for variable in sorted(_PIPFILE_MARKERS & set(declaration)):
+                expression = declaration[variable]
+                if not isinstance(expression, str):
+                    raise LockfileError(f"Invalid Pipfile marker for {name}: {variable}.")
+                markers.append(f"({variable} {expression})")
+        else:
+            raise LockfileError(f"Invalid Pipfile dependency {name!r}.")
+        if not isinstance(version, str) or not isinstance(extras, list) or any(
+            not isinstance(extra, str) or not extra for extra in extras
+        ):
+            raise LockfileError(f"Invalid Pipfile dependency {name!r}.")
+        extra_text = f"[{','.join(extras)}]" if extras else ""
+        marker_text = f"; {' and '.join(markers)}" if markers else ""
+        roots.append(_parse_requirement(
+            f"{name}{extra_text}{'' if version == '*' else version}{marker_text}", "Pipfile"
+        ))
+    return roots
+
+
+def _project_requirements(pyproject: dict, source: str, *, allow_dynamic: bool = False) -> List:
+    project = pyproject.get("project", {})
+    if not isinstance(project, dict):
+        raise LockfileError(f"Invalid [project] in {source}.")
+    dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list) or any(not isinstance(item, str) for item in dynamic):
+        raise LockfileError(f"Invalid dynamic project metadata in {source}.")
+    if "dependencies" in dynamic and not allow_dynamic:
+        raise LockfileError(f"Dynamic dependencies are unsupported for {source}; declare them explicitly.")
+    dependencies = project.get("dependencies", [])
+    if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
+        raise LockfileError(f"Invalid project dependencies in {source}.")
+    return [_parse_requirement(item, source) for item in dependencies]
+
+
+def _poetry_legacy_requirements(pyproject: dict, environment) -> List:
+    legacy = pyproject.get("tool", {}).get("poetry", {}).get("dependencies", {})
+    if not isinstance(legacy, dict):
+        raise LockfileError("Invalid Poetry dependencies in pyproject.toml.")
+    if "dependencies" in pyproject.get("project", {}).get("dynamic", []) and not any(
+        name.lower() != "python" for name in legacy
+    ):
+        raise LockfileError("Dynamic Poetry dependencies must be declared in tool.poetry.dependencies.")
+    roots = []
+    for name, definition in legacy.items():
+        if name.lower() == "python":
+            continue
+        for option in _poetry_dependency_options(definition, "pyproject.toml"):
+            if not _poetry_option_applies(option, environment, "pyproject.toml"):
+                continue
+            extras = option.get("extras", [])
+            if not isinstance(extras, list) or any(not isinstance(extra, str) or not extra for extra in extras):
+                raise LockfileError(f"Invalid Poetry dependency extras for {name} in pyproject.toml.")
+            extra_text = f"[{','.join(extras)}]" if extras else ""
+            version = _poetry_specifier(option.get("version", "*"), f"dependency {name}")
+            roots.append(_parse_requirement(f"{name}{extra_text}{version}", "pyproject.toml"))
+    return roots
+
+
+def _check_locked_requirement(requirement, packages, environment, source, lock_name, extras=("",)):
+    marker = str(requirement.marker) if requirement.marker else None
+    if not any(_marker_applies(marker, environment, source, extra) for extra in extras):
+        return
+    name = canonical_name(requirement.name)
+    try:
+        matches = [
+            package for package in packages.get(name, ())
+            if requirement.specifier.contains(package.version, prereleases=True)
+        ]
+    except InvalidVersion as exc:
+        raise LockfileError(f"{lock_name} has an invalid locked version for {name}.") from exc
+    if not matches:
+        raise LockfileError(
+            f"{lock_name} does not lock {requirement} for the target required by {source}; relock."
+        )
+
+
+def _packages_by_name(packages: Iterable[LockedPackage]) -> Dict[str, List[LockedPackage]]:
+    result: Dict[str, List[LockedPackage]] = {}
+    for package in packages:
+        result.setdefault(package.name, []).append(package)
+    return result
+
+
 def pipfile_hash(pipfile: dict) -> str:
     """Pipenv (plette) ``Pipfile.get_hash`` over the parsed Pipfile."""
     data = {
@@ -603,6 +731,9 @@ def _load_pipenv(path: Path, environment):
             url = source_entries[0].get("url")
         indexes.append(_index_url(url, f"Pipfile.lock package {name}"))
         packages.append(_package(name, version[2:], entry.get("hashes", []), "Pipfile.lock"))
+    by_name = _packages_by_name(packages)
+    for requirement in _pipfile_requirements(pipfile):
+        _check_locked_requirement(requirement, by_name, environment, "Pipfile", "Pipfile.lock")
     return packages, _ordered_unique(indexes)
 
 
@@ -666,7 +797,7 @@ def _load_pdm(path: Path, environment):
             raise LockfileError("PDM find_links sources are unsupported; use a package index.")
         indexes.append(_index_url(source.get("url", ""), f"PDM source {source.get('name', '')}"))
 
-    packages = []
+    packages, selected_entries = [], []
     for entry in lock.get("package", []):
         name = entry.get("name", "<unnamed>")
         unsupported = sorted({"path", "url", "git", "editable", "revision"} & set(entry))
@@ -679,10 +810,120 @@ def _load_pdm(path: Path, environment):
             continue
         if not _marker_applies(entry.get("marker"), environment, f"pdm.lock package {name}"):
             continue
+        _require_python(entry.get("requires_python"), environment, f"pdm.lock package {name}")
         packages.append(
             _package(name, entry.get("version"), [item.get("hash") for item in entry.get("files", [])], "pdm.lock")
         )
+        selected_entries.append(entry)
+    by_name = _packages_by_name(packages)
+    for requirement in _project_requirements(pyproject, "pyproject.toml"):
+        _check_locked_requirement(requirement, by_name, environment, "pyproject.toml", "pdm.lock")
+    for entry in selected_entries:
+        source = f"pdm.lock package {entry['name']}"
+        dependencies = entry.get("dependencies", [])
+        extras = entry.get("extras", [])
+        if (
+            not isinstance(dependencies, list)
+            or any(not isinstance(item, str) for item in dependencies)
+            or not isinstance(extras, list)
+            or any(not isinstance(extra, str) or not extra for extra in extras)
+        ):
+            raise LockfileError(f"Invalid dependencies or extras in {source}.")
+        for text in dependencies:
+            _check_locked_requirement(
+                _parse_requirement(text, source), by_name, environment, source, "pdm.lock",
+                extras=tuple(extras) or ("",),
+            )
     return packages, _ordered_unique(indexes)
+
+
+def verify_locked_installation(
+    selection: LockSelection, context_dir: Path, site_packages: Path, environment
+) -> None:
+    """Verify target dependency closure against the installed wheel metadata."""
+    lock_path = Path(context_dir) / selection.path
+    if selection.kind == "pipenv":
+        roots = _pipfile_requirements(_read_toml(_manifest(lock_path, "Pipfile")))
+        root_source = "Pipfile"
+    else:
+        pyproject = _read_toml(_manifest(lock_path, "pyproject.toml"))
+        roots = _project_requirements(
+            pyproject, "pyproject.toml", allow_dynamic=selection.kind == "poetry"
+        )
+        if selection.kind == "poetry":
+            roots.extend(_poetry_legacy_requirements(pyproject, environment))
+        root_source = "pyproject.toml"
+
+    expected = {package.name: package for package in selection.packages}
+    installed = {}
+    for metadata in sorted(site_packages.glob("*.dist-info/METADATA")):
+        try:
+            with metadata.open(encoding="utf-8") as stream:
+                message = Parser().parse(stream, headersonly=True)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise LockfileError(f"Cannot read staged package metadata: {metadata}.") from exc
+        if message.defects or any(
+            len(message.get_all(field, [])) != 1 for field in ("Metadata-Version", "Name", "Version")
+        ) or len(message.get_all("Requires-Python", [])) > 1:
+            raise LockfileError(f"Invalid staged package metadata: {metadata}.")
+        name, version = message.get("Name"), message.get("Version")
+        if not name or not version:
+            raise LockfileError(f"Staged package metadata is missing Name or Version: {metadata}.")
+        name = canonical_name(name.strip())
+        if name in installed or name not in expected:
+            raise LockfileError(f"Unexpected or duplicate staged package {name} in {selection.path.name}.")
+        try:
+            if Version(version.strip()) != Version(expected[name].version):
+                raise LockfileError(
+                    f"Staged package {name} does not match the version in {selection.path.name}."
+                )
+        except InvalidVersion as exc:
+            raise LockfileError(f"Staged package {name} has an invalid version.") from exc
+        _require_python(message.get("Requires-Python"), environment, f"staged package {name}")
+        installed[name] = [
+            _parse_requirement(text, f"staged package {name}", allow_url=True)
+            for text in message.get_all("Requires-Dist", [])
+        ]
+    missing = sorted(set(expected) - set(installed))
+    if missing:
+        raise LockfileError(
+            f"{selection.path.name} selected packages missing from staged wheel metadata: "
+            f"{', '.join(missing)}."
+        )
+
+    pending = [(name, "") for name in sorted(installed)]
+    seen = set()
+
+    def require(requirement, source, extra=""):
+        marker = str(requirement.marker) if requirement.marker else None
+        if not _marker_applies(marker, environment, source, extra):
+            return
+        if requirement.url:
+            raise LockfileError(f"Direct URL requirement {requirement.name} in {source} is unsupported.")
+        name = canonical_name(requirement.name)
+        package = expected.get(name)
+        try:
+            compatible = package is not None and requirement.specifier.contains(
+                package.version, prereleases=True
+            )
+        except InvalidVersion as exc:
+            raise LockfileError(f"{selection.path.name} has an invalid version for {name}.") from exc
+        if not compatible:
+            raise LockfileError(
+                f"{source} requires {requirement} for the target, but {selection.path.name} "
+                "does not contain a compatible staged package."
+            )
+        pending.extend((name, canonical_name(extra)) for extra in requirement.extras)
+
+    for requirement in roots:
+        require(requirement, root_source)
+    while pending:
+        name, extra = pending.pop()
+        if (name, extra) in seen:
+            continue
+        seen.add((name, extra))
+        for requirement in installed[name]:
+            require(requirement, f"staged package {name}", extra)
 
 
 # --- uv -------------------------------------------------------------------
@@ -875,6 +1116,7 @@ def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
 def _load_uv(path: Path, environment):
     lock = _read_toml(path)
     pyproject = _read_toml(_manifest(path, "pyproject.toml"))
+    _project_requirements(pyproject, "pyproject.toml")
     if lock.get("version") != 1:
         raise LockfileError("uv.lock version is unsupported; relock with a current uv.")
     if "manifest" in lock:

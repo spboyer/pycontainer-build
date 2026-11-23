@@ -15,10 +15,12 @@ from pycontainer.lockfiles import (
     LockfileError,
     detect_lockfile,
     load_lockfile,
+    pdm_content_hash,
     pipfile_hash,
     poetry_content_hash,
     preflight_lockfile,
     target_environment,
+    verify_locked_installation,
 )
 from test_dependency_staging import BASE_CONFIG, _builder, _write_named_wheel, _write_wheel
 
@@ -524,6 +526,42 @@ def test_pipenv_rejects_missing_default_source(tmp_path):
         load_lockfile(context, Path("Pipfile.lock"), PY311)
 
 
+@pytest.mark.parametrize("name", ["", "invalid name", "bad\n--index-url https://example.invalid/simple"])
+def test_locked_package_names_cannot_inject_requirements(tmp_path, name):
+    context = _copy(tmp_path, "pipenv")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["default"][name] = {
+        "version": "==1.0", "hashes": ["sha256:" + "a" * 64], "index": "pypi",
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="invalid package name"):
+        load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+
+@pytest.mark.parametrize(("kind", "missing"), [
+    ("pipenv", "click"),
+    ("pdm", "click"),
+    ("pdm", "socksio"),
+])
+def test_pipenv_and_pdm_reject_missing_locked_dependencies(tmp_path, kind, missing):
+    context = _copy(tmp_path, kind)
+    if kind == "pipenv":
+        lock_path = context / "Pipfile.lock"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        del lock["default"][missing]
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    else:
+        lock_path = context / "pdm.lock"
+        blocks = lock_path.read_text(encoding="utf-8").split("\n[[package]]\n")
+        blocks = [block for block in blocks if not block.startswith(f'name = "{missing}"\n')]
+        lock_path.write_text("\n[[package]]\n".join(blocks), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match=rf"does not lock {missing}"):
+        load_lockfile(context, Path(FORMATS[kind][0]), PY311)
+
+
 def _write_uv_project(
     context, wheel=None, *, registry="https://pypi.org/simple", digest=None, declare_index=True
 ):
@@ -583,6 +621,17 @@ def test_index_credentials_must_be_placeholders(tmp_path):
     selection = load_lockfile(placeholder, Path("uv.lock"), PY311)
     assert selection.index_urls == ("https://${INDEX_USER}:${INDEX_TOKEN}@example.com/simple",)
     assert "--extra-index-url https://${INDEX_USER}" in selection.render_requirements()
+
+
+@pytest.mark.parametrize("registry", [
+    "http://${INDEX_USER}:${INDEX_TOKEN}@example.com/simple",
+    "http://example.com/simple?token=${INDEX_TOKEN}",
+    "http://example.com/${INDEX_TOKEN}/simple",
+])
+def test_index_credentials_require_https(tmp_path, registry):
+    context = _write_uv_project(tmp_path / "context", registry=registry)
+    with pytest.raises(LockfileError, match="HTTPS"):
+        load_lockfile(context, Path("uv.lock"), PY311)
 
 
 @pytest.mark.parametrize(
@@ -704,6 +753,20 @@ def test_uv_lock_without_wheels_fails(tmp_path):
         load_lockfile(context, Path("uv.lock"), PY311)
 
 
+def test_uv_dynamic_dependencies_fail_before_installation(tmp_path):
+    context = _write_uv_project(tmp_path / "ctx")
+    manifest = context / "pyproject.toml"
+    text = manifest.read_text(encoding="utf-8")
+    text = text.replace(
+        'dependencies = ["fixture-dep==1.0", "colorama>=0.4; sys_platform == \'win32\'"]',
+        'dynamic = ["dependencies"]',
+    )
+    manifest.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Dynamic dependencies are unsupported"):
+        preflight_lockfile(context, Path("uv.lock"))
+
+
 def _offline_wheelhouse(monkeypatch, context):
     wheel = _write_wheel(context / "wheelhouse")
     monkeypatch.setenv("PIP_NO_INDEX", "1")
@@ -714,6 +777,255 @@ def _offline_wheelhouse(monkeypatch, context):
 def _layer_names(layer):
     with tarfile.open(layer.tar_path) as archive:
         return archive.getnames()
+
+
+def _write_pipenv_project(context, *, requires=(), extras=()):
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=requires, extras=extras)
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    extra_text = ", extras = [" + ", ".join(f'"{extra}"' for extra in extras) + "]" if extras else ""
+    pipfile = (
+        '[[source]]\nname = "pypi"\nurl = "https://pypi.org/simple"\nverify_ssl = true\n'
+        f'\n[packages]\nmarker-root = {{version = "==1.0"{extra_text}}}\n'
+    )
+    (context / "Pipfile").write_text(pipfile, encoding="utf-8")
+    lock = {
+        "_meta": {
+            "pipfile-spec": 6,
+            "hash": {"sha256": pipfile_hash(tomllib.loads(pipfile))},
+            "requires": {},
+            "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True}],
+        },
+        "default": {
+            "marker-root": {"version": "==1.0", "hashes": [f"sha256:{digest}"], "index": "pypi"},
+        },
+    }
+    (context / "Pipfile.lock").write_text(json.dumps(lock), encoding="utf-8")
+    return context
+
+
+def test_pipenv_build_rejects_missing_target_transitive_dependency(tmp_path, monkeypatch):
+    context = _write_pipenv_project(
+        tmp_path / "context",
+        requires=["missing-child>=1.0; platform_machine == 'x86_64'"],
+    )
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        builder.build()
+
+
+@pytest.mark.parametrize(("arch", "requirement", "message"), [
+    ("arm64", "missing-child>=1; platform_machine == 'x86_64'", None),
+    ("amd64", "missing-child>=1; platform_machine == 'x86_64'", "marker-root.*missing-child"),
+    ("amd64", "missing-child; platform_release >= '6'", "platform_release is unknown"),
+])
+def test_pipenv_staged_wheel_closure_uses_target_markers(tmp_path, arch, requirement, message):
+    context = _write_pipenv_project(tmp_path / "context")
+    environment = target_environment("linux", arch, "3.11", "3.11.8")
+    selection = load_lockfile(context, Path("Pipfile.lock"), environment)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        f"Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\nRequires-Dist: {requirement}\n\n",
+        encoding="utf-8",
+    )
+
+    if message:
+        with pytest.raises(LockfileError, match=message):
+            verify_locked_installation(selection, context, site, environment)
+    else:
+        verify_locked_installation(selection, context, site, environment)
+
+
+def test_staged_wheel_closure_allows_an_extra_with_no_dependencies(tmp_path):
+    context = _write_pipenv_project(tmp_path / "context", extras=["feature"])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\nProvides-Extra: feature\n\n",
+        encoding="utf-8",
+    )
+
+    verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_staged_wheel_closure_rejects_only_applicable_direct_urls(tmp_path, requested):
+    context = _write_pipenv_project(tmp_path / "context", extras=["feature"] if requested else [])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\n"
+        "Requires-Dist: optional @ https://example.invalid/optional.whl ; extra == 'feature'\n\n",
+        encoding="utf-8",
+    )
+
+    if requested:
+        with pytest.raises(LockfileError, match="Direct URL requirement optional"):
+            verify_locked_installation(selection, context, site, PY311)
+    else:
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize(("root_dependency", "middle_dependency", "message"), [
+    ("middle[feature]>=1.0", "missing-child>=1.0; extra == 'feature'", "middle.*missing-child"),
+    ("middle>=2.0", "missing-child; extra == 'feature'", "marker-root.*middle"),
+])
+def test_pipenv_staged_wheel_closure_checks_versions_and_transitive_extras(
+    tmp_path, root_dependency, middle_dependency, message
+):
+    context = _write_pipenv_project(tmp_path / "context")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["default"]["middle"] = {
+        "version": "==1.0", "hashes": ["sha256:" + "a" * 64], "index": "pypi",
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    for name, dependency in (
+        ("marker-root", root_dependency),
+        ("middle", middle_dependency),
+    ):
+        metadata = site / f"{name.replace('-', '_')}-1.0.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\nRequires-Dist: {dependency}\n\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(LockfileError, match=message):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("headers", [
+    "Name: marker-root\nName: other\nVersion: 1.0\n",
+    "Name: marker-root\nVersion: 1.0\nRequires-Python: >=3.10\nRequires-Python: >=3.12\n",
+    "Name: marker-root\nVersion: 1.0\nRequires-Dist missing-colon\n",
+])
+def test_staged_wheel_closure_rejects_malformed_metadata(tmp_path, headers):
+    context = _write_pipenv_project(tmp_path / "context")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(f"Metadata-Version: 2.1\n{headers}\n", encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Invalid staged package metadata"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("kind", ["uv", "uv-extra", "poetry", "poetry-legacy"])
+def test_staged_wheel_closure_rejects_unrecorded_dependencies(tmp_path, kind):
+    context = tmp_path / "context"
+    if kind in {"uv", "uv-extra"}:
+        _write_uv_project(context)
+        lock_name = "uv.lock"
+        if kind == "uv-extra":
+            manifest = context / "pyproject.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace("fixture-dep==1.0", "fixture-dep[feature]==1.0"),
+                encoding="utf-8",
+            )
+            lock_path = context / lock_name
+            lock_path.write_text(
+                lock_path.read_text(encoding="utf-8")
+                .replace('{ name = "fixture-dep" },', '{ name = "fixture-dep", extra = ["feature"] },', 1)
+                .replace(
+                    '{ name = "fixture-dep", specifier = "==1.0" }',
+                    '{ name = "fixture-dep", extras = ["feature"], specifier = "==1.0" }',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+    else:
+        context.mkdir()
+        if kind == "poetry":
+            manifest = (
+                '[project]\nname = "demo"\nversion = "1.0"\nrequires-python = ">=3.10"\n'
+                'dependencies = ["fixture-dep[feature]==1.0"]\n'
+            )
+        else:
+            manifest = (
+                '[tool.poetry]\nname = "demo"\nversion = "1.0"\n'
+                '[tool.poetry.dependencies]\npython = ">=3.10"\n'
+                'fixture-dep = {version = "1.0", extras = ["feature"]}\n'
+            )
+        (context / "pyproject.toml").write_text(manifest, encoding="utf-8")
+        (context / "poetry.lock").write_text(
+            f'''[[package]]
+name = "fixture-dep"
+version = "1.0"
+python-versions = ">=3.10"
+groups = ["main"]
+files = [{{file = "fixture_dep-1.0-py3-none-any.whl", hash = "sha256:{"a" * 64}"}}]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.10"
+content-hash = "{poetry_content_hash(tomllib.loads(manifest))}"
+''',
+            encoding="utf-8",
+        )
+        lock_name = "poetry.lock"
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "fixture_dep-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    marker = "" if kind == "uv" else "; extra == 'feature'"
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: fixture-dep\nVersion: 1.0\n"
+        f"Requires-Dist: missing-child>=1.0{marker}\n\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="fixture-dep.*missing-child"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+def test_pdm_build_rejects_missing_extra_dependency_from_wheel_metadata(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse, "marker-root",
+        requires=["missing-child>=1.0; extra == 'feature'"], extras=["feature"],
+    )
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    manifest = (
+        '[project]\nname = "demo"\nversion = "1.0"\nrequires-python = ">=3.10"\n'
+        'dependencies = ["marker-root[feature]==1.0"]\n'
+    )
+    (context / "pyproject.toml").write_text(manifest, encoding="utf-8")
+    (context / "pdm.lock").write_text(
+        f'''[metadata]
+lock_version = "4.5.1"
+strategy = ["inherit_metadata"]
+content_hash = "sha256:{pdm_content_hash(tomllib.loads(manifest))}"
+
+[[package]]
+name = "marker-root"
+version = "1.0"
+groups = ["default"]
+files = [{{file = "{wheel.name}", hash = "sha256:{digest}"}}]
+''',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        builder.build()
 
 
 def _write_target_marker_uv_project(context):
@@ -838,7 +1150,7 @@ def test_locked_build_rejects_unknown_target_markers_before_pip(tmp_path, monkey
 
 def test_lock_selection_cache_distinguishes_target_python_versions(tmp_path, monkeypatch):
     context = _copy(tmp_path, "uv")
-    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:latest")
     python312 = {
         **BASE_CONFIG,
         "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.12.4"]},
@@ -939,14 +1251,15 @@ def test_locked_requirements_fail_closed_for_unknown_target_marker(tmp_path):
 
 @pytest.mark.parametrize(
     ("line", "message"),
-    [("--platform=win_amd64", "cannot override"), ("-r other.txt", "cannot include")],
+    [("--platform=win_amd64", "cannot override"), ("-r ../outside.txt", "inside the build context")],
 )
 def test_generated_locked_requirements_validate_options_before_pip(tmp_path, monkeypatch, line, message):
     context = tmp_path / "context"
     stage = tmp_path / "stage"
     context.mkdir()
     stage.mkdir()
-    requirements = stage / "locked-requirements.txt"
+    (tmp_path / "outside.txt").write_text("outside==1.0\n", encoding="utf-8")
+    requirements = context / "locked-requirements.txt"
     requirements.write_text(line + "\n", encoding="utf-8")
     monkeypatch.setattr(
         "pycontainer.dependencies.subprocess.Popen",
@@ -960,30 +1273,81 @@ def test_generated_locked_requirements_validate_options_before_pip(tmp_path, mon
         )
 
 
-@pytest.mark.parametrize("invalid", ["oversized", "outside-staging"])
+@pytest.mark.parametrize("invalid", ["oversized", "outside-context"])
 def test_generated_locked_requirements_enforce_size_and_location(tmp_path, monkeypatch, invalid):
     context = tmp_path / "context"
     stage = tmp_path / "stage"
     context.mkdir()
     stage.mkdir()
     requirements = (
-        stage / "locked-requirements.txt"
+        context / "locked-requirements.txt"
         if invalid == "oversized"
-        else tmp_path / "outside-requirements.txt"
+        else stage / "locked-requirements.txt"
     )
     requirements.write_text("fixture-dep==1.0 --hash=sha256:" + "a" * 64, encoding="utf-8")
-    monkeypatch.setattr("pycontainer.dependencies.MAX_REQUIREMENTS_BYTES", 32)
+    if invalid == "oversized":
+        monkeypatch.setattr("pycontainer.dependencies.MAX_REQUIREMENTS_BYTES", 32)
     monkeypatch.setattr(
         "pycontainer.dependencies.subprocess.Popen",
         lambda *args, **kwargs: pytest.fail("pip must not run for invalid generated requirements"),
     )
-    message = "combined .* limit" if invalid == "oversized" else "staging directory"
+    message = "combined .* limit" if invalid == "oversized" else "inside the build context"
 
     with pytest.raises(ValueError, match=message):
         install_requirements(
             requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
             "python:3.11-slim", BASE_CONFIG, locked=True, base_image_tag_verified=True,
         )
+
+
+@pytest.mark.parametrize("installation_fails", [False, True])
+@pytest.mark.parametrize("include_paths", [
+    ["."],
+    [".pycontainer-lockfile-concurrent/requirements.txt", "app.py"],
+])
+def test_locked_build_keeps_generated_requirements_inside_context_and_cleans_up(
+    tmp_path, monkeypatch, installation_fails, include_paths
+):
+    context = _write_uv_project(tmp_path / "context")
+    other_build = context / ".pycontainer-lockfile-concurrent" / "requirements.txt"
+    other_build.parent.mkdir()
+    other_build.write_text("temporary requirements from another build\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    builder = _builder(
+        tmp_path, monkeypatch, context=Path("context"), include_deps=True,
+        include_paths=include_paths, exclude_defaults=False,
+    )
+    requirements_paths = []
+
+    def install(requirements, destination, context_dir, *args, **kwargs):
+        requirements_paths.append(requirements)
+        assert requirements.is_absolute()
+        assert requirements.resolve().is_relative_to(context_dir.resolve())
+        assert "--hash=sha256:" in requirements.read_text(encoding="utf-8")
+        assert kwargs["locked"] is True
+        if installation_fails:
+            raise RuntimeError("installation failed")
+        destination.mkdir(parents=True)
+        (destination / "fixture_dep.py").write_text("value = 1\n", encoding="utf-8")
+        metadata = destination / "fixture_dep-1.0.dist-info" / "METADATA"
+        metadata.parent.mkdir()
+        metadata.write_text("Metadata-Version: 2.1\nName: fixture-dep\nVersion: 1.0\n\n", encoding="utf-8")
+
+    monkeypatch.setattr("pycontainer.builder.install_requirements", install)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    if installation_fails:
+        with pytest.raises(RuntimeError, match="installation failed"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG)
+    else:
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG)
+        app_layer = builder._create_app_layer(layers, builder.context_include_paths)
+        assert not any(".pycontainer-lockfile-" in name for name in _layer_names(app_layer))
+
+    assert len(requirements_paths) == 1
+    assert not requirements_paths[0].exists()
+    assert not requirements_paths[0].parent.exists()
+    assert other_build.exists()
 
 
 @pytest.mark.parametrize(
@@ -1064,11 +1428,14 @@ def test_locked_build_installs_hashed_target_selection_reproducibly(tmp_path, mo
     wheel = _offline_wheelhouse(monkeypatch, context)
     _write_uv_project(context, wheel)
     (context / "requirements.txt").write_text("unrelated-package==9.9\n")
+    monkeypatch.chdir(tmp_path)
 
     digests = []
     for run in range(2):
         builder = _builder(
-            tmp_path / f"run-{run}", monkeypatch, context=context, include_deps=True, generate_sbom=True
+            tmp_path / f"run-{run}", monkeypatch,
+            context=Path("context") if run == 0 else context,
+            include_deps=True, generate_sbom=True,
         )
         builder.build()
         digests.append(builder.layers[0].digest)

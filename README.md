@@ -149,8 +149,8 @@ docker run -p 8000:8000 ghcr.io/user/myapp:latest
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
 - ✅ **Layer caching** — Content-addressable storage with LRU eviction
-- ✅ **Cache invalidation** — Keys file contents, relative paths, workdir, and
-  reproducibility settings
+- ✅ **Cache invalidation** — Keys file contents, relative paths, hardlink
+  relationships, workdir, and reproducibility settings
 - ✅ **Fast incremental builds** — Reuses unchanged layers from cache
 
 **Base Images & Dependencies** (Phase 2):
@@ -330,7 +330,7 @@ pycontainer build \
 ```
 
 **Base Image & Dependencies**:
-- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`)
+- `--base-image IMAGE` — Base image to build on (auto-detected from `requires-python` if not specified, e.g., `python:3.11-slim`). Local, daemon-free sources are also accepted; see [Local base images](#local-base-images).
 - `--include-deps` — Stage importable dependencies from a lockfile or
   requirements file as target-compatible binary wheels, or copy a verified
   pure-Python venv. Requirements files, including generated lock selections,
@@ -341,6 +341,8 @@ pycontainer build \
   `PYTHONPATH`, and their console entrypoints are added to `PATH`; the Python
   interpreter running pycontainer must have `pip` available. Source
   distributions and cross-compilation are not supported.
+  Pip runs without the host's `PYTHONPATH`, and pip configuration cannot disable
+  target `Requires-Python` checks.
   Custom base images must set `PYTHON_IMPLEMENTATION=CPython`,
   `PYTHON_VERSION`, and either `PYTHON_LIBC=glibc-2.17` or
   `PYTHON_LIBC=musl-1.2` in their image config so wheel tags can be validated.
@@ -374,7 +376,7 @@ pycontainer build \
   Local image names/annotations also cannot establish libc. Adding a tag to a
   digest does not make it safe; use an image config with supported metadata
   or a tag-only registry pull. Unsupported metadata always fails, as does
-  metadata conflicting with a verified tag-only pull.
+  Python or libc metadata conflicting with a verified tag-only pull.
   Digest and unverified local sources also require explicit
   `PYTHON_IMPLEMENTATION=CPython` and `PYTHON_VERSION`; claimed names do not
   establish the Python ABI. These metadata checks apply to lockfile,
@@ -390,9 +392,10 @@ pycontainer build \
 
 **Lockfiles**: With `--include-deps`, the dependency source is chosen in this
 order: `--lockfile`, then `--requirements`, then a single lockfile at the
-context root, then a venv, then `requirements.txt`. More than one root lockfile
-is an error until you choose one. No locking tool is needed at build time, and
-none is added as a dependency:
+context root, then a venv, then `requirements.txt`. Explicit `--lockfile` and
+`--requirements` are mutually exclusive. More than one root lockfile is an
+error until you choose one. No locking tool is needed at build time, and none
+is added as a dependency:
 
 1. The lock is checked against its manifest (`pyproject.toml` or `Pipfile`):
    Poetry and PDM content hashes, the Pipfile hash, or uv's recorded
@@ -406,6 +409,10 @@ none is added as a dependency:
    Pip does not resolve transitive dependencies in this mode: the lock must
    record the complete target graph and a matching wheel hash for each target.
 
+The build context must be writable: temporary `.pycontainer-lockfile-*`
+directories hold generated requirements, are excluded from images, and are
+removed after staging.
+
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
 freshness), Python compatibility and wheel availability are checked during
@@ -417,14 +424,19 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+PDM and uv projects with dynamic dependencies are unsupported. Poetry dynamic
+dependencies must be declared in `tool.poetry.dependencies`.
 Poetry's Python and dependency ranges support PEP 440 constraints, exact
 versions, wildcards, and single caret or tilde constraints; other
 Poetry-specific combinations are rejected. Applicable Poetry root and
 recorded transitive dependencies, including requested extras, must be present
-at compatible locked versions. Poetry and uv graph checks rely on the lock's
-recorded dependency metadata and cannot reconstruct dependencies omitted
-from the lock itself. uv extras without recorded dependencies are treated
-as empty, consistent with uv.
+at compatible locked versions. uv extras without recorded dependencies are
+treated as empty, consistent with uv.
+Pipenv roots and PDM roots and recorded edges must be present at compatible
+locked versions. For all four formats, staged wheel dependency metadata is
+checked for target-compatible transitive versions, markers and requested
+extras before creating a layer. This cannot detect dependencies omitted from
+the wheels' own metadata.
 uv registry URLs must match the current `[[tool.uv.index]]` declarations
 or the implicit PyPI index; settings from `uv.toml` and legacy index options
 are not supported. Limited-resolution uv locks are accepted only when their
@@ -436,8 +448,58 @@ unrecognized equivalences are rejected even if they are logically equal.
 Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
 PyPI itself is left to your pip configuration so mirrors keep working, and
 pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
-Hashes verify the bytes, not which server supplied them. Index credentials must be `${VARIABLE}`
-placeholders, never literal secrets.
+Hashes verify the bytes, not which server supplied them. Index credentials
+must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
+
+### Local base images
+
+`--base-image` (and `base_image` in `[build]`) can read a base image from disk
+without a registry, credentials, or a Docker daemon:
+
+```bash
+# OCI image layout (for example `skopeo copy docker://python:3.11-slim oci:base:3.11-slim`)
+pycontainer build --tag app:v1 --base-image oci:./base:3.11-slim
+pycontainer build --tag app:v1 --base-image oci:./base@sha256:<manifest-digest>
+
+# A previous pycontainer output is itself an OCI layout
+pycontainer build --tag app:v2 --base-image oci:./dist/image:app:v1 --output ./dist/v2
+
+# Uncompressed `docker save` archive (legacy and Docker 25+ formats)
+pycontainer build --tag app:v1 --base-image docker-archive:./python.tar:python:3.11-slim
+```
+
+- `oci:<path>[:<ref>]` selects an index entry whose
+  `org.opencontainers.image.ref.name` or `io.containerd.image.name` annotation
+  exactly matches `<ref>` (or `@sha256:<digest>`). For a single-entry index,
+  either annotation on the index itself can also identify the entry. The
+  reference may be omitted when the layout holds one image, or a set of images
+  that all carry platform metadata. Nested image indexes use the same exact
+  OS/architecture/variant selection as registry pulls.
+- `docker-archive:<path>[:<repo-tag>]` selects a `manifest.json` entry by
+  `RepoTags`, normalized like registry references (`python:3.11-slim` matches
+  `docker.io/library/python:3.11-slim`). The tag may be omitted when the archive
+  holds one image.
+- The path ends at the first `:` after an optional Windows drive prefix, so
+  paths containing `:` are not supported. Relative paths resolve against the
+  current directory, and the source must not overlap `--output`.
+- Every blob is checked against its digest and size, and every base layer is
+  checked against its config `rootfs.diff_ids` (`tar`, `tar+gzip`; `tar+zstd`
+  needs Python 3.14+). Unknown layer media types, layers labeled as plain
+  `tar` whose bytes are compressed or not a tar stream, unsafe or duplicate
+  archive members, sparse members, symlinked OCI layout blobs, archive links
+  that escape the archive, and
+  more than 100,000 members, 1,000 layers or 16 MiB of metadata are rejected.
+  Each OCI index, including nested indexes, is limited to 1,000 entries.
+  Layers are limited to 64 GiB (including decompressed content); Docker archive
+  member sizes are checked before any selected image blobs are staged.
+- Compressed outer archives (`docker save | gzip`) and `oci-archive:` tarballs
+  are not supported; extract or decompress them first.
+- OCI annotations and Docker archive tags do not establish an image's Python
+  ABI or libc. For `--include-deps`, local images must set
+  `PYTHON_IMPLEMENTATION=CPython`, `PYTHON_VERSION`, and either
+  `PYTHON_LIBC=glibc-2.17` or `PYTHON_LIBC=musl-1.2` in their image config,
+  even if their name claims to be an official Python image. These settings are
+  not required when dependency staging is disabled.
 
 **Context Selection**:
 - `--include PATH` — Include a context-root-relative file or directory; repeat to select multiple paths instead of automatic discovery
@@ -480,6 +542,8 @@ The cache automatically:
 - Invalidates when file contents, relative paths, permission bits, the
   workdir or reproducibility settings change (mtime is ignored for
   reproducible builds)
+- Invalidates when hardlinks between selected files are added or removed;
+  the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
 
 **Saving and restoring the cache (offline export/import):** the `--cache-dir`
@@ -555,8 +619,18 @@ url = "ghcr.io/myorg/myapp"
 
 Explicit CLI options override `[build]` values; omitted options leave the file
 values intact, and settings absent from both use `BuildConfig` defaults. Keys
-in `[build]` may use hyphens or underscores. Unknown settings and values with
-the wrong TOML type are reported as configuration errors.
+in `[build]` may use hyphens or underscores. After overrides are applied,
+unknown settings and values with the wrong TOML type are reported as
+configuration errors.
+
+`--config` also accepts a `pyproject.toml` whose settings live under
+`[tool.pycontainer]` (with `[tool.pycontainer.env]` and
+`[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
+The same keys, validation and CLI precedence apply. A file that defines both
+`[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
+one. Poetry-only keys such as `push` are reported as unknown by
+`pycontainer build`; use `--push` instead. See
+[Dockerfile import](docs/dockerfile-import.md).
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
@@ -719,6 +793,7 @@ This style is intentional for the experimental phase.
 - **[Local Development Guide](docs/local-development.md)** — Complete guide for using pycontainer-build locally
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 
 ### External References
 
