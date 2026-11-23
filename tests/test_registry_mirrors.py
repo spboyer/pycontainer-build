@@ -622,6 +622,8 @@ def test_cli_and_toml_mirror_options_merge_per_upstream(tmp_path, monkeypatch, t
         f"[{table}.registry_mirrors]\n"
         '"index.docker.io" = ["file-mirror.example"]\n'
         '"ghcr.io" = ["ghcr-mirror.example"]\n'
+        f"[{table}.security.kubernetes]\n"
+        "read-only-root-filesystem = true\n"
     )
     assert config_from_file(toml).registry_mirrors == {
         "docker.io": ["file-mirror.example"],
@@ -637,6 +639,7 @@ def test_cli_and_toml_mirror_options_merge_per_upstream(tmp_path, monkeypatch, t
         "ghcr.io": ["ghcr-mirror.example"],
         "docker.io": ["first.example", "second.example:5000"],
     }
+    assert config.security["kubernetes"]["read_only_root_filesystem"] is True
 
 
 @pytest.mark.parametrize(
