@@ -118,8 +118,10 @@ record. To test only dependency importability in the real target base image,
 without Skopeo, add `--dependency-layer-only`; that mode is not release evidence.
 Add `--multi-platform-index` to build both targets, select the native image
 from the index, verify its imported config digest and start it. Index evidence
-is separate from single-platform release evidence. Neither mode is part of
-default pytest.
+is separate from single-platform release evidence.
+To run an imported quoted shell-form `ENTRYPOINT`, use `--shell-command`
+(optionally `--shell '["/bin/bash", "-c"]'`); this mode is not release evidence.
+These modes are not part of default pytest.
 
 `.github/workflows/runtime-check.yml` runs the full check natively on
 `linux/amd64` (`ubuntu-24.04`) and `linux/arm64` (`ubuntu-24.04-arm`) for
