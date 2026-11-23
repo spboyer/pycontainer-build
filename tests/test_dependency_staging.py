@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -1382,3 +1383,438 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
 
     with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+
+def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> None:
+    wheelhouse.mkdir(parents=True, exist_ok=True)
+    module = name.replace("-", "_")
+    dist_info = f"{module}-1.0.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
+    metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
+    files = {
+        f"{module}/__init__.py": b"",
+        f"{dist_info}/METADATA": (metadata + "\n").encode(),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ).encode(),
+    }
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, content in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode()
+        writer.writerow((path, f"sha256={digest.rstrip('=')}", len(content)))
+    writer.writerow((f"{dist_info}/RECORD", "", ""))
+    files[f"{dist_info}/RECORD"] = record.getvalue().encode()
+    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-py3-none-any.whl", "w") as wheel:
+        for path, content in files.items():
+            wheel.writestr(path, content)
+
+
+def _install_marker_fixture(
+    tmp_path, requirements, arch, python_version, full_version, libc="glibc-2.17"
+):
+    context = tmp_path / "context"
+    requirements_file = context / "requirements.txt"
+    requirements_file.write_text(
+        "--no-index\n--find-links ./wheelhouse\n" + "".join(f"{line}\n" for line in requirements)
+    )
+    destination = tmp_path / "stage" / "site-packages"
+    install_requirements(
+        requirements_file,
+        destination,
+        context,
+        "linux",
+        arch,
+        python_version,
+        f"python:{python_version}-slim",
+        {"config": {"Env": [f"PYTHON_VERSION={full_version}", f"PYTHON_LIBC={libc}"]}},
+        base_image_tag_verified=True,
+    )
+    return {name for name, _ in staged_packages(destination)}
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("amd64", {"marker-amd", "marker-root-amd"}),
+        ("arm64", {"marker-arm", "marker-feat", "marker-root-arm"}),
+    ],
+)
+def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
+    tmp_path, arch, expected
+):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    # A context-local pip must not replace the builder's pip.
+    (tmp_path / "context").mkdir()
+    (tmp_path / "context" / "pip.py").write_text("raise SystemExit('shadowed pip')\n")
+    _write_named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            "marker-plain",
+            'marker-arm; platform_machine == "aarch64"',
+            'marker-amd; platform_machine == "x86_64"',
+            'marker-win; sys_platform == "win32"',
+            'marker-oldpy; python_version < "3.10"',
+            'marker-linux; platform_system == "Linux" and os_name == "posix"',
+            'marker-feat; extra == "feat" and platform_machine == "aarch64"',
+        ],
+        extras=["feat"],
+    )
+    for name in (
+        "marker-plain", "marker-arm", "marker-amd", "marker-win", "marker-oldpy",
+        "marker-linux", "marker-feat", "marker-root-arm", "marker-root-amd",
+    ):
+        _write_named_wheel(wheelhouse, name)
+
+    installed = _install_marker_fixture(
+        tmp_path,
+        [
+            "marker-root[feat]",
+            'marker-root-arm; platform_machine == "aarch64"',
+            'marker-root-amd; platform_machine == "x86_64"',
+        ],
+        arch,
+        "3.9",
+        "3.9.18",
+    )
+
+    assert installed == {
+        "marker-root", "marker-plain", "marker-oldpy", "marker-linux", *expected
+    }
+
+
+def test_requirements_install_keeps_markers_that_match_host_and_target(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse,
+        "marker-root",
+        requires=[
+            "marker-plain",
+            'marker-cpython; implementation_name == "cpython"',
+            'marker-full; python_full_version >= "3.11.0"',
+        ],
+    )
+    for name in ("marker-plain", "marker-cpython", "marker-full"):
+        _write_named_wheel(wheelhouse, name)
+
+    installed = _install_marker_fixture(
+        tmp_path, ["marker-root"], "amd64", "3.11", "3.11.8"
+    )
+
+    assert installed == {"marker-root", "marker-plain", "marker-cpython", "marker-full"}
+
+
+def test_target_marker_selects_newest_compatible_libc_wheel(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse, "marker-root",
+        requires=['fixture-dep; platform_machine == "aarch64"'],
+    )
+    for minor in (17, 28, 39):
+        _write_wheel(wheelhouse, tag=f"cp311-cp311-manylinux_2_{minor}_aarch64")
+
+    installed = _install_marker_fixture(
+        tmp_path, ["marker-root"], "arm64", "3.11", "3.11.8", "glibc-2.28"
+    )
+
+    assert installed == {"marker-root", "fixture-dep"}
+    wheel = (tmp_path / "stage" / "site-packages" / "fixture_dep-1.0.dist-info" / "WHEEL")
+    assert "Tag: cp311-cp311-manylinux_2_28_aarch64" in wheel.read_text()
+
+
+def test_requirements_install_without_markers_needs_no_full_python_version(tmp_path):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=["marker-plain"])
+    _write_named_wheel(wheelhouse, "marker-plain")
+
+    installed = _install_marker_fixture(tmp_path, ["marker-root"], "arm64", "3.11", "3.11")
+
+    assert installed == {"marker-root", "marker-plain"}
+
+
+@pytest.mark.parametrize(
+    ("requires", "requirement", "full_version", "variable"),
+    [
+        (['marker-kernel; platform_release >= "5"'], "marker-root", "3.11.8", "platform_release"),
+        ([], 'marker-root; python_full_version >= "3.11.1"', "3.11", "python_full_version"),
+    ],
+)
+def test_requirements_install_fails_closed_for_unknown_target_marker_values(
+    tmp_path, requires, requirement, full_version, variable
+):
+    wheelhouse = tmp_path / "context" / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=requires)
+    _write_named_wheel(wheelhouse, "marker-kernel")
+
+    with pytest.raises(ValueError, match=f"refusing to stage.*{variable}"):
+        _install_marker_fixture(tmp_path, [requirement], "arm64", "3.11", full_version)
+
+
+def _write_venv(context, dists, pyvenv="version = 3.11.7\n", lib=("Lib",)):
+    site_packages = context.joinpath(".venv", *lib, "site-packages")
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (context / ".venv" / "pyvenv.cfg").write_text(pyvenv)
+    for name, headers in dists.items():
+        metadata = site_packages / f"{name.replace('-', '_')}-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+            + "".join(f"{header}\n" for header in headers)
+            + "\n"
+        )
+        (metadata / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+
+
+def _stage_venv(tmp_path, monkeypatch, context, arch="amd64"):
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    layer_dir = tmp_path / f"layers-{arch}"
+    layer_dir.mkdir(exist_ok=True)
+    return builder._create_deps_layer(
+        layer_dir,
+        base_config={**BASE_CONFIG, "architecture": arch},
+        os_name="linux",
+        arch=arch,
+    )
+
+
+def test_virtualenv_transitive_markers_are_verified_for_each_target(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(
+        context,
+        {"venv-root": ['Requires-Dist: venv-arm-helper; platform_machine == "aarch64"']},
+    )
+
+    assert _stage_venv(tmp_path, monkeypatch, context, "amd64") is not None
+    with pytest.raises(ValueError, match="refusing to stage.*venv-arm-helper"):
+        _stage_venv(tmp_path, monkeypatch, context, "arm64")
+
+    _write_venv(context, {"venv-arm-helper": []})
+    assert _stage_venv(tmp_path, monkeypatch, context, "arm64") is not None
+
+
+def test_virtualenv_root_markers_are_verified_for_the_target(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text(
+        "venv-root\n"
+        "venv-windows-only; sys_platform == 'win32'\n"
+        "venv-linux-only; sys_platform == 'linux'  # comment\n"
+    )
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+    _write_venv(context, {"venv-linux-only": []})
+    assert _stage_venv(tmp_path, monkeypatch, context) is not None
+
+
+def test_virtualenv_project_dependency_markers_are_verified(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "app"\n'
+        "dependencies = [\"venv-linux-only; sys_platform == 'linux'\"]\n"
+    )
+
+    with pytest.raises(ValueError, match="dependencies requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "headers, root, error",
+    [
+        (
+            [
+                "Provides-Extra: speed",
+                'Requires-Dist: venv-fast; extra == "speed"',
+                'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
+            ],
+            "",
+            None,
+        ),
+        (
+            [
+                "Provides-Extra: broker",
+                'Requires-Dist: venv-broker; platform_system == "Windows" and extra == "broker"',
+                'Requires-Dist: venv-broker; platform_system == "Darwin" and extra == "broker"',
+                'Requires-Dist: venv-broker; platform_system == "Linux" and extra == "broker"',
+            ],
+            "",
+            None,
+        ),
+        (
+            [
+                "Provides-Extra: gpu",
+                'Requires-Dist: venv-gpu; platform_machine == "x86_64" and extra == "gpu"',
+            ],
+            "",
+            "cannot tell whether extra 'gpu'",
+        ),
+        (
+            [
+                "Provides-Extra: speed",
+                'Requires-Dist: venv-fast; extra == "speed"',
+                'Requires-Dist: venv-linux-speed; sys_platform == "linux" and extra == "speed"',
+            ],
+            "venv-root[speed]\n",
+            "venv-root requires venv-fast",
+        ),
+    ],
+)
+def test_virtualenv_extras_fail_only_when_their_request_cannot_be_ruled_out(
+    tmp_path, monkeypatch, headers, root, error
+):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": headers})
+    (context / "requirements.txt").write_text(root)
+
+    if error is None:
+        assert _stage_venv(tmp_path, monkeypatch, context) is not None
+    else:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_unknown_target_marker_values_fail_closed_when_missing(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(
+        context, {"venv-root": ['Requires-Dist: venv-kernel; platform_release >= "5"']}
+    )
+
+    with pytest.raises(ValueError, match="venv-kernel.*unknown for the target"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+    _write_venv(context, {"venv-kernel": []})
+    assert _stage_venv(tmp_path, monkeypatch, context) is not None
+
+
+def test_virtualenv_egg_info_requires_sections_are_verified(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {})
+    egg_info = context / ".venv" / "Lib" / "site-packages" / "venv_egg.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 1.1\nName: venv-egg\nVersion: 1.0\n")
+    (egg_info / "requires.txt").write_text('[:sys_platform == "linux"]\nvenv-linux-only\n')
+
+    with pytest.raises(ValueError, match="venv-egg requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_unparsed_root_markers_fail_closed(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": ['Requires-Dist: venv-any; python_version >= "3"']})
+    (context / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\nvenv-linux-only = { version = "*", platform = "linux" }\n'
+    )
+
+    with pytest.raises(ValueError, match=r"\[tool.poetry\] may declare environment markers"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_uv_virtualenv_version_info_must_match_image(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []}, pyvenv="implementation = CPython\nversion_info = 3.14\n")
+
+    with pytest.raises(ValueError, match="targets Python 3.14"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+def test_virtualenv_roots_include_files_seen_first_as_constraints(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text("-r base.txt\n-c constraints.txt\nvenv-root\n")
+    (context / "constraints.txt").write_text("-r base.txt\n")
+    (context / "base.txt").write_text("venv-linux-only; sys_platform != 'win32'\n")
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"Pipfile": "[packages]\nvenv-linux-only = {version = \"*\", markers = \"sys_platform != 'win32'\"}\n"},
+        {
+            "pyproject.toml": (
+                '[project]\nname = "app"\ndynamic = ["dependencies"]\n'
+                '[tool.setuptools.dynamic]\ndependencies = {file = ["deps.txt"]}\n'
+            ),
+            "deps.txt": "venv-linux-only; sys_platform != 'win32'\n",
+        },
+        {"pyproject.toml": '[project]\nname = "app"\ndynamic = ["dependencies"]\n'},
+    ],
+)
+def test_virtualenv_unparsed_dependency_sources_fail_closed(tmp_path, monkeypatch, files):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": ['Requires-Dist: venv-any; python_version >= "3"']})
+    for name, text in files.items():
+        (context / name).write_text(text)
+
+    with pytest.raises(ValueError, match="may declare environment markers|cannot be read"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_reads_roots_from_install_option_and_utf16_requirements(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(context, {"venv-root": []})
+    (context / "requirements.txt").write_text(
+        "--only-binary=:all:\nvenv-root\nvenv-linux-only; sys_platform == 'linux'\n",
+        encoding="utf-16",
+    )
+
+    with pytest.raises(ValueError, match="requirements file requires venv-linux-only"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+
+def test_virtualenv_definite_extras_match_unnormalized_marker_spellings(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _write_venv(context, {})
+    egg_info = context / ".venv" / "Lib" / "site-packages" / "venv_egg.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 1.1\nName: venv-egg\nVersion: 1.0\n")
+    (egg_info / "requires.txt").write_text("[Speed_Ups]\nvenv-fast\n")
+    (context / "requirements.txt").write_text("venv-egg[speed-ups]\n")
+
+    with pytest.raises(ValueError, match="venv-egg requires venv-fast"):
+        _stage_venv(tmp_path, monkeypatch, context)
+
+@pytest.mark.parametrize(
+    ("lib", "home", "fails"),
+    [
+        (("lib", "python3.11"), "/usr/bin", False),
+        (("lib", "python3.11"), "C:/msys64/mingw64/bin", True),
+        (("lib", "python3.11"), None, True),
+        (("Lib",), "C:\\Python311", True),
+    ],
+)
+def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
+    tmp_path, monkeypatch, lib, home, fails
+):
+    context = tmp_path / "context"
+    pyvenv = "version = 3.11.7\n" + (f"home = {home}\n" if home else "")
+    _write_venv(
+        context,
+        {
+            "venv-root": [
+                "Provides-Extra: uvloop",
+                'Requires-Dist: venv-uvloop; sys_platform != "win32" and extra == "uvloop"',
+            ]
+        },
+        pyvenv=pyvenv,
+        lib=lib,
+    )
+    (context / "requirements.txt").write_text("venv-root\n")
+
+    if fails:
+        with pytest.raises(ValueError, match="extra 'uvloop' of venv-root"):
+            _stage_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_venv(tmp_path, monkeypatch, context) is not None
