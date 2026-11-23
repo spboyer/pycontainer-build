@@ -978,6 +978,81 @@ def _layer_names(layer):
         return archive.getnames()
 
 
+@pytest.mark.parametrize(
+    ("base_image", "environment", "wheel_tag"),
+    [
+        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
+            "cp311-cp311-musllinux_1_2_x86_64",
+        ),
+    ],
+)
+def test_locked_build_uses_verified_base_abi_and_libc(
+    tmp_path, monkeypatch, indexes, base_image, environment, wheel_tag
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(context / "wheelhouse", tag=wheel_tag)
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=recorded.url)
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+
+    builder.build()
+
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+    assert not rogue.requests
+
+
+@pytest.mark.parametrize(
+    ("base_image", "environment", "message"),
+    [
+        (
+            "python:3.11-slim@sha256:" + "a" * 64,
+            ["PYTHON_IMPLEMENTATION=CPython"],
+            "unverified",
+        ),
+        ("python@sha256:" + "a" * 64, ["PYTHON_LIBC=musl-1.2"], "Python ABI"),
+        ("python:3.11-slim", ["PYTHON_LIBC=musl-1.2"], "conflicts"),
+    ],
+)
+def test_locked_build_rejects_unverified_base_before_pip(
+    tmp_path, monkeypatch, base_image, environment, message
+):
+    context = _write_uv_project(tmp_path / "context")
+    base_config = {
+        **BASE_CONFIG,
+        "config": {
+            **BASE_CONFIG["config"],
+            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+        },
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran before validating the base image"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        builder.build()
+
+
 def test_locked_build_installs_only_from_recorded_index_reproducibly(tmp_path, monkeypatch, indexes):
     context = tmp_path / "context"
     wheel = _write_wheel(context / "wheelhouse")
@@ -1049,7 +1124,8 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     site_packages.parent.mkdir()
 
     install_locked_requirements(
-        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None
+        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None,
+        base_image_tag_verified=True,
     )
 
     assert {path.name for path in site_packages.iterdir()} >= {"fixture_dep", "other_dep"}
