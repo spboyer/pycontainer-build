@@ -1704,8 +1704,8 @@ def test_locked_build_filters_global_and_site_pip_config(tmp_path, monkeypatch, 
         "_original = c.get_configuration_files\n"
         "def _files():\n"
         "    files = _original()\n"
-        f"    files[c.Kind.GLOBAL] = {[str(config)] if scope == 'global' else []!r}\n"
-        "    files[c.Kind.USER] = []\n"
+        f"    files['global'] = {[str(config)] if scope == 'global' else []!r}\n"
+        "    files['user'] = []\n"
         "    return files\n"
         "c.get_configuration_files = _files\n"
     )
@@ -1720,8 +1720,9 @@ def test_locked_build_filters_global_and_site_pip_config(tmp_path, monkeypatch, 
             "from pip._internal.configuration import Configuration; "
             "c=Configuration(isolated=False); c.load(); print(c.get_value('install.requirement'))",
         ],
-        capture_output=True, text=True, timeout=30, check=True,
+        capture_output=True, text=True, timeout=30,
     )
+    assert probe.returncode == 0, probe.stderr
     assert probe.stdout.strip() == str(extra)
 
     if bypass:
