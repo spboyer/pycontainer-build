@@ -226,7 +226,15 @@ def test_build_output_and_cache_are_excluded_but_requested_venv_deps_are_staged(
     )
     layer_dir = tmp_path / "layers"
     layer_dir.mkdir()
-    dependency_layer = builder._create_deps_layer(layer_dir)
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8",
+            "PYTHON_LIBC=glibc-2.17",
+        ]},
+    }
+    dependency_layer = builder._create_deps_layer(layer_dir, base_config=base_config)
     layer = builder._create_app_layer(layer_dir, builder.context_include_paths)
 
     with tarfile.open(dependency_layer.tar_path) as archive:

@@ -5,6 +5,7 @@ from .builder import ImageBuilder
 from .config_loader import config_from_file
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
     TILT_PLACEHOLDER_TAG,
@@ -69,7 +70,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     if platform:
-        b.add_argument("--platform",help="Target platform (e.g., linux/amd64, linux/arm64)")
+        b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list (linux/amd64,linux/arm64) to build an OCI image index")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
     b.add_argument(
         "--sbom",
@@ -85,6 +86,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
     b.add_argument("--manifest-annotation",dest="manifest_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-manifest annotation (repeatable)")
     b.add_argument("--index-annotation",dest="index_annotations",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set a local image-index annotation (repeatable)")
+    b.add_argument("--release-notes",dest="release_notes_file",metavar="FILE",help="Embed a UTF-8 release notes file (max 8 KiB after LF normalization) as an image label; relative to the build context")
+    b.add_argument("--release-notes-label",dest="release_notes_label",metavar="KEY",help=f"Label key for --release-notes (default: {DEFAULT_RELEASE_NOTES_LABEL})")
     b.add_argument("--scan",action="store_true",default=None,help="Gate the generated image using optional Grype 0.119.0 (experimental)")
     b.add_argument("--scan-executable",help="Grype executable path or name")
     b.add_argument("--scan-threshold",choices=SCAN_SEVERITIES,help="Fail at this severity or higher (default: high)")
@@ -210,6 +213,8 @@ def main():
         'labels': dict(args.labels) if args.labels is not None else None,
         'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
         'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
+        'release_notes_file': args.release_notes_file,
+        'release_notes_label': args.release_notes_label,
         'scan': args.scan,
         'scan_executable': args.scan_executable,
         'scan_threshold': args.scan_threshold,
@@ -270,6 +275,8 @@ def main():
     try:
         builder=ImageBuilder(cfg)
         out=builder.build()
+    except ReleaseNotesError as exc:
+        parser.error(str(exc))
     except HistoryStorageError as exc:
         parser.exit(1,f"Build history error: {exc}\n")
     except ScanError as exc:

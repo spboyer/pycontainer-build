@@ -1923,13 +1923,17 @@ def test_locked_build_uses_verified_base_abi_and_libc(
         **BASE_CONFIG,
         "config": {
             **BASE_CONFIG["config"],
-            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+            "Env": ["PYTHON_VERSION=3.11.8", *environment],
         },
     }
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
     )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    def pull(*args):
+        builder._base_image_tag_verified = "@" not in base_image
+        return [], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
 
     builder.build()
 
@@ -1977,7 +1981,16 @@ def test_locked_build_uses_libc_derived_from_verified_base_layers(
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:3.11-slim"
     )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([layer], BASE_CONFIG))
+    base_config = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11.8"]},
+    }
+
+    def pull(*args):
+        builder._base_image_tag_verified = True
+        return [layer], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
 
     if not success:
         with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
@@ -2008,13 +2021,17 @@ def test_locked_build_rejects_unverified_base_before_pip(
         **BASE_CONFIG,
         "config": {
             **BASE_CONFIG["config"],
-            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+            "Env": ["PYTHON_VERSION=3.11.8", *environment],
         },
     }
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
     )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    def pull(*args):
+        builder._base_image_tag_verified = "@" not in base_image
+        return [], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
     monkeypatch.setattr(
         "pycontainer.dependencies.subprocess.Popen",
         lambda *args, **kwargs: pytest.fail("pip ran before validating the base image"),

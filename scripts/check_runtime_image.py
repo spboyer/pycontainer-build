@@ -33,6 +33,7 @@ LOCK_FIXTURE_PATH = "tests/fixtures/runtime-lock"
 LOCK_FIXTURE = Path(__file__).resolve().parents[1] / LOCK_FIXTURE_PATH
 STDOUT_LIMIT = 2000
 FIXTURE_REGISTRY = 'source = { registry = "https://pypi.org/simple" }'
+INDEX_PLATFORMS = ("linux/amd64", "linux/arm64")
 
 
 def require_executable(name):
@@ -189,11 +190,21 @@ def record_image(evidence, builder):
     }
 
 
-def run_layout(docker, skopeo, layout, image_ref, timeout, platform, evidence):
+def run_layout(
+    docker, skopeo, layout, image_ref, timeout, platform, evidence,
+    *, source_reference="runtime-check", expected_config_digest=None,
+):
     """Import an OCI layout into Docker, run it once, and return stdout."""
     try:
+        copy_command = [skopeo]
+        if expected_config_digest is not None:
+            os_name, arch = platform.split("/")
+            copy_command.extend(["--override-os", os_name, "--override-arch", arch])
+        copy_command.extend(
+            ["copy", f"oci:{layout}:{source_reference}", f"docker-daemon:{image_ref}"]
+        )
         subprocess.run(
-            [skopeo, "copy", f"oci:{layout}:runtime-check", f"docker-daemon:{image_ref}"],
+            copy_command,
             check=True,
             timeout=timeout,
         )
@@ -205,6 +216,16 @@ def run_layout(docker, skopeo, layout, image_ref, timeout, platform, evidence):
             raise RuntimeError(
                 f"imported image platform {image_platform} does not match target {platform}"
             )
+        if expected_config_digest is not None:
+            imported_config_digest = command_output(
+                [docker, "image", "inspect", "--format", "{{.Id}}", image_ref]
+            )
+            evidence["imported_config_digest"] = imported_config_digest
+            if imported_config_digest != expected_config_digest:
+                raise RuntimeError(
+                    f"imported image config digest {imported_config_digest} does not "
+                    f"match selected {platform} config {expected_config_digest}"
+                )
         stdout = subprocess.run(
             [docker, "run", "--pull=never", "--rm", image_ref],
             check=True,
@@ -389,6 +410,11 @@ def main(argv=None):
         default="requirements",
         help="dependency fixture to verify (lockfile requires a full OCI startup)",
     )
+    parser.add_argument(
+        "--multi-platform-index",
+        action="store_true",
+        help="Build an amd64/arm64 image index and import the native target",
+    )
     modes.add_argument(
         "--shell-command",
         action="store_true",
@@ -406,14 +432,27 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.timeout < 1:
         parser.error("--timeout must be positive")
+    if args.multi_platform_index:
+        for option, selected in (
+            ("--dependency-layer-only", args.dependency_layer_only),
+            ("--shell-command", args.shell_command),
+            ("--cmd-only", args.cmd_only),
+        ):
+            if selected:
+                parser.error(f"--multi-platform-index cannot be combined with {option}")
+        if args.platform not in INDEX_PLATFORMS:
+            parser.error("index check supports linux/amd64 and linux/arm64 only")
+
     if args.shell is not None and not args.shell_command:
         parser.error("--shell requires --shell-command")
     if args.dependency_fixture == "lockfile" and (
-        args.cmd_only or args.shell_command or args.dependency_layer_only
+        args.cmd_only or args.shell_command or args.dependency_layer_only or args.multi_platform_index
     ):
         parser.error("--dependency-fixture lockfile requires a full OCI startup")
 
-    if args.cmd_only:
+    if args.multi_platform_index:
+        mode = "oci-index-import-startup"
+    elif args.cmd_only:
         mode = "cmd-only"
     elif args.shell_command:
         mode = "shell-command"
@@ -510,15 +549,15 @@ def run_check(args, evidence):
             entrypoint = ["runtime-fixture"]
         layout = temp_path / "oci-layout"
         config = BuildConfig(
-            tag="runtime-check",
+            tag="runtime.example/check:v1" if args.multi_platform_index else "runtime-check",
             base_image=args.base_image,
             context_dir=str(context),
             output_dir=str(layout),
             entrypoint=entrypoint,
-            platform=args.platform,
+            platform=",".join(INDEX_PLATFORMS) if args.multi_platform_index else args.platform,
             include_deps=True,
             include_paths=["app.py", "expected.json"] if args.dependency_fixture == "lockfile" else None,
-            generate_sbom=True,
+            generate_sbom=not args.multi_platform_index,
             use_cache=False,
         )
 
@@ -528,11 +567,28 @@ def run_check(args, evidence):
                 builder.build()
         else:
             builder.build()
-        record_image(evidence, builder)
-        sbom = (layout / "sbom.json").read_text()
-        package_name = "runtime-pure" if args.dependency_fixture == "lockfile" else "runtime-fixture"
-        if f'"name": "{package_name}"' not in sbom:
-            raise RuntimeError("SBOM does not describe the staged runtime dependency")
+        if args.multi_platform_index:
+            os_name, arch = args.platform.split("/")
+            matches = [
+                image for image in builder.platform_images
+                if image.platform.get("os") == os_name
+                and image.platform.get("architecture") == arch
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(f"image index does not contain exactly one {args.platform} image")
+            image = matches[0]
+            evidence["image"] = {
+                "index_digest": builder.index_digest,
+                "manifest_digest": image.manifest_digest,
+                "config_digest": image.config_digest,
+                "layer_digests": [layer.digest for layer in image.layers],
+            }
+        else:
+            record_image(evidence, builder)
+            sbom = (layout / "sbom.json").read_text()
+            package_name = "runtime-pure" if args.dependency_fixture == "lockfile" else "runtime-fixture"
+            if f'"name": "{package_name}"' not in sbom:
+                raise RuntimeError("SBOM does not describe the staged runtime dependency")
         if args.dependency_layer_only:
             with tempfile.TemporaryDirectory(
                 prefix="pycontainer-dependency-runtime-"
@@ -580,9 +636,16 @@ def run_check(args, evidence):
                 print("Target dependency import check passed.")
             return
 
-        stdout = run_layout(
-            docker, skopeo, layout, image_ref, args.timeout, args.platform, evidence
-        )
+        if args.multi_platform_index:
+            stdout = run_layout(
+                docker, skopeo, layout, image_ref, args.timeout, args.platform, evidence,
+                source_reference=builder.config.all_tags()[0],
+                expected_config_digest=image.config_digest,
+            )
+        else:
+            stdout = run_layout(
+                docker, skopeo, layout, image_ref, args.timeout, args.platform, evidence
+            )
         marker = LOCK_MARKER if args.dependency_fixture == "lockfile" else RUNTIME_MARKER
         if (stdout != marker + "\n" if args.dependency_fixture == "lockfile" else marker not in stdout):
             raise RuntimeError("container did not import and run its staged dependency")

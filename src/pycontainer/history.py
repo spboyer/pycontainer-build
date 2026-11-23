@@ -43,7 +43,8 @@ class BuildTiming:
         try:
             yield
         finally:
-            self.phases_ns[name] = time.perf_counter_ns() - started
+            elapsed = time.perf_counter_ns() - started
+            self.phases_ns[name] = self.phases_ns.get(name, 0) + elapsed
 
     def record(self, status):
         return {
