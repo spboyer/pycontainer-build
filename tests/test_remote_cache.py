@@ -551,26 +551,21 @@ def test_cache_credentials_stay_on_cache_host_and_off_storage(tmp_path, registry
     assert all(auth == CACHE_AUTH for *_, auth in cache_requests)
 
 
-# Remove when merging main after #177; strict mode turns that merge's XPASS into a failure.
-REQUIRES_EXACT_HOST_AUTH = pytest.mark.xfail(
-    strict=True, reason="lookalike GHCR/ACR hosts leak credentials until #177 lands"
-)
-
-
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 @pytest.mark.parametrize(
-    ("host", "authorization", "azure_calls"),
+    ("host", "authorization", "azure_calls", "login_server"),
     [
-        ("ghcr.io", "Bearer synthetic-github-token", 0),
-        pytest.param("ghcr.io.attacker.test", None, 0, marks=REQUIRES_EXACT_HOST_AUTH),
-        ("trusted.azurecr.io", "Bearer synthetic-azure-token", 1),
-        pytest.param(
-            "trusted.azurecr.io.attacker.test", None, 0, marks=REQUIRES_EXACT_HOST_AUTH
-        ),
+        ("ghcr.io", "Bearer synthetic-github-token", 0, None),
+        ("ghcr.io:0443", "Bearer synthetic-github-token", 0, None),
+        ("ghcr.io.attacker.test", None, 0, None),
+        ("trusted.azurecr.io", "Bearer synthetic-azure-token", 1, "trusted.azurecr.io"),
+        ("trusted.azurecr.io:0443", "Bearer synthetic-azure-token", 1, "trusted.azurecr.io"),
+        ("trusted.azurecr.io", None, 2, "other.azurecr.io"),
+        ("trusted.azurecr.io.attacker.test", None, 0, None),
     ],
 )
 def test_cache_registry_credentials_are_scoped_to_the_actual_host(
-    tmp_path, monkeypatch, option, host, authorization, azure_calls
+    tmp_path, monkeypatch, option, host, authorization, azure_calls, login_server
 ):
     for name in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD", "REGISTRY_TOKEN"):
         monkeypatch.delenv(name, raising=False)
@@ -589,7 +584,7 @@ def test_cache_registry_credentials_are_scoped_to_the_actual_host(
         return subprocess.CompletedProcess(
             command, 0, stdout=json.dumps({
                 "accessToken": "synthetic-azure-token",
-                "loginServer": "trusted.azurecr.io",
+                "loginServer": login_server,
             })
         )
 
