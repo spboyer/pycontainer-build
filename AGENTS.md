@@ -32,7 +32,9 @@ currently has no `__main__.py`.
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings.
+content, normalized relative paths, workdir, and reproducibility settings, plus
+the context-relative hardlink targets `tarfile` emits (never inode numbers or
+absolute paths); key version 3 invalidated earlier keys that lacked them.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
