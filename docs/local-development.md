@@ -502,14 +502,11 @@ pycontainer build \
   --base-image python:3.11-slim-bookworm \
   --include-deps
 
-# Build for both platforms and push
-for PLATFORM in linux/amd64 linux/arm64; do
-  ARCH=$(echo $PLATFORM | cut -d/ -f2)
-  pycontainer build \
-    --tag ghcr.io/user/myapp:${ARCH} \
-    --platform $PLATFORM \
-    --push
-done
+# Build one OCI image index for both platforms and push it under one tag
+pycontainer build \
+  --tag ghcr.io/user/myapp:v1 \
+  --platform linux/amd64,linux/arm64 \
+  --push
 ```
 
 ---

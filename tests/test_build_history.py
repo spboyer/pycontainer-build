@@ -12,7 +12,7 @@ import pytest
 from pycontainer import cli
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
-from pycontainer.history import BuildHistory, HistoryStorageError
+from pycontainer.history import BuildHistory, BuildTiming, HistoryStorageError
 
 from test_dependency_staging import _base_metadata_layer, _dpkg_libc
 
@@ -155,10 +155,11 @@ def test_enabled_optional_phases_are_reported(tmp_path, monkeypatch):
         **BASE_CONFIG,
         "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
     }
-    monkeypatch.setattr(
-        ImageBuilder, "_pull_base_image",
-        lambda self, layers_dir, os_name, arch: ([layer], base_config),
-    )
+    def verified_pull(self, layers_dir, os_name, arch):
+        self._base_image_tag_verified = True
+        return [layer], base_config
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", verified_pull)
     staged_configs = []
 
     def stage_deps(self, layers_dir, **kwargs):
@@ -181,8 +182,29 @@ def test_enabled_optional_phases_are_reported(tmp_path, monkeypatch):
     assert set(phases) == {"base_image", "dependencies", "application", "sbom"}
 
 
+def test_repeated_phase_durations_accumulate(monkeypatch):
+    import pycontainer.history as history_module
+
+    timing = BuildTiming()
+    ticks = iter([0, 10, 20, 45])
+    monkeypatch.setattr(history_module, "time", type("Clock", (), {
+        "perf_counter_ns": staticmethod(lambda: next(ticks)),
+    }))
+
+    with timing.phase("base_image"):
+        pass
+    with timing.phase("base_image"):
+        pass
+
+    assert timing.phases_ns["base_image"] == 35
+
+
 def test_libc_evidence_failure_records_dependency_phase(tmp_path, monkeypatch):
-    _offline_base(monkeypatch)
+    def verified_pull(self, layers_dir, os_name, arch):
+        self._base_image_tag_verified = True
+        return [], BASE_CONFIG
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", verified_pull)
     config = _history_config(tmp_path, include_deps=True)
 
     with pytest.raises(ValueError, match="absent or ambiguous"):
