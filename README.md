@@ -560,6 +560,10 @@ The build context must be writable: temporary `.pycontainer-lockfile-*`
 directories hold generated requirements, are excluded from images, and are
 removed after staging.
 
+The lockfile's project manifest must resolve inside the build context. Symlinks
+to files within the context are supported; dangling or external links are
+rejected. Path checks do not protect against concurrent filesystem changes.
+
 `--dry-run` checks lockfile selection and locally verifiable freshness
 without pulling the base image. Target markers (including uv marker
 freshness), Python compatibility and wheel availability are checked during

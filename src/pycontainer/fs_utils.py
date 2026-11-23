@@ -54,6 +54,24 @@ def relative_context_path(path):
     return relative
 
 
+def context_file_path(context_dir, path):
+    """Reject file links that escape the context or have no target."""
+    context = Path(context_dir)
+    path = Path(path)
+    try:
+        resolved = path.resolve(strict=True)
+        resolved_context = context.resolve(strict=True)
+    except FileNotFoundError as exc:
+        if path.is_symlink():
+            raise ValueError(f"{path.name} is a dangling link; it must resolve inside the build context.") from exc
+        return path
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Unable to resolve {path.name} inside the build context: {exc}") from exc
+    if not resolved.is_relative_to(resolved_context):
+        raise ValueError(f"{path.name} must resolve inside the build context.")
+    return path
+
+
 def _glob_matches(path_parts, pattern_parts):
     if not pattern_parts:
         return not path_parts

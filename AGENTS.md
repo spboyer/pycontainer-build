@@ -309,6 +309,9 @@ ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
 Generated requirements live temporarily inside the writable build context;
 `.pycontainer-lockfile-*` staging directories are always excluded from images.
+Manifest paths are rechecked before lock reads and installation verification;
+in-context links are allowed, while external or dangling links fail. Resolution
+does not protect against concurrent filesystem changes.
 Poetry checks locked and legacy Python ranges and recorded applicable root,
 transitive and extra dependencies. uv limited environments must match the
 recorded supported markers and include the target; unverifiable marker
