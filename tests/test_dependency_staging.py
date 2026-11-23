@@ -467,7 +467,7 @@ def test_linked_conda_virtualenv_warns_and_installs_export(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("selected", ["src", "src/nested/environment.yml"])
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_selected_linked_source_conda_descriptor_is_detected(
+def test_selected_linked_source_is_rejected_before_pull(
     tmp_path, monkeypatch, selected, dry_run,
 ):
     context = tmp_path / "context"
@@ -476,40 +476,40 @@ def test_selected_linked_source_conda_descriptor_is_detected(
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     _symlink_or_skip(context / "src", source, directory=True)
-    builder = _builder(
-        tmp_path / "run", monkeypatch, context=context, include_deps=True,
-        include_paths=[selected], dry_run=dry_run,
-    )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
 
-    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
-        builder.build()
+    with pytest.raises(ValueError, match="directory links are never followed"):
+        _builder(
+            tmp_path / "run", monkeypatch, context=context, include_deps=True,
+            include_paths=[selected], dry_run=dry_run,
+        ).build()
 
 
-def test_selected_linked_source_detection_respects_excludes(tmp_path, monkeypatch, caplog):
+def test_excluded_linked_source_is_not_followed(tmp_path, monkeypatch, caplog):
     context = tmp_path / "context"
     context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
     source = tmp_path / "linked-source"
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     _symlink_or_skip(context / "src", source, directory=True)
     builder = _builder(
         tmp_path / "run", monkeypatch, context=context, include_deps=True,
-        include_paths=["src"], exclude_paths=["src/nested"], dry_run=True,
+        include_paths=["src", "app.py"], exclude_paths=["src"], dry_run=True,
     )
 
     assert builder.build() == builder.config.tag
     assert not [record for record in caplog.records if "Conda" in record.message]
 
 
-def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, caplog):
+def test_selected_source_conda_descriptor_prefers_pip_requirements(
+    tmp_path, monkeypatch, caplog,
+):
     context = tmp_path / "context"
-    context.mkdir()
-    source = tmp_path / "linked-source"
+    source = context / "src"
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     (source / "app.py").write_text("print('app')\n")
-    _symlink_or_skip(context / "src", source, directory=True)
     venv = context / ".venv" / "Lib" / "site-packages"
     venv.mkdir(parents=True)
     (venv / "venv_dep.py").write_text("value = 1\n")
@@ -622,7 +622,7 @@ def test_requirements_alias_to_conda_descriptor_is_rejected(
 ):
     descriptor = tmp_path / signal
     descriptor.write_text("numpy\n")
-    _symlink_or_skip(tmp_path / "requirements.txt", descriptor)
+    _symlink_or_skip(tmp_path / "requirements.txt", Path(signal))
     builder = _builder(
         tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
         exclude_paths=[signal] if exclude_target else [], dry_run=True,
@@ -661,7 +661,10 @@ def test_conda_rejects_requirements_symlink_outside_context(tmp_path, monkeypatc
     outside = tmp_path / "export.txt"
     outside.write_text("")
     _symlink_or_skip(context / "requirements.txt", outside)
-    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        exclude_paths=["requirements.txt"],
+    )
     with pytest.raises(ValueError, match="stay inside the build context"):
         builder.build()
 
