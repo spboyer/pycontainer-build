@@ -1,8 +1,10 @@
 """Hermetic Python-version matrix and non-atomic publication regressions."""
+import base64
 import json
 import hashlib
 import tarfile
 import subprocess
+import zipfile
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
@@ -809,7 +811,7 @@ def test_target_wheel_staging_uses_each_minor_and_architecture(tmp_path, monkeyp
                        ("3.12", "linux", "amd64"), ("3.12", "linux", "arm64")]
 
 
-def _write_matrix_lock_project(context):
+def _write_matrix_lock_project(context, *, include_stubs=False):
     from test_dependency_staging import _write_named_wheel
     from test_lockfiles import _write_target_marker_uv_project
 
@@ -839,6 +841,18 @@ def _write_matrix_lock_project(context):
             tag = f"cp{minor}-cp{minor}-manylinux2014_{machine}"
             _write_named_wheel(wheelhouse, "fixture-dep", requires=requires, tag=tag)
             wheel = wheelhouse / f"fixture_dep-1.0-{tag}.whl"
+            if include_stubs:
+                with zipfile.ZipFile(wheel) as archive:
+                    files = {name: archive.read(name) for name in archive.namelist()}
+                stub = b"value: int\n"
+                stub_hash = base64.urlsafe_b64encode(hashlib.sha256(stub).digest()).rstrip(b"=")
+                files["fixture_dep/__init__.pyi"] = stub
+                files["fixture_dep-1.0.dist-info/RECORD"] += (
+                    f"fixture_dep/__init__.pyi,sha256={stub_hash.decode()},{len(stub)}\n".encode()
+                )
+                with zipfile.ZipFile(wheel, "w") as archive:
+                    for name, content in files.items():
+                        archive.writestr(name, content)
             digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
             wheel_refs.append(
                 f'{{ url = "https://example.invalid/{wheel.name}", hash = "sha256:{digest}" }}'
@@ -854,14 +868,17 @@ def _write_matrix_lock_project(context):
     original.unlink()
 
 
-def test_locked_matrix_selects_target_markers_wheels_and_override(tmp_path, monkeypatch):
+@pytest.mark.parametrize("strip_type_stubs", [False, True])
+def test_locked_matrix_selects_target_markers_wheels_and_override(
+    tmp_path, monkeypatch, strip_type_stubs
+):
     build, _, pulls = matrix(
         tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
-        default_python_version="3.12", tags=["stable"],
+        default_python_version="3.12", tags=["stable"], strip_type_stubs=strip_type_stubs,
     )
     context = Path(build.config.context_dir)
-    _write_matrix_lock_project(context)
+    _write_matrix_lock_project(context, include_stubs=True)
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
     base_auth = []
@@ -914,6 +931,7 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(tmp_path, monk
                 ).read().decode()
             tag = f"cp{version.replace('.', '')}-cp{version.replace('.', '')}-manylinux2014_{machines[arch]}"
             assert f"Tag: {tag}" in wheel
+            assert ("app/.python/site-packages/fixture_dep/__init__.pyi" in names) != strip_type_stubs
             for candidate, suffix in suffixes.items():
                 root = f"app/.python/site-packages/marker_root_{suffix}/__init__.py"
                 transitive = f"app/.python/site-packages/marker_trans_{suffix}/__init__.py"

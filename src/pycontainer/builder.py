@@ -225,6 +225,7 @@ from .dependencies import (
     reject_shipped_credentials,
     staged_packages,
     stage_virtualenv,
+    strip_type_stubs,
     target_python_full_version,
     target_python_version,
     target_libc_config,
@@ -1182,6 +1183,8 @@ class ImageBuilder:
                 print(f"  Dependency Source: {kind} ({described})")
                 if kind == "lock":
                     print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
+            if self.config.strip_type_stubs:
+                print("  Strip Type Stubs: True")
         if self.config.system_packages:
             print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         for name in render_security_fragments(self.config.security, self.config.context_dir):
@@ -1430,6 +1433,10 @@ class ImageBuilder:
                 )
                 reject_credentialed_direct_urls(site_packages)
 
+            if self.config.strip_type_stubs:
+                removed = strip_type_stubs(site_packages)
+                if removed:
+                    print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
