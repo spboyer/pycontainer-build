@@ -82,12 +82,26 @@ def _pin_pip_configuration(allowed_keys):
 def _freeze_pip_configuration(snapshot):
     from pip._internal.cli import parser
     from pip._internal.commands import create_command
+    from pip._internal.configuration import Configuration
 
     original_items = parser.ConfigOptionParser._get_ordered_configuration_items
+    shape_probe = Configuration(isolated=False)
+    shape_probe.get_environ_vars = lambda: [("timeout", "123")]
+    shape_probe._load_environment_vars()
+    probe_values = [value for _, value in shape_probe.items()]
+    if probe_values == ["123"]:
+        flattened = {}
+        for values in snapshot["configuration"]:
+            flattened.update(values)
+        frozen_items = tuple(flattened.items())
+    elif probe_values == [{":env:.timeout": "123"}]:
+        frozen_items = tuple(enumerate(snapshot["configuration"]))
+    else:
+        raise TargetMarkerError("unsupported pip configuration shape")
 
     class FrozenConfiguration:
         def items(self):
-            return enumerate(snapshot["configuration"])
+            return iter(frozen_items)
 
     def configuration_items(self):
         configuration = self.config

@@ -826,7 +826,9 @@ the backend used for closure verification, Python version and implementation,
 workdir, type-stub stripping, pip version, the installer backend and sanitized index and find-links
 identities, including their exact paths. Plain
 requirements also key allowlisted ambient pip settings, read locally through
-pip's configuration parser even on a hit; locked installs are `--isolated`.
+pip's configuration parser even on a hit; snapshots preserve file/environment
+precedence with both pip 25's flat settings and pip 26's per-file settings.
+Shadowed settings are still checked for unsafe sources. Locked installs are `--isolated`.
 Index credentials and userinfo placeholders never enter cache metadata.
 Anything that cannot be proven is
 an explicit miss printed as

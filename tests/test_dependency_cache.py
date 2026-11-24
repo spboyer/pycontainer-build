@@ -8,12 +8,14 @@ import json
 import multiprocessing
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import tomllib
 import zipfile
 from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -1753,6 +1755,102 @@ def test_parse_pip_config_keys_sanitized_settings_and_rejects_unprovable_ones():
         with pytest.raises(DependencyCacheMiss, match=reason) as miss:
             parse_pip_config(line + "\n")
         assert "/tmp" not in str(miss.value) and "feed" not in str(miss.value)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["pip-25-flat", "pip-26-files"])
+@pytest.mark.parametrize("unsafe_shadowed", [False, True])
+def test_pip_config_snapshot_preserves_levels_and_effective_options(
+    monkeypatch, capsys, nested, unsafe_shadowed,
+):
+    from pip._internal import commands, configuration
+
+    global_settings = {
+        "global.index-url": "https://example.invalid/simple?feed=private"
+        if unsafe_shadowed else "https://example.invalid/simple",
+        "global.timeout": "10",
+    }
+    user_settings = {"global.timeout": "20"}
+    env_settings = {":env:.index-url": "https://public.invalid/simple"}
+    levels = [global_settings, user_settings, env_settings]
+    config = SimpleNamespace(
+        load=lambda: None,
+        _config={
+            variant: {f"source-{variant}": values} if nested else values
+            for variant, values in enumerate(levels)
+        },
+    )
+    parser = SimpleNamespace(
+        config=config,
+        _get_ordered_configuration_items=lambda: [
+            ("timeout", "20"), ("index-url", "https://public.invalid/simple"),
+        ],
+    )
+    monkeypatch.setattr(configuration, "OVERRIDE_ORDER", (0, 1, 2))
+    monkeypatch.setattr(commands, "create_command", lambda name: SimpleNamespace(parser=parser))
+    exec(dependency_cache._PIP_CONFIG_SNAPSHOT, {})
+    captured = capsys.readouterr().out
+    assert json.loads(captured)["configuration"] == levels
+    monkeypatch.setattr(
+        dependency_cache.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=captured),
+    )
+    if unsafe_shadowed:
+        with pytest.raises(DependencyCacheMiss, match="query string"):
+            ambient_pip_settings()
+    else:
+        snapshot = ambient_pip_settings()
+        assert snapshot.configuration == tuple(levels)
+        assert snapshot.ordered == (
+            ("timeout", "20"), ("index-url", "https://public.invalid/simple"),
+        )
+        assert any(value == "https://example.invalid/simple" for _, value in snapshot.identity)
+
+
+def test_pip_config_snapshot_rejects_mixed_shapes(monkeypatch):
+    from pip._internal import commands, configuration
+
+    config = SimpleNamespace(
+        load=lambda: None,
+        _config={0: {"global.timeout": "10", "source": {"global.timeout": "20"}}},
+    )
+    monkeypatch.setattr(configuration, "OVERRIDE_ORDER", (0,))
+    monkeypatch.setattr(
+        commands, "create_command", lambda name: SimpleNamespace(parser=SimpleNamespace(config=config)),
+    )
+    with pytest.raises(ValueError, match="unsupported pip configuration shape"):
+        exec(dependency_cache._PIP_CONFIG_SNAPSHOT, {})
+
+
+def test_real_frozen_pip_configuration_preserves_source_precedence():
+    snapshot = {
+        "configuration": [
+            {"global.index-url": "https://global.invalid/simple", "global.timeout": "10"},
+            {"install.index-url": "https://install.invalid/simple"},
+            {":env:.index-url": "https://captured.invalid/simple"},
+        ],
+        "ordered": [
+            ["index-url", "https://global.invalid/simple"], ["timeout", "10"],
+            ["index-url", "https://install.invalid/simple"],
+            ["index-url", "https://captured.invalid/simple"],
+        ],
+    }
+    script = """
+import json, os, sys
+from pycontainer._pip_target import _pin_pip_configuration, _freeze_pip_configuration
+from pip._internal.commands import create_command
+os.environ["PIP_INDEX_URL"] = "https://changed.invalid/simple"
+_pin_pip_configuration({"index-url", "timeout"})
+_freeze_pip_configuration(json.loads(sys.argv[1]))
+options, _ = create_command("install").parse_args([])
+print(json.dumps([options.index_url, options.timeout, options.platforms]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(snapshot)],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PYTHONPATH": str(Path(dependency_cache.__file__).parents[1])},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["https://captured.invalid/simple", 10, None]
 
 
 def test_real_ambient_pip_config_is_read_and_sanitized(tmp_path, monkeypatch):

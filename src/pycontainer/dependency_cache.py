@@ -36,7 +36,7 @@ from .dependencies import (
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
 # Bump when installer or closure-verification behavior changes.
-INSTALLER_BACKEND = "pip-target-v10"
+INSTALLER_BACKEND = "pip-target-v11"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -97,11 +97,23 @@ _ENCODING_DECLARATION = re.compile(r"^[ \t]*#.*?coding[:=][ \t]*([-\w.]+)")
 _PIP_CONFIG_SNAPSHOT = """
 import json
 from pip._internal.commands import create_command
+from pip._internal.configuration import OVERRIDE_ORDER
 
 parser = create_command("install").parser
 parser.config.load()
+configuration = []
+for variant in OVERRIDE_ORDER:
+    values = parser.config._config[variant]
+    if not isinstance(values, dict):
+        raise ValueError("unsupported pip configuration shape")
+    if all(isinstance(value, str) for value in values.values()):
+        configuration.append(values)
+    elif all(isinstance(value, dict) for value in values.values()):
+        configuration.extend(values.values())
+    else:
+        raise ValueError("unsupported pip configuration shape")
 print(json.dumps({
-    "configuration": [values for _, values in parser.config.items()],
+    "configuration": configuration,
     "ordered": list(parser._get_ordered_configuration_items()),
 }))
 """
