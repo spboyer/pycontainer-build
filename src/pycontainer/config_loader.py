@@ -5,7 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig, canonical_registry
-from .build_args import resolve_arguments
+from .build_args import redact_values, resolve_arguments
 from .metadata import validate_metadata
 
 
@@ -14,6 +14,31 @@ TOOL_TABLE = "[tool.pycontainer]"
 PLUGIN_ONLY_HINTS = {
     "push": "push is a Poetry plugin setting; use 'pycontainer build --push' for direct builds",
 }
+
+
+class ConfigValidationError(ValueError):
+    """One or more source-qualified configuration diagnostics."""
+
+    def __init__(self, diagnostics: List[str], redaction_values=()):
+        self.diagnostics = list(diagnostics)
+        self._redaction_values = tuple(redaction_values)
+        super().__init__("\n".join(self.diagnostics))
+
+    def redact(self, message: str) -> str:
+        return redact_values(message, self._redaction_values)
+
+
+def _declared_default_values(config: Dict[str, Any]) -> List[str]:
+    """Return declared build-argument defaults from raw, possibly invalid, settings."""
+    values = []
+    for key, declarations in config.items():
+        if key.replace('-', '_') != 'build_args' or not isinstance(declarations, dict):
+            continue
+        for declaration in declarations.values():
+            value = declaration.get("default") if isinstance(declaration, dict) else declaration
+            if isinstance(value, str):
+                values.append(value)
+    return values
 
 
 def _load_config_table(path: Path, required: bool = False) -> Tuple[str, Dict[str, Any]]:
@@ -125,6 +150,22 @@ def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
 
     type_hints = get_type_hints(BuildConfig)
     for key, value in config.items():
+        if key == "validate":
+            nested_table = f"{table[:-1]}.validate]"
+            if not isinstance(value, dict):
+                raise ValueError(f"Invalid value for {nested_table}: expected a table.")
+            unknown = sorted(set(value) - {"ignore"})
+            if unknown:
+                raise ValueError(f"Unknown {nested_table} setting(s): {', '.join(unknown)}.")
+            ignores = value.get("ignore", [])
+            if not isinstance(ignores, list) or any(not isinstance(item, str) for item in ignores):
+                raise ValueError(f"Invalid value for {nested_table}.ignore: expected list[str].")
+            from .image_validation import validate_ignores
+            try:
+                validate_ignores(ignores)
+            except ValueError as exc:
+                raise ValueError(f"{nested_table}.ignore: {exc}") from None
+            continue
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):
             raise ValueError(
@@ -182,8 +223,12 @@ def load_explicit_file_config(path: Path) -> Tuple[str, Dict[str, Any]]:
     or misspelled table is an error rather than a silent fall-back to defaults.
     """
     table, file_config = _load_config_table(path, required=True)
-    file_config = _normalize_config_keys(file_config, f"Config file {table}")
-    return table, file_config
+    try:
+        normalized = _normalize_config_keys(file_config, f"Config file {table}")
+    except ValueError as exc:
+        values = _declared_default_values(file_config)
+        raise ConfigValidationError([redact_values(str(exc), values)], values) from None
+    return table, normalized
 
 
 def config_from_file(

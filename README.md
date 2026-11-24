@@ -46,6 +46,9 @@ uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a
 
 ### Build Your First Image
 
+For offline configuration checks before committing, use the optional
+[pre-commit configuration-validation hook](docs/pre-commit.md).
+
 ```bash
 # Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
@@ -214,6 +217,7 @@ offline preparation, error behavior and the opt-in acceptance test.
 **Production Features** (Phase 4):
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
+- ✅ **Configuration templates and wizard** — `pycontainer init` for FastAPI, Flask and generic apps
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
 - ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
   OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
@@ -772,6 +776,17 @@ error handling, and custom-directory inspection.
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+- `--analyze-layers` — Write `layer-analysis.json` with per-layer sizes,
+  repeated content and predicted squash savings
+- `--squash` — Opt in to merging the layers pycontainer creates (dependencies
+  and application) into one layer; base-image layers are never squashed
+
+The default layout is unchanged unless `--squash` is given. Squashing
+preserves overlay semantics (whiteouts, opaque directories, links, metadata)
+or fails explicitly, but it usually saves little space for pycontainer's own
+layers and gives up layer-level cache reuse between the dependency and
+application layers. See [Layer analysis and squashing](docs/layer-squashing.md)
+before enabling it.
 
 Labels inherit from the base image; their precedence is CLI, configuration
 file, detected framework, then base image. Manifest and index annotations are
@@ -873,6 +888,8 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+analyze-layers = false      # true writes layer-analysis.json
+squash = false              # true merges builder-created layers only
 release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
@@ -964,6 +981,45 @@ conflicting tables or usage errors, and lists the registry,
 dependency-resolution and runtime checks it did not perform. A passing
 validation does not prove a build will succeed. See
 [configuration validation](docs/validate-config.md).
+
+### Validating images offline
+
+`pycontainer validate image` verifies an existing OCI layout and reports
+best-practice findings without a registry or container daemon. Use
+`pycontainer build --validate --push` to run the same checks before publishing:
+
+```bash
+pycontainer validate image --output dist/image --format json
+pycontainer validate image --tag myapp:latest --platform linux/arm64
+pycontainer build --config pycontainer.toml --validate --push
+```
+
+Validation exits 0 below the requested severity threshold, 1 for findings at or
+above it, and 2 for usage, layout or integrity errors. Base-image provenance
+is reported as unknown, not inferred from labels. See the
+[image validation rules, suppression and limits](docs/validation.md).
+
+### Generating a configuration file
+
+`pycontainer init` writes a `[build]` file offline from a template, or from an
+explicitly invoked terminal wizard. It never prompts for credentials, never
+contacts a registry or daemon, and never edits `pyproject.toml`:
+
+```bash
+pycontainer init --list-templates                       # fastapi, flask, generic
+pycontainer init --template fastapi                     # writes pycontainer.toml
+pycontainer init -t flask --app web:app --port 8080 -o deploy/flask.toml
+pycontainer init --interactive                          # TTY only; never overwrites
+pycontainer build --config pycontainer.toml
+```
+
+The result is validated with the same loader and resolver `build --config`
+uses before it is published. An existing regular file is refused unless
+`--force` is passed (templates only); links, directories and special files are
+rejected. Cancellation never exposes a partial output file.
+Creating without `--force` requires hard-link support for atomic no-clobber publication.
+Templates write configuration only; they do not add application code or new
+framework detection. See [configuration templates and wizard](docs/init-config.md).
 
 ### Build arguments
 
@@ -1295,6 +1351,7 @@ This style is intentional for the experimental phase.
 - **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Layer Analysis and Squashing](docs/layer-squashing.md)** — Opt-in layer report and builder-layer squashing trade-offs
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 - **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection

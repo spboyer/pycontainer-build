@@ -43,7 +43,8 @@ omitted `BuildConfig.build_args` preserves literal dollars; an explicitly
 provided table, including an empty one, enables interpolation.
 
 `pycontainer validate` is a namespace: a bare `validate` is a usage error.
-`validate image` is reserved for image linting and is not yet available.
+`validate image` checks an existing OCI layout separately; see
+[offline image validation](validation.md).
 
 ## Checks
 
@@ -59,7 +60,8 @@ provided table, including an empty one, enables interpolation.
   inactive rules and the single-target restriction.
 - Semantic checks shared with `build`: SBOM format, system package names, tag
   and base-image references, platform format, relative include/exclude and
-  requirements paths, an existing context directory, and the supported
+  requirements paths, an existing context directory, distinct exposed ports
+  from 1 to 65535, and the supported
   dependency-staging platforms when `include-deps` is set.
 
 Each diagnostic names its source file and where the offending value came from:
@@ -85,3 +87,6 @@ locks, contacts a registry or writes files, so it cannot verify:
   or entrypoint detection.
 
 A successful validation is therefore not proof that a build will succeed.
+
+An optional [pre-commit hook](pre-commit.md) validates selected configuration
+files using this same offline command.

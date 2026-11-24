@@ -701,8 +701,9 @@ def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):
 
 
 @pytest.mark.parametrize("function", ["main", "ma\u00efn"])
+@pytest.mark.parametrize("squash", [False, True])
 def test_requirements_install_stages_importable_target_wheel_and_sbom(
-    tmp_path, monkeypatch, function
+    tmp_path, monkeypatch, function, squash
 ):
     context = tmp_path / "context"
     context.mkdir()
@@ -718,6 +719,7 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         include_deps=True,
         generate_sbom=True,
         entrypoint=["fixture-dep"],
+        squash=squash,
     )
 
     builder.build()
@@ -772,6 +774,7 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         include_deps=True,
         generate_sbom=True,
         entrypoint=["fixture-dep"],
+        squash=squash,
     )
     repeated.build()
     assert dependency_layer.digest == repeated.layers[0].digest

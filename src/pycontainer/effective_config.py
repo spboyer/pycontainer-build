@@ -9,8 +9,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
 from .build_args import EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
-from .config import BuildConfig
-from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
+from .config import BuildConfig, validate_exposed_ports
+from .config_loader import (
+    BUILD_TABLE,
+    ConfigValidationError,
+    _validate_config,
+    load_explicit_file_config,
+    merge_configs,
+)
 from .dependencies import validate_target_platform
 from .file_rules import FileRuleError
 from .fs_utils import relative_context_path
@@ -49,18 +55,6 @@ NOT_PERFORMED = (
     "runtime: OCI import and container startup",
     "build context: file selection, framework defaults and entrypoint detection",
 )
-
-
-class ConfigValidationError(ValueError):
-    """One or more source-qualified configuration diagnostics."""
-
-    def __init__(self, diagnostics: List[str], redaction_values=()):
-        self.diagnostics = list(diagnostics)
-        self._redaction_values = tuple(redaction_values)
-        super().__init__("\n".join(self.diagnostics))
-
-    def redact(self, message: str) -> str:
-        return redact_values(message, self._redaction_values)
 
 
 def _origin(field: str, overrides: Dict[str, Any], table: Optional[str], file_keys) -> str:
@@ -121,6 +115,7 @@ def semantic_errors(cfg: BuildConfig, origin) -> List[str]:
         check("platform", parse_platform, platform)
     check("base_image", lambda value: parse_local_image_reference(value) or parse_image_reference(value), cfg.base_image)
     check("tag", lambda _: cfg.all_tags(), cfg.tag)
+    check("exposed_ports", validate_exposed_ports, cfg.exposed_ports)
     check("include_paths", relative_context_path, *(cfg.include_paths or []))
     check("exclude_paths", relative_context_path, *cfg.exclude_paths)
     context = Path(cfg.context_dir)
@@ -146,6 +141,22 @@ def resolve_build_config(
     table, file_config = None, {}
     if config_path is not None:
         table, file_config = load_explicit_file_config(config_path)
+    cfg = resolve_settings(
+        file_config, overrides, table, build_arg_overrides=build_arg_overrides,
+        detect_base_image=config_path is None,
+    )
+    return cfg, table
+
+
+def resolve_settings(
+    file_config: Dict[str, Any],
+    overrides: Dict[str, Any],
+    table: Optional[str],
+    *,
+    build_arg_overrides: Optional[List[str]] = None,
+    detect_base_image: bool = False,
+) -> BuildConfig:
+    """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
     origin = lambda field: _origin(field, overrides, table, file_config)
     declarations = merged.get("build_args") or {}
@@ -200,7 +211,7 @@ def resolve_build_config(
         raise ConfigValidationError(
             [redact_values(error, arguments.values()) for error in errors], arguments.values()
         ) from None
-    if config_path is None and "base_image" not in overrides:
+    if detect_base_image and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
         except (AttributeError, OSError, TypeError, ValueError) as exc:
@@ -214,4 +225,4 @@ def resolve_build_config(
     errors = semantic_errors(cfg, origin)
     if errors:
         raise ConfigValidationError([cfg.redact(error) for error in errors], arguments.values())
-    return cfg, table
+    return cfg

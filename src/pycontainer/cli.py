@@ -1,11 +1,15 @@
 import argparse, json, os, logging, sys
+from contextlib import ExitStack
 from pathlib import Path
 from .config import SBOM_FORMATS, SCAN_SEVERITIES
+from .config_loader import _declared_default_values, _validate_config, load_explicit_file_config
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
 from .build_args import redact_values, resolve_arguments
 from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
+from .fs_utils import output_directory_lock
+from .image_validation import finding_exit_code, validate_ignores, validate_image
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -32,6 +36,74 @@ def _metadata_argument(value: str) -> tuple[str, str]:
     if not separator or not key.strip():
         raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
     return key, item
+
+def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None,
+                      redact=str, base_exposed_ports=None):
+    try:
+        report=validate_image(output, tag=tag, platform=platform, ignores=ignores,
+                              base_exposed_ports=base_exposed_ports, redact=redact)
+    except (OSError, ValueError) as exc:
+        print(f"error: {redact(str(exc))}", file=sys.stderr)
+        return 2
+    if expected_digest is not None and report["image"]["digest"] != expected_digest:
+        print("error: the built image no longer matches the selected layout manifest.", file=sys.stderr)
+        return 2
+    if format_ == "json":
+        print(json.dumps(report, sort_keys=True))
+    else:
+        for finding in report["findings"]:
+            print(f"{finding['severity']}: {finding['rule_id']}: {finding['message']}")
+            print(f"  remediation: {finding['remediation']}")
+        if not report["findings"]:
+            print("No image validation findings.")
+        print("Base image provenance: unknown (PCB002 is deferred).")
+    return finding_exit_code(report, fail_on)
+
+def _declared_argument_redactor(declarations):
+    """Redact declared build-argument values, even when the declarations are invalid."""
+    values=_declared_default_values({"build_args": declarations})
+    return lambda message: redact_values(message, values)
+
+def _validate_image_command(parser, args):
+    for option in ("output", "tag", "platform", "config"):
+        if getattr(args, option) == "":
+            parser.error(f"--{option} must not be empty.")
+    ignores=list(args.ignore or [])
+    redact=str
+    if args.config is not None:
+        try:
+            table, config=load_explicit_file_config(Path(args.config))
+            redact=_declared_argument_redactor(config.get("build_args"))
+            _validate_config(config, table)
+            ignores=[*config.get("validate", {}).get("ignore", []), *ignores]
+        except (OSError, ValueError) as exc:
+            print(f"error: {redact(str(exc))}", file=sys.stderr)
+            raise SystemExit(2)
+    try:
+        validate_ignores(ignores)
+    except ValueError as exc:
+        parser.error(redact(str(exc)))
+    code=_image_validation(Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on, redact=redact)
+    if code:
+        raise SystemExit(code)
+
+INIT_TEMPLATE_OPTIONS = ("tag", "base_image", "context_dir", "app", "port", "platform", "include_deps")
+
+def _init_command(parser, args):
+    from .init_config import DEFAULT_OUTPUT, TEMPLATES, run_template, run_wizard
+    given=[name for name in (*INIT_TEMPLATE_OPTIONS, "output") if getattr(args, name) is not None]
+    if args.list_templates:
+        if given or args.force:
+            parser.error("--list-templates takes no other options.")
+        for name, spec in TEMPLATES.items():
+            print(f"{name}: {spec['description']}")
+        return
+    if args.interactive:
+        if given or args.force:
+            parser.error("--interactive asks for every setting; do not combine it with other options.")
+        raise SystemExit(run_wizard())
+    options={name: getattr(args, name) for name in INIT_TEMPLATE_OPTIONS if getattr(args, name) is not None}
+    raise SystemExit(run_template(args.template, args.output if args.output is not None else DEFAULT_OUTPUT, args.force, options))
 
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
@@ -119,6 +191,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,val
         default=None,
         help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
     )
+    b.add_argument("--squash",action="store_true",default=None,help="Flatten builder-created dependency and application layers into one layer (base layers are unchanged; loses layer-level cache reuse)")
+    b.add_argument("--analyze-layers",action="store_true",default=None,help="Report per-platform layer sizes, repeated content and squash savings to layer-analysis.json")
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
     b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
@@ -142,15 +216,37 @@ def main():
     _tolerate_unencodable_output()
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="cmd",required=True)
-    b=sub.add_parser("build")
+    b=sub.add_parser("build",help="Build an OCI image layout")
     _add_build_options(b)
-    val=sub.add_parser("validate",help="Validate configuration offline without building")
-    val_sub=val.add_subparsers(dest="validate_cmd",required=True)
-    vc=val_sub.add_parser("config",help="Validate effective configuration offline (exit 0 or 2)")
-    vc.add_argument("paths",nargs="*",metavar="PATH",help="Files to validate (default: build defaults)")
-    vc.add_argument("--config","-c",dest="config_paths",action="append",metavar="PATH")
+    b.add_argument("--validate",action="store_true",help="Validate the image after building and before pushing")
+    b.add_argument("--ignore",action="append",metavar="RULE",help="Ignore an image validation rule (requires --validate; repeatable)")
+    # --- validate subcommand ---
+    val=sub.add_parser("validate",help="Validate configuration or an OCI image offline")
+    val_sub=val.add_subparsers(dest="validate_cmd",metavar="{config,image}",required=True)
+    vc=val_sub.add_parser(
+        "config",
+        help="Validate the effective build configuration offline",
+        description="Resolve defaults, configuration files and CLI overrides exactly as 'build' does, "
+        "without building, pulling, pushing or touching the cache. Exit 0 when valid, 2 otherwise.",
+    )
+    vc.add_argument("paths",nargs="*",metavar="PATH",help="Configuration files to validate (default: build defaults)")
+    vc.add_argument("--config","-c",dest="config_paths",action="append",metavar="PATH",help="Validate a single configuration file")
     _add_build_options(vc,push=False,validation=True)
     vc.set_defaults(config=None,record_history=None,history_dir=None,verbose=None)
+    vi=val_sub.add_parser(
+        "image",
+        help="Verify and lint an existing OCI image layout offline",
+        description="Verify reachable OCI blobs, then lint the selected image. Exit 0 below the "
+        "failure threshold, 1 for findings, and 2 for usage, layout or integrity errors.",
+    )
+    vi.add_argument("--output",default="dist/image",help="OCI layout directory (default: dist/image)")
+    vi.add_argument("--tag",help="Select the OCI reference name")
+    vi.add_argument("--platform",help="Select the image platform (os/arch[/variant])")
+    vi.add_argument("--format",choices=("text","json"),default="text",help="Output format (default: text)")
+    vi.add_argument("--fail-on",choices=("warning","error"),default="warning",help="Minimum failing severity (default: warning)")
+    vi.add_argument("--config","-c",help="Read validation ignores from a configuration file")
+    vi.add_argument("--ignore",action="append",metavar="RULE",help="Ignore a rule ID (repeatable; extends config ignores)")
+    # --- end validate subcommand ---
     sk=sub.add_parser("skaffold-build",help="Build and push for a Skaffold custom buildCommand (reads IMAGE, BUILD_CONTEXT, PUSH_IMAGE, PLATFORMS)")
     _add_build_options(sk,tagging=False,context=False,push=False,platform=False)
     ti=sub.add_parser("tilt-build",help="Build and push for a Tilt custom_build with skips_local_docker=True (reads EXPECTED_REF)")
@@ -165,6 +261,28 @@ def main():
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    # --- init subcommand (templates and interactive wizard) ---
+    from .init_config import DEFAULT_OUTPUT, TEMPLATES
+    ini=sub.add_parser(
+        "init",
+        help="Create a build configuration file from a template or an interactive wizard",
+        description="Write a [build] configuration file offline. Existing files are never replaced "
+        "without --force; the wizard never replaces files.",
+    )
+    mode=ini.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--template","-t",choices=tuple(TEMPLATES),help="Generate a configuration from a template")
+    mode.add_argument("--interactive","-i",action="store_true",help="Answer prompts in a terminal (requires a TTY)")
+    mode.add_argument("--list-templates",action="store_true",help="List the available templates")
+    ini.add_argument("--output","-o",help=f"Relative output path (default: {DEFAULT_OUTPUT})")
+    ini.add_argument("--force",action="store_true",help="Replace an existing output file (templates only)")
+    ini.add_argument("--tag",help="Image tag (default: local/<context directory name>:latest)")
+    ini.add_argument("--base-image",help="Base image (default: python:<requires-python>-slim)")
+    ini.add_argument("--context",dest="context_dir",help="Build context directory (default: .)")
+    ini.add_argument("--app",help="Application target: module:app for fastapi/flask, module for generic")
+    ini.add_argument("--port",type=int,help="Exposed port (default: 8000 fastapi, 5000 flask, none generic)")
+    ini.add_argument("--platform",help="Target platform, e.g. linux/amd64 or linux/arm64")
+    ini.add_argument("--include-deps",action=argparse.BooleanOptionalAction,default=None,help="Stage dependencies (default: on for fastapi/flask)")
+    # --- end init subcommand ---
     reg=sub.add_parser("registry",help="Delete or prune images in a registry")
     reg_sub=reg.add_subparsers(dest="registry_cmd",required=True)
     rd=reg_sub.add_parser("delete",help="Delete one manifest digest (removes every tag pointing to it)")
@@ -201,6 +319,9 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="init":
+        _init_command(ini, args)
+        return
     if args.cmd=="registry":
         raise SystemExit(_run_registry(parser,args))
     if args.cmd=="history":
@@ -226,6 +347,12 @@ def main():
         print(message)
         raise SystemExit(code)
 
+    if args.cmd=="validate" and args.validate_cmd=="image":
+        _validate_image_command(vi, args)
+        return
+
+    if args.cmd=="build" and args.ignore and not args.validate:
+        b.error("--ignore requires --validate.")
     if args.cmd=="generate":
         from .deployment import generate_compose, generate_kubernetes
         try:
@@ -285,6 +412,8 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'squash': args.squash,
+        'analyze_layers': args.analyze_layers,
         'labels': dict(args.labels) if args.labels is not None else None,
         'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
         'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,
@@ -361,6 +490,14 @@ def main():
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
+    validate = args.cmd=="build" and args.validate
+    if validate and cfg.dry_run:
+        b.error("--validate cannot be used with --dry-run.")
+    ignores=[*cfg.validate.get("ignore", []), *(getattr(args,"ignore",None) or [])]
+    try:
+        validate_ignores(ignores)
+    except ValueError as exc:
+        b.error(cfg.redact(str(exc)))
     if devloop:
         try:
             source="--platform" if args.cmd=="tilt-build" and args.platform is not None else "platform"
@@ -390,20 +527,45 @@ def main():
             parser.exit(1,f"Build history error: {cfg.redact(str(exc))}\n")
         print("Built:", cfg.redact(str(out)))
 
-        if push:
-            if username and not password:
-                password=os.getenv('REGISTRY_PASSWORD')
-            if args.cmd=="tilt-build" and push_target is None:
-                push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
-            pushed=builder.push(
-                registry_url=push_target,
-                username=username,
-                password=password,
-                show_progress=not args.no_progress,
-            )
-            if getattr(args,"output_ref",None):
-                write_reference(Path(args.output_ref),pushed)
-                print("Wrote image reference to", cfg.redact(str(args.output_ref)))
+        with ExitStack() as stack:
+            if validate:
+                try:
+                    stack.enter_context(output_directory_lock(builder.config.output_dir))
+                except (OSError, RuntimeError) as exc:
+                    print(f"error: {cfg.redact(str(exc))}", file=sys.stderr)
+                    raise SystemExit(2)
+                images = builder.platform_images
+                multi = len(images) > 1
+                for image in images:
+                    platform = "/".join(image.platform[key] for key in ("os", "architecture") if key in image.platform)
+                    if image.platform.get("variant"):
+                        platform += "/" + image.platform["variant"]
+                    code=_image_validation(
+                        Path(builder.config.output_dir),
+                        "@" + builder.manifest_digest if multi else builder.config.tag,
+                        platform, ignores, "text", "warning", expected_digest=image.manifest_digest,
+                        redact=cfg.redact, base_exposed_ports=image.base_exposed_ports,
+                    )
+                    if code:
+                        raise SystemExit(code)
+
+            if push:
+                if username and not password:
+                    password=os.getenv('REGISTRY_PASSWORD')
+                if args.cmd=="tilt-build" and push_target is None:
+                    push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
+                push_options=dict(
+                    registry_url=push_target,
+                    username=username,
+                    password=password,
+                    show_progress=not args.no_progress,
+                )
+                if validate and cfg.scan:
+                    push_options["_output_locked"]=True
+                pushed=builder.push(**push_options)
+                if getattr(args,"output_ref",None):
+                    write_reference(Path(args.output_ref),pushed)
+                    print("Wrote image reference to", cfg.redact(str(args.output_ref)))
     except ScanError as exc:
         parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
     except (OSError, ValueError, RuntimeError) as exc:

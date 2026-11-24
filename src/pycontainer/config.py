@@ -10,6 +10,24 @@ from .file_rules import FileRuleError, evaluate_file_rules
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+MIN_PORT, MAX_PORT = 1, 65535
+
+
+def validate_exposed_ports(ports):
+    """Reject non-integer, out-of-range or duplicate exposed ports."""
+    if not isinstance(ports, list):
+        raise ValueError("exposed_ports must be a list of integers.")
+    seen = set()
+    for port in ports:
+        if type(port) is not int:
+            raise ValueError(f"exposed port {port!r} is not an integer.")
+        if not MIN_PORT <= port <= MAX_PORT:
+            raise ValueError(f"exposed port {port} is outside {MIN_PORT}-{MAX_PORT}.")
+        if port in seen:
+            raise ValueError(f"exposed port {port} is listed more than once.")
+        seen.add(port)
+
+
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 MULTI_PLATFORM_SCAN_ERROR = (
@@ -183,6 +201,9 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    validate: Dict[str, List[str]] = field(default_factory=dict)
+    squash: bool = False
+    analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
     index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
