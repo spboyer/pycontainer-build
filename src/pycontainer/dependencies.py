@@ -958,6 +958,7 @@ def _scan_requirements(
         initial_path = logical_root / initial_path.relative_to(context_root)
     pending = [(initial_path, False, frozenset(), False)]
     visited = set()
+    parsed_files = {}
     total_bytes = 0
     hash_pinned = True
     roots = []
@@ -997,12 +998,16 @@ def _scan_requirements(
                 f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
             )
         visited.add((path, constraint))
-        size, lines = _logical_requirement_lines(
-            path, display=display, context_root=context_root, log_redact=log_redact,
-            max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
-            environment_path=environment_path,
-        )
-        total_bytes += size
+        # Interpret each role separately without re-reading the same logical file.
+        if path not in parsed_files:
+            size, lines = _logical_requirement_lines(
+                path, display=display, context_root=context_root, log_redact=log_redact,
+                max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
+                environment_path=environment_path,
+            )
+            total_bytes += size
+            parsed_files[path] = tuple(lines)
+        lines = parsed_files[path]
         for _, line in lines:
             expanded = _expand_requirement_variables(line)
             try:

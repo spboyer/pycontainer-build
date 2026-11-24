@@ -926,14 +926,40 @@ def test_repeated_symlink_target_does_not_skip_nested_requirement_validation(tmp
         validate_requirements(requirements, tmp_path)
 
 
-def test_requirements_size_limit_counts_each_distinct_parse(tmp_path, monkeypatch):
-    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+@pytest.mark.parametrize(
+    "includes",
+    ["-r shared.txt\n-c shared.txt\n", "-c shared.txt\n-r shared.txt\n"],
+)
+def test_requirements_size_limit_reuses_shared_file_across_roles(tmp_path, monkeypatch, includes):
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("-r shared.txt\n-c shared.txt\n")
-    (tmp_path / "shared.txt").write_text("#" * 60)
+    requirements.write_text(includes)
+    shared = tmp_path / "shared.txt"
+    shared.write_text("shared==1.0\n-r nested.txt\n")
+    nested = tmp_path / "nested.txt"
+    nested.write_text("nested==2.0\n")
+    monkeypatch.setattr(
+        dependencies, "MAX_REQUIREMENTS_BYTES",
+        requirements.stat().st_size + shared.stat().st_size + nested.stat().st_size,
+    )
+    original_open = Path.open
+    reads = []
 
-    with pytest.raises(ValueError, match="combined"):
-        validate_requirements(requirements, tmp_path)
+    def track_reads(path, *args, **kwargs):
+        if path in (shared, nested) and args and args[0] == "rb":
+            reads.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_reads)
+    constraints = []
+    roots, paths, hash_pinned = dependencies._scan_requirements(
+        requirements, tmp_path, constraints=constraints,
+    )
+
+    assert roots == ["shared==1.0", "nested==2.0"]
+    assert constraints == ["shared==1.0", "nested==2.0"]
+    assert paths == sorted([requirements, shared, nested])
+    assert not hash_pinned
+    assert reads == [shared, nested]
 
 
 def test_requirements_size_limit_counts_each_symlink_alias(tmp_path, monkeypatch):
