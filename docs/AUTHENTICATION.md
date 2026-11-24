@@ -40,6 +40,30 @@ Push Request
         └─> Success
 ```
 
+### Remote cache requests
+
+Remote-cache import and export resolve credentials for the cache registry,
+independently of image push. They use `get_registry_auth` with
+`include_generic_environment=False`: `REGISTRY_TOKEN`, `REGISTRY_USERNAME`
+and `REGISTRY_PASSWORD` are ignored because they carry no registry identity,
+including when the cache and image registry are the same host. CLI image-push
+credentials are not passed to the cache.
+
+Host-scoped Docker configuration, GHCR's `GITHUB_TOKEN` and ACR's Azure CLI
+provider remain available. For other private cache registries, configure an
+exact registry entry in `~/.docker/config.json`. Without usable cache
+credentials, an unauthorized import warns and rebuilds locally; an
+unauthorized export fails explicitly. Normal image authentication continues
+to accept generic environment credentials. A registry's authentication
+challenge can direct credential exchange to a token service on another origin;
+trust both the cache registry and its advertised token service.
+Cache connections honor `--registry-ca-file` and the exact-host
+`--insecure-registry` opt-in. Credentials are sent over HTTP only to loopback
+hosts. Blob redirects never carry registry credentials and every hop must use
+HTTPS, except that an exact-host `--insecure-registry` may redirect over HTTP
+to its own origin (same scheme, host and port). Cross-origin HTTP hops,
+HTTPS-to-HTTP downgrades and URL credentials are rejected on every hop.
+
 ## Components
 
 ### 1. Auth Providers (`src/pycontainer/auth.py`)
@@ -347,7 +371,9 @@ separate.
   `RegistryAuthenticationError` before secrets leave the process.
 - HTTPS-to-HTTP redirects and HTTP token realms from HTTPS registries are
   rejected. `Authorization`, `Proxy-Authorization` and `Cookie` are dropped on
-  cross-origin redirects; blob storage redirects are credential-free.
+  cross-origin redirects; blob storage redirects are credential-free on every
+  hop and use HTTPS unless they stay on an explicitly insecure registry's own
+  origin.
 - Embedded URL credentials are rejected and error URLs omit userinfo/query
   secrets. Registry connections ignore environment/system proxies.
 - Concurrent initial bearer challenges share token acquisition and replay once;

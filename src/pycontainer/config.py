@@ -164,6 +164,8 @@ class BuildConfig:
     use_cache: bool = True
     cache_dir: Optional[str] = None
     max_cache_size_mb: int = 5000
+    cache_from: Optional[str] = None
+    cache_to: Optional[str] = None
     labels: Optional[Dict[str, str]] = None
     user: Optional[str] = None
     cmd: Optional[List[str]] = None
@@ -271,6 +273,18 @@ class BuildConfig:
             from .tags import resolve_tags
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+        if self.cache_from is not None or self.cache_to is not None:
+            from .remote_cache import parse_cache_spec
+
+            for name in ("cache_from", "cache_to"):
+                value = getattr(self, name)
+                if value is not None:
+                    parse_cache_spec(value, name)
+            if not self.reproducible:
+                raise ValueError(
+                    "cache_from and cache_to require reproducible builds; "
+                    "non-reproducible layers embed host timestamps and ownership."
+                )
         platforms = normalize_platforms(self.platform)
         if len(platforms) > 1:
             unsupported = [p for p in platforms if p not in MULTI_PLATFORM_TARGETS]
@@ -291,6 +305,10 @@ class BuildConfig:
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
+
+    def _needs_build_argument_redaction(self) -> bool:
+        """Return whether resolved arguments have nonempty values to redact."""
+        return any(self._resolved_build_args.values())
 
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""

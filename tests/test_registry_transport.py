@@ -1,4 +1,5 @@
 """Transport security tests: opt-in HTTP registries and custom CA trust."""
+import base64
 import hashlib
 import io
 import json
@@ -12,10 +13,11 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
-from pycontainer import cli
+from pycontainer import auth as auth_module, cli
 from pycontainer.auth import RegistryAuth
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
@@ -45,8 +47,10 @@ class _Registry:
         self.manifests = {}
         self.requests = []
         self.redirect = None
+        self.blob_redirect = None
         self.token_realm = None
         self.token_response = None
+        self.routes = {}
 
 
 def _handler(state):
@@ -70,7 +74,9 @@ def _handler(state):
 
         def do_GET(self):
             self._record()
-            if (
+            if self.path in state.routes:
+                self._send(*state.routes[self.path])
+            elif (
                 state.token_realm
                 and self.headers.get("Authorization") != "Bearer acquired-token"
             ):
@@ -96,8 +102,13 @@ def _handler(state):
                         {"Content-Type": MANIFEST_TYPE, "Docker-Content-Digest": digest},
                     )
             elif "/blobs/" in self.path:
-                body = state.blobs.get(self.path.rsplit("/", 1)[1])
-                self._send(404) if body is None else self._send(200, body)
+                if state.blob_redirect:
+                    self._send(
+                        307, headers={"Location": state.blob_redirect + self.path}
+                    )
+                else:
+                    body = state.blobs.get(self.path.rsplit("/", 1)[1])
+                    self._send(404) if body is None else self._send(200, body)
             else:
                 self._send(404)
 
@@ -325,6 +336,87 @@ def test_cross_origin_redirect_drops_authorization():
 
     assert source.requests[0][2] == "Bearer secret"
     assert target.requests[0][2] is None
+
+
+def _blob_redirect_fixture(state, first_location):
+    content = b"redirected-layer"
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    state.routes[f"/v2/team/app/blobs/{digest}"] = (
+        307, b"", {"Location": first_location}
+    )
+    return content, digest
+
+
+def test_insecure_loopback_pull_blob_follows_relative_same_origin_redirect(tmp_path):
+    with _serve() as (port, state):
+        content, digest = _blob_redirect_fixture(state, "/storage/blob")
+        state.routes["/storage/blob"] = (200, content)
+        client = RegistryClient(
+            f"127.0.0.1:{port}", "team/app", auth_token="secret", insecure=True
+        )
+        assert client.pull_blob(digest, tmp_path / "blob", len(content))
+
+    assert (tmp_path / "blob").read_bytes() == content
+    assert [(path, auth) for _method, path, auth in state.requests] == [
+        (f"/v2/team/app/blobs/{digest}", "Bearer secret"),
+        ("/storage/blob", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "allowed"),
+    [
+        ("/storage/first", "/storage/final", True),
+        ("/storage/first", "{secure}/final", True),
+        ("{secure}/first", "{secure}/final", True),
+        ("{other}/blob", None, False),
+        ("/storage/first", "{other}/final", False),
+        ("/storage/first", "http://localhost:{port}/storage/final", False),
+        ("/storage/first", "http://user:pw@127.0.0.1:{port}/storage/final", False),
+        ("{secure}/first", "http://127.0.0.1:{port}/storage/final", False),
+    ],
+)
+def test_insecure_pull_blob_redirect_policy_applies_to_every_hop(
+    tmp_path, certificate_authority, first, second, allowed
+):
+    server_context, ca_file = certificate_authority
+    with _serve() as (port, state), _serve() as (other_port, other), _serve(
+        server_context
+    ) as (secure_port, secure):
+        names = {
+            "port": port,
+            "other": f"http://127.0.0.1:{other_port}",
+            "secure": f"https://127.0.0.1:{secure_port}",
+        }
+        content, digest = _blob_redirect_fixture(state, first.format(**names))
+        for server in (state, other, secure):
+            server.routes["/storage/final"] = server.routes["/final"] = (200, content)
+            if second is not None:
+                server.routes["/storage/first"] = server.routes["/first"] = (
+                    302, b"", {"Location": second.format(**names)}
+                )
+        client = RegistryClient(
+            f"127.0.0.1:{port}",
+            "team/app",
+            auth_token="secret",
+            insecure=True,
+            ca_file=ca_file,
+        )
+        if allowed:
+            assert client.pull_blob(digest, tmp_path / "blob", len(content))
+            assert (tmp_path / "blob").read_bytes() == content
+        else:
+            with pytest.raises(RegistryRequestError):
+                client.pull_blob(digest, tmp_path / "blob", len(content))
+            assert not (tmp_path / "blob").exists()
+
+    assert state.requests[0][2] == "Bearer secret"
+    redirected = state.requests[1:] + other.requests + secure.requests
+    assert all(auth is None for _method, _path, auth in redirected)
+    assert allowed or not any(
+        path.endswith("final") for _method, path, _auth in redirected
+    )
+    assert allowed or other.requests == []
 
 
 @pytest.mark.parametrize(
@@ -931,3 +1023,84 @@ def test_builder_pull_and_push_honor_registry_transport(
         assert builder.push(show_progress=False) == f"{registry}/team/app:v1"
         assert state.blobs[config_digest] == config_bytes
         assert state.manifests["v1"] == manifest_bytes
+
+
+@pytest.mark.parametrize("transport", ["http", "custom-ca-https"])
+def test_remote_cache_honors_transport_and_isolates_redirect_credentials(
+    tmp_path, monkeypatch, caplog, certificate_authority, no_sleep,
+    opener_constructions, transport
+):
+    server_context, ca_file = certificate_authority
+    tls_context = server_context if transport == "custom-ca-https" else None
+    home = tmp_path / "home"
+    (home / ".docker").mkdir(parents=True)
+    monkeypatch.setattr(auth_module.Path, "home", lambda: home)
+    monkeypatch.setenv("REGISTRY_TOKEN", "synthetic-image-push-token")
+    monkeypatch.setenv("REGISTRY_USERNAME", "push-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "synthetic-push-password")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+
+    with _serve(tls_context) as (port, registry), _serve(server_context) as (storage_port, storage):
+        host = f"127.0.0.1:{port}"
+        cache_spec = f"type=registry,ref={host}/team/cache"
+        (home / ".docker" / "config.json").write_text(json.dumps({
+            "auths": {host: {"username": "cache-user", "password": "cache-pass"}}
+        }))
+
+        def make_builder(name, *, configured, **cache_options):
+            return ImageBuilder(BuildConfig(
+                context_dir=str(context),
+                output_dir=str(tmp_path / f"{name}-out"),
+                cache_dir=str(tmp_path / f"{name}-cache"),
+                include_paths=["app.py"],
+                insecure_registries=[host] if configured and not tls_context else [],
+                registry_ca_file=ca_file if configured else None,
+                **cache_options,
+            ))
+
+        def app_layer(builder, name):
+            directory = tmp_path / f"{name}-layers"
+            directory.mkdir()
+            return builder._create_app_layer(directory, builder.context_include_paths)
+
+        writer = make_builder(
+            "writer", configured=True, cache_from=cache_spec, cache_to=cache_spec
+        )
+        assert writer.remote_cache_from is writer.remote_cache_to
+        cold = app_layer(writer, "writer")
+        storage.blobs.update(registry.blobs)
+        registry.blob_redirect = f"https://127.0.0.1:{storage_port}"
+
+        unconfigured = make_builder("unconfigured", configured=False, cache_from=cache_spec)
+        before = len(registry.requests)
+        with caplog.at_level(logging.WARNING, logger="pycontainer.remote_cache"):
+            rebuilt = app_layer(unconfigured, "unconfigured")
+        assert rebuilt.digest == cold.digest
+        assert "could not import" in caplog.text
+        assert len(registry.requests) == before
+
+        reader = make_builder("reader", configured=True, cache_from=cache_spec)
+
+        def forbid_rebuild(*_args, **_kwargs):
+            pytest.fail("The configured registry cache should supply the layer")
+
+        monkeypatch.setattr(ImageBuilder, "_write_app_layer", forbid_rebuild)
+        warm = app_layer(reader, "reader")
+        assert (warm.digest, warm.size) == (cold.digest, cold.size)
+        assert Path(warm.tar_path).read_bytes() == Path(cold.tar_path).read_bytes()
+
+        expected = "Basic " + base64.b64encode(b"cache-user:cache-pass").decode()
+        assert registry.requests
+        assert all(auth == expected for _, _, auth in registry.requests)
+        assert len(storage.requests) == 2
+        assert all(auth is None for _, _, auth in storage.requests)
+        assert reader.remote_cache_from.client._get_blob_opener() is (
+            reader.remote_cache_from.client._get_blob_opener()
+        )
+        assert sum(
+            any(isinstance(handler, NoRedirect) for handler in handlers)
+            for handlers in opener_constructions
+        ) == 1

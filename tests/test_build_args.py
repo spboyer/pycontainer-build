@@ -234,6 +234,66 @@ def test_real_dry_run_redacts_arguments_and_resolves_cli_fields(tmp_path, monkey
     assert not (tmp_path / "dist").exists()
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_cli_redacts_retained_build_argument_diagnostics(
+    tmp_path, monkeypatch, capsys, caplog, fail
+):
+    value = "private-retained-value"
+    config = BuildConfig(context_dir=str(tmp_path), build_args={"VALUE": value})
+    config.build_args.clear()
+
+    class Builder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            logging.getLogger("retained-argument-test").warning("diagnostic %s", value)
+            if fail:
+                raise RuntimeError(f"synthetic failure: {value}")
+            return "layout"
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli, "ImageBuilder", Builder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build"])
+    with caplog.at_level(logging.WARNING):
+        if fail:
+            with pytest.raises(SystemExit) as error:
+                cli.main()
+            assert error.value.code == 2
+        else:
+            cli.main()
+
+    output = capsys.readouterr()
+    assert value not in output.out + output.err + caplog.text
+    assert "<redacted>" in caplog.text
+    if fail:
+        assert "<redacted>" in output.err
+
+
+@pytest.mark.parametrize("arguments", [None, {}, {"EMPTY": ""}])
+def test_cli_preserves_failure_cause_without_redactable_values(
+    tmp_path, monkeypatch, arguments
+):
+    config = BuildConfig(context_dir=str(tmp_path), build_args=arguments)
+
+    class Builder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            try:
+                raise ValueError("synthetic cause")
+            except ValueError as error:
+                raise RuntimeError("synthetic failure") from error
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli, "ImageBuilder", Builder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build"])
+    with pytest.raises(RuntimeError) as error:
+        cli.main()
+    assert isinstance(error.value.__cause__, ValueError)
+
+
 def test_cli_label_precedence_interpolates_and_hides_metadata(tmp_path, monkeypatch, capsys):
     (tmp_path / "app.py").write_text("print('hello')")
     path = tmp_path / "config.toml"
@@ -318,7 +378,10 @@ def test_security_fragment_output_path_redacts_build_arguments(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("operation", ["pull", "push"])
-def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, caplog, operation):
+@pytest.mark.parametrize("retain_values", [False, True])
+def test_direct_build_redacts_registry_rate_limit_logs(
+    tmp_path, monkeypatch, caplog, operation, retain_values
+):
     value = "private-registry"
     config = BuildConfig(
         base_image="${REGISTRY}.example/team/base:v1",
@@ -328,6 +391,8 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
         output_dir=str(tmp_path / "out"),
         use_cache=False,
     )
+    if retain_values:
+        config.build_args.clear()
     builder = ImageBuilder(config)
     monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
 
@@ -356,14 +421,22 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
     assert value not in caplog.text
 
 
-def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("operation", ["pull", "push"])
+@pytest.mark.parametrize("retain_values", [False, True])
+def test_direct_build_redacts_azure_auth_logs(
+    tmp_path, monkeypatch, caplog, operation, retain_values
+):
     value = "privatehost"
     config = BuildConfig(
         base_image="${REGISTRY}.azurecr.io/team/base:v1",
+        tag="${REGISTRY}.azurecr.io/team/app:v1",
         build_args={"REGISTRY": value},
         context_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
         use_cache=False,
     )
+    if retain_values:
+        config.build_args.clear()
     for provider in (auth_module.EnvironmentAuthProvider, auth_module.DockerConfigAuthProvider):
         monkeypatch.setattr(provider, "get_token", lambda self, registry: None)
         monkeypatch.setattr(provider, "get_credentials", lambda self, registry: None)
@@ -374,12 +447,52 @@ def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
         RegistryClient, "pull_manifest",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
     )
+    monkeypatch.setattr(
+        RegistryClient, "push_blob",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
+    )
+    builder = ImageBuilder(config)
+    builder.manifest_digest = "sha256:" + "a" * 64
+    builder.config_digest = "sha256:" + "b" * 64
+    builder.layers = []
+    manifest = tmp_path / "out" / "blobs" / "sha256" / ("a" * 64)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"{}")
 
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="stopped"):
-        ImageBuilder(config)._pull_base_image(tmp_path / "layers", "linux", "amd64")
+        if operation == "pull":
+            builder._pull_base_image(tmp_path / "layers", "linux", "amd64")
+        else:
+            builder.push(show_progress=False)
 
     assert "Azure CLI authentication failed" in caplog.text
     assert value not in caplog.text
+
+
+def test_mirror_auth_redacts_retained_build_argument(tmp_path, monkeypatch, caplog):
+    value = "private-mirror"
+    config = BuildConfig(
+        base_image="upstream.example/team/base:v1",
+        registry_mirrors={"upstream.example": [f"{value}.azurecr.io"]},
+        context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": value},
+    )
+    config.build_args.clear()
+    monkeypatch.setattr(
+        auth_module.DockerConfigAuthProvider, "get_credentials", lambda *args: None
+    )
+    monkeypatch.setattr(
+        auth_module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1)
+    )
+    monkeypatch.setattr(
+        RegistryClient, "pull_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
+    )
+
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="stopped"):
+        ImageBuilder(config)._pull_base_image(tmp_path / "layers", "linux", "amd64")
+    assert "Azure CLI authentication failed" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
 
 
 def test_direct_build_redacts_system_package_logs(tmp_path, monkeypatch, caplog):

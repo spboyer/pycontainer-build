@@ -30,6 +30,8 @@ CLI_FLAGS = {
     "exclude_defaults": "--no-default-excludes",
     "use_cache": "--no-cache",
     "cache_dir": "--cache-dir",
+    "cache_from": "--cache-from",
+    "cache_to": "--cache-to",
     "include_deps": "--include-deps",
     "requirements_file": "--requirements",
     "verbose": "--verbose",
@@ -43,7 +45,7 @@ CLI_FLAGS = {
 }
 
 NOT_PERFORMED = (
-    "registry: base image existence, platform match, authentication and push",
+    "registry: base image and remote cache availability, platform match, authentication and push",
     "dependency resolution: dependency source selection, wheel installation and target Python ABI",
     "runtime: OCI import and container startup",
     "build context: file selection, framework defaults and entrypoint detection",
@@ -75,6 +77,7 @@ CONSTRUCTOR_GROUPS = (
     ("generate_sbom",),
     ("tag", "tags", "semver_tags", "latest_tag"),
     ("platform",),
+    ("cache_from", "cache_to", "reproducible"),
 )
 
 
@@ -98,6 +101,15 @@ def _constructor_errors(merged: Dict[str, Any], origin) -> List[str]:
                         field = "tags"
                     else:
                         field = "semver_tags" if merged.get("semver_tags") else "latest_tag"
+            elif group[0] == "cache_from":
+                for field in ("cache_from", "cache_to"):
+                    if merged.get(field) is not None:
+                        try:
+                            BuildConfig(**{field: merged[field]})
+                        except ValueError:
+                            break
+                else:
+                    field = "reproducible"
             else:
                 field = group[0]
             errors.append(f"{origin(field)}: {exc}")

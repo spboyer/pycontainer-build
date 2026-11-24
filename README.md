@@ -738,8 +738,70 @@ a build, and they do not cover explicitly named inputs such as requirements or
 manifest files.
 
 **Caching Options**:
-- `--no-cache` — Disable layer caching, force full rebuild
+- `--no-cache` — Disable local caching and remote imports; exports remain enabled
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
+- `--cache-from type=registry,ref=REGISTRY/REPO` — Import the application
+  layer from a registry cache repository (disabled by `--no-cache`)
+- `--cache-to type=registry,ref=REGISTRY/REPO` — Export the application layer
+  to a registry cache repository
+
+**Registry remote cache (experimental)**: only the application layer is
+shared; the dependency layer and base image are not cached remotely. Records
+are OCI artifacts tagged `app-<key>` in the cache repository, where the key is
+a SHA-256 over the record schema, layer format, tar settings, builder Python
+version, and the same file identity used by the local cache (file content,
+relative paths, modes, hard-link topology, workdir, reproducibility and a
+namespace for expanded configuration). Storage paths and unused build
+arguments do not affect that namespace.
+Remote caching requires reproducible builds. The same settings
+are available in `[build]` as `cache-from` and `cache-to`; `ref` must not include
+a tag or digest. Only
+`type=registry` is supported; S3, Azure Blob and GCS backends are tracked in
+#61 and #34.
+
+Trust boundary: a digest proves that a blob was not altered in transit, not
+who produced it. Every principal with push access to the cache repository is a
+trusted writer whose layers are copied verbatim into your images. Use a
+dedicated cache repository that only trusted CI jobs can push to, and give
+pull-request or fork builds pull-only access. Records are not signed.
+
+Cache authentication uses host-scoped Docker configuration, `GITHUB_TOKEN`
+for GHCR, or Azure CLI credentials for ACR. It ignores `REGISTRY_TOKEN`,
+`REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, even when the cache and image
+registry are the same, because these environment variables do not identify
+their intended host. Image-push credentials and CLI username/password values
+are not reused for caching. Configure the cache registry in
+`~/.docker/config.json` or use its host-specific provider. Cache connections
+also honor `--registry-ca-file` and exact-host `--insecure-registry` settings;
+the latter warns and permits HTTP credentials only for loopback hosts.
+
+Import is best-effort: a missing record is a quiet miss, and an invalid record,
+integrity failure, auth or network error logs a warning and rebuilds the layer
+locally. Export errors fail the build: missing or malformed records may be
+replaced, but registry-read, size-limit and digest failures during the initial
+record lookup abort before any registry writes. Manifests and configs are
+size-bounded, layers are limited to 4 GiB and verified by digest and size,
+credentials come from the cache registry's own provider, and control-plane
+redirects strip `Authorization` across origins. Redirected blob storage
+receives no registry credentials. A registry can direct credential exchange
+to its advertised token service, so trust both the cache registry and its
+token service. Every blob redirect hop must contain no URL credentials and
+use HTTPS; the only exception is an exact-host `--insecure-registry`
+redirecting over HTTP to its own origin.
+When remote caching is enabled, generated and cached tars are checked against
+the original source identity and sources are rechecked; mismatched cached
+layers are rebuilt. Export verifies
+blob presence even when the tag is current, then uploads any missing blobs
+before publishing a new tag. Identical concurrent writers produce identical
+records; differing tag publications are last-write-wins. An interrupted export
+leaves untagged blobs that readers never see. Some registries may reject the
+custom artifact and config media types.
+
+```bash
+pycontainer build --tag myapp:ci --push \
+  --cache-from type=registry,ref=ghcr.io/org/myapp-cache \
+  --cache-to type=registry,ref=ghcr.io/org/myapp-cache
+```
 
 **Local Build History**:
 
@@ -1035,13 +1097,14 @@ variables. Only explicit interpolation into persisted image fields (including
 labels, environment, command or workdir) stores a value in image metadata.
 Configuration/source files selected for the app layer are still copied normally;
 exclude files containing defaults if they should not be shipped.
-Diagnostic output redacts nonempty argument values. Cache metadata contains
-hashed resolved configuration/target/backend identity, not argument values;
-argument builds omit source-path metadata. Unused argument changes do not
-invalidate the app-layer cache. The cache stores actual layer contents, not
-encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
-scoped interface; imported values escape dollars to preserve their runtime
-meaning when loaded. Build arguments do not introduce stages or conditions.
+Diagnostic output redacts nonempty resolved argument values even if a direct
+caller later changes `build_args`. Cache metadata contains hashed resolved
+configuration/target/backend identity, not argument values; argument builds
+omit source-path metadata. Unused argument changes do not invalidate the
+app-layer cache. The cache stores actual layer contents, not encrypted data.
+Dockerfile `import --build-arg` remains a separate, Dockerfile-scoped interface;
+imported values escape dollars to preserve their runtime meaning when loaded.
+Build arguments do not introduce stages or conditions.
 
 ---
 
@@ -1155,8 +1218,9 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
 platform is built in isolation: it selects its own base manifest, stages its own
-wheel-only dependency layer, and shares the byte-identical application layer
-(its cache key needs no platform input; dependency layers are never cached).
+wheel-only dependency layer, and shares the byte-identical application layer.
+The cache namespace includes the requested platform configuration; dependency
+layers are never cached.
 Virtualenv closure is verified separately against each target base. Explicit
 dependencies and detected lockfiles take precedence over virtualenvs; otherwise,
 exclude a virtualenv (for example, `--exclude .venv`) to select `requirements.txt`.

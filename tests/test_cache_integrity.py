@@ -137,6 +137,24 @@ def test_cache_identity_includes_workdir_and_reproducibility(tmp_path):
     assert cache.get_layer(files, workdir="/app", reproducible=True) is not None
 
 
+def test_cache_store_rejects_identity_with_emitted_hardlinks(tmp_path):
+    cache = LayerCache(tmp_path / "cache")
+    source = tmp_path / "source.py"
+    source.write_text("content")
+    files = [(source, Path("source.py"))]
+    layer = tmp_path / "layer.tar"
+    layer.write_bytes(b"layer")
+
+    with pytest.raises(ValueError, match="either an identity or emitted hardlinks"):
+        cache.store_layer(
+            files,
+            _digest(layer.read_bytes()),
+            layer,
+            identity=cache.files_identity(files),
+            hardlinks={},
+        )
+
+
 def test_cache_identity_tracks_file_order_when_not_reproducible(tmp_path):
     cache = LayerCache(tmp_path / "cache")
     first = tmp_path / "first.py"

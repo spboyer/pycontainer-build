@@ -178,7 +178,7 @@ insecure-registries = ["localhost:5000", "registry.lan:5000"]
   hosts keep HTTPS and fail with the usual TLS/network error if the server
   only speaks HTTP.
 - Each build logs `WARNING: using plain HTTP for insecure registry ...` once
-  per insecure host that it contacts (base-image pull or push).
+  per insecure host that it contacts (base-image pull, push, or remote cache).
 - **Credentials are never sent over HTTP to non-loopback hosts.** Only
   `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped loopback literals may
   receive Basic or bearer credentials over HTTP. For any other HTTP registry,
@@ -226,6 +226,9 @@ registry-ca-file = "corp-root-ca.pem"
 - `Authorization`, `Proxy-Authorization`, and `Cookie` are removed when a
   redirect changes scheme, host, or effective port (an omitted port equals its
   scheme default). Blob storage redirects are always fetched without credentials.
+- Each blob redirect hop must use HTTPS, except HTTP to the same origin as an
+  explicitly insecure registry or mirror. Cross-origin HTTP is rejected even
+  when the source registry or mirror is explicitly insecure.
 - Each client reuses one verifying TLS context and request opener. Its
   non-redirecting blob opener is created once under a lock on first pull,
   using that same context; push-only clients never construct it. Concurrent

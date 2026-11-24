@@ -483,6 +483,77 @@ def test_skaffold_cli_ignores_config_tags_and_dry_run(tmp_path, monkeypatch, rec
 
 
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_forwards_remote_cache_options(tmp_path, monkeypatch, recording, command):
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        argv = [command]
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+        argv = [command, "--context", str(tmp_path)]
+    cache = "type=registry,ref=cache.example/team/app"
+
+    history_dir = tmp_path / "history"
+    run_cli(
+        monkeypatch, *argv, "--cache-from", cache, "--cache-to", cache,
+        "--record-history", "--history-dir", str(history_dir),
+    )
+
+    (builder,) = recording
+    assert builder.config.cache_from == cache
+    assert builder.config.cache_to == cache
+    assert builder.config.record_history is True
+    assert builder.config.history_dir == str(history_dir)
+    assert builder.pushes
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_remote_cache_failure_stops_push(tmp_path, monkeypatch, recording, command):
+    def fail_build(_self):
+        raise cli.RemoteCacheError("synthetic cache failure")
+
+    monkeypatch.setattr(RecordingBuilder, "build", fail_build)
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        argv = [command]
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+        argv = [command, "--context", str(tmp_path)]
+
+    with pytest.raises(SystemExit) as error:
+        run_cli(monkeypatch, *argv, "--cache-to", "type=registry,ref=cache.example/team/app")
+
+    assert error.value.code == 1
+    assert recording[0].pushes == []
+
+
+def test_devloop_remote_cache_failure_redacts_build_arguments(
+    tmp_path, monkeypatch, recording, capsys
+):
+    value = "private-cache-value"
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(f'[build.build-args]\nVALUE = "{value}"\n')
+    monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    def fail_build(_self):
+        raise cli.RemoteCacheError(f"synthetic cache failure: {value}")
+
+    monkeypatch.setattr(RecordingBuilder, "build", fail_build)
+    with pytest.raises(SystemExit) as error:
+        run_cli(
+            monkeypatch, "tilt-build", "--config", str(config),
+            "--context", str(tmp_path), "--cache-to", "type=registry,ref=cache.example/team/app",
+        )
+
+    assert error.value.code == 1
+    assert value not in capsys.readouterr().err
+    assert recording[0].pushes == []
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
 def test_devloop_build_arguments_preserve_tool_reference(
     tmp_path, monkeypatch, recording, capsys, command,
 ):

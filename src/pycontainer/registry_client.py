@@ -46,6 +46,7 @@ MAX_TAG_PAGES = 10_000
 MAX_LISTED_TAGS = 100_000
 DOCKER_HUB_ALIASES = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 SENSITIVE_HEADERS = ("Authorization", "Proxy-Authorization", "Cookie")
+BLOB_REGISTRY_ATTRIBUTE = "_pycontainer_blob_registry"
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,17 @@ class RegistryAuthenticationConnectionError(
     RegistryAuthenticationError, RegistryConnectionError
 ):
     """Raised when a token realm cannot be reached after the retry budget."""
+
+
+class RegistryNotFoundError(RegistryRequestError):
+    """Raised when a requested registry manifest does not exist."""
+
+    def __init__(self, message: str):
+        super().__init__(f"{message} (manifest not found).")
+
+
+class RegistryManifestFormatError(RegistryRequestError):
+    """Raised when a registry manifest cannot be decoded as a JSON object."""
 
 
 class RegistryRateLimitError(RegistryRequestError):
@@ -221,6 +233,18 @@ def _join_url(source_url: str, location: str, insecure: bool = False) -> str:
     return target
 
 
+def _check_blob_redirect(registry_url: str, target_url: str, insecure: bool) -> None:
+    """Allow plain HTTP blob hops only back to an explicitly insecure registry."""
+    if urllib.parse.urlsplit(target_url).scheme.lower() == "https":
+        return
+    if insecure and _origin(target_url) == _origin(registry_url):
+        return
+    raise RegistryRequestError(
+        "Registry blob redirects must use HTTPS unless they stay on the "
+        "explicitly insecure registry's own origin."
+    )
+
+
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     """Follow redirects without downgrades or cross-origin authorization."""
 
@@ -237,8 +261,15 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _check_transport(req.full_url, newurl, self.insecure)
+        blob_registry = getattr(req, BLOB_REGISTRY_ATTRIBUTE, None)
+        if blob_registry is not None:
+            _check_blob_redirect(blob_registry, newurl, self.insecure)
         new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_request is not None and _origin(req.full_url) != _origin(newurl):
+        if new_request is not None and blob_registry is not None:
+            setattr(new_request, BLOB_REGISTRY_ATTRIBUTE, blob_registry)
+        if new_request is not None and (
+            blob_registry is not None or _origin(req.full_url) != _origin(newurl)
+        ):
             for key, _value in new_request.header_items():
                 if any(key.lower() == header.lower() for header in SENSITIVE_HEADERS):
                     new_request.remove_header(key)
@@ -1077,6 +1108,7 @@ class RegistryClient:
         reference: str,
         expected_digest: Optional[str] = None,
         expected_size: Optional[int] = None,
+        max_size: Optional[int] = None,
     ) -> Tuple[Dict, str]:
         """Pull manifest, returning its decoded JSON and registry digest."""
         if expected_digest is not None:
@@ -1085,6 +1117,8 @@ class RegistryClient:
             type(expected_size) is not int or expected_size < 0
         ):
             raise ValueError("Expected manifest size must be a non-negative integer.")
+        if max_size is not None and (type(max_size) is not int or max_size < 0):
+            raise ValueError("Maximum manifest size must be a non-negative integer.")
 
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
         headers = {
@@ -1099,18 +1133,18 @@ class RegistryClient:
             "GET",
             url,
             headers=headers,
-            max_response_bytes=(
-                MAX_MANIFEST_BYTES
-                if expected_size is None
-                else min(expected_size, MAX_MANIFEST_BYTES)
+            max_response_bytes=min(
+                limit for limit in (expected_size, max_size, MAX_MANIFEST_BYTES)
+                if limit is not None
             ),
         )
+        if status == 404:
+            raise self._error(
+                "Manifest pull", url, status, body, response_headers,
+                error_class=RegistryNotFoundError,
+            )
         if status != 200:
             raise self._error("Manifest pull", url, status, body, response_headers)
-        if not body:
-            raise RegistryRequestError(
-                f"Registry returned an empty manifest response for {reference}."
-            )
         if expected_size is not None and len(body) != expected_size:
             raise BlobIntegrityError(
                 f"Downloaded manifest has size {len(body)}, expected {expected_size}."
@@ -1121,39 +1155,45 @@ class RegistryClient:
                 f"Downloaded manifest hashes to {body_digest}, expected "
                 f"{expected_digest}."
             )
+        digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
+            "docker-content-digest"
+        )
+        if digest:
+            if digest.startswith("sha512:"):
+                expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
+            elif digest.startswith("sha256:"):
+                expected_header = body_digest
+            else:
+                # Unsupported algorithms remain opaque and are not treated as verified.
+                expected_header = None
+            if expected_header is not None and digest != expected_header:
+                raise BlobIntegrityError(
+                    f"Registry-reported manifest digest does not match its body "
+                    f"digest {body_digest}."
+                )
+        else:
+            digest = body_digest
+        if not body:
+            raise RegistryManifestFormatError(
+                f"Registry returned an empty manifest response for {reference}."
+            )
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
             parse_error = f" at line {error.lineno}, column {error.colno}"
         except UnicodeDecodeError:
             parse_error = ": expected UTF-8"
+        except (RecursionError, ValueError):
+            parse_error = ": exceeded supported JSON limits"
         else:
             parse_error = None
         if parse_error:
-            raise RegistryRequestError(
+            raise RegistryManifestFormatError(
                 f"Registry returned invalid manifest JSON{parse_error}."
             )
         if not isinstance(manifest, dict):
-            raise RegistryRequestError(
+            raise RegistryManifestFormatError(
                 f"Registry returned a non-object manifest for {reference}."
-            )
-        digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
-            "docker-content-digest"
-        )
-        if not digest:
-            return manifest, body_digest
-        if digest.startswith("sha512:"):
-            expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
-        elif digest.startswith("sha256:"):
-            expected_header = body_digest
-        else:
-            # Unsupported algorithms cannot be verified; return the header opaquely so
-            # callers never treat it, or a sha256 alias, as a verified digest.
-            return manifest, digest
-        if digest != expected_header:
-            raise BlobIntegrityError(
-                f"Registry-reported manifest digest does not match its body "
-                f"digest {body_digest}."
             )
         return manifest, digest
 
@@ -1326,9 +1366,12 @@ class RegistryClient:
 
     def _open_blob_redirect(self, url: str, location: str):
         target = _join_url(url, location, self.insecure)
-        return self._opener.open(
-            urllib.request.Request(target), timeout=self.timeout
-        )
+        _check_blob_redirect(self.base_url, target, self.insecure)
+        # Storage receives no registry credentials, even on the same origin;
+        # SafeRedirect applies the same blob policy to every later hop.
+        request = urllib.request.Request(target)
+        setattr(request, BLOB_REGISTRY_ATTRIBUTE, self.base_url)
+        return self._opener.open(request, timeout=self.timeout)
 
     def _download_blob_once(
         self,

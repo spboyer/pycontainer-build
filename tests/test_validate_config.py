@@ -108,6 +108,106 @@ def test_cli_overrides_take_precedence_and_are_attributed(offline, monkeypatch, 
     assert _run(monkeypatch, ["validate", "config", "-c", path, "--platform", "linux/amd64"]) == 0
 
 
+@pytest.mark.parametrize("option", ["cache-from", "cache-to"])
+@pytest.mark.parametrize("source", ["file", "cli"])
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_invalid_remote_cache_identifies_its_source(
+    offline, monkeypatch, capsys, option, source, table
+):
+    valid = "type=registry,ref=registry.example/team/cache"
+    invalid = "type=registry,ref=registry.example/team/cache:tag"
+    value = invalid if source == "file" else valid
+    path = _write(offline / "config.toml", f'[{table}]\n{option} = "{value}"\n')
+    extra = [f"--{option}", invalid] if source == "cli" else []
+    origin = f"CLI option --{option}" if source == "cli" else f"[{table}].{option.replace('-', '_')}"
+
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, [*command, *extra]) == 2
+        err = capsys.readouterr().err
+        assert f"{origin}:" in err
+        assert "without a tag or digest" in err
+
+
+@pytest.mark.parametrize("source", ["file", "cli"])
+def test_remote_cache_requires_reproducibility_with_source(offline, monkeypatch, capsys, source):
+    setting = "reproducible = false\n" if source == "file" else ""
+    path = _write(
+        offline / "config.toml",
+        '[build]\ncache-to = "type=registry,ref=registry.example/team/cache"\n' + setting,
+    )
+    extra = ["--no-reproducible"] if source == "cli" else []
+    origin = "[build].reproducible:" if source == "file" else "CLI option --no-reproducible:"
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, [*command, *extra]) == 2
+        err = capsys.readouterr().err
+        assert origin in err
+        assert "require reproducible builds" in err
+
+
+def test_invalid_cache_spec_is_attributed_before_reproducibility(offline, monkeypatch, capsys):
+    options = [
+        "--cache-from", "type=registry,ref=registry.example/team/source",
+        "--cache-to", "type=registry,ref=registry.example/team/destination:tag",
+        "--no-reproducible",
+    ]
+    assert _run(monkeypatch, ["validate", "config", *options]) == 2
+    err = capsys.readouterr().err
+    assert "CLI option --cache-to:" in err
+    assert "without a tag or digest" in err
+
+
+def test_invalid_remote_cache_redacts_argument_values(offline, monkeypatch, capsys):
+    value = "private-cache.example"
+    source = offline / value
+    source.mkdir()
+    path = _write(
+        source / "config.toml",
+        f'[build]\ncache-from = "type=registry,ref={value}/team/cache:tag"\n'
+        f'[build.build-args]\nVALUE = "{value}"\n',
+    )
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, command) == 2
+        err = capsys.readouterr().err
+        assert "[build].cache_from:" in err
+        assert value not in err
+        assert "<redacted>" in err
+
+
+def test_remote_cache_overrides_match_build_without_offline_side_effects(offline, monkeypatch):
+    path = _write(
+        offline / "config.toml",
+        '[build]\ncache-from = "type=s3,ref=bucket/cache"\n',
+    )
+    source = "type=registry,ref=registry.example/team/source"
+    destination = "type=registry,ref=registry.example/team/destination"
+    options = ["--cache-from", source, "--cache-to", destination, "--no-cache"]
+    configs = []
+    original = effective_config.resolve_build_config
+
+    def resolve(*args):
+        result = original(*args)
+        configs.append(result[0])
+        return result
+
+    monkeypatch.setattr(cli, "resolve_build_config", resolve)
+    before = _tree(offline)
+    assert _run(monkeypatch, ["validate", "config", path, *options]) == 0
+    assert _tree(offline) == before
+
+    class FakeBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeBuilder)
+    assert _run(monkeypatch, ["build", "--config", path, *options]) == 0
+    assert [(cfg.cache_from, cfg.cache_to, cfg.use_cache) for cfg in configs] == [
+        (source, destination, False), (source, destination, False),
+    ]
+
+
 @pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
 def test_cli_overrides_invalid_file_types_before_validation(offline, monkeypatch, capsys, table):
     path = _write(offline / "config.toml", f'[{table}]\nplatform = 123\ninclude-deps = "invalid"\n')

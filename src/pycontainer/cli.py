@@ -4,6 +4,7 @@ from .config import SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
+from .remote_cache import RemoteCacheError
 from .build_args import redact_values, resolve_arguments
 from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
@@ -86,8 +87,10 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,val
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
     if not validation:
         b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
-    b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
+    b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable local cache and remote imports (exports remain enabled)")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
+    b.add_argument("--cache-from",help="Import the app layer from a registry cache: type=registry,ref=REGISTRY/REPOSITORY")
+    b.add_argument("--cache-to",help="Export the app layer to a registry cache: type=registry,ref=REGISTRY/REPOSITORY")
     if not validation:
         history_options=b.add_mutually_exclusive_group()
         history_options.add_argument("--record-history",dest="record_history",action="store_true",default=None,help="Record private local build timing history")
@@ -273,6 +276,8 @@ def main():
         'exclude_defaults': args.exclude_defaults,
         'use_cache': args.use_cache,
         'cache_dir': args.cache_dir,
+        'cache_from': args.cache_from,
+        'cache_to': args.cache_to,
         'record_history': args.record_history,
         'history_dir': args.history_dir,
         'include_deps': args.include_deps,
@@ -381,7 +386,10 @@ def main():
 
     from .scanning import ScanError
     log_filter = _BuildArgumentLogFilter(cfg)
-    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    handlers = (
+        list(logging.getLogger().handlers)
+        if cfg._needs_build_argument_redaction() else []
+    )
     for handler in handlers:
         handler.addFilter(log_filter)
     try:
@@ -408,10 +416,12 @@ def main():
             if getattr(args,"output_ref",None):
                 write_reference(Path(args.output_ref),pushed)
                 print("Wrote image reference to", cfg.redact(str(args.output_ref)))
+    except RemoteCacheError as exc:
+        parser.exit(1, f"error: {cfg.redact(str(exc))}\n")
     except ScanError as exc:
         parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
     except (OSError, ValueError, RuntimeError) as exc:
-        if not cfg.build_args:
+        if not cfg._needs_build_argument_redaction():
             raise
         parser.error(cfg.redact(str(exc)))
     finally:

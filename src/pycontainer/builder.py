@@ -213,6 +213,12 @@ from .local_image import (
     verify_layer_diff_ids,
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .remote_cache import (
+    RegistryLayerCache,
+    RemoteCacheError,
+    app_layer_cache_key,
+    parse_cache_spec,
+)
 from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .squash import SquashError, squash_layers
@@ -459,6 +465,28 @@ class ImageBuilder:
             self.cache=LayerCache(cache_dir=cache_dir, max_size_mb=config.max_cache_size_mb)
         else:
             self.cache=None
+        self.remote_cache_from=None
+        self.remote_cache_to=None
+        if not self.dry_run:
+            log_options=(
+                {"log_redact": self.config.redact}
+                if self.config._needs_build_argument_redaction() else {}
+            )
+            if config.cache_from and config.use_cache:
+                self.remote_cache_from=RegistryLayerCache(
+                    parse_cache_spec(config.cache_from, "cache_from"),
+                    client_factory=self._registry_client,
+                    **log_options,
+                )
+            if config.cache_to:
+                ref=parse_cache_spec(config.cache_to, "cache_to")
+                self.remote_cache_to=(
+                    self.remote_cache_from
+                    if self.remote_cache_from and self.remote_cache_from.ref==ref
+                    else RegistryLayerCache(
+                        ref, client_factory=self._registry_client, **log_options
+                    )
+                )
 
     def _print(self, message: str):
         print(self.config.redact(message))
@@ -842,7 +870,10 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
         client=RegistryClient(
             registry,
             repo,
@@ -864,7 +895,10 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1131,7 +1165,10 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1265,6 +1302,10 @@ class ImageBuilder:
         for name in render_security_fragments(self.config.security, self.config.context_dir):
             self._print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         self._print(f"  Use Cache: {self.config.use_cache}")
+        if self.config.cache_from:
+            self._print(f"  Cache From: {self.config.cache_from}")
+        if self.config.cache_to:
+            self._print(f"  Cache To: {self.config.cache_to}")
 
     def _uses_lockfile(self) -> bool:
         if self.config.lockfile:
@@ -1564,6 +1605,7 @@ class ImageBuilder:
 
     def _create_app_layer(self, layers_dir, include_paths):
         ctx=Path(self.config.context_dir)
+        include_paths=tuple(include_paths)
         files=select_context_files(ctx, include_paths, self.context_excludes)
         configured_requirements = ctx / (self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE)
         reject_shipped_credentials(
@@ -1575,39 +1617,148 @@ class ImageBuilder:
             ],
         )
 
-        if self.cache:
-            cached=self.cache.get_layer(
-                files,
-                workdir=self.config.workdir,
-                reproducible=self.config.reproducible,
+        identity=None
+        if self.cache or self.remote_cache_from or self.remote_cache_to:
+            identity=(self.cache or LayerCache()).files_identity(
+                files, self.config.workdir, self.config.reproducible,
                 namespace=self.config.cache_identity(),
             )
-            if cached:
-                digest, cache_path=cached
-                final=layers_dir/digest.split(":",1)[1]
-                tmp=_create_temporary_file(layers_dir,"app-cache")
-                try:
-                    with cache_path.open("rb") as source, tmp.open("wb") as target:
-                        shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
-                        target.flush()
-                        os.fsync(target.fileno())
-                    actual_digest, size = _hash_file(tmp)
-                    if actual_digest != digest:
-                        raise LayerIntegrityError(
-                            f"Cached layer hashes to {actual_digest}, not {digest}."
-                        )
-                    _publish_content_addressed(tmp, final, digest, size)
-                    return OCILayer(
-                        "application/vnd.oci.image.layer.v1.tar",
-                        digest,
-                        size,
-                        str(final),
-                    )
-                finally:
-                    tmp.unlink(missing_ok=True)
 
+        layer=None
+        if self.cache:
+            layer=self._app_layer_from_local_cache(layers_dir, files, identity)
+        if layer is None and self.remote_cache_from:
+            layer=self._app_layer_from_remote_cache(layers_dir, files, identity)
+        if layer is None:
+            layer=self._write_app_layer(layers_dir, files, identity, include_paths)
+        if self.remote_cache_from or self.remote_cache_to:
+            self._verify_app_identity(files, identity, include_paths)
+        if self.remote_cache_to:
+            self._export_app_layer(layer, identity)
+        return layer
+
+    def _app_layer_from_local_cache(self, layers_dir, files, identity):
+        cached=self.cache.get_layer(
+            files,
+            workdir=self.config.workdir,
+            reproducible=self.config.reproducible,
+            identity=identity,
+        )
+        if not cached:
+            return None
+        digest, cache_path=cached
+        final=layers_dir/digest.split(":",1)[1]
+        tmp=_create_temporary_file(layers_dir,"app-cache")
+        try:
+            with cache_path.open("rb") as source, tmp.open("wb") as target:
+                shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
+                target.flush()
+                os.fsync(target.fileno())
+            actual_digest, size = _hash_file(tmp)
+            if actual_digest != digest:
+                raise LayerIntegrityError(
+                    f"Cached layer hashes to {actual_digest}, not {digest}."
+                )
+            if (
+                (self.remote_cache_from or self.remote_cache_to)
+                and not self._cached_app_layer_matches(tmp, files, identity)
+            ):
+                return None
+            _publish_content_addressed(tmp, final, digest, size)
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar",
+                digest,
+                size,
+                str(final),
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _app_layer_from_remote_cache(self, layers_dir, files, identity):
+        fetched=self.remote_cache_from.fetch(app_layer_cache_key(identity), layers_dir)
+        if not fetched:
+            return None
+        digest, path, size=fetched
+        if not self._cached_app_layer_matches(path, files, identity):
+            return None
+        if self.cache:
+            self.cache.store_layer(
+                files,
+                digest,
+                path,
+                workdir=self.config.workdir,
+                reproducible=self.config.reproducible,
+                identity=identity,
+                record_source_files=not (
+                    self.config.build_args or self.config._needs_build_argument_redaction()
+                ),
+            )
+        return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
+
+    def _verify_app_identity(self, files, identity, include_paths, *, hardlinks=None):
+        current_files=select_context_files(
+            Path(self.config.context_dir), include_paths, self.context_excludes
+        )
+        expected_names=sorted(Path(relative).as_posix() for _, relative in files)
+        current_names=sorted(Path(relative).as_posix() for _, relative in current_files)
+        if current_names!=expected_names:
+            raise RemoteCacheError(
+                "Application sources changed during the build; refusing to use "
+                "a layer that may not match its cache key."
+            )
+        current=LayerCache().files_identity(
+            current_files,
+            self.config.workdir,
+            self.config.reproducible,
+            hardlinks=hardlinks,
+            namespace=self.config.cache_identity(),
+        )
+        if current!=identity:
+            raise RemoteCacheError(
+                "Application sources changed during the build; refusing to use "
+                "a layer that may not match its cache key."
+            )
+
+    def _verify_app_layer_identity(self, path, files, identity):
+        message=None
+        try:
+            actual=LayerCache().app_layer_identity(
+                files, path, self.config.workdir, namespace=self.config.cache_identity()
+            )
+        except (
+            tarfile.TarError, OSError, ValueError, EOFError, OverflowError, RecursionError
+        ) as error:
+            message=self.config.redact(
+                f"Could not verify the application layer against its input identity: {error}"
+            )
+            if not self.config._needs_build_argument_redaction():
+                raise RemoteCacheError(message) from error
+        if message is not None:
+            # Do not retain an unredacted exception in a build-argument traceback.
+            raise RemoteCacheError(message)
+        if actual!=identity:
+            raise RemoteCacheError(
+                "Application sources changed during the build or the application "
+                "layer does not match them; refusing to use an inconsistent layer."
+            )
+
+    def _cached_app_layer_matches(self, path, files, identity):
+        try:
+            self._verify_app_layer_identity(path, files, identity)
+        except RemoteCacheError as error:
+            logger.warning("%s", self.config.redact(f"Ignoring cached application layer: {error}"))
+            return False
+        return True
+
+    def _export_app_layer(self, layer, identity):
+        self.remote_cache_to.store(
+            app_layer_cache_key(identity), layer.digest, Path(layer.tar_path), layer.size
+        )
+
+    def _write_app_layer(self, layers_dir, files, identity, include_paths):
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=ordered_app_files(files, self.config.reproducible)
+        uses_remote_cache=self.remote_cache_from or self.remote_cache_to
         try:
             with tarfile.open(tmp,'w') as tar:
                 for abs_path, rel in files_sorted:
@@ -1627,6 +1778,11 @@ class ImageBuilder:
                     else:
                         tar.addfile(tarinfo)
                 hardlinks=emitted_hardlinks(files_sorted, tar.getmembers())
+            if uses_remote_cache:
+                self._verify_app_identity(
+                    files, identity, include_paths, hardlinks=hardlinks
+                )
+                self._verify_app_layer_identity(tmp, files, identity)
             digest, size = _hash_file(tmp)
             final=layers_dir/digest.split(":",1)[1]
             _publish_content_addressed(tmp, final, digest, size)
@@ -1638,9 +1794,12 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
-                    namespace=self.config.cache_identity(),
-                    record_source_files=not bool(self.config.build_args),
-                    hardlinks=hardlinks,
+                    identity=identity if uses_remote_cache else None,
+                    namespace=None if uses_remote_cache else self.config.cache_identity(),
+                    record_source_files=not (
+                        self.config.build_args or self.config._needs_build_argument_redaction()
+                    ),
+                    hardlinks=None if uses_remote_cache else hardlinks,
                 )
 
             return OCILayer(

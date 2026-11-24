@@ -18,6 +18,7 @@ daemon without discussing the trade-off first.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
 - `cache.py`: optional local application-layer cache.
+- `remote_cache.py`: experimental registry-backed application-layer cache.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `registry_cleanup.py`: `registry delete`/`prune` planning and confirmation.
   Deletion is by manifest digest and removes every aliased tag; never select a
@@ -50,11 +51,15 @@ currently has no `__main__.py`.
 ## Cache behavior
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
-selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings, plus
+selects another location and `--no-cache` disables local caching and remote
+imports, but not explicit exports. Cache keys include file
+content, normalized relative paths, workdir, reproducibility settings, and a
+namespace for expanded configuration excluding storage paths, plus
 the context-relative hardlink targets `tarfile` emits (never inode numbers or
 absolute paths); key version 3 invalidated earlier keys that lacked them, and
 version 4 invalidated Windows entries whose symlink text kept backslashes.
+Unused build arguments do not affect the namespace; when arguments are present,
+local cache indexes omit source paths.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -63,6 +68,27 @@ the same OS (`tests/test_cache_portability.py`); source modes are part of the
 key, so Windows and Linux caches are not interchangeable. The non-gating
 `cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
 cross-OS restore outcomes.
+
+`--cache-from`/`--cache-to type=registry,ref=<registry>/<repo>` share only the
+app layer through `RegistryClient`, using versioned keys over the local file
+identity, layer format and builder Python version. Push access to the cache
+repository defines the trusted writers; digests prove integrity, not
+provenance. Import failures warn and rebuild; remote caching validates the tar
+against its source identity and rechecks sources. Mismatched cached layers are
+rebuilt; export publishes blobs before the tag and fails explicitly. Missing
+or malformed manifests can be replaced, but registry-read, size-limit and
+digest failures during the initial record lookup abort before any registry
+writes. Nonempty resolved build-argument values remain redacted if `build_args`
+changes; preserve exception context when no values require redaction.
+Control-plane redirects drop `Authorization`
+across origins. Blob redirects carry no credentials, and every hop must be HTTPS
+unless it stays on an explicitly insecure registry's own origin.
+Cache connections honor the same custom CA and exact-host HTTP opt-in as image
+pulls and pushes; HTTP credentials are restricted to loopback hosts.
+Cache auth excludes unscoped `REGISTRY_TOKEN` and `REGISTRY_USERNAME`/
+`REGISTRY_PASSWORD` environment credentials, including for same-host caches;
+use host-scoped Docker config, GHCR or ACR providers instead.
+S3, Azure Blob and GCS backends remain open in #61 and #34.
 
 ## Setup and verified checks
 

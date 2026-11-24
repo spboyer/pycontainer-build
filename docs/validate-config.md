@@ -19,9 +19,10 @@ pycontainer validate config -c PATH [OVERRIDES]
 - **Overrides:** the effective-config options accepted by `build` (`--tag`,
   `--semver-tags`, `--latest`, `--base-image`, `--context`, `--include`,
   `--exclude`, `--no-default-excludes`, `--no-cache`, `--cache-dir`,
-  `--include-deps`, `--requirements`, `--platform`, `--no-reproducible`,
-  `--sbom`, `--system-package`, `--no-detect-system-packages`) take
-  precedence over file values. Push credentials and operational flags
+  `--cache-from`, `--cache-to`, `--include-deps`, `--requirements`,
+  `--platform`, `--no-reproducible`, `--sbom`, `--system-package`,
+  `--no-detect-system-packages`) take precedence over file values. Push
+  credentials and operational flags
   (`--push`, `--registry`, `--username`, `--password`, `--no-progress`,
   `--verbose`, `--dry-run`) are rejected.
 
@@ -57,7 +58,8 @@ provided table, including an empty one, enables interpolation.
 - Semantic checks shared with `build`: SBOM format, system package names, tag
   and base-image references, platform format, relative include/exclude and
   requirements paths, an existing context directory, and the supported
-  dependency-staging platforms when `include-deps` is set.
+  dependency-staging platforms when `include-deps` is set. Registry cache
+  specifications and their reproducible-build requirement are also checked.
 
 Each diagnostic names its source file and where the offending value came from:
 a table field such as `[tool.pycontainer].platform`, a CLI option such as
@@ -75,7 +77,8 @@ a table field such as `[tool.pycontainer].platform`, a CLI option such as
 Validation is offline. It never constructs the image builder, acquires cache
 locks, contacts a registry or writes files, so it cannot verify:
 
-- base image existence, platform match, registry authentication or push;
+- base image and remote-cache availability, platform match, registry
+  authentication, artifact support or push;
 - dependency source selection, wheel installation or target Python ABI;
 - OCI import or container startup;
 - build-context file selection, framework defaults or entrypoint detection.

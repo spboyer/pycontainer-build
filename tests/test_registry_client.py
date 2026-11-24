@@ -23,6 +23,7 @@ from pycontainer.registry_client import (
     TRANSFER_CHUNK_SIZE,
     RegistryAuthenticationError,
     RegistryClient,
+    RegistryNotFoundError,
     RegistryQuotaError,
     RegistryRateLimitError,
     RegistryRequestError,
@@ -837,6 +838,71 @@ def _patch_urlopen(monkeypatch, handler):
     return requests, delays
 
 
+def test_bounded_manifest_response_redacts_secrets_and_observes_rate_limit(
+    monkeypatch, caplog
+):
+    token = "synthetic-bounded-token"
+    client = RegistryClient("registry.example", "team/app", auth_token=token)
+    response = _Response(
+        b"oversized",
+        headers={"ratelimit-limit": "100", "ratelimit-remaining": "0"},
+    )
+    monkeypatch.setattr(client._opener, "open", lambda request, timeout: response)
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        with pytest.raises(RegistryRequestError, match="exceeds 2 bytes") as error:
+            client.pull_manifest(f"cache-{token}", max_size=2)
+
+    assert response.read_sizes == [3]
+    assert "rate limit is nearly exhausted" in caplog.text
+    assert token not in str(error.value)
+    assert token not in "".join(traceback.format_exception(error.value))
+    assert token not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("expected_size", "max_size", "global_limit"),
+    [(4, 2, 8), (4, 8, 2), (None, 2, 8), (None, 8, 2)],
+)
+def test_manifest_uses_strictest_response_limit(
+    monkeypatch, expected_size, max_size, global_limit
+):
+    client = RegistryClient("registry.example", "team/app")
+    response = _Response(b"1234")
+    monkeypatch.setattr("pycontainer.registry_client.MAX_MANIFEST_BYTES", global_limit)
+    monkeypatch.setattr(client._opener, "open", lambda request, timeout: response)
+
+    with pytest.raises(RegistryRequestError, match="exceeds 2 bytes"):
+        client.pull_manifest("latest", expected_size=expected_size, max_size=max_size)
+    assert response.read_sizes == [3]
+
+
+@pytest.mark.parametrize("max_size", [-1, True, 1.5, "2"])
+def test_manifest_rejects_invalid_maximum_size(max_size):
+    client = RegistryClient("registry.example", "team/app")
+    with pytest.raises(ValueError, match="Maximum manifest size"):
+        client.pull_manifest("latest", max_size=max_size)
+
+
+def test_missing_manifest_error_redacts_registry_credentials(monkeypatch):
+    token = "synthetic-missing-token"
+    client = RegistryClient("registry.example", "team/app", auth_token=token)
+    _patch_urlopen(
+        monkeypatch,
+        lambda request, _count: (_ for _ in ()).throw(
+            _http_error(request.full_url, 404, body=b"synthetic-untrusted-body")
+        ),
+    )
+
+    with pytest.raises(RegistryNotFoundError, match="not found") as error:
+        client.pull_manifest(f"cache-{token}")
+
+    assert token not in str(error.value)
+    assert token not in "".join(traceback.format_exception(error.value))
+    assert "synthetic-untrusted-body" not in str(error.value)
+    assert error.value.status == 404
+
+
 def test_denied_manifest_push_reports_operation_and_permission_hint(
     monkeypatch,
 ):
@@ -1644,27 +1710,29 @@ def test_auth_upload_replay_preserves_nonzero_body_offset(monkeypatch, rewind_fa
         assert [payload for _, payload in requests] == [b"payload", b"payload"]
 
 
-def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
+def test_blob_redirect_redacts_query_and_http_error_traceback(
     tmp_path, monkeypatch, caplog
 ):
     redirect = "https://storage.example/blob?token=synthetic-query-token"
     reason_token = "synthetic-status-token"
 
-    class Opener:
+    class RegistryOpener:
         def open(self, request, timeout):
             raise _http_error(request.full_url, 307, {"Location": redirect})
 
-    def fake_urlopen(request, timeout):
-        headers = Message()
-        headers["Retry-After"] = "120"
-        headers["RateLimit-Remaining"] = "0"
-        raise urllib.error.HTTPError(
-            request.full_url, 429, f"Bearer {reason_token}", headers, io.BytesIO(b"")
-        )
+    class StorageOpener:
+        def open(self, request, timeout):
+            assert request.get_header("Authorization") is None
+            headers = Message()
+            headers["Retry-After"] = "120"
+            headers["RateLimit-Remaining"] = "0"
+            raise urllib.error.HTTPError(
+                request.full_url, 429, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+            )
 
     client = RegistryClient("registry.example", "team/app")
-    client._blob_opener = Opener()
-    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    client._blob_opener = RegistryOpener()
+    monkeypatch.setattr(client._opener, "open", StorageOpener().open)
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
@@ -1675,6 +1743,43 @@ def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
     assert "storage.example" in str(error.value)
     assert "storage.example" in caplog.text
     for secret in ("synthetic-query-token", reason_token):
+        assert secret not in str(error.value)
+        assert secret not in caplog.text
+        assert secret not in rendered
+
+
+def test_blob_redirect_rejects_url_credentials_without_exposing_http_error(
+    tmp_path, monkeypatch, caplog
+):
+    reason_token = "synthetic-status-token"
+    redirect = (
+        "https://synthetic-user:synthetic-password@storage.example/blob"
+        "?token=synthetic-query-token"
+    )
+
+    class Opener:
+        def open(self, request, timeout):
+            headers = Message()
+            headers["Location"] = redirect
+            raise urllib.error.HTTPError(
+                request.full_url, 307, f"Bearer {reason_token}", headers, io.BytesIO(b"")
+            )
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        with pytest.raises(RegistryRequestError, match="embedded credentials") as error:
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    rendered = "".join(traceback.format_exception(error.value))
+    for secret in (
+        "synthetic-user",
+        "synthetic-password",
+        "synthetic-query-token",
+        reason_token,
+    ):
         assert secret not in str(error.value)
         assert secret not in caplog.text
         assert secret not in rendered

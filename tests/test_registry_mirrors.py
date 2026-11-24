@@ -257,8 +257,9 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
 
 
 @pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("retain_values", [False, True])
 def test_build_arguments_redact_mirror_logs_and_progress(
-    tmp_path, mirror_auth, caplog, capsys, fallback
+    tmp_path, mirror_auth, caplog, capsys, fallback, retain_values
 ):
     value = "private-base-reference"
     with _serve() as (upstream, up), _serve() as (mirror, mir):
@@ -269,6 +270,8 @@ def test_build_arguments_redact_mirror_logs_and_progress(
             tmp_path, upstream, [mirror], base_ref="team/base:${VERSION}",
             build_args={"VERSION": value}, verbose=True,
         )
+        if retain_values:
+            builder.config.build_args.clear()
         with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_mirrors"):
             layers, _ = _pull(builder, tmp_path)
 
@@ -309,21 +312,43 @@ def test_https_mirror_uses_configured_ca_or_falls_back(
 
 @pytest.mark.parametrize("redirected_object", ["manifests", "blobs"])
 def test_mirror_cross_origin_redirect_never_sends_credentials(
-    tmp_path, mirror_auth, redirected_object
+    tmp_path, mirror_auth, mirror_ca, redirected_object
 ):
-    with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
+    server_context, ca_file = mirror_ca
+    storage_tls = server_context if redirected_object == "blobs" else None
+    scheme = "https" if storage_tls else "http"
+    with _serve() as (upstream, up), _serve() as (mirror, mir), _serve(storage_tls) as (
         storage, target
     ):
         mir.serve_image()
         target.serve_image()
-        mir.redirect_paths[f"/{redirected_object}/"] = f"http://{storage}"
-        layers, config = _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
+        mir.redirect_paths[f"/{redirected_object}/"] = f"{scheme}://{storage}"
+        builder = _builder(tmp_path, upstream, [mirror], registry_ca_file=ca_file)
+        layers, config = _pull(builder, tmp_path)
 
     assert config["os"] == "linux" and len(layers) == 1
     assert up.requests == []
     assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
     assert target.requests
     assert all(auth is None for _, _, auth in target.requests)
+
+
+def test_insecure_mirror_refuses_cross_origin_http_blob_redirect(
+    tmp_path, mirror_auth
+):
+    with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
+        storage, target
+    ):
+        up.serve_image()
+        mir.serve_image()
+        target.serve_image()
+        mir.redirect_paths["/blobs/"] = f"http://{storage}"
+        with pytest.raises(RegistryRequestError, match="blob redirects must use HTTPS"):
+            _pull(_builder(tmp_path, upstream, [mirror]), tmp_path)
+
+    assert mir.requests
+    assert target.requests == []
+    assert up.requests == []
 
 
 def test_mirror_pull_ignores_environment_proxy(tmp_path, mirror_auth, monkeypatch):
@@ -480,7 +505,10 @@ def test_rate_limited_mirror_does_not_fall_back(tmp_path, mirror_auth):
     assert up.requests == []
 
 
-@pytest.mark.parametrize("status, body", [(413, b""), (507, b""), (500, b"quota exceeded")])
+@pytest.mark.parametrize(
+    "status, body",
+    [(413, b""), (507, b""), (500, b"quota exceeded"), (404, b"quota exceeded")],
+)
 def test_quota_error_from_mirror_does_not_fall_back(tmp_path, mirror_auth, status, body):
     with _serve() as (upstream, up), _serve() as (mirror, mir):
         up.serve_image()
