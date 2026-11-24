@@ -850,6 +850,36 @@ def test_pdm_static_urls_strategy_alone_fails_closed(tmp_path):
         preflight_lockfile(context, Path("pdm.lock"))
 
 
+@pytest.mark.parametrize("name", [
+    "https://user:synthetic-secret@example.invalid/private",
+    "injected\nlog-line",
+    "injected\tlog-field",
+])
+@pytest.mark.parametrize("diagnostic", ["package-url", "file-url", "invalid-files"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_url_guard_diagnostics_do_not_echo_package_names(tmp_path, name, diagnostic, preflight):
+    context = _pdm_with_recorded_urls(
+        tmp_path, static_urls=False, package="pluggy", package_url=diagnostic == "package-url",
+    )
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8").replace('name = "pluggy"', f"name = {json.dumps(name)}")
+    if diagnostic == "invalid-files":
+        start = text.index("files = [\n", text.index(f"name = {json.dumps(name)}"))
+        text = text[:start] + 'files = [\n    "invalid",\n' + text[start + len("files = [\n"):]
+    lock_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError) as error:
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+    message = str(error.value)
+    assert name not in message
+    assert "synthetic-secret" not in message
+    assert "\n" not in message
+    assert "\t" not in message
+
+
 @pytest.mark.parametrize("malformed", ["strategy", "packages", "files"])
 def test_pdm_malformed_strategy_or_files_fail_closed(tmp_path, malformed):
     context = _copy(tmp_path, "pdm")

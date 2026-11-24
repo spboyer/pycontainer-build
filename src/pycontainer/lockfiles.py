@@ -890,15 +890,13 @@ def _reject_pdm_recorded_urls(lock: dict, strategy: list) -> None:
     if not isinstance(packages, list) or any(not isinstance(entry, dict) for entry in packages):
         raise LockfileError("pdm.lock package entries are invalid; relock with PDM.")
     for entry in packages:
-        name = entry.get("name")
-        source = f"package {name}" if isinstance(name, str) and name else "a package"
         if "url" in entry:
-            raise LockfileError(unsupported.format(source))
+            raise LockfileError(unsupported.format("a package"))
         files = entry.get("files", [])
         if not isinstance(files, list) or any(not isinstance(item, dict) for item in files):
-            raise LockfileError(f"pdm.lock {source} has invalid files entries; relock with PDM.")
+            raise LockfileError("pdm.lock has invalid package files entries; relock with PDM.")
         if any("url" in item for item in files):
-            raise LockfileError(unsupported.format(f"{source} files"))
+            raise LockfileError(unsupported.format("package files"))
 
 
 def _load_pdm(path: Path, environment, context_dir: Path, manifest=None):
