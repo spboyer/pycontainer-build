@@ -81,3 +81,6 @@ locks, contacts a registry or writes files, so it cannot verify:
 - build-context file selection, framework defaults or entrypoint detection.
 
 A successful validation is therefore not proof that a build will succeed.
+
+An optional [pre-commit hook](pre-commit.md) validates selected configuration
+files using this same offline command.

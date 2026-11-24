@@ -193,6 +193,8 @@ class BuildConfig:
     python_versions: List[str] = field(default_factory=list)
     python_matrix: Dict[str, str] = field(default_factory=dict)
     default_python_version: Optional[str] = None
+    squash: bool = False
+    analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
     index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False

@@ -883,13 +883,15 @@ def _serve_wheelhouse(index, context):
 
 
 @pytest.mark.parametrize("strip_type_stubs", [False, True])
+@pytest.mark.parametrize("squash", [False, True])
 def test_locked_matrix_selects_target_markers_wheels_and_override(
-    tmp_path, monkeypatch, request, strip_type_stubs
+    tmp_path, monkeypatch, request, strip_type_stubs, squash
 ):
     build, _, pulls = matrix(
         tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
         default_python_version="3.12", tags=["stable"], strip_type_stubs=strip_type_stubs,
+        squash=squash, analyze_layers=True,
         build_args={"VALUE": "${NOT_AN_ARGUMENT}"},
         labels={"literal": "${VALUE}", "escaped": "$${VALUE}"},
     )
@@ -926,6 +928,10 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
     monkeypatch.setattr(dependencies_module, "install_requirements", install)
     build.build()
 
+    for child in build.children.values():
+        assert (Path(child.config.output_dir) / "layer-analysis.json").is_file()
+        assert all(len(image.layers) == (2 if squash else 3)
+                   for image in child.platform_images)
     assert installs == [
         (version, arch, variant, True, True)
         for version in ("3.11", "3.12")
@@ -946,7 +952,7 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
         assert child.config.redact("${NOT_AN_ARGUMENT}") == "<redacted>"
         for image in child.platform_images:
             arch = image.platform["architecture"]
-            with tarfile.open(image.layers[-2].tar_path) as archive:
+            with tarfile.open(image.layers[-1 if squash else -2].tar_path) as archive:
                 names = set(archive.getnames())
                 wheel = archive.extractfile(
                     "app/.python/site-packages/fixture_dep-1.0.dist-info/WHEEL"

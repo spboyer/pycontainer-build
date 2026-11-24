@@ -46,6 +46,9 @@ uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a
 
 ### Build Your First Image
 
+For offline configuration checks before committing, use the optional
+[pre-commit configuration-validation hook](docs/pre-commit.md).
+
 ```bash
 # Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
@@ -772,6 +775,17 @@ error handling, and custom-directory inspection.
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+- `--analyze-layers` — Write `layer-analysis.json` with per-layer sizes,
+  repeated content and predicted squash savings
+- `--squash` — Opt in to merging the layers pycontainer creates (dependencies
+  and application) into one layer; base-image layers are never squashed
+
+The default layout is unchanged unless `--squash` is given. Squashing
+preserves overlay semantics (whiteouts, opaque directories, links, metadata)
+or fails explicitly, but it usually saves little space for pycontainer's own
+layers and gives up layer-level cache reuse between the dependency and
+application layers. See [Layer analysis and squashing](docs/layer-squashing.md)
+before enabling it.
 
 Labels inherit from the base image; their precedence is CLI, configuration
 file, detected framework, then base image. Manifest and index annotations are
@@ -873,6 +887,8 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+analyze-layers = false      # true writes layer-analysis.json
+squash = false              # true merges builder-created layers only
 release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
@@ -1289,6 +1305,7 @@ This style is intentional for the experimental phase.
 - **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Layer Analysis and Squashing](docs/layer-squashing.md)** — Opt-in layer report and builder-layer squashing trade-offs
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 - **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
