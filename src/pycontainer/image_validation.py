@@ -502,8 +502,8 @@ def _exposed_port(key):
     return number, protocol
 
 
-def _display_keys(keys):
-    shown = [json.dumps(key[:MAX_REPORTED_KEY_LENGTH], ensure_ascii=True) for key in keys[:MAX_REPORTED_KEYS]]
+def _display_keys(keys, redact=str):
+    shown = [json.dumps(redact(key)[:MAX_REPORTED_KEY_LENGTH], ensure_ascii=True) for key in keys[:MAX_REPORTED_KEYS]]
     if len(keys) > MAX_REPORTED_KEYS:
         shown.append(f"and {len(keys) - MAX_REPORTED_KEYS} more")
     return ", ".join(shown)
@@ -650,7 +650,7 @@ def _listeners(argv):
     return _UNKNOWN
 
 
-def _port_findings(runtime, non_root, base_exposed_ports):
+def _port_findings(runtime, non_root, base_exposed_ports, redact=str):
     keys = list(runtime.get("ExposedPorts") or {})
     exposed, invalid, duplicate = set(), [], []
     for key in keys:
@@ -663,8 +663,8 @@ def _port_findings(runtime, non_root, base_exposed_ports):
             exposed.add(port)
     triggered = []
     if invalid or duplicate:
-        parts = [f"invalid: {_display_keys(invalid)}" if invalid else "",
-                 f"duplicate: {_display_keys(duplicate)}" if duplicate else ""]
+        parts = [f"invalid: {_display_keys(invalid, redact)}" if invalid else "",
+                 f"duplicate: {_display_keys(duplicate, redact)}" if duplicate else ""]
         triggered.append(("PCB008", "Image ExposedPorts has " + "; ".join(p for p in parts if p) + "."))
 
     argv = [*(runtime.get("Entrypoint") or []), *(runtime.get("Cmd") or [])]
@@ -693,7 +693,7 @@ def _port_findings(runtime, non_root, base_exposed_ports):
         if dropped:
             triggered.append((
                 "PCB013",
-                f"Configured exposed ports replaced base-image port(s) {_display_keys(dropped)}.",
+                f"Configured exposed ports replaced base-image port(s) {_display_keys(dropped, redact)}.",
             ))
     return triggered
 
@@ -703,7 +703,7 @@ def _is_root(runtime):
     return not user or user == "root" or (user.isascii() and user.isdecimal() and not user.strip("0"))
 
 
-def _findings(runtime, ignores, base_exposed_ports=None):
+def _findings(runtime, ignores, base_exposed_ports=None, redact=str):
     triggered = []
     root = _is_root(runtime)
     if root:
@@ -718,7 +718,7 @@ def _findings(runtime, ignores, base_exposed_ports=None):
         if value and any(part in name.upper() for part in ("PASSWORD", "TOKEN", "SECRET")):
             triggered.append(("PCB005", None))
             break
-    triggered.extend(_port_findings(runtime, not root, base_exposed_ports))
+    triggered.extend(_port_findings(runtime, not root, base_exposed_ports, redact))
     findings = []
     for rule_id, message in triggered:
         if rule_id in ignores:
@@ -731,10 +731,11 @@ def _findings(runtime, ignores, base_exposed_ports=None):
     return findings
 
 
-def validate_image(output, tag=None, platform=None, ignores=(), base_exposed_ports=None):
+def validate_image(output, tag=None, platform=None, ignores=(), base_exposed_ports=None, redact=str):
     """Verify every reachable blob, then lint one unambiguously selected image.
 
     ``base_exposed_ports`` lists the base image's ExposedPorts keys when known (``build``).
+    ``redact`` removes configured values from raw diagnostic keys before encoding.
     """
     validate_ignores(ignores)
     layout = _VerifiedLayout(output)
@@ -743,7 +744,7 @@ def validate_image(output, tag=None, platform=None, ignores=(), base_exposed_por
     return {
         "image": {"digest": digest, "platform": "/".join(part for part in selected_platform if part)},
         "provenance": {"status": "unknown"},
-        "findings": _findings(runtime, set(ignores), base_exposed_ports),
+        "findings": _findings(runtime, set(ignores), base_exposed_ports, redact),
     }
 
 

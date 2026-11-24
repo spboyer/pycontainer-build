@@ -40,7 +40,8 @@ def _metadata_argument(value: str) -> tuple[str, str]:
 def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None,
                       redact=str, base_exposed_ports=None):
     try:
-        report=validate_image(output, tag=tag, platform=platform, ignores=ignores, base_exposed_ports=base_exposed_ports)
+        report=validate_image(output, tag=tag, platform=platform, ignores=ignores,
+                              base_exposed_ports=base_exposed_ports, redact=redact)
     except (OSError, ValueError) as exc:
         print(f"error: {redact(str(exc))}", file=sys.stderr)
         return 2

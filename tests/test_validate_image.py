@@ -1425,6 +1425,50 @@ def test_exposed_port_messages_escape_untrusted_keys(tmp_path, monkeypatch, caps
     assert "\x1b" not in message and "\\u001b" in message and "x" * 40 not in message
 
 
+PORT_REDACTION_VALUES = [
+    "buildarg-unique-value-123",
+    'unicode-\u00eb-quote"-backslash\\-value',
+    "long-build-argument-" * 4,
+]
+
+
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize("rule_id", ["PCB008", "PCB013"])
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_port_findings_redact_configured_values_before_encoding(
+    tmp_path, monkeypatch, capsys, format_, rule_id, secret
+):
+    key = f"bad-{secret}-port"
+    descriptor, _, _ = _image(
+        tmp_path, config={"ExposedPorts": {key: {}} if rule_id == "PCB008" else {}}
+    )
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = {json.dumps(secret)}\n')
+    if rule_id == "PCB013":
+        original = cli.validate_image
+
+        def validate(*args, **kwargs):
+            kwargs["base_exposed_ports"] = [key]
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(cli, "validate_image", validate)
+    assert _validate(
+        monkeypatch, tmp_path, "--config", str(config), "--format", format_
+    ) == (1 if rule_id == "PCB008" else 0)
+    captured = capsys.readouterr()
+    assert not captured.err
+    if format_ == "json":
+        report = json.loads(captured.out)
+        assert set(report) == {"image", "provenance", "findings"}
+        finding = next(item for item in report["findings"] if item["rule_id"] == rule_id)
+        assert set(finding) == {"rule_id", "severity", "message", "remediation"}
+        message = finding["message"]
+    else:
+        message = next(line for line in captured.out.splitlines() if f": {rule_id}:" in line)
+    assert json.dumps("bad-<redacted>-port") in message
+
+
 def test_non_object_exposed_ports_is_a_config_error(tmp_path, monkeypatch, capsys):
     descriptor, _, _ = _image(tmp_path, config={"ExposedPorts": ["8000/tcp"]})
     _layout(tmp_path, [descriptor])
@@ -1511,6 +1555,28 @@ def test_build_socket_only_listener_does_not_block_push(tmp_path, monkeypatch, c
     output = capsys.readouterr().out
     assert "info: PCB010:" in output and "PCB009" not in output
     assert len(pushes) == 1
+
+
+@pytest.mark.parametrize("rule_id", ["PCB008", "PCB013"])
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_build_port_findings_redact_live_argument_values(
+    tmp_path, monkeypatch, capsys, rule_id, secret
+):
+    key = f"bad-{secret}-port"
+    config, pushes = _port_build(
+        tmp_path, monkeypatch, {key: {}},
+        ("exposed-ports = [9000]\n" if rule_id == "PCB013" else "")
+        + '\n[build.build-args]\nTOKEN = "declared-default"\n',
+    )
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--build-arg", f"TOKEN={secret}", "--validate", "--push"],
+    ) == (1 if rule_id == "PCB008" else 0)
+    captured = capsys.readouterr()
+    assert not captured.err
+    message = next(line for line in captured.out.splitlines() if f": {rule_id}:" in line)
+    assert json.dumps("bad-<redacted>-port") in message
+    assert len(pushes) == (0 if rule_id == "PCB008" else 1)
 
 
 def test_multi_platform_validation_uses_each_base_image_ports(tmp_path, monkeypatch):
