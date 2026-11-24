@@ -36,6 +36,7 @@ CLOSURE_TIMEOUT_SECONDS = 120
 MAX_STAGED_BYTES = 512 * 1024 * 1024
 MAX_STAGED_FILES = 100_000
 INSTALL_TIMEOUT_SECONDS = 300
+_LOCKFILE_STAGING_PREFIX = ".pycontainer-lockfile-"
 
 # Shared target table. Values are legacy aliases for validated glibc targets;
 # the suffix after "manylinux2014_" is the machine tag for every generated tag.
@@ -118,6 +119,16 @@ _PIP_CONFIG_ALLOWED = sorted(
     name[4:].lower().replace("_", "-")
     for name in _PIP_ENVIRONMENT_ALLOWED - {"PIP_CONFIG_FILE"}
 )
+# Locked installs never take source-selection settings from the host: only the
+# lock's recorded index may supply artifacts.
+_PIP_SOURCE_CONFIG_KEYS = {
+    "extra-index-url",
+    "find-links",
+    "index-url",
+    "no-index",
+    "trusted-host",
+}
+_PIP_LOCKED_CONFIG_ALLOWED = sorted(set(_PIP_CONFIG_ALLOWED) - _PIP_SOURCE_CONFIG_KEYS)
 _PIP_STDERR_LIMIT = 1024 * 1024
 _PIP_EXCERPT_LINES = 6
 _PIP_EXCERPT_LINE_CHARS = 300
@@ -126,6 +137,11 @@ _AUTH_HINT = (
     "PIP_EXTRA_INDEX_URL, a pip config file, .netrc (or NETRC), keyring with "
     "PIP_KEYRING_PROVIDER=import or subprocess, or ${VAR} placeholders in the "
     "requirements file."
+)
+_LOCKED_AUTH_HINT = (
+    "Locked installs ignore host pip settings and config files; provide index "
+    "credentials through ${VAR} placeholders in the lock's index URL or "
+    ".netrc (or NETRC)."
 )
 
 
@@ -473,14 +489,15 @@ def install_requirements(
     target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
-    locked_options = ["--no-deps", "--require-hashes"] if locked else []
+    # Locked installs use only the generated --index-url: no pip config files or PIP_* options.
+    locked_options = ["--isolated", "--no-deps", "--require-hashes"] if locked else []
     error_file = destination.parent / _MARKER_ERROR_FILE
     marker_config = {
         "environment": _target_marker_environment(
             os_name, arch, python_version, base_config, variant
         ),
         "error_file": str(error_file),
-        "allowed_config_keys": _PIP_CONFIG_ALLOWED,
+        "allowed_config_keys": _PIP_LOCKED_CONFIG_ALLOWED if locked else _PIP_CONFIG_ALLOWED,
     }
     command = [
         sys.executable,
@@ -504,7 +521,11 @@ def install_requirements(
         "-r",
         str(requirements),
     ]
-    environment = _pip_environment(destination.parent)
+    environment = (
+        _locked_pip_environment(destination.parent)
+        if locked
+        else _pip_environment(destination.parent)
+    )
     # pip logs index HTTP failures only at debug level, so keep its debug log in
     # host temp space (never the tarred stage) to classify authentication errors.
     with tempfile.TemporaryDirectory(prefix="pycontainer-pip-") as diagnostics:
@@ -568,6 +589,7 @@ def install_requirements(
                 arch,
                 python_version,
                 redact(pip_debug, secrets),
+                _LOCKED_AUTH_HINT if locked else _AUTH_HINT,
                 variant,
             ) + hint
         )
@@ -606,6 +628,24 @@ def _pip_environment(temporary_dir: Path) -> dict:
     return environment
 
 
+def _locked_pip_environment(temporary_dir: Path) -> dict:
+    """Environment for a locked install: no host PIP_* settings or pip config files."""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith(("PIP_", "_PIP_"))
+    }
+    environment.update(
+        {
+            "PIP_CONFIG_FILE": os.devnull,
+            "TMP": str(temporary_dir),
+            "TEMP": str(temporary_dir),
+            "TMPDIR": str(temporary_dir),
+        }
+    )
+    return environment
+
+
 def _placeholder_names(requirement_files: Iterable[Path]) -> List[str]:
     names = set()
     for path in requirement_files:
@@ -633,6 +673,7 @@ def _pip_failure_message(
     arch: str,
     python_version: str,
     pip_debug: str = "",
+    auth_hint: str = _AUTH_HINT,
     variant: Optional[str] = None,
 ) -> str:
     """Classify a failed install from redacted pip stderr and debug log text."""
@@ -648,7 +689,7 @@ def _pip_failure_message(
     if _INDEX_AUTH_FAILURE.search(diagnostics):
         return (
             "Authentication to a package index failed (HTTP 401/403) while "
-            f"installing target dependencies. {_AUTH_HINT}" + details
+            f"installing target dependencies. {auth_hint}" + details
         )
     if _CONNECTION_FAILURE.search(diagnostics):
         return (
@@ -709,6 +750,54 @@ def reject_credentialed_direct_urls(site_packages: Path) -> None:
                 f"Installed package metadata {direct_url.parent.name}/direct_url.json "
                 "records a URL with credentials; refusing to place it in the image."
             )
+
+
+def install_locked_requirements(
+    requirement_sets: Iterable[Tuple[str, str]],
+    destination: Path,
+    context_dir: Path,
+    os_name: str,
+    arch: str,
+    python_version: str,
+    base_image: str,
+    base_config: Optional[dict],
+    *,
+    variant: Optional[str] = None,
+    base_image_tag_verified: bool = False,
+) -> None:
+    """Install each recorded index's packages from that index alone, then merge them."""
+    requirement_sets = list(requirement_sets)
+    stage_root = destination.parent
+    with tempfile.TemporaryDirectory(prefix=_LOCKFILE_STAGING_PREFIX, dir=context_dir.resolve()) as temp:
+        for number, (_, text) in enumerate(requirement_sets):
+            requirements = Path(temp) / f"locked-requirements-{number}.txt"
+            target = destination if len(requirement_sets) == 1 else stage_root / f"locked-site-{number}"
+            requirements.write_text(text, encoding="utf-8")
+            install_requirements(
+                requirements, target, context_dir, os_name, arch, python_version,
+                base_image, base_config, variant=variant, locked=True,
+                base_image_tag_verified=base_image_tag_verified,
+            )
+            if target != destination:
+                _merge_site_packages(target, destination)
+                shutil.rmtree(target)
+    destination.mkdir(parents=True, exist_ok=True)
+
+
+def _merge_site_packages(source: Path, destination: Path) -> None:
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif target.exists():
+            if target.read_bytes() != path.read_bytes():
+                raise RuntimeError(
+                    f"Locked packages from different indexes both install {relative.as_posix()}."
+                )
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, target)
 
 
 def _read_marker_error(error_file: Path) -> str:

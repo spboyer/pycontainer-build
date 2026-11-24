@@ -46,6 +46,9 @@ uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a
 
 ### Build Your First Image
 
+For offline configuration checks before committing, use the optional
+[pre-commit configuration-validation hook](docs/pre-commit.md).
+
 ```bash
 # Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
@@ -630,13 +633,28 @@ normalization and include the target; unverifiable marker equivalence and
 unknown target marker values fail explicitly. Normalization supports
 `python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
 unrecognized equivalences are rejected even if they are logically equal.
-Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
-PyPI itself is left to your pip configuration so mirrors keep working, and
-pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
-The same pip bootstrap used for ordinary requirements ignores inherited settings
-that can override the wheel target or add requirements.
-Hashes verify the bytes, not which server supplied them. Index credentials
-must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
+Each package is installed only from the index its lock records, one pip run
+per index with `--isolated` and every `PIP_*` variable and pip config file
+ignored, so `PIP_INDEX_URL`, `pip.conf`, `--find-links` wheelhouses or another
+index serving the same hash cannot substitute an artifact. Per-package sources
+come from uv `source.registry`, Poetry `source` (none means PyPI, which must
+then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
+first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
+only with a single effective index (PyPI or one source named `pypi`), and
+`pdm.toml` `[pypi]` settings are rejected. User or global PDM index settings
+(`pdm config pypi.url`, `PDM_PYPI_URL`) are not recorded in the lock and
+cannot be detected; such a lock is installed from PyPI, where its hashes must
+still match. To build through a PyPI mirror,
+relock against the mirror so the lock records it. The recorded index is
+trusted for the files its pages link to (PyPI serves them from
+files.pythonhosted.org), and hashes verify the bytes. Recorded indexes must
+use HTTPS; plain HTTP is accepted only for loopback hosts, because pip may
+send netrc credentials. Index credentials must
+be `${VARIABLE}` placeholders in the URL's credentials or query values (never
+its host or path, which fix the source) over HTTPS, or netrc, never literal
+secrets; proxy and CA bundle variables such as
+`HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
+normal pip behavior, including your pip configuration.
 
 ### Local base images
 
@@ -772,6 +790,17 @@ error handling, and custom-directory inspection.
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+- `--analyze-layers` — Write `layer-analysis.json` with per-layer sizes,
+  repeated content and predicted squash savings
+- `--squash` — Opt in to merging the layers pycontainer creates (dependencies
+  and application) into one layer; base-image layers are never squashed
+
+The default layout is unchanged unless `--squash` is given. Squashing
+preserves overlay semantics (whiteouts, opaque directories, links, metadata)
+or fails explicitly, but it usually saves little space for pycontainer's own
+layers and gives up layer-level cache reuse between the dependency and
+application layers. See [Layer analysis and squashing](docs/layer-squashing.md)
+before enabling it.
 
 Labels inherit from the base image; their precedence is CLI, configuration
 file, detected framework, then base image. Manifest and index annotations are
@@ -873,6 +902,8 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+analyze-layers = false      # true writes layer-analysis.json
+squash = false              # true merges builder-created layers only
 release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
@@ -930,7 +961,8 @@ volumes = ["/data", "/var/cache/app"]
 `[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
 The same keys, validation and CLI precedence apply. A file that defines both
 `[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
-one. Poetry-only keys such as `push` are reported as unknown by
+one. A file passed explicitly that defines neither table (for example a
+misspelled `[biuld]`) is an error, not a silent fall-back to defaults. Poetry-only keys such as `push` are reported as unknown by
 `pycontainer build`; use `--push` instead. See
 [Dockerfile import](docs/dockerfile-import.md).
 
@@ -943,6 +975,26 @@ how to apply them.
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
+
+### Validating configuration offline
+
+`pycontainer validate config` resolves the effective build configuration the
+same way `build` does (defaults, local Python detection, `[build]` or
+`[tool.pycontainer]`, and CLI-over-file precedence) without building, pulling,
+pushing, touching the cache or writing files:
+
+```bash
+pycontainer validate config                    # build defaults for the current directory
+pycontainer validate config pycontainer.toml pyproject.toml --platform linux/arm64
+pycontainer validate config -c pyproject.toml
+```
+
+It exits 0 when every configuration is valid and 2 for invalid settings,
+missing files, files without a `[build]` or `[tool.pycontainer]` table,
+conflicting tables or usage errors, and lists the registry,
+dependency-resolution and runtime checks it did not perform. A passing
+validation does not prove a build will succeed. See
+[configuration validation](docs/validate-config.md).
 
 ### Build arguments
 
@@ -1214,6 +1266,7 @@ This style is intentional for the experimental phase.
 - **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Layer Analysis and Squashing](docs/layer-squashing.md)** — Opt-in layer report and builder-layer squashing trade-offs
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 - **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection

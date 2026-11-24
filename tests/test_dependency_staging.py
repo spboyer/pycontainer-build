@@ -680,8 +680,9 @@ def test_staged_package_metadata_errors_are_explicit_for_sbom(tmp_path):
 
 
 @pytest.mark.parametrize("function", ["main", "ma\u00efn"])
+@pytest.mark.parametrize("squash", [False, True])
 def test_requirements_install_stages_importable_target_wheel_and_sbom(
-    tmp_path, monkeypatch, function
+    tmp_path, monkeypatch, function, squash
 ):
     context = tmp_path / "context"
     context.mkdir()
@@ -697,6 +698,7 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         include_deps=True,
         generate_sbom=True,
         entrypoint=["fixture-dep"],
+        squash=squash,
     )
 
     builder.build()
@@ -751,6 +753,7 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
         include_deps=True,
         generate_sbom=True,
         entrypoint=["fixture-dep"],
+        squash=squash,
     )
     repeated.build()
     assert dependency_layer.digest == repeated.layers[0].digest
@@ -2232,6 +2235,7 @@ def test_locked_pip_ignores_pythonpath_shadowing(tmp_path, monkeypatch):
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     requirements = context / "requirements.txt"
     requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
         f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
     )
     poison = tmp_path / "pythonpath"
@@ -2261,7 +2265,10 @@ def test_locked_pip_cannot_ignore_target_requires_python(tmp_path, monkeypatch, 
     wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     requirements = context / "requirements.txt"
-    requirements.write_text(f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8")
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
+    )
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
     if source == "environment":
