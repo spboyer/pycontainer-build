@@ -251,6 +251,14 @@ def test_existing_pyproject_settings_are_untouched(offline, monkeypatch, capsys)
     assert pyproject.read_text() == original
 
 
+@pytest.mark.parametrize("lockfile", ["poetry.lock", "Pipfile.lock", "pdm.lock", "uv.lock"])
+def test_dependency_advisory_recognizes_lockfiles(offline, monkeypatch, capsys, lockfile):
+    (offline / lockfile).write_text("")
+
+    assert _run(monkeypatch, ["init", "-t", "fastapi"]) == 0
+    assert "no supported lockfile" not in capsys.readouterr().out
+
+
 def test_list_templates(offline, monkeypatch, capsys):
     assert _run(monkeypatch, ["init", "--list-templates"]) == 0
     assert [line.split(":")[0] for line in capsys.readouterr().out.splitlines()] == ["fastapi", "flask", "generic"]

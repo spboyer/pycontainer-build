@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 
 from .config_loader import BUILD_TABLE
 from .effective_config import resolve_build_config, resolve_settings
+from .lockfiles import LOCKFILE_KINDS
 from .project import detect_python_version
 
 DEFAULT_OUTPUT = "pycontainer.toml"
@@ -245,10 +246,11 @@ def advisories(settings: Dict[str, Any]) -> List[str]:
     notes = []
     if settings.get("include_deps"):
         venv = any((ctx / name).is_dir() for name in ("venv", ".venv", "env"))
-        if not venv and not (ctx / "requirements.txt").is_file():
+        lockfile = any((ctx / name).is_file() for name in LOCKFILE_KINDS)
+        if not venv and not lockfile and not (ctx / "requirements.txt").is_file():
             notes.append(
-                f"include_deps is enabled but {ctx / 'requirements.txt'} and a venv were not found; "
-                "add one before building."
+                f"include_deps is enabled but no supported lockfile, {ctx / 'requirements.txt'} "
+                "or venv was found; add one before building."
             )
     pyproject = ctx / "pyproject.toml"
     if pyproject.is_file():

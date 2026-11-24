@@ -94,6 +94,19 @@ def test_rendered_toml_round_trips_and_validates():
     assert set(data) <= {f.name for f in fields(BuildConfig)}
 
 
+def test_import_preserves_runtime_dollars_when_loading_build_config(tmp_path):
+    from pycontainer.config_loader import config_from_file
+
+    result = import_dockerfile(
+        'FROM python:3.12\nENV PORT=8000\nCMD ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]\n'
+    )
+    path = tmp_path / "pyproject.toml"
+    path.write_text(render_toml(result.config))
+    config = config_from_file(path)
+    assert config.cmd == ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]
+    assert config.env == {"PORT": "8000"}
+
+
 def test_merge_replaces_only_pycontainer_tables():
     existing = '[project]\nname = "x"\n\n[tool.pycontainer]\ntag = "old"\n\n[tool.pycontainer.env]\nA = "1"\n\n[tool.ruff]\nline-length = 99\n'
     merged = merge_into_pyproject(existing, render_toml({"workdir": "/w"}))
@@ -322,3 +335,131 @@ def test_force_refuses_to_add_tool_table_beside_build(tmp_path, monkeypatch, cap
     assert _run_cli(monkeypatch, ["import", str(dockerfile), "-o", str(out), "--force"]) == 2
     assert out.read_text() == existing
     assert "already defines [build]" in capsys.readouterr().err
+
+
+def test_shell_form_uses_default_shell_and_preserves_quotes_verbatim():
+    result = import_dockerfile("FROM x\nENTRYPOINT echo \"a  b\" 'c $HOME' && exec run\n")
+    assert result.config["entrypoint"] == ["/bin/sh", "-c", "echo \"a  b\" 'c $HOME' && exec run"]
+
+
+def test_explicit_shell_converts_shell_form_but_not_exec_form():
+    text = 'FROM x\nENTRYPOINT ["python", "-m", "app"]\nCMD serve --port "8 0"\n'
+    result = import_dockerfile(text, shell=["/bin/bash", "-lc"])
+    assert result.config["entrypoint"] == ["python", "-m", "app"]
+    assert result.config["cmd"] == ["/bin/bash", "-lc", 'serve --port "8 0"']
+    assert any("/bin/bash" in n for n in result.notes)
+
+
+def test_dockerfile_shell_applies_to_later_instructions_and_still_warns():
+    text = 'FROM x\nCMD early\nSHELL ["/bin/ash", "-eo", "pipefail", "-c"]\nENTRYPOINT late\n'
+    result = import_dockerfile(text, shell=["/bin/bash", "-c"])
+    assert result.config["cmd"] == ["/bin/bash", "-c", "early"]
+    assert result.config["entrypoint"] == ["/bin/ash", "-eo", "pipefail", "-c", "late"]
+    assert any("SHELL" in w and "RUN" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("value", ["/bin/bash -c", "[]", '[""]', '["/bin/sh", 1]', '{"a": 1}', '["/bin/sh\\u0000"]'])
+def test_malformed_dockerfile_shell_is_ignored_with_warning(value):
+    result = import_dockerfile(f"FROM x\nSHELL {value}\nCMD run\n")
+    assert result.config["cmd"] == ["/bin/sh", "-c", "run"]
+    assert any("SHELL" in w and "ignored" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("shell", [[], [""], ["/bin/sh", 1], "/bin/sh -c", ["/bin/sh\x00"]])
+def test_malformed_explicit_shell_is_rejected(shell):
+    with pytest.raises(ValueError, match="shell"):
+        import_dockerfile("FROM x\nCMD run\n", shell=shell)
+
+
+@pytest.mark.parametrize("value", ["/bin/bash -c", "[]", '["/bin/sh", 1]', "not json"])
+def test_cli_shell_option_rejects_malformed_arrays(tmp_path, monkeypatch, capsys, value):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM x\nCMD run\n")
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "--shell", value]) == 2
+    assert "shell" in capsys.readouterr().err
+
+
+def test_cli_shell_option_converts_shell_form(tmp_path, monkeypatch, capsys):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM x\nCMD run it\n")
+    assert _run_cli(monkeypatch, ["import", str(dockerfile), "--shell", '["/bin/bash", "-c"]']) == 0
+    assert 'cmd = ["/bin/bash", "-c", "run it"]' in capsys.readouterr().out
+
+
+def test_invalid_exec_json_is_shell_form_with_accurate_note():
+    result = import_dockerfile("FROM x\nCMD [python, app.py]\n")
+    assert result.config["cmd"] == ["/bin/sh", "-c", "[python, app.py]"]
+    assert any("shell form" in n for n in result.notes)
+
+
+def test_import_never_executes_shell_text(monkeypatch):
+    import os
+    import subprocess
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("importer must not execute commands")
+
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, forbidden)
+    monkeypatch.setattr(os, "system", forbidden)
+    monkeypatch.setattr(os, "popen", forbidden)
+    result = import_dockerfile("FROM x\nSHELL [\"/bin/bash\", \"-c\"]\nCMD touch /tmp/pwned && rm -rf /\n")
+    assert result.config["cmd"] == ["/bin/bash", "-c", "touch /tmp/pwned && rm -rf /"]
+
+
+def test_stopsignal_maps_docker_spellings_and_warns_on_unknown():
+    assert import_dockerfile("FROM x\nSTOPSIGNAL SIGINT\n").config["stop_signal"] == "SIGINT"
+    assert import_dockerfile("FROM x\nSTOPSIGNAL term\n").config["stop_signal"] == "SIGTERM"
+    assert import_dockerfile("FROM x\nSTOPSIGNAL 9\n").config["stop_signal"] == "SIGKILL"
+    assert import_dockerfile("FROM x\nSTOPSIGNAL rtmin+3\n").config["stop_signal"] == "SIGRTMIN+3"
+    assert import_dockerfile("FROM x\nARG S=SIGQUIT\nSTOPSIGNAL $S\n").config["stop_signal"] == "SIGQUIT"
+    for value in ("99", "SIGFOO"):
+        result = import_dockerfile(f"FROM x\nSTOPSIGNAL {value}\n")
+        assert "stop_signal" not in result.config
+        assert any("STOPSIGNAL" in w for w in result.warnings)
+
+
+def test_volume_maps_json_and_word_forms_and_warns_on_unsafe_paths():
+    text = 'FROM x\nARG D=/data\nVOLUME ["/srv/uploads", "$D"]\nVOLUME /logs /data relative\n'
+    result = import_dockerfile(text)
+    assert result.config["volumes"] == ["/srv/uploads", "/data", "/logs"]
+    assert any("VOLUME" in w and "relative" in w for w in result.warnings)
+    assert any("metadata" in n for n in result.notes)
+    data = tomllib.loads(render_toml(result.config))["tool"]["pycontainer"]
+    assert data["volumes"] == ["/srv/uploads", "/data", "/logs"]
+
+
+def test_imported_volume_literal_dollar_survives_config_loading(tmp_path):
+    from pycontainer.config_loader import config_from_file
+
+    result = import_dockerfile('FROM python:3.12\nVOLUME ["/cost$5"]\n')
+    path = tmp_path / "pyproject.toml"
+    path.write_text(render_toml(result.config))
+
+    assert result.config["volumes"] == ["/cost$5"]
+    assert config_from_file(path).volumes == ["/cost$5"]
+
+
+def test_existing_import_output_is_unchanged_without_new_instructions():
+    assert import_dockerfile(SAMPLE).config["cmd"] == ["/bin/sh", "-c", "uvicorn app:app"]
+
+
+def test_shell_form_on_distroless_base_warns_missing_shell():
+    result = import_dockerfile("FROM gcr.io/distroless/python3\nCMD python app.py\n")
+    assert result.config["cmd"] == ["/bin/sh", "-c", "python app.py"]
+    assert any("distroless" in w for w in result.warnings)
+    exec_result = import_dockerfile('FROM gcr.io/distroless/python3\nCMD ["python", "app.py"]\n')
+    assert not any("distroless" in w for w in exec_result.warnings)
+
+
+@pytest.mark.parametrize("alias,canonical", [("IOT", "SIGABRT"), ("cld", "SIGCHLD"), ("SIGPOLL", "SIGIO")])
+def test_stopsignal_alias_maps_to_canonical(alias, canonical):
+    result = import_dockerfile(f"FROM python:3.12\nSTOPSIGNAL {alias}\n")
+    assert result.config["stop_signal"] == canonical
+
+
+@pytest.mark.parametrize("args", ["", "[]"])
+def test_empty_volume_warns(args):
+    result = import_dockerfile(f"FROM python:3.12\nVOLUME {args}\n")
+    assert "volumes" not in result.config
+    assert any("VOLUME has no paths" in w for w in result.warnings)

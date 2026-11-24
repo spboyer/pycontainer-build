@@ -25,14 +25,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked test dependencies
         run: uv sync --locked --group test
       
       - name: Run tests
-        run: uv run --locked --group test python -m pytest tests/ -v -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests/ -v -m "not registry_integration and not scanner_integration"
 
   build:
     name: Build Package
@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: '3.11'
       
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked build dependencies
@@ -61,10 +61,18 @@ jobs:
           name: dist
           path: dist/
 
+  runtime:
+    name: Target runtime verification
+    needs: test
+    uses: ./.github/workflows/runtime-check.yml
+    permissions:
+      contents: read
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    # Default needs semantics: a failed, skipped or cancelled runtime gate blocks the release.
+    needs: [build, runtime]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,6 +83,23 @@ jobs:
         with:
           name: dist
           path: dist/
+      
+      - name: Download runtime evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: runtime-evidence-linux-*
+          path: runtime-evidence/
+
+      - name: Verify release-attempt runtime evidence
+        run: >-
+          python3 scripts/verify_runtime_evidence.py
+          --evidence-dir runtime-evidence
+          --require linux/amd64
+          --require linux/arm64
+          --commit ${{ github.sha }}
+          --run-id ${{ github.run_id }}
+          --run-attempt ${{ github.run_attempt }}
+          --summary runtime-evidence/runtime-evidence-summary.md
       
       - name: Extract version from tag
         id: version
@@ -95,6 +120,8 @@ jobs:
           
           # Save to file for multiline output
           echo "$CHANGELOG" > changelog.txt
+          printf '\n' >> changelog.txt
+          cat runtime-evidence/runtime-evidence-summary.md >> changelog.txt
           echo "Generated changelog for release"
       
       - name: Create Release

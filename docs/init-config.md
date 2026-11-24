@@ -39,9 +39,11 @@ Template options, all validated before anything is written:
 | `--force` | Replace an existing output file |
 
 The `fastapi` and `flask` templates enable dependency staging, so the build
-needs `requirements.txt` (listing `uvicorn` or `flask`) or a virtualenv in the
-context; `init` prints a note when neither is present. Entrypoints use
-`python -m` so they do not depend on console scripts being on `PATH`.
+needs a supported lockfile, `requirements.txt` or a virtualenv in the context
+containing the required packages (including `uvicorn` or `flask`). `init`
+prints a note when no source is present; it does not validate the source.
+Entrypoints use `python -m` so they do not depend on console scripts being on
+`PATH`.
 
 ### Customization
 
