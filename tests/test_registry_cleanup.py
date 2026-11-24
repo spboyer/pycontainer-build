@@ -544,13 +544,16 @@ def test_unresolvable_tag_aborts_before_any_delete(monkeypatch, registry, capsys
     assert registry.methods("DELETE") == []
 
 
-def test_failed_delete_stops_remaining_deletions(monkeypatch, registry, capsys):
+@pytest.mark.parametrize("status", [500, 429])
+def test_failed_delete_stops_remaining_deletions(monkeypatch, registry, capsys, status):
     _repo_tags(registry, "v4.0.0", "v3.0.0", "v2.0.0", "v1.0.0")
-    registry.fail("DELETE", "/manifests/", 500, times=1)
+    registry.fail("DELETE", "/manifests/", status, times=1)
 
     assert _run(monkeypatch, "prune", f"{HOST}/{REPO}", "--keep", "1", "--execute", "--yes") == 1
     assert len(registry.methods("DELETE")) == 1
-    assert "Deleted 0 of 3" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "Deleted 0 of 3" in error
+    assert f"HTTP {status}" in error
 
 
 UNSUPPORTED_DIGEST = "blake3:" + "0" * 64

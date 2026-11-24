@@ -295,10 +295,11 @@ def run_prune(args, out=print) -> int:
         try:
             client.delete_manifest(digest)
         except RegistryRequestError as error:
-            raise type(error)(
+            error.args = (
                 f"{error} Deleted {deleted} of {len(plan.deletions)} digest(s) "
-                "before this failure; no further deletions were attempted."
-            ) from error
+                "before this failure; no further deletions were attempted.",
+            )
+            raise
         deleted += 1
         out(f"Deleted {digest} (tags: {', '.join(tags)}).")
     return 0
