@@ -30,6 +30,7 @@ from pycontainer.registry_client import (
 )
 
 SERVER_TIMEOUT_SECONDS = 10
+SERVER_POLL_INTERVAL_SECONDS = 0.01
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"
 LAYER_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
@@ -173,7 +174,9 @@ def _serve(tls_context=None):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(state))
     if tls_context is not None:
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": SERVER_POLL_INTERVAL_SECONDS}, daemon=True
+    )
     thread.start()
     try:
         yield f"127.0.0.1:{server.server_address[1]}", state
