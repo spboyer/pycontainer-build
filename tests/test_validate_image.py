@@ -257,6 +257,68 @@ def test_invalid_validation_configuration_is_an_error(tmp_path, monkeypatch, cap
     assert "validat" in capsys.readouterr().err.lower()
 
 
+SECRET_ARGUMENT = "REDACTION_FIXTURE_2459"
+
+
+def _assert_redacted(capsys):
+    captured = capsys.readouterr()
+    assert SECRET_ARGUMENT not in captured.out + captured.err
+    assert "<redacted>" in captured.err
+
+
+@pytest.mark.parametrize(
+    "validate_table",
+    [
+        f'ignore = ["{SECRET_ARGUMENT}"]\n',
+        f'{SECRET_ARGUMENT} = ["PCB001"]\n',
+    ],
+)
+def test_invalid_validation_configuration_redacts_build_arguments(tmp_path, monkeypatch, capsys, validate_table):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n[build.validate]\n{validate_table}'
+    )
+
+    assert _validate(monkeypatch, tmp_path, "--config", str(config)) == 2
+    _assert_redacted(capsys)
+
+
+def test_unknown_cli_ignore_redacts_configured_build_arguments(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = {{ default = "{SECRET_ARGUMENT}" }}\n')
+
+    assert _validate(monkeypatch, tmp_path, "--config", str(config), "--ignore", SECRET_ARGUMENT) == 2
+    _assert_redacted(capsys)
+
+
+def test_layout_errors_redact_configured_build_arguments(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n')
+
+    assert _validate(
+        monkeypatch, tmp_path, "--config", str(config), "--output", str(tmp_path / f"output-{SECRET_ARGUMENT}")
+    ) == 2
+    _assert_redacted(capsys)
+
+
+def test_size_thresholds_preserve_redaction_on_layout_errors(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n'
+        '[build.validate]\nmax_layer_size_mb = 1\n'
+    )
+    assert _validate(
+        monkeypatch, tmp_path, "--config", str(config),
+        "--output", str(tmp_path / f"output-{SECRET_ARGUMENT}"),
+        "--max-image-size-mb", "1",
+    ) == 2
+    _assert_redacted(capsys)
+
+
 def test_unknown_cli_ignore_is_an_error(tmp_path, monkeypatch, capsys):
     descriptor, _, _ = _image(tmp_path)
     _layout(tmp_path, [descriptor])
@@ -979,6 +1041,16 @@ def test_build_checks_unknown_ignore_before_building(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cli, "ImageBuilder", lambda *_: pytest.fail("must reject before building"))
     assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--ignore", "PCB999"]) == 2
     assert "PCB999" in capsys.readouterr().err
+
+
+def test_build_unknown_ignore_redacts_build_arguments(tmp_path, monkeypatch, capsys):
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    config.write_text(config.read_text() + f'\n[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n')
+    monkeypatch.setattr(cli, "ImageBuilder", lambda *_: pytest.fail("must reject before building"))
+    assert _run(
+        monkeypatch, ["build", "--config", str(config), "--validate", "--ignore", SECRET_ARGUMENT]
+    ) == 2
+    _assert_redacted(capsys)
 
 
 def test_build_rejects_unknown_config_ignore_before_building(tmp_path, monkeypatch, capsys):

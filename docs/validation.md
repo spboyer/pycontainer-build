@@ -56,7 +56,9 @@ max_layer_size_mb = 200     # optional; largest single stored layer
 Repeat `--ignore RULE` to add CLI suppressions to the TOML list. Unknown IDs,
 invalid types and unknown validation settings are errors. PCB002 is a known,
 reserved ID, so ignoring it is currently a no-op. Suppressions apply only to
-findings, never to layout or integrity errors.
+findings, never to layout or integrity errors. Configuration, ignore and layout
+diagnostics redact declared build-argument values, as `validate config` does;
+`validate image` redacts declared defaults because it accepts no `--build-arg`.
 
 `--max-image-size-mb` and `--max-layer-size-mb` (on `validate image`, and on
 `build` together with `--validate`) override the matching TOML key only when

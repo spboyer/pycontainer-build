@@ -102,29 +102,41 @@ def _image_validation(
         print("Base image provenance: unknown (PCB002 is deferred).")
     return finding_exit_code(report, fail_on)
 
+def _declared_argument_redactor(declarations):
+    """Redact declared build-argument values, even when the declarations are invalid."""
+    values=[]
+    if isinstance(declarations, dict):
+        for declaration in declarations.values():
+            value=declaration.get("default") if isinstance(declaration, dict) else declaration
+            if isinstance(value, str):
+                values.append(value)
+    return lambda message: redact_values(message, values)
+
 def _validate_image_command(parser, args):
     for option in ("output", "tag", "platform", "config"):
         if getattr(args, option) == "":
             parser.error(f"--{option} must not be empty.")
     ignores=list(args.ignore or [])
     file_validate={}
+    redact=str
     if args.config is not None:
         try:
             table, config=load_explicit_file_config(Path(args.config))
+            redact=_declared_argument_redactor(config.get("build_args"))
             _validate_config(config, table)
             file_validate=config.get("validate", {})
             ignores=[*file_validate.get("ignore", []), *ignores]
         except (OSError, ValueError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            print(f"error: {redact(str(exc))}", file=sys.stderr)
             raise SystemExit(2)
     try:
         validate_ignores(ignores)
     except ValueError as exc:
-        parser.error(str(exc))
+        parser.error(redact(str(exc)))
     thresholds=_size_thresholds(parser, args, file_validate)
     code=_image_validation(
         Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on,
-        thresholds=thresholds,
+        thresholds=thresholds, redact=redact,
     )
     if code:
         raise SystemExit(code)
@@ -498,7 +510,7 @@ def main():
     try:
         validate_ignores(ignores)
     except ValueError as exc:
-        b.error(str(exc))
+        b.error(cfg.redact(str(exc)))
     thresholds=_size_thresholds(b, args, cfg.validate)
     if devloop:
         try:

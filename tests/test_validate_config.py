@@ -199,6 +199,24 @@ def test_source_labels_redact_resolved_arguments(offline, monkeypatch, capsys, v
     assert ("ok:" if valid else "error:") in output
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_missing_argument_redacts_other_known_values_in_source(offline, monkeypatch, capsys, override):
+    value = "supplied-value" if override else "declared-value"
+    source = offline / value
+    source.mkdir()
+    path = _write(
+        source / "config.toml",
+        '[build]\n[build.build-args]\nVALUE = "declared-value"\nREQUIRED = {}\n',
+    )
+    extra = ["--build-arg", f"VALUE={value}"] if override else []
+    assert _run(monkeypatch, ["validate", "config", path, *extra]) == 2
+    output = capsys.readouterr().err
+    assert value not in output
+    assert "<redacted>" in output
+    assert "config.toml" in output
+    assert "Missing required build argument(s): REQUIRED." in output
+
+
 def test_validation_applies_security_after_platform_override_and_expansion(offline, monkeypatch, capsys):
     path = _write(
         offline / "config.toml",
