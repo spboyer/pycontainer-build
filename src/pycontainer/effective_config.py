@@ -163,11 +163,25 @@ def resolve_settings(
     """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
     origin = lambda field: _origin(field, overrides, table, file_config)
+    declarations = merged.get("build_args") or {}
     try:
-        arguments = resolve_arguments(merged.get("build_args") or {}, build_arg_overrides)
+        arguments = resolve_arguments(declarations, build_arg_overrides)
     except ValueError as exc:
+        # Resolution can fail before returning otherwise valid defaults/overrides.
+        known_values = []
+        if isinstance(declarations, dict):
+            for declaration in declarations.values():
+                value = declaration.get("default") if isinstance(declaration, dict) else declaration
+                if isinstance(value, str):
+                    known_values.append(value)
+            for item in build_arg_overrides or []:
+                name, separator, value = item.partition("=")
+                if separator and name in declarations:
+                    known_values.append(value)
         field_origin = "CLI option --build-arg" if "--build-arg" in str(exc) or str(exc).startswith("Undeclared build argument ") else origin("build_args")
-        raise ConfigValidationError([f"{field_origin}: {exc}"]) from None
+        raise ConfigValidationError(
+            [redact_values(f"{field_origin}: {exc}", known_values)], known_values
+        ) from None
     try:
         _validate_config(merged, table or BUILD_TABLE)
     except ValueError as exc:
