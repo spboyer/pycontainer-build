@@ -1689,6 +1689,28 @@ def test_attribution_requires_the_expected_manifest_digest(tmp_path):
     _sized_image(tmp_path, 1)
     with pytest.raises(ValueError, match="expected manifest digest"):
         image_validation.validate_image(tmp_path, base_layer_count=0)
+    with pytest.raises(ValueError, match="expected manifest digest"):
+        image_validation.validate_image(tmp_path, base_layer_count=0.5)
+
+
+@pytest.mark.parametrize("count", [0.5, 1.0, True, False, "0", "1", -1, 2])
+def test_base_layer_count_must_be_a_valid_integer(tmp_path, count):
+    descriptor, _, _ = _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Base layer count"):
+        image_validation.validate_image(
+            tmp_path, expected_digest=descriptor["digest"], base_layer_count=count,
+        )
+
+
+@pytest.mark.parametrize(("count", "base"), [(0, 0), (1, 1)])
+def test_valid_base_layer_counts_are_attributed(tmp_path, count, base):
+    descriptor, _, _ = _sized_image(tmp_path, 1)
+    size = image_validation.validate_image(
+        tmp_path, expected_digest=descriptor["digest"], base_layer_count=count,
+    )["size"]
+    assert size["contributions"] == {
+        "status": "determined", "base_bytes": base, "application_bytes": 1 - base,
+    }
 
 
 def _with_base_layer(monkeypatch, tmp_path, data=b"compressed base layer"):
@@ -2028,6 +2050,101 @@ def test_port_findings_redact_configured_values_before_encoding(
     else:
         message = next(line for line in captured.out.splitlines() if f": {rule_id}:" in line)
     assert json.dumps("bad-<redacted>-port") in message
+
+
+def _marker_media_type(secret):
+    return f"application/example.{secret}.tar+gzip"
+
+
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_size_report_redacts_configured_values_in_media_types(
+    tmp_path, monkeypatch, capsys, format_, secret
+):
+    descriptor, _, _ = _image(tmp_path, layer_type=_marker_media_type(secret))
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = {json.dumps(secret)}\n')
+    assert _validate(monkeypatch, tmp_path, "--config", str(config), "--format", format_) == 0
+    captured = capsys.readouterr()
+    assert not captured.err
+    for representation in (secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]):
+        assert representation not in captured.out
+    redacted = "application/example.<redacted>.tar+gzip"
+    if format_ == "json":
+        size = json.loads(captured.out)["size"]
+        assert size["layers"][0]["media_type"] == redacted
+        assert size["layers"][0]["compression"] == "gzip"
+        assert size["largest_layer"]["media_type"] == redacted
+    else:
+        assert f", {redacted})" in captured.out
+
+
+def test_size_report_api_redacts_media_types_and_keeps_raw_without_redactor(tmp_path):
+    media_type = _marker_media_type("synthetic-media-redaction-marker")
+    descriptor, _, _ = _image(tmp_path, layer_type=media_type)
+    _layout(tmp_path, [descriptor])
+    redacted = image_validation.validate_image(
+        tmp_path, redact=lambda text: text.replace("synthetic-media-redaction-marker", "<redacted>"),
+    )["size"]
+    assert redacted["layers"][0]["media_type"] == "application/example.<redacted>.tar+gzip"
+    assert redacted["largest_layer"]["media_type"] == "application/example.<redacted>.tar+gzip"
+    assert redacted["layers"][0]["compression"] == "gzip"
+    raw = image_validation.validate_image(tmp_path)["size"]
+    assert raw["layers"][0]["media_type"] == media_type
+    assert raw["largest_layer"]["media_type"] == media_type
+
+
+@pytest.mark.parametrize("control", ["\x1b[2J", "\x07", "\x9b", "\u202e", "\n"])
+def test_size_text_escapes_terminal_control_characters(tmp_path, monkeypatch, capsys, control):
+    media_type = f"application/example{control}.tar+gzip"
+    descriptor, _, _ = _image(tmp_path, layer_type=media_type)
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path) == 0
+    out = capsys.readouterr().out
+    assert media_type not in out and control not in out.replace("\n", "")
+    assert json.dumps(media_type)[1:-1] in out
+    assert _validate(monkeypatch, tmp_path, "--format", "json") == 0
+    size = _report(capsys)["size"]
+    assert size["layers"][0]["media_type"] == media_type
+    assert size["layers"][0]["compression"] == "gzip"
+
+
+def test_size_text_keeps_standard_media_types_unescaped(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path, layer_type=GZIP_LAYER)
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path) == 0
+    assert f", {GZIP_LAYER})." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_build_size_report_redacts_live_argument_values(tmp_path, monkeypatch, capsys, secret):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    media_type = _marker_media_type(secret)
+    data = b"b" * (256 * 1024)
+    original = builder.ImageBuilder._pull_base_image
+
+    def pull(self, layers_dir, os_name, arch):
+        _, base = original(self, layers_dir, os_name, arch)
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        path = layers_dir / digest.split(":", 1)[1]
+        path.write_bytes(data)
+        base["rootfs"]["diff_ids"] = ["sha256:" + "1" * 64]
+        return [builder.OCILayer(media_type, digest, len(data), str(path))], base
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", pull)
+    with config.open("a") as stream:
+        stream.write('\n[build.build-args]\nTOKEN = "declared-default"\n')
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--build-arg", f"TOKEN={secret}", "--validate", "--push"],
+    ) == 0
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert secret not in captured.out and json.dumps(secret)[1:-1] not in captured.out
+    assert f"{len(data)} bytes" in captured.out
+    assert "application/example.<redacted>.tar+gzip" in captured.out
+    assert len(pushes) == 1
 
 
 def test_validate_image_keeps_prior_positional_parameters(tmp_path):

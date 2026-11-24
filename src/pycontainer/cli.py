@@ -62,10 +62,14 @@ def _size_thresholds(parser, args, file_validate):
 def _mib(size):
     return f"{size} bytes ({size / MIB:.2f} MiB)"
 
+def _terminal_text(value):
+    """Escape untrusted text containing control or other non-printable characters."""
+    return value if value.isprintable() else json.dumps(value, ensure_ascii=True)[1:-1]
+
 def _print_size(size):
     largest = size["largest_layer"]
     layers = "no layers" if largest is None else (
-        f"largest layer {_mib(largest['bytes'])}, {largest['media_type']}"
+        f"largest layer {_mib(largest['bytes'])}, {_terminal_text(largest['media_type'])}"
     )
     print(f"Stored image size: {_mib(size['image_bytes'])} "
           f"(config and {len(size['layers'])} layer descriptor(s); {layers}).")

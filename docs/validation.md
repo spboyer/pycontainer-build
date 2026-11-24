@@ -123,7 +123,12 @@ ignoring PCB006 or PCB007 does not suppress it.
   `media_type`), or `null` for an image without layers.
 - `layers`: each layer's `digest`, `bytes`, `media_type`, `compression`
   (`gzip`, `zstd`, `none` for plain tar, or `unknown`, derived from the media
-  type) and `role`.
+  type) and `role`. Layer media types are not restricted, so reported
+  `media_type` values (here and in `largest_layer`) redact declared
+  build-argument values in text and JSON, as port findings do; `compression`
+  is derived from the original media type. Text output escapes media types
+  containing control or other non-printable characters as JSON string
+  escapes; JSON output relies on standard JSON escaping.
 - `contributions`: base versus application/dependency bytes, plus
   `config_bytes` separately.
 - `thresholds`: each configured value is an **exact decimal string**, using
@@ -144,6 +149,10 @@ The `validate_image(..., thresholds=...)` API accepts `None` or a mapping with
 string keys naming the supported thresholds. Empty mappings and known keys with
 `None` values leave thresholds unset. Non-mapping inputs, non-string keys and
 unknown names raise `ValueError`, including when their values are `None`.
+Its `redact` callable is applied to reported layer media types; the default
+returns them unchanged. `base_layer_count` requires `expected_digest` and
+must be an `int` (not `bool`, float or string) from 0 through the number of
+layers in the selected manifest; anything else raises `ValueError`.
 
 These are **stored blob sizes**. Base layers pulled from a registry usually
 keep their compressed media types, so they count compressed bytes, while

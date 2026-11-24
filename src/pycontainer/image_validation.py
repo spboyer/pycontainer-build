@@ -809,7 +809,7 @@ def _compression(media_type):
     return "unknown"
 
 
-def _size_report(config_size, layers, base_layer_count, thresholds):
+def _size_report(config_size, layers, base_layer_count, thresholds, redact=str):
     if base_layer_count is not None and not 0 <= base_layer_count <= len(layers):
         raise ImageValidationError("Base layer count does not match the selected image.")
     entries = []
@@ -819,7 +819,7 @@ def _size_report(config_size, layers, base_layer_count, thresholds):
         else:
             role = "base" if position < base_layer_count else "application"
         entries.append({
-            "digest": digest, "bytes": size, "media_type": media_type,
+            "digest": digest, "bytes": size, "media_type": redact(media_type),
             "compression": _compression(media_type), "role": role,
         })
     largest = max(entries, key=lambda entry: entry["bytes"], default=None)
@@ -886,10 +886,13 @@ def validate_image(
 
     ``base_layer_count`` attributes the first layers of the selected manifest to the base
     image. It requires ``expected_digest``, the manifest digest the caller built.
-    ``base_exposed_ports`` lists known base ports; ``redact`` sanitizes diagnostic keys.
+    ``base_exposed_ports`` lists known base ports; ``redact`` sanitizes diagnostic keys and
+    reported layer media types.
     """
     if base_layer_count is not None and expected_digest is None:
         raise ValueError("Base layer attribution requires the expected manifest digest.")
+    if base_layer_count is not None and type(base_layer_count) is not int:
+        raise ValueError("Base layer count must be an integer.")
     validate_ignores(ignores)
     if thresholds is None:
         thresholds = {}
@@ -910,7 +913,7 @@ def validate_image(
     if expected_digest is not None and digest != expected_digest:
         raise ImageValidationError("The built image no longer matches the selected layout manifest.")
     _, _, config_size, layers = layout.images[digest]
-    size = _size_report(config_size, layers, base_layer_count, thresholds)
+    size = _size_report(config_size, layers, base_layer_count, thresholds, redact)
     ignored = set(ignores)
     return {
         "image": {"digest": digest, "platform": "/".join(part for part in selected_platform if part)},
