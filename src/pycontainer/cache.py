@@ -1,10 +1,12 @@
 """Content-addressed application layer cache."""
 import hashlib
+import io
 import json
 import logging
 import os
 import shutil
 import stat
+import tarfile
 import tempfile
 import time
 from contextlib import contextmanager
@@ -17,11 +19,48 @@ from .fs_utils import file_lock
 
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
-_CACHE_KEY_VERSION = 2
+_CACHE_KEY_VERSION = 4
+
+
+def app_layer_arcname(workdir: str, relative_path: Path) -> str:
+    return f"{workdir.lstrip('/')}/{Path(relative_path).as_posix()}"
+
+
+def ordered_app_files(
+    files: List[Tuple[Path, Path]], reproducible: bool
+) -> List[Tuple[Path, Path]]:
+    if reproducible:
+        return sorted(files, key=lambda item: Path(item[1]).as_posix())
+    return list(files)
+
+
+def emitted_hardlinks(
+    ordered_files: List[Tuple[Path, Path]], members: List[tarfile.TarInfo]
+) -> Dict[str, str]:
+    """Map context-relative hardlink members to their context-relative targets."""
+    if len(ordered_files) != len(members):
+        raise RuntimeError("Application layer members do not match its source files")
+    relative_by_arcname = {
+        member.name: Path(relative).as_posix()
+        for (_, relative), member in zip(ordered_files, members)
+    }
+    return {
+        Path(relative).as_posix(): relative_by_arcname[member.linkname]
+        for (_, relative), member in zip(ordered_files, members)
+        if member.islnk()
+    }
 
 
 class CacheIndexError(RuntimeError):
     """Raised when the persisted cache index cannot be trusted."""
+
+    def __init__(self, message: str, index_file: Optional[Path] = None):
+        if index_file is not None:
+            message = (
+                f"{message}. Delete {index_file} to discard the cached entries "
+                "(their layers are rebuilt on the next build), or rerun with --no-cache."
+            )
+        super().__init__(message)
 
 
 class CacheIntegrityError(RuntimeError):
@@ -91,18 +130,38 @@ class LayerCache:
     def _relative_path(path: Path) -> str:
         return Path(path).as_posix()
 
+    @staticmethod
+    def _probe_hardlinks(
+        ordered_files: List[Tuple[Path, Path]], workdir: str
+    ) -> Dict[str, str]:
+        """Predict the hardlinks tarfile emits for these files, in emission order."""
+        candidates = []
+        for abs_path, rel_path in ordered_files:
+            metadata = Path(abs_path).lstat()
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                candidates.append((abs_path, rel_path))
+        if len(candidates) < 2:
+            return {}
+        with tarfile.open(fileobj=io.BytesIO(), mode="w") as probe:
+            members = [
+                probe.gettarinfo(abs_path, arcname=app_layer_arcname(workdir, rel_path))
+                for abs_path, rel_path in candidates
+            ]
+        return emitted_hardlinks(candidates, members)
+
     def _compute_files_digest(
         self,
         files: List[Tuple[Path, Path]],
         workdir: str = "/app",
         reproducible: bool = True,
+        hardlinks: Optional[Dict[str, str]] = None,
+        *,
+        namespace: Optional[str] = None,
     ) -> str:
         file_records = []
-        ordered_files = (
-            sorted(files, key=lambda item: self._relative_path(item[1]))
-            if reproducible
-            else files
-        )
+        ordered_files = ordered_app_files(files, reproducible)
+        if hardlinks is None:
+            hardlinks = self._probe_hardlinks(ordered_files, workdir)
         for abs_path, rel_path in ordered_files:
             abs_path = Path(abs_path)
             rel_name = self._relative_path(rel_path)
@@ -111,12 +170,13 @@ class LayerCache:
                 "path": rel_name,
                 "mode": stat.S_IMODE(metadata.st_mode),
                 "size": metadata.st_size,
+                "hardlink": hardlinks.get(rel_name),
             }
 
             if stat.S_ISLNK(metadata.st_mode):
                 record["kind"] = "symlink"
                 record["content"] = hashlib.sha256(
-                    os.fsencode(os.readlink(abs_path))
+                    os.fsencode(os.readlink(abs_path).replace(os.sep, "/"))
                 ).hexdigest()
             elif stat.S_ISREG(metadata.st_mode):
                 record["kind"] = "file"
@@ -139,6 +199,8 @@ class LayerCache:
             "reproducible": bool(reproducible),
             "files": file_records,
         }
+        if namespace is not None:
+            identity["namespace"] = namespace
         serialized = json.dumps(
             identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -155,20 +217,27 @@ class LayerCache:
         try:
             data = json.loads(self.index_file.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise CacheIndexError(f"Malformed cache index {self.index_file}: {error}") from error
+            raise CacheIndexError(
+                f"Malformed cache index {self.index_file}: {error}", self.index_file
+            ) from error
         if not isinstance(data, dict):
-            raise CacheIndexError(f"Malformed cache index {self.index_file}: expected an object")
+            raise CacheIndexError(
+                f"Malformed cache index {self.index_file}: expected an object", self.index_file
+            )
 
         entries = {}
         for key, value in data.items():
             if not isinstance(key, str) or not isinstance(value, dict):
-                raise CacheIndexError(f"Malformed cache index entry in {self.index_file}")
+                raise CacheIndexError(
+                    f"Malformed cache index entry in {self.index_file}", self.index_file
+                )
             try:
                 entry = CacheEntry(**value)
                 self._digest_hex(entry.digest)
             except (TypeError, ValueError) as error:
                 raise CacheIndexError(
-                    f"Malformed cache index entry {key!r} in {self.index_file}: {error}"
+                    f"Malformed cache index entry {key!r} in {self.index_file}: {error}",
+                    self.index_file,
                 ) from error
             if (
                 isinstance(entry.size, bool)
@@ -179,10 +248,12 @@ class LayerCache:
                 or not isinstance(entry.source_files, list)
                 or any(not isinstance(path, str) for path in entry.source_files)
             ):
-                raise CacheIndexError(f"Malformed cache index entry {key!r} in {self.index_file}")
+                raise CacheIndexError(
+                    f"Malformed cache index entry {key!r} in {self.index_file}", self.index_file
+                )
             entries[key] = entry
 
-        self._unique_blob_sizes(entries)
+        self._unique_blob_sizes(entries, self.index_file)
         return entries
 
     def _save_index(self, entries: Dict[str, CacheEntry]):
@@ -202,13 +273,16 @@ class LayerCache:
             temp_path.unlink(missing_ok=True)
 
     @staticmethod
-    def _unique_blob_sizes(entries: Dict[str, CacheEntry]) -> Dict[str, int]:
+    def _unique_blob_sizes(
+        entries: Dict[str, CacheEntry], index_file: Optional[Path] = None
+    ) -> Dict[str, int]:
         sizes = {}
         for entry in entries.values():
             previous_size = sizes.setdefault(entry.digest, entry.size)
             if previous_size != entry.size:
                 raise CacheIndexError(
-                    f"Cache index has conflicting sizes for shared blob {entry.digest}"
+                    f"Cache index has conflicting sizes for shared blob {entry.digest}",
+                    index_file,
                 )
         return sizes
 
@@ -245,12 +319,15 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
     ) -> Optional[Tuple[str, Path]]:
         if not self.enabled:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = self._compute_files_digest(
+            files, workdir, reproducible, namespace=namespace
+        )
         with self._index_lock():
             entries = self._load_index()
             entry = entries.get(files_digest)
@@ -284,6 +361,9 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
+        record_source_files: bool = True,
+        hardlinks: Optional[Dict[str, str]] = None,
     ) -> Path:
         layer_path = Path(layer_path)
         if not self.enabled:
@@ -295,7 +375,9 @@ class LayerCache:
             raise CacheIntegrityError(
                 f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
             )
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = self._compute_files_digest(
+            files, workdir, reproducible, hardlinks, namespace=namespace
+        )
         blob_path = self._blob_path(digest)
 
         with self._index_lock():
@@ -308,7 +390,10 @@ class LayerCache:
                 size=size,
                 created=time.time(),
                 last_used=time.time(),
-                source_files=[self._relative_path(relative) for _, relative in files],
+                source_files=(
+                    [self._relative_path(relative) for _, relative in files]
+                    if record_source_files else []
+                ),
             )
             self._evict_if_needed(entries)
             self._save_index(entries)

@@ -4,6 +4,28 @@ import json, tempfile, shutil
 from pathlib import Path
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
+from pycontainer.oci import build_index_json
+
+def test_index_ref_name_is_on_manifest_descriptor():
+    """OCI image-layout tools such as Skopeo resolve tags on the descriptor."""
+    index=build_index_json("sha256:"+"a"*64,10,"runtime-check","arm64","linux")
+
+    assert index["manifests"][0]["annotations"]=={"org.opencontainers.image.ref.name":"runtime-check"}
+    assert index["annotations"]["org.opencontainers.image.ref.name"]=="runtime-check"
+    assert "annotations" not in build_index_json("sha256:"+"a"*64,10)["manifests"][0]
+
+def test_index_has_one_descriptor_per_ref_name():
+    digest="sha256:"+"a"*64
+    single=build_index_json(digest,10,"app:v1","arm64","linux",variant="v8")
+    assert build_index_json(digest,10,"app:v1","arm64","linux",variant="v8",ref_names=["app:v1"])==single
+
+    index=build_index_json(digest,10,"app:v1","arm64","linux",variant="v8",ref_names=["app:v1","app:v2","app:v1"])
+    descriptors=index["manifests"]
+    assert [d["annotations"]["org.opencontainers.image.ref.name"] for d in descriptors]==["app:v1","app:v2"]
+    assert {(d["mediaType"],d["digest"],d["size"],json.dumps(d["platform"])) for d in descriptors}=={
+        ("application/vnd.oci.image.manifest.v1+json",digest,10,'{"architecture": "arm64", "os": "linux", "variant": "v8"}')}
+    assert descriptors[0]["annotations"] is not descriptors[1]["annotations"]
+    assert index["annotations"]=={"org.opencontainers.image.ref.name":"app:v1"}
 
 @pytest.mark.registry_integration
 def test_oci_layout_structure():
@@ -29,6 +51,7 @@ def test_oci_layout_structure():
         assert index["annotations"]["org.opencontainers.image.ref.name"]=="test:v1"
         
         manifest_desc=index["manifests"][0]
+        assert manifest_desc["annotations"]["org.opencontainers.image.ref.name"]=="test:v1"
         assert manifest_desc["platform"]["architecture"]=="amd64"
         assert manifest_desc["platform"]["os"]=="linux"
         

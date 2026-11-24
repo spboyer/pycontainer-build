@@ -8,7 +8,22 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 TABLE_NAME = "tool.pycontainer"
-SHELL_FORM_PREFIX = ["/bin/sh", "-c"]
+DEFAULT_SHELL = ["/bin/sh", "-c"]
+SHELL_FORM_PREFIX = DEFAULT_SHELL
+
+# Linux generic signal numbers (amd64/arm64), matching Docker's Linux table.
+LINUX_SIGNAL_NUMBERS = {
+    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT",
+    7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL", 10: "SIGUSR1", 11: "SIGSEGV", 12: "SIGUSR2",
+    13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM", 16: "SIGSTKFLT", 17: "SIGCHLD",
+    18: "SIGCONT", 19: "SIGSTOP", 20: "SIGTSTP", 21: "SIGTTIN", 22: "SIGTTOU",
+    23: "SIGURG", 24: "SIGXCPU", 25: "SIGXFSZ", 26: "SIGVTALRM", 27: "SIGPROF",
+    28: "SIGWINCH", 29: "SIGIO", 30: "SIGPWR", 31: "SIGSYS", 34: "SIGRTMIN", 64: "SIGRTMAX",
+    **{34 + n: f"SIGRTMIN+{n}" for n in range(1, 16)},
+    **{64 - n: f"SIGRTMAX-{n}" for n in range(1, 15)},
+}
+# Linux alias names that Docker accepts, mapped to their canonical SIGNAME.
+SIGNAL_ALIASES = {"SIGIOT": "SIGABRT", "SIGCLD": "SIGCHLD", "SIGPOLL": "SIGIO"}
 
 # Instructions with no pycontainer equivalent, and what to do instead.
 UNSUPPORTED_ADVICE = {
@@ -19,9 +34,9 @@ UNSUPPORTED_ADVICE = {
     "ADD": "files come from context_dir via include_paths/exclude_paths; "
            "remote URLs, archive extraction and --chown are not supported",
     "HEALTHCHECK": "health checks are not supported; configure them in your runtime",
-    "VOLUME": "volumes are not supported; declare them in your runtime",
-    "SHELL": "custom shells are not supported",
-    "STOPSIGNAL": "stop signals are not supported",
+    "VOLUME": "only absolute container paths are imported, as image metadata",
+    "SHELL": "only exec-form SHELL is applied, to later shell-form CMD/ENTRYPOINT",
+    "STOPSIGNAL": "only Linux signal names or numbers are imported",
     "ONBUILD": "ONBUILD triggers are not supported",
     "MAINTAINER": "deprecated; add a maintainer entry under [tool.pycontainer.labels] if needed",
 }
@@ -178,22 +193,76 @@ def _parse_key_values(args: str) -> List[Tuple[str, Optional[str]]]:
     return pairs
 
 
-def _command_list(args: str) -> List[str]:
+def validate_shell(shell: object, source: str = "shell") -> List[str]:
+    """Return a copy of shell if it is a usable exec-form shell array, else raise ValueError."""
+    if (
+        not isinstance(shell, list)
+        or not shell
+        or not all(isinstance(part, str) for part in shell)
+        or not shell[0].strip()
+        or any("\x00" in part for part in shell)
+    ):
+        raise ValueError(
+            f"{source} must be a non-empty JSON array of strings with a non-empty "
+            f"executable first and no NUL characters, e.g. [\"/bin/bash\", \"-c\"]; got {shell!r}."
+        )
+    return list(shell)
+
+
+def parse_shell_option(value: str) -> List[str]:
+    """Parse the import --shell JSON array option."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--shell must be a JSON array of strings: {exc}.") from exc
+    return validate_shell(parsed, "--shell")
+
+
+def _exec_form(args: str) -> Optional[List[str]]:
     stripped = args.strip()
     if stripped.startswith("["):
         try:
             parsed = json.loads(stripped)
-            if isinstance(parsed, list) and all(isinstance(p, str) for p in parsed):
-                return parsed
         except json.JSONDecodeError:
-            pass
-    return SHELL_FORM_PREFIX + [stripped]
+            return None
+        if isinstance(parsed, list) and all(isinstance(p, str) for p in parsed):
+            return parsed
+    return None
+
+
+def _command_list(args: str, shell: Optional[List[str]] = None) -> List[str]:
+    exec_form = _exec_form(args)
+    if exec_form is not None:
+        return exec_form
+    return list(shell or DEFAULT_SHELL) + [args.strip()]
+
+
+def _import_stop_signal(value: str) -> Optional[str]:
+    """Map a Dockerfile STOPSIGNAL value to a canonical SIGNAME, as Docker parses it."""
+    from .config import STOP_SIGNALS
+
+    raw = value.strip().upper()
+    if raw.isdigit():
+        return LINUX_SIGNAL_NUMBERS.get(int(raw))
+    name = raw if raw.startswith("SIG") else "SIG" + raw
+    name = SIGNAL_ALIASES.get(name, name)
+    return name if name in STOP_SIGNALS else None
+
+
+def _volume_paths(args: str) -> List[str]:
+    exec_form = _exec_form(args)
+    return exec_form if exec_form is not None else args.split()
 
 
 def import_dockerfile(
-    text: str, build_args: Optional[Dict[str, str]] = None
+    text: str,
+    build_args: Optional[Dict[str, str]] = None,
+    shell: Optional[List[str]] = None,
 ) -> ImportResult:
     """Map a Dockerfile to [tool.pycontainer] settings plus explicit warnings."""
+    from .config import validate_volume
+
+    current_shell = validate_shell(shell, "shell") if shell is not None else list(DEFAULT_SHELL)
     parsed = parse_dockerfile(text)
     overrides = dict(build_args or {})
     warnings: List[str] = []
@@ -249,6 +318,7 @@ def import_dockerfile(
     env: Dict[str, str] = {}
     labels: Dict[str, str] = {}
     ports: List[int] = []
+    volumes: List[str] = []
     workdir = "/"
     workdir_set = False
 
@@ -296,9 +366,62 @@ def import_dockerfile(
                     warnings.append(f"Line {ins.line}: EXPOSE {token} is not a numeric port; skipped.")
         elif name in ("CMD", "ENTRYPOINT"):
             key = "cmd" if name == "CMD" else "entrypoint"
-            config[key] = _command_list(ins.args)
-            if not ins.args.strip().startswith("["):
-                notes.append(f"Line {ins.line}: {name} shell form converted to {SHELL_FORM_PREFIX} + command.")
+            config[key] = _command_list(ins.args, current_shell)
+            if _exec_form(ins.args) is None:
+                notes.append(
+                    f"Line {ins.line}: {name} shell form converted to {current_shell} + command "
+                    "(text kept verbatim; the shell must exist in the target image)."
+                )
+                if "distroless" in str(config.get("base_image", "")).lower():
+                    warnings.append(
+                        f"Line {ins.line}: {name} shell form needs {current_shell[0]}, which "
+                        "distroless images usually lack; use exec form instead."
+                    )
+        elif name == "SHELL":
+            try:
+                current_shell = validate_shell(_exec_form(ins.args), "SHELL")
+            except ValueError:
+                warnings.append(
+                    f"Line {ins.line}: SHELL must be a JSON array of strings with a non-empty "
+                    "executable; ignored."
+                )
+            else:
+                warnings.append(
+                    f"Line {ins.line}: SHELL {current_shell} applied only to later shell-form "
+                    "CMD/ENTRYPOINT conversion; RUN is not executed, and the shell is not "
+                    "recorded in the image config or inherited by images built from it."
+                )
+        elif name == "STOPSIGNAL":
+            value = expand(ins, ins.args).strip()
+            signal = _import_stop_signal(value)
+            if signal is None:
+                warnings.append(
+                    f"Line {ins.line}: STOPSIGNAL {value!r} is not a recognized Linux signal; skipped."
+                )
+            else:
+                config["stop_signal"] = signal
+                if signal != value:
+                    notes.append(f"Line {ins.line}: STOPSIGNAL {value} mapped to {signal}.")
+        elif name == "VOLUME":
+            paths = _volume_paths(expand(ins, ins.args))
+            if not paths:
+                warnings.append(f"Line {ins.line}: VOLUME has no paths; skipped.")
+                continue
+            for path in paths:
+                candidate = path.rstrip("/") or path
+                try:
+                    validate_volume(candidate)
+                except ValueError:
+                    warnings.append(
+                        f"Line {ins.line}: VOLUME {path!r} is not a normalized absolute, "
+                        "non-root container path (relative or unsafe); skipped."
+                    )
+                    continue
+                if candidate not in volumes:
+                    volumes.append(candidate)
+            notes.append(
+                f"Line {ins.line}: VOLUME imported as image metadata only; no mount is created."
+            )
         elif name == "USER":
             config["user"] = expand(ins, ins.args).strip()
         elif name == "MAINTAINER":
@@ -319,6 +442,8 @@ def import_dockerfile(
         config["labels"] = labels
     if ports:
         config["exposed_ports"] = ports
+    if volumes:
+        config["volumes"] = volumes
     return ImportResult(config, warnings, notes)
 
 
@@ -329,7 +454,8 @@ def _toml_value(value: object) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return json.dumps(str(value), ensure_ascii=False)
+    # Imported Dockerfile values are already resolved; preserve runtime dollars.
+    return json.dumps(str(value).replace("$", "$$"), ensure_ascii=False)
 
 
 def _toml_key(key: str) -> str:
@@ -351,18 +477,66 @@ def render_toml(config: Dict[str, object]) -> str:
 
 def merge_into_pyproject(existing: str, snippet: str) -> str:
     """Replace any [tool.pycontainer*] tables in existing text with snippet."""
+    # Keep float tokens comparable, including NaN, when checking unrelated values.
+    original = tomllib.loads(existing, parse_float=lambda value: (value,))
     kept: List[str] = []
+    trailing: List[str] = []
     skipping = False
-    for line in existing.splitlines():
-        header = re.match(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$", line)
-        if header:
-            table = header.group(1).replace('"', "").replace(" ", "")
-            skipping = table == TABLE_NAME or table.startswith(TABLE_NAME + ".")
-        if not skipping:
+    lines = existing.split("\n")
+    segment_start = 0
+
+    def complete_prefix(start: int, end: int) -> bool:
+        prefix = "\n".join(lines[start:end]) + ("\n" if end > start else "")
+        try:
+            tomllib.loads(prefix)
+        except tomllib.TOMLDecodeError:
+            return False
+        return True
+
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            try:
+                header = tomllib.loads(line.rstrip("\r"))
+            except tomllib.TOMLDecodeError:
+                header = None
+            if header is not None:
+                tool = header.get("tool")
+                is_target = isinstance(tool, dict) and "pycontainer" in tool
+                if is_target != skipping:
+                    # A header-like line inside a multiline value has an incomplete prefix.
+                    is_header = complete_prefix(segment_start, index)
+                    if not is_header and segment_start:
+                        # Array-of-tables fragments may need earlier context.
+                        is_header = complete_prefix(0, index)
+                    if is_header:
+                        if skipping:
+                            kept.extend(trailing)
+                        trailing.clear()
+                        skipping = is_target
+                        segment_start = index
+        if skipping:
+            if not line.strip() or line.lstrip().startswith("#"):
+                trailing.append(line)
+            else:
+                trailing.clear()
+        else:
             kept.append(line)
+    if skipping:
+        kept.extend(trailing)
     base = "\n".join(kept).rstrip()
     merged = (base + "\n\n" if base else "") + snippet
-    tomllib.loads(merged)
+    try:
+        updated = tomllib.loads(merged, parse_float=lambda value: (value,))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Cannot safely merge [tool.pycontainer]: {exc}") from exc
+    for data in (original, updated):
+        tool = data.get("tool")
+        if isinstance(tool, dict):
+            tool.pop("pycontainer", None)
+            if not tool:
+                data.pop("tool")
+    if original != updated:
+        raise ValueError("Cannot safely merge [tool.pycontainer] without changing unrelated TOML.")
     return merged
 
 
@@ -385,12 +559,13 @@ def run_import(
     output: Optional[Path],
     force: bool = False,
     build_args: Optional[Dict[str, str]] = None,
+    shell: Optional[List[str]] = None,
 ) -> Tuple[str, int]:
     """Run the import; return (message for stdout, exit code)."""
     if not dockerfile.is_file():
         raise FileNotFoundError(f"Dockerfile not found: {dockerfile}")
     result = import_dockerfile(
-        dockerfile.read_text(encoding="utf-8"), build_args
+        dockerfile.read_text(encoding="utf-8"), build_args, shell
     )
     snippet = render_toml(result.config)
     report = format_report(result, str(dockerfile))

@@ -4,6 +4,10 @@ This example demonstrates building container images for different CPU architectu
 
 ## Overview
 
+Dependency staging validates libc from explicit metadata, mapped releases or
+effective package metadata in verified official tag-only base layers. Unversioned
+tags do not imply a fixed libc floor; missing or unsupported evidence fails closed.
+
 Cross-platform builds allow you to:
 
 - Build `linux/amd64` images from ARM Macs (Apple Silicon)

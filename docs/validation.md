@@ -68,6 +68,8 @@ but does not fail solely because of them. `build --validate` always fails on
 any unsuppressed warning or error, after writing the layout and before a push.
 Its `--ignore` option requires `--validate`, and validation cannot be combined
 with `--dry-run`. Without `--validate`, the build output is unchanged.
+For multi-platform builds, every built platform must pass before pushing the
+image index. When combined with `--scan`, both gates must pass.
 
 | Exit code | Meaning |
 |---|---|
