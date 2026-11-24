@@ -475,6 +475,16 @@ class ImageBuilder:
     def _print(self, message: str):
         print(self.config.redact(message))
 
+    def _strip_type_stubs(self, site_packages: Path) -> List[str]:
+        if not self.config.build_args:
+            return strip_type_stubs(site_packages)
+        try:
+            return strip_type_stubs(site_packages, redact=self.config.redact)
+        except (OSError, ValueError) as error:
+            error_type, message = type(error), self.config.redact(str(error))
+        # Raised outside the handler so no chained exception keeps the unredacted text.
+        raise error_type(message)
+
     def _record_failed_history(self, timing, config):
         try:
             self._history.validate_location(config.context_dir, config.output_dir)
@@ -1601,7 +1611,7 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                removed = strip_type_stubs(site_packages)
+                removed = self._strip_type_stubs(site_packages)
                 if removed:
                     self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")

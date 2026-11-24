@@ -1,6 +1,9 @@
 import json
+import logging
+import shutil
 import sys
 import tarfile
+import traceback
 from pathlib import Path
 
 import pytest
@@ -274,6 +277,66 @@ def test_builder_redacts_build_argument_values_in_removed_stub_names(
     output = capsys.readouterr().out
     assert "types-requests" not in output
     assert "Removed type stub distributions: <redacted>, types-six" in output
+
+
+def test_builder_redacts_build_argument_values_in_kept_stub_warning(
+    tmp_path, monkeypatch, caplog
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+
+    with caplog.at_level(logging.WARNING):
+        _builder(
+            tmp_path / "build", monkeypatch, context,
+            strip_type_stubs=True, build_args={"STUB": "Django_Stubs"},
+        ).build()
+
+    assert "Keeping <redacted>-1.0.dist-info" in caplog.text
+    assert "Django_Stubs" not in caplog.text
+
+
+def test_builder_redacts_build_argument_values_in_stub_errors(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    site = context / ".venv" / "Lib" / "site-packages"
+    _site_packages(site)
+    (site / "types_requests-1.0.dist-info" / "RECORD").unlink()
+    (context / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path / "build", monkeypatch, context,
+        strip_type_stubs=True, build_args={"STUB": "types_requests"},
+    )
+
+    with pytest.raises(ValueError, match="without a RECORD: <redacted>") as error:
+        builder.build()
+
+    formatted = "".join(traceback.format_exception(error.value))
+    assert "types_requests" not in formatted
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+def test_builder_redacts_build_argument_values_in_stub_os_errors(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path / "build", monkeypatch, context,
+        strip_type_stubs=True, build_args={"STUB": "types_requests"},
+    )
+
+    real_rmtree = shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise PermissionError(13, "Access is denied", str(path))
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(PermissionError, match="<redacted>-1.0.dist-info") as error:
+        builder.build()
+
+    assert "types_requests" not in "".join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is None and error.value.__context__ is None
 
 
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
