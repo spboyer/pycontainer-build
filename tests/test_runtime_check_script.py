@@ -253,9 +253,11 @@ def test_lock_option_builds_offline_and_records_verified_fixture(script, tmp_pat
 
         def build(self):
             built.append(self.config)
-            assert os.environ["PIP_NO_INDEX"] == "1"
-            assert Path(os.environ["PIP_FIND_LINKS"]) == Path(self.config.context_dir) / "wheelhouse"
-            assert (Path(self.config.context_dir) / "uv.lock").exists()
+            context = Path(self.config.context_dir)
+            assert os.environ["PIP_FIND_LINKS"] == "original"
+            assert "PIP_NO_INDEX" not in os.environ
+            assert 'registry = "http://127.0.0.1:' in (context / "uv.lock").read_text()
+            assert "[[tool.uv.index]]" in (context / "pyproject.toml").read_text()
             assert self.config.entrypoint == ["python", "/app/app.py"]
             assert self.config.include_paths == ["app.py", "expected.json"]
             output = Path(self.config.output_dir)
@@ -327,19 +329,18 @@ def test_real_offline_lock_staging_checks_wheel_hashes(script, tmp_path, monkeyp
         wheel = context / "wheelhouse" / "runtime_pure-1.0-py3-none-any.whl"
         digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
         lock.write_text(lock.read_text().replace(digest, "0" * 64))
-    monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True,
         platform=platform, generate_sbom=True, include_paths=["app.py", "expected.json"],
     )
     base = {**BASE_CONFIG, "architecture": platform.split("/")[1]}
     monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base))
-    if bad_hash:
-        with pytest.raises(RuntimeError, match="must match their recorded hashes"):
-            builder.build()
-        return
-    builder.build()
+    with script.serve_lock_wheelhouse(context):
+        if bad_hash:
+            with pytest.raises(RuntimeError, match="must match their recorded hashes"):
+                builder.build()
+            return
+        builder.build()
     layer = builder.layers[0]
     with tarfile.open(layer.tar_path, "r") as archive:
         paths = archive.getnames()
