@@ -103,6 +103,30 @@ def parse_platform_variant(platform: str) -> Optional[str]:
     return parts[2] if len(parts) == 3 else None
 
 
+def _redacted_os_error(error: OSError, redact) -> OSError:
+    """Rebuild an OSError with redacted text while keeping errno and filenames."""
+    def text(value):
+        return None if value is None else redact(os.fsdecode(value))
+
+    filename, filename2 = text(error.filename), text(error.filename2)
+    if isinstance(error.errno, int) and error.strerror is not None:
+        args = (error.errno, text(error.strerror), filename)
+        winerror = getattr(error, "winerror", None)
+        if winerror is not None:
+            args += (winerror, filename2)
+    else:
+        args = (redact(str(error)),)
+    try:
+        replacement = type(error)(*args)
+    except Exception:
+        replacement = OSError(*args)
+    if filename is not None and replacement.filename is None:
+        replacement.filename = filename
+    if filename2 is not None:
+        replacement.filename2 = filename2
+    return replacement
+
+
 def _validate_registry_descriptor(
     descriptor: Dict, description: str
 ) -> Tuple[str, int, str]:
@@ -476,14 +500,15 @@ class ImageBuilder:
         print(self.config.redact(message))
 
     def _strip_type_stubs(self, site_packages: Path) -> List[str]:
-        if not self.config.build_args:
-            return strip_type_stubs(site_packages)
+        redact = self.config.redact
         try:
-            return strip_type_stubs(site_packages, redact=self.config.redact)
-        except (OSError, ValueError) as error:
-            error_type, message = type(error), self.config.redact(str(error))
+            return strip_type_stubs(site_packages, redact=redact)
+        except OSError as error:
+            replacement = _redacted_os_error(error, redact)
+        except ValueError as error:
+            replacement = ValueError(redact(str(error)))
         # Raised outside the handler so no chained exception keeps the unredacted text.
-        raise error_type(message)
+        raise replacement
 
     def _record_failed_history(self, timing, config):
         try:

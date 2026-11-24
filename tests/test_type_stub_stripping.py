@@ -279,33 +279,43 @@ def test_builder_redacts_build_argument_values_in_removed_stub_names(
     assert "Removed type stub distributions: <redacted>, types-six" in output
 
 
+def _stub_builder(tmp_path, monkeypatch, context, value, retained):
+    builder = _builder(
+        tmp_path / "build", monkeypatch, context,
+        strip_type_stubs=True, build_args={"STUB": value},
+    )
+    if retained:
+        # Resolved values stay redacted after the public field is cleared.
+        builder.config.build_args = None
+    return builder
+
+
+@pytest.mark.parametrize("retained", [False, True])
 def test_builder_redacts_build_argument_values_in_kept_stub_warning(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch, caplog, retained
 ):
     context = tmp_path / "context"
     _site_packages(context / ".venv" / "Lib" / "site-packages")
     (context / "app.py").write_text("print('app')\n")
+    builder = _stub_builder(tmp_path, monkeypatch, context, "Django_Stubs", retained)
 
     with caplog.at_level(logging.WARNING):
-        _builder(
-            tmp_path / "build", monkeypatch, context,
-            strip_type_stubs=True, build_args={"STUB": "Django_Stubs"},
-        ).build()
+        builder.build()
 
     assert "Keeping <redacted>-1.0.dist-info" in caplog.text
     assert "Django_Stubs" not in caplog.text
 
 
-def test_builder_redacts_build_argument_values_in_stub_errors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retained", [False, True])
+def test_builder_redacts_build_argument_values_in_stub_errors(
+    tmp_path, monkeypatch, retained
+):
     context = tmp_path / "context"
     site = context / ".venv" / "Lib" / "site-packages"
     _site_packages(site)
     (site / "types_requests-1.0.dist-info" / "RECORD").unlink()
     (context / "app.py").write_text("print('app')\n")
-    builder = _builder(
-        tmp_path / "build", monkeypatch, context,
-        strip_type_stubs=True, build_args={"STUB": "types_requests"},
-    )
+    builder = _stub_builder(tmp_path, monkeypatch, context, "types_requests", retained)
 
     with pytest.raises(ValueError, match="without a RECORD: <redacted>") as error:
         builder.build()
@@ -315,15 +325,14 @@ def test_builder_redacts_build_argument_values_in_stub_errors(tmp_path, monkeypa
     assert error.value.__cause__ is None and error.value.__context__ is None
 
 
-def test_builder_redacts_build_argument_values_in_stub_os_errors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retained", [False, True])
+def test_builder_redacts_build_argument_values_in_stub_os_errors(
+    tmp_path, monkeypatch, retained
+):
     context = tmp_path / "context"
     _site_packages(context / ".venv" / "Lib" / "site-packages")
     (context / "app.py").write_text("print('app')\n")
-    builder = _builder(
-        tmp_path / "build", monkeypatch, context,
-        strip_type_stubs=True, build_args={"STUB": "types_requests"},
-    )
-
+    builder = _stub_builder(tmp_path, monkeypatch, context, "types_requests", retained)
     real_rmtree = shutil.rmtree
 
     def fail(path, *args, **kwargs):
@@ -335,6 +344,9 @@ def test_builder_redacts_build_argument_values_in_stub_os_errors(tmp_path, monke
     with pytest.raises(PermissionError, match="<redacted>-1.0.dist-info") as error:
         builder.build()
 
+    assert error.value.errno == 13
+    assert error.value.strerror == "Access is denied"
+    assert error.value.filename.endswith("<redacted>-1.0.dist-info")
     assert "types_requests" not in "".join(traceback.format_exception(error.value))
     assert error.value.__cause__ is None and error.value.__context__ is None
 
