@@ -80,12 +80,13 @@ def _print_size(size):
 
 def _image_validation(
     output, tag, platform, ignores, format_, fail_on, expected_digest=None,
-    thresholds=None, base_layer_count=None, redact=str,
+    thresholds=None, base_layer_count=None, redact=str, base_exposed_ports=None,
 ):
     try:
         report=validate_image(
             output, tag=tag, platform=platform, ignores=ignores, thresholds=thresholds,
             expected_digest=expected_digest, base_layer_count=base_layer_count,
+            base_exposed_ports=base_exposed_ports, redact=redact,
         )
     except (OSError, ValueError) as exc:
         print(f"error: {redact(str(exc))}", file=sys.stderr)
@@ -602,7 +603,7 @@ def main():
                         platform, ignores, "text", "warning", expected_digest=image.manifest_digest,
                         thresholds=thresholds,
                         base_layer_count=len(image.layers) - image.app_layer_count,
-                        redact=cfg.redact,
+                        redact=cfg.redact, base_exposed_ports=image.base_exposed_ports,
                     )
                     if code:
                         raise SystemExit(code)

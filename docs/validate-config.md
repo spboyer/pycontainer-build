@@ -57,7 +57,8 @@ provided table, including an empty one, enables interpolation.
   normalize to the same setting.
 - Semantic checks shared with `build`: SBOM format, system package names, tag
   and base-image references, platform format, relative include/exclude and
-  requirements paths, an existing context directory, and the supported
+  requirements paths, an existing context directory, distinct exposed ports
+  from 1 to 65535, and the supported
   dependency-staging platforms when `include-deps` is set.
 
 Each diagnostic names its source file and where the offending value came from:

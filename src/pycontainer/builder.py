@@ -1,10 +1,10 @@
 import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry, validate_exposed_ports
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -273,6 +273,7 @@ class PlatformImage:
     config_size: int
     layers: List[OCILayer]
     app_layer_count: int
+    base_exposed_ports: List[str] = field(default_factory=list)
 
 
 def _read_verified_blob(layers_dir: Path, digest: str, size: int, description: str) -> bytes:
@@ -476,6 +477,7 @@ class ImageBuilder:
         return timing.phase(name) if timing else nullcontext()
 
     def build(self):
+        validate_exposed_ports(self.config.exposed_ports)
         self.config.validate_metadata()
         self._conda_warning_emitted = False
         self._dependency_source_cache = None
@@ -670,6 +672,8 @@ class ImageBuilder:
             validate_target_platform(os_name, arch, parse_platform_variant(platform))
         with self._time_history_phase("base_image"):
             base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        base_exposed = ((base_config or {}).get("config") or {}).get("ExposedPorts")
+        base_exposed_ports = list(base_exposed) if isinstance(base_exposed, dict) else []
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(platform)
@@ -785,6 +789,7 @@ class ImageBuilder:
             config_size=len(cfg_bytes),
             layers=all_layers,
             app_layer_count=len(app_layers),
+            base_exposed_ports=base_exposed_ports,
         )
         if self.config.analyze_layers:
             self._layer_reports.append(analyze_platform(image, source_layers, squash_stats))

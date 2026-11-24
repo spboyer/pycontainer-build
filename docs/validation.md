@@ -34,6 +34,16 @@ their reachable contents are still verified.
 | PCB005 | error | A non-empty environment variable whose name contains `PASSWORD`, `TOKEN`, or `SECRET` (case-insensitive) persists a likely secret in the image. Supply secrets at runtime instead. |
 | PCB006 | warning | The stored image size exceeds `max_image_size_mb`. Reduce the base image or layer contents, or raise the threshold. Evaluated only when the threshold is set. |
 | PCB007 | warning | The largest stored layer exceeds `max_layer_size_mb`. Slim that layer or choose a smaller base image, or raise the threshold. Evaluated only when the threshold is set. |
+| PCB008 | error | An `ExposedPorts` key is not `<1-65535>[/tcp\|udp\|sctp]`, or two keys normalize to the same port and protocol. Fix the image port metadata. |
+| PCB009 | warning | A recognized server's TCP listener ports differ from the exposed TCP ports, in either direction. Align the command and `exposed-ports`. |
+| PCB010 | info | Ports are exposed but the listener cannot be determined: the server has no explicit port, uses a socket or file descriptor, is shell-wrapped, or the command is not recognized. The listener check is skipped rather than guessed. |
+| PCB011 | warning | A port below 1024 is exposed while the user is non-root. Listen on 1024 or higher, or ensure the runtime permits binding it. |
+| PCB012 | info | UDP or SCTP ports are present. They are preserved unchanged and excluded from the listener check. |
+| PCB013 | info | Base-image ports were dropped because configured `exposed-ports` replace `ExposedPorts`. Reported only by `build --validate`. |
+
+`info` findings are
+reported but never affect the exit code, whatever `--fail-on` threshold is
+used.
 
 Findings contain a rule ID, severity, message and remediation. Environment
 names and values are not printed. Image labels and annotations are claims,
@@ -59,6 +69,8 @@ reserved ID, so ignoring it is currently a no-op. Suppressions apply only to
 findings, never to layout or integrity errors. Configuration, ignore and layout
 diagnostics redact declared build-argument values, as `validate config` does;
 `validate image` redacts declared defaults because it accepts no `--build-arg`.
+Port findings redact raw keys before JSON escaping and truncation in both text
+and JSON output; `build --validate` uses the resolved argument values.
 Both commands also redact declared defaults from key-normalization collisions
 (for example `my-key` and `my_key`), which are reported before other checks.
 
@@ -143,6 +155,39 @@ the layout still holds that exact manifest digest, it reports `status:
 determined`, `base` and `application` roles, and both byte totals. Text output
 prints the same summary and note. Multi-platform builds report and check sizes
 separately for each platform's manifest.
+## Port rules
+
+Configured `exposed-ports` must be distinct integers from 1 to 65535.
+`build` and `validate config` reject duplicates and out-of-range values with
+exit 2 before the base image is pulled or any layout blob is written.
+Image port keys and explicit listener ports accept ASCII decimal leading
+zeros; normalization and range checks apply before comparison. Integer
+conversion is bounded to five significant digits, even for long inputs.
+
+The listener check reads only the image's `Entrypoint` and `Cmd` argv. It
+recognizes `uvicorn` (`--port`), `gunicorn` (every `-b`/`--bind`; `unix:`
+binds are ignored when mixed with TCP binds; Unix-only binds or file
+descriptors make the TCP listener unknown), `flask run` (`--port`/`-p`), Django `runserver
+[addr:]port`, `streamlit run` (`--server.port`) and Jupyter `lab`, `notebook`
+and `server` (`--port`, `--ServerApp.port`, `--NotebookApp.port`), directly
+or through `python -m` (including `python -m django`). Gradio apps launched as `python app.py`, Celery
+workers and other commands produce PCB010 when ports are exposed. Django
+options other than the standard `runserver` options, before or after the
+address, also make the listener
+unknown, as do attached or clustered short options (`-p8000`, `-Rb :8000`)
+and abbreviated long options (`--bin`), whose effect is parser-specific.
+An unmodeled option followed by an option-looking value is also ambiguous:
+for example, Flask can consume `--port=9000` as the value of `--extra-files`.
+These cases produce non-failing PCB010 rather than a guessed port mismatch.
+
+This check does not guess. Ports set through environment variables
+(`UVICORN_PORT`, `FLASK_RUN_PORT`, `STREAMLIT_SERVER_PORT`,
+`GRADIO_SERVER_PORT`), in application source (for example Gradio
+`launch(server_port=...)`), by a shell wrapper or by runtime command
+overrides are not inferred, and the image config does not record a separately
+resolved listener port. `ExposedPorts` is metadata only and does not prove
+what the process binds. Named users are not resolved against `/etc/passwd`
+for PCB011; non-numeric users other than `root` are treated as non-root.
 
 ## Integrity and limits
 
