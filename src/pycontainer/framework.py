@@ -87,6 +87,8 @@ def _detect_framework(
     configured_ports=False,
     configured_workdir=None,
 ):
+    if include_paths is not None and not include_paths:
+        return None
     context_path = Path(context_dir).absolute()
     ctx = context_path.resolve()
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []

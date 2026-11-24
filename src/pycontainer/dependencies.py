@@ -3,6 +3,7 @@ import codecs
 import configparser
 import csv
 import json
+import logging
 import os
 import re
 import shlex
@@ -23,11 +24,12 @@ from .credentials import (
     redact,
     url_has_credentials,
 )
-from .venv_markers import declared_roots, host_environments, venv_layout_os
+from .venv_markers import declared_roots, host_facts, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
 MAX_REQUIREMENTS_NESTING = 64
+logger = logging.getLogger(__name__)
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 CLOSURE_TIMEOUT_SECONDS = 120
@@ -171,10 +173,20 @@ def target_python_version(
         raise ValueError("Dependency staging supports CPython targets only.")
 
     value = environment.get("PYTHON_VERSION")
+    match = re.match(r"(\d+\.\d+)(?:\.(\d+))?(?:-|$)", image_tag)
     if value and re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value):
+        if official_python and match:
+            version_parts = tuple(int(part) for part in value.split("."))
+            tag_parts = tuple(int(part) for part in match.group(1).split("."))
+            if match.group(2) is not None:
+                tag_parts += (int(match.group(2)),)
+            if version_parts[:len(tag_parts)] != tag_parts[:len(version_parts)]:
+                raise ValueError(
+                    f"Verified base image tag {image_tag!r} conflicts with "
+                    f"PYTHON_VERSION={value} in its image config."
+                )
         return ".".join(value.split(".")[:2])
 
-    match = re.match(r"(\d+\.\d+)(?:\.\d+)?(?:-|$)", image_tag)
     if official_python and match:
         return match.group(1)
     raise ValueError(
@@ -182,6 +194,14 @@ def target_python_version(
         "use a verified tag-only official python:<major>.<minor> pull or a base image with "
         "PYTHON_VERSION metadata."
     )
+
+
+def target_python_full_version(base_config: Optional[dict]) -> Optional[str]:
+    """Return the base image's exact ``PYTHON_VERSION`` when it is a final release."""
+    value = _base_environment(base_config).get("PYTHON_VERSION")
+    if value and re.fullmatch(r"\d+\.\d+\.\d+", value):
+        return value
+    return None
 
 
 def _base_environment(base_config: Optional[dict]) -> dict:
@@ -431,6 +451,7 @@ def install_requirements(
     base_config: Optional[dict],
     variant: Optional[str] = None,
     *,
+    locked: bool = False,
     base_image_tag_verified: bool = False,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
@@ -439,10 +460,18 @@ def install_requirements(
         base_image_tag_verified=base_image_tag_verified,
         variant=variant,
     )
-    requirement_files = _scan_requirements(requirements, context_dir)[1]
+    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
+    if not locked and not hash_pinned:
+        logger.warning(
+            "%s is not fully pinned with ==versions and --hash values, so the "
+            "dependency layer is not reproducible. Use a lockfile or "
+            "`pip-compile --generate-hashes`.",
+            requirements.name,
+        )
     target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
+    locked_options = ["--no-deps", "--require-hashes"] if locked else []
     error_file = destination.parent / _MARKER_ERROR_FILE
     marker_config = {
         "environment": _target_marker_environment(
@@ -455,6 +484,7 @@ def install_requirements(
         sys.executable,
         # Ignore PYTHONPATH/PYTHONHOME so host modules cannot shadow the pinned pip.
         "-E",
+        "-P",
         "-c",
         _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
         json.dumps(marker_config),
@@ -463,6 +493,7 @@ def install_requirements(
         "--no-input",
         "--no-cache-dir",
         "--no-compile",
+        *locked_options,
         # pip's conflict check evaluates markers of the host's installed packages.
         "--no-warn-conflicts",
         "--target",
@@ -523,6 +554,11 @@ def install_requirements(
             f"platform; refusing to use host markers. {details}"
         )
     if returncode:
+        hint = (
+            " Locked artifacts must match their recorded hashes."
+            if locked
+            else ""
+        )
         raise RuntimeError(
             _pip_failure_message(
                 redact(pip_output, secrets),
@@ -531,7 +567,7 @@ def install_requirements(
                 python_version,
                 redact(pip_debug, secrets),
                 variant,
-            )
+            ) + hint
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -763,13 +799,15 @@ def _scan_requirements(
     context_dir: Path,
     check_overrides: bool = True,
     constraints: Optional[List[str]] = None,
-) -> Tuple[List[str], List[Path]]:
-    """Validate a context-local requirements graph; return root lines and files."""
+) -> Tuple[List[str], List[Path], bool]:
+    """Validate a local requirements graph and report roots, files and hash pinning."""
     context_root = context_dir.resolve()
     logical_root = Path(os.path.abspath(context_dir))
     pending = [(Path(os.path.abspath(requirements)), False, frozenset(), False)]
     visited = set()
+    counted_files = set()
     total_bytes = 0
+    hash_pinned = True
     roots = []
     while pending:
         path, environment_path, ancestors, constraint = pending.pop()
@@ -799,12 +837,14 @@ def _scan_requirements(
             if environment_path:
                 raise OSError("Cannot access an environment-based requirements file.") from None
             raise
-        total_bytes += size
-        if total_bytes > MAX_REQUIREMENTS_BYTES:
-            raise ValueError(
-                "Requirements files exceed the combined "
-                f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-            )
+        if resolved not in counted_files:
+            counted_files.add(resolved)
+            total_bytes += size
+            if total_bytes > MAX_REQUIREMENTS_BYTES:
+                raise ValueError(
+                    "Requirements files exceed the combined "
+                    f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+                )
 
         for _, line in _logical_requirement_lines(
             path, display=display, context_root=context_root
@@ -816,6 +856,11 @@ def _scan_requirements(
                 raise ValueError(f"Invalid requirements syntax in {display}.") from exc
             if not options:
                 continue
+            if not options[0].startswith("-"):
+                if not constraint:
+                    hash_pinned = hash_pinned and _is_hash_pinned(options)
+            elif options[0] == "--editable" or options[0].startswith(("-e", "--editable=")):
+                hash_pinned = False
             for option in options:
                 name = option.split("=", 1)[0]
                 if check_overrides and name in _PIP_OVERRIDE_OPTIONS:
@@ -865,7 +910,25 @@ def _scan_requirements(
                 pending.append(
                     (included_path, environment_include, ancestors | {path}, include_constraint)
                 )
-    return roots, sorted({path for path, _ in visited})
+    return roots, sorted({path for path, _ in visited}), hash_pinned
+
+
+def _is_hash_pinned(options: List[str]) -> bool:
+    words = []
+    has_hash = False
+    skip_value = False
+    for option in options:
+        if skip_value:
+            skip_value = False
+        elif option == "--hash":
+            has_hash = skip_value = True
+        elif option.startswith("--hash="):
+            has_hash = True
+        elif not option.startswith("-"):
+            words.append(option)
+    specifier = " ".join(words).split(";", 1)[0].strip()
+    exact = re.fullmatch(r"[^=<>!~@,]+===?\s*[^\s,*]+", specifier) is not None
+    return exact and has_hash
 
 
 def reject_literal_credentials(
@@ -1021,41 +1084,14 @@ def _verify_target_closure(
             "Cannot verify the target dependency closure of egg distributions: "
             f"{', '.join(legacy)}. Reinstall them as wheels or use a requirements file."
         )
-    distributions = []
-    for dist_info in sorted(site_packages.glob("*.dist-info")):
-        metadata = dist_info / "METADATA"
-        if not metadata.is_file() or metadata.is_symlink():
-            raise ValueError(f"Virtualenv package is missing METADATA: {dist_info.name}")
-        if metadata.stat().st_size > MAX_METADATA_BYTES:
-            raise ValueError(
-                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
-                f"{dist_info.name}"
-            )
-        try:
-            text = metadata.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
-        message = Parser().parsestr(text, headersonly=True)
-        if message.defects:
-            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
-        headers = {
-            name: [str(value) for value in message.get_all(name, [])]
-            for name in _CLOSURE_HEADERS
-        }
-        distributions.append(
-            {
-                "path": f"{dist_info.name}/METADATA",
-                "directory": dist_info.name[: -len(".dist-info")],
-                "headers": headers,
-            }
-        )
+    distributions = _read_staged_distributions(site_packages)
     if not distributions and not any(lines for _, _, lines in roots):
         return
 
     environment = _target_marker_environment(os_name, arch, python_version, base_config, variant)
     request = {
         "environment": environment,
-        "hosts": host_environments(environment, version_established, host_os_name),
+        "host": host_facts(environment, version_established, host_os_name),
         "distributions": distributions,
         "roots": roots,
         "constraints": constraint_lines,
@@ -1107,6 +1143,39 @@ def _verify_target_closure(
             + "; ".join(problems)
             + ". Use a requirements file so pip resolves dependencies for the target."
         )
+
+
+def _read_staged_distributions(site_packages: Path) -> List[dict]:
+    """Collect bounded wheel metadata without importing the staged packages."""
+    distributions = []
+    for dist_info in sorted(site_packages.glob("*.dist-info")):
+        metadata = dist_info / "METADATA"
+        if not metadata.is_file() or metadata.is_symlink():
+            raise ValueError(f"Package is missing METADATA: {dist_info.name}")
+        if metadata.stat().st_size > MAX_METADATA_BYTES:
+            raise ValueError(
+                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
+                f"{dist_info.name}"
+            )
+        try:
+            text = metadata.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
+        message = Parser().parsestr(text, headersonly=True)
+        if message.defects:
+            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
+        headers = {
+            name: [str(value) for value in message.get_all(name, [])]
+            for name in _CLOSURE_HEADERS
+        }
+        distributions.append(
+            {
+                "path": f"{dist_info.name}/METADATA",
+                "directory": dist_info.name[: -len(".dist-info")],
+                "headers": headers,
+            }
+        )
+    return distributions
 
 
 def _validate_virtualenv_version(

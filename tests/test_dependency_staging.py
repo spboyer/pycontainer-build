@@ -336,7 +336,7 @@ def test_conda_prefix_cannot_be_staged_when_signal_is_excluded(tmp_path, monkeyp
         tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
         exclude_paths=[".venv/conda-meta"],
     )
-    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+    with pytest.raises(FileNotFoundError, match="no supported .*virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 
@@ -471,7 +471,7 @@ def test_linked_conda_virtualenv_warns_and_installs_export(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("selected", ["src", "src/nested/environment.yml"])
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_selected_linked_source_conda_descriptor_is_detected(
+def test_selected_linked_source_is_rejected_before_pull(
     tmp_path, monkeypatch, selected, dry_run,
 ):
     context = tmp_path / "context"
@@ -480,40 +480,40 @@ def test_selected_linked_source_conda_descriptor_is_detected(
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     _symlink_or_skip(context / "src", source, directory=True)
-    builder = _builder(
-        tmp_path / "run", monkeypatch, context=context, include_deps=True,
-        include_paths=[selected], dry_run=dry_run,
-    )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
 
-    with pytest.raises(ValueError, match="Conda staging is unsupported.*pip freeze"):
-        builder.build()
+    with pytest.raises(ValueError, match="directory links are never followed"):
+        _builder(
+            tmp_path / "run", monkeypatch, context=context, include_deps=True,
+            include_paths=[selected], dry_run=dry_run,
+        ).build()
 
 
-def test_selected_linked_source_detection_respects_excludes(tmp_path, monkeypatch, caplog):
+def test_excluded_linked_source_is_not_followed(tmp_path, monkeypatch, caplog):
     context = tmp_path / "context"
     context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
     source = tmp_path / "linked-source"
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     _symlink_or_skip(context / "src", source, directory=True)
     builder = _builder(
         tmp_path / "run", monkeypatch, context=context, include_deps=True,
-        include_paths=["src"], exclude_paths=["src/nested"], dry_run=True,
+        include_paths=["src", "app.py"], exclude_paths=["src"], dry_run=True,
     )
 
     assert builder.build() == builder.config.tag
     assert not [record for record in caplog.records if "Conda" in record.message]
 
 
-def test_selected_linked_source_prefers_pip_requirements(tmp_path, monkeypatch, caplog):
+def test_selected_source_conda_descriptor_prefers_pip_requirements(
+    tmp_path, monkeypatch, caplog,
+):
     context = tmp_path / "context"
-    context.mkdir()
-    source = tmp_path / "linked-source"
+    source = context / "src"
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     (source / "app.py").write_text("print('app')\n")
-    _symlink_or_skip(context / "src", source, directory=True)
     venv = context / ".venv" / "Lib" / "site-packages"
     venv.mkdir(parents=True)
     (venv / "venv_dep.py").write_text("value = 1\n")
@@ -625,7 +625,7 @@ def test_requirements_alias_to_conda_descriptor_is_rejected(
 ):
     descriptor = tmp_path / signal
     descriptor.write_text("numpy\n")
-    _symlink_or_skip(tmp_path / "requirements.txt", descriptor)
+    _symlink_or_skip(tmp_path / "requirements.txt", Path(signal))
     builder = _builder(
         tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
         exclude_paths=[signal] if exclude_target else [], dry_run=True,
@@ -2326,7 +2326,7 @@ def test_include_deps_without_dependency_source_fails_explicitly(tmp_path, monke
     context.mkdir()
     builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
 
-    with pytest.raises(FileNotFoundError, match="no supported virtualenv"):
+    with pytest.raises(FileNotFoundError, match="no supported lockfile, virtualenv"):
         builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
 
 ARM_V7_CONFIG = {**BASE_CONFIG, "architecture": "arm", "variant": "v7"}
@@ -2349,18 +2349,21 @@ def _arm_v7_builder(tmp_path, monkeypatch, context):
     )
 
 
-def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> None:
+def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=(), requires_python=None,
+                       tag="py3-none-any") -> None:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     module = name.replace("-", "_")
     dist_info = f"{module}-1.0.dist-info"
     metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    if requires_python:
+        metadata += f"Requires-Python: {requires_python}\n"
     metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
     metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
     files = {
         f"{module}/__init__.py": b"",
         f"{dist_info}/METADATA": (metadata + "\n").encode(),
         f"{dist_info}/WHEEL": (
-            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
         ).encode(),
     }
     record = io.StringIO()
@@ -2370,9 +2373,81 @@ def _write_named_wheel(wheelhouse: Path, name: str, requires=(), extras=()) -> N
         writer.writerow((path, f"sha256={digest.rstrip('=')}", len(content)))
     writer.writerow((f"{dist_info}/RECORD", "", ""))
     files[f"{dist_info}/RECORD"] = record.getvalue().encode()
-    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-py3-none-any.whl", "w") as wheel:
+    with zipfile.ZipFile(wheelhouse / f"{module}-1.0-{tag}.whl", "w") as wheel:
         for path, content in files.items():
             wheel.writestr(path, content)
+
+
+@pytest.mark.parametrize(("image", "version"), [
+    ("python:3.11-slim", "3.12.4"),
+    ("python:3.11.8-slim", "3.11.9"),
+])
+def test_verified_python_tag_rejects_conflicting_python_version(image, version):
+    base_config = {"config": {"Env": [f"PYTHON_VERSION={version}"]}}
+    with pytest.raises(ValueError, match="conflicts.*PYTHON_VERSION"):
+        target_python_version(image, base_config, base_image_tag_verified=True)
+
+
+def test_unverified_python_tag_does_not_override_python_version():
+    base_config = {"config": {"Env": ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.12.4"]}}
+    assert target_python_version(
+        "python:3.11-slim@sha256:" + "a" * 64, base_config, base_image_tag_verified=True
+    ) == "3.12"
+
+
+def test_locked_pip_ignores_pythonpath_shadowing(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root")
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    requirements = context / "requirements.txt"
+    requirements.write_text(
+        f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
+    )
+    poison = tmp_path / "pythonpath"
+    poison.mkdir()
+    (poison / "pip.py").write_text("raise RuntimeError('shadowed pip')\n", encoding="utf-8")
+    marker = tmp_path / "sitecustomize-ran"
+    (poison / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+
+    install_requirements(
+        requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
+        "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+    )
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("source", ["environment", "config"])
+def test_locked_pip_cannot_ignore_target_requires_python(tmp_path, monkeypatch, source):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires_python=">=3.12")
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    requirements = context / "requirements.txt"
+    requirements.write_text(f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    if source == "environment":
+        monkeypatch.setenv("PIP_IGNORE_REQUIRES_PYTHON", "1")
+    else:
+        monkeypatch.delenv("PIP_IGNORE_REQUIRES_PYTHON", raising=False)
+        config = tmp_path / "pip.conf"
+        config.write_text("[install]\nignore-requires-python = true\n", encoding="utf-8")
+        monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+
+    with pytest.raises(RuntimeError, match="Target dependency installation failed"):
+        install_requirements(
+            requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
+            "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+        )
 
 
 def _install_marker_fixture(
@@ -3478,7 +3553,7 @@ def test_virtualenv_optional_roots_fail_only_when_selection_is_unknown(tmp_path,
         '[project.optional-dependencies]\n'
         'speed = ["not-installed", "venv-linux; sys_platform == \'linux\'"]\n'
     )
-    # Every plausible host would have installed not-installed, so speed was not selected.
+    # Any venv host would have installed not-installed, so speed was not selected.
     assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
 
     pyproject.write_text(
@@ -3575,6 +3650,110 @@ def test_virtualenv_posix_layout_rules_out_extras_that_skip_windows(
 
     if fails:
         with pytest.raises(ValueError, match=r"extra \[uvloop\] of venv-root"):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+_POSIX_VENV = {"pyvenv": "version = 3.11.7\nhome = /usr/bin\n", "lib": ("lib", "python3.11")}
+_WINDOWS_VENV = {"pyvenv": "version = 3.11.7\nhome = C:\\Python311\n", "lib": ("Lib",)}
+_UNPROVEN_SPEED = "Cannot determine whether extra [speed] of venv-root"
+
+
+@pytest.mark.parametrize("layout", [_POSIX_VENV, _WINDOWS_VENV], ids=["posix", "windows"])
+@pytest.mark.parametrize(
+    ("marker", "root", "error"),
+    [
+        # An armv7l creator could have selected [speed] without installing venv-fast (#142).
+        ('extra == "speed" and platform_machine != "armv7l"', "", _UNPROVEN_SPEED),
+        ('extra == "speed" and platform_machine != "riscv64"', "", _UNPROVEN_SPEED),
+        ('extra == "speed" and sys_platform != "freebsd14"', "", _UNPROVEN_SPEED),
+        # Inactive on the amd64 target, so its absence never matters.
+        ('extra == "speed" and platform_machine == "armv7l"', "", None),
+        ('extra == "speed"', "", None),
+        ('extra == "speed" and platform_machine == "x" or extra == "speed"', "", None),
+        (
+            'extra == "speed" and platform_machine != "armv7l"',
+            "venv-root[speed]\n",
+            "venv-root 1.0 [speed] requires 'venv-fast",
+        ),
+        ('extra == "speed"', "venv-root[speed]\n", "venv-root 1.0 [speed] requires 'venv-fast"),
+    ],
+)
+def test_virtualenv_extras_are_not_ruled_out_for_unknown_creator_hosts(
+    tmp_path, monkeypatch, layout, marker, root, error
+):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {"venv-root": ["Provides-Extra: speed", f"Requires-Dist: venv-fast; {marker}"]},
+        **layout,
+    )
+    (context / "requirements.txt").write_text(root)
+
+    if error is None:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+    else:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+
+
+@pytest.mark.parametrize(
+    "table",
+    ['[project]\nname = "app"\n[project.optional-dependencies]\n', "[dependency-groups]\n"],
+    ids=["optional", "group"],
+)
+@pytest.mark.parametrize(
+    ("entry", "fails"),
+    [
+        ("venv-absent; platform_machine != 'armv7l'", True),
+        ("venv-absent; sys_platform != 'freebsd14'", True),
+        ("venv-absent", False),
+        ("venv-absent; platform_machine == 'armv7l'", False),
+        ("venv-root; platform_machine != 'armv7l'", False),
+    ],
+)
+def test_virtualenv_groups_are_not_ruled_out_for_unknown_creator_hosts(
+    tmp_path, monkeypatch, table, entry, fails
+):
+    context = tmp_path / "context"
+    _write_base_venv(context, {"venv-root": []}, **_POSIX_VENV)
+    (context / "pyproject.toml").write_text(f'{table}speed = ["{entry}"]\n')
+
+    if fails:
+        with pytest.raises(
+            ValueError, match=r"Cannot determine whether pyproject .*'speed' was selected"
+        ):
+            _stage_base_venv(tmp_path, monkeypatch, context)
+    else:
+        assert _stage_base_venv(tmp_path, monkeypatch, context) is not None
+
+
+@pytest.mark.parametrize(
+    ("layout", "fails"), [(_WINDOWS_VENV, False), (_POSIX_VENV, True)], ids=["windows", "posix"]
+)
+def test_virtualenv_extras_are_not_ruled_out_by_enumerating_platforms(
+    tmp_path, monkeypatch, layout, fails
+):
+    context = tmp_path / "context"
+    _write_base_venv(
+        context,
+        {
+            "venv-root": [
+                "Provides-Extra: broker",
+                *(
+                    f'Requires-Dist: venv-broker; platform_system == "{system}"'
+                    ' and extra == "broker"'
+                    for system in ("Windows", "Darwin", "Linux")
+                ),
+            ]
+        },
+        **layout,
+    )
+    (context / "requirements.txt").write_text("venv-root\n")
+
+    # A POSIX creator need not be Darwin or Linux; a Windows layout implies Windows.
+    if fails:
+        with pytest.raises(ValueError, match=r"Cannot determine whether extra \[broker\]"):
             _stage_base_venv(tmp_path, monkeypatch, context)
     else:
         assert _stage_base_venv(tmp_path, monkeypatch, context) is not None

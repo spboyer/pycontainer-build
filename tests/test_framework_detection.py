@@ -446,7 +446,7 @@ def test_detector_accepts_preselected_files_and_never_executes_them(tmp_path):
     assert not marker.exists()
 
 
-def test_linked_source_directory_outside_context_is_not_detected(tmp_path, caplog):
+def test_linked_source_directory_outside_context_is_rejected(tmp_path):
     context = tmp_path / "context"
     write_file(context, "requirements.txt", "streamlit\n")
     source = tmp_path / "external"
@@ -456,8 +456,8 @@ def test_linked_source_directory_outside_context_is_not_detected(tmp_path, caplo
     except OSError as error:
         pytest.skip(f"Directory symlink unavailable: {error}")
 
-    assert detect_framework(context, include_paths=["src"]) is None
-    assert "directory symlink resolves outside the build context" in caplog.text
+    with pytest.raises(ValueError, match="directory links are never followed"):
+        detect_framework(context, include_paths=["src"])
 
 
 def test_preselected_files_still_respect_explicit_and_default_excludes(tmp_path):

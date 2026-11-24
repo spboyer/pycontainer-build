@@ -61,9 +61,13 @@ def validate_system_packages(packages) -> List[str]:
     return result
 
 
-def _requirement_names(context_dir: Path, requirements_file: str) -> Set[str]:
+def _normalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _requirement_names(context_dir: Path, requirements_file: Optional[str]) -> Set[str]:
     names: Set[str] = set()
-    requirements = context_dir / requirements_file
+    requirements = context_dir / (requirements_file or "requirements.txt")
     if requirements.is_file():
         for line in requirements.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.split("#", 1)[0].strip()
@@ -85,11 +89,13 @@ def _requirement_names(context_dir: Path, requirements_file: str) -> Set[str]:
 
 
 def detect_required_packages(
-    context_dir, requirements_file: str, family: str
+    context_dir, requirements_file: Optional[str], family: str, extra_names: Iterable[str] = ()
 ) -> Dict[str, str]:
     """Map system package -> Python package that implies it."""
     found: Dict[str, str] = {}
-    for python_name in sorted(_requirement_names(Path(context_dir), requirements_file)):
+    names = _requirement_names(Path(context_dir), requirements_file)
+    names.update(_normalize(name) for name in extra_names)
+    for python_name in sorted(names):
         for package in PYTHON_PACKAGE_SYSTEM_DEPS.get(python_name, {}).get(family, ()):
             found.setdefault(package, python_name)
     return found
@@ -317,7 +323,7 @@ def inspect_base_layers(layers: Iterable) -> Tuple[Optional[str], Optional[Set[s
     return family, installed
 
 
-def report_system_packages(config, base_layers) -> SystemPackageReport:
+def report_system_packages(config, base_layers, locked_names: Iterable[str] = ()) -> SystemPackageReport:
     """Compare required system packages with the base image and log findings."""
     report = SystemPackageReport()
     explicit = validate_system_packages(config.system_packages)
@@ -329,7 +335,9 @@ def report_system_packages(config, base_layers) -> SystemPackageReport:
 
     required = list(explicit)
     detected = (
-        detect_required_packages(config.context_dir, config.requirements_file, family)
+        detect_required_packages(
+            config.context_dir, config.requirements_file, family, locked_names
+        )
         if family and config.detect_system_packages
         else {}
     )
