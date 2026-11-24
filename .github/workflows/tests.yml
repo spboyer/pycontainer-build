@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked test dependencies
@@ -44,7 +44,11 @@ jobs:
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
+      - name: Install optional pre-commit test tooling
+        run: uv pip install -r tests/pre-commit-requirements.txt
+      - name: Run hermetic pre-commit hook tests
+        run: uv run --locked --group test python -m pytest tests/test_pre_commit_hook.py -q
 
   # Evidence for #148, not a gate: populate a --cache-dir on each OS, then
   # restore every OS's cache into another absolute path and checkout location.
@@ -126,7 +130,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked build dependencies
@@ -143,7 +147,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked Poetry plugin dependencies
@@ -162,7 +166,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked Hatch plugin dependencies
@@ -186,7 +190,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: plugins/vscode-pycontainer/package-lock.json
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Install the core for the extension smoke test
@@ -227,6 +231,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: tests
     uses: ./.github/workflows/runtime-check.yml
+    with:
+      check-index: true
     permissions:
       contents: read
 
@@ -240,7 +246,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked test dependencies

@@ -15,7 +15,7 @@ import tarfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Tuple
+from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
 
 from .blob_store import (
     BlobIntegrityError,
@@ -135,6 +135,8 @@ def open_local_image_source(
     os_name: Optional[str],
     arch: Optional[str],
     variant: Optional[str] = None,
+    *,
+    progress: Callable[[str], None] = print,
 ):
     """Open a local base image source after rejecting overlap with the output.
 
@@ -149,7 +151,9 @@ def open_local_image_source(
         )
     if reference.transport == OCI_TRANSPORT:
         return OCILayoutSource(reference)
-    return DockerArchiveSource(reference, Path(layers_dir), os_name, arch, variant)
+    return DockerArchiveSource(
+        reference, Path(layers_dir), os_name, arch, variant, progress=progress
+    )
 
 
 def check_local_image_bounds(config_size: int, layer_sizes: List[int]) -> None:
@@ -396,10 +400,11 @@ class OCILayoutSource:
                 f"OCI layout {self.root} has unsupported imageLayoutVersion "
                 f"{layout.get('imageLayoutVersion')!r}; expected '1.0.0'."
             )
-        self.index = _load_json_object(
-            self._read_file(self.root / "index.json", "OCI layout index"),
-            f"OCI layout index in {self.root}",
-        )
+        index_bytes = self._read_file(self.root / "index.json", "OCI layout index")
+        # Everything below index.json is content-addressed and digest-verified,
+        # so its bytes identify the selectable snapshot of this layout.
+        self.snapshot_digest = f"sha256:{hashlib.sha256(index_bytes).hexdigest()}"
+        self.index = _load_json_object(index_bytes, f"OCI layout index in {self.root}")
 
     def __enter__(self):
         return self
@@ -691,11 +696,14 @@ class DockerArchiveSource:
         os_name: Optional[str],
         arch: Optional[str],
         variant: Optional[str] = None,
+        *,
+        progress: Callable[[str], None] = print,
     ):
         self.path = reference.path
         self.reference = reference
         self.layers_dir = layers_dir
         self.source_name = str(reference.path)
+        self._progress = progress
         self.platform: Optional[Dict[str, str]] = None
         self._published: Dict[str, int] = {}
         if not self.path.is_file():
@@ -894,7 +902,7 @@ class DockerArchiveSource:
         for position, (layer_path, member) in enumerate(zip(layer_paths, layer_members), 1):
             description = f"layer {position}"
             path_digest = self._path_digest(layer_path)
-            print(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
+            self._progress(f"  Loading layer {position}/{len(layer_paths)} from {self.path.name}")
             try:
                 digest, size = _stage_stream(
                     self._open_member(member), self.layers_dir, path_digest,

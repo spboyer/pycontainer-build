@@ -6,21 +6,26 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import threading
 import tomllib
+import venv
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from pycontainer import lockfiles as lockfile_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.dependencies import (
     _PIP_TARGET_SCRIPT,
     _merge_site_packages,
+    _scan_requirements,
     install_locked_requirements,
-    validate_requirements,
+    install_requirements,
+    staged_packages,
 )
 from pycontainer.lockfiles import (
     LockedPackage,
@@ -34,8 +39,12 @@ from pycontainer.lockfiles import (
     poetry_content_hash,
     preflight_lockfile,
     target_environment,
+    verify_locked_installation,
 )
-from test_dependency_staging import BASE_CONFIG, _builder, _write_wheel
+from test_dependency_staging import (
+    BASE_CONFIG, _base_metadata_layer, _builder, _dpkg_libc, _symlink_or_skip,
+    _write_named_wheel, _write_wheel,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lockfiles"
 FORMATS = {
@@ -71,12 +80,153 @@ def _selected(selection):
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))
-def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind):
+def test_lock_selection_keeps_its_manifest_roots(tmp_path, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    roots, source = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+    replacement = "[packages]\n" if kind == "pipenv" else '[project]\nname = "replacement"\n'
+    (context / manifest_name).write_text(replacement, encoding="utf-8")
+    retained, retained_source = lockfile_module._locked_verification_roots(selection, context, PY311)
+
+    assert tuple(map(str, retained)) == tuple(map(str, roots))
+    assert retained_source == source
+    with pytest.raises(LockfileError, match="roots changed after dependency selection"):
+        verify_locked_installation(
+            selection, context, tmp_path / "site", PY311, verification_roots=([], source)
+        )
+    incomplete = LockSelection(selection.kind, selection.path, selection.packages)
+    with pytest.raises(LockfileError, match="missing its manifest-root snapshot"):
+        verify_locked_installation(incomplete, context, tmp_path / "site", PY311)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_reader_uses_the_manifest_captured_for_roots(tmp_path, monkeypatch, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    manifest_path = context / manifest_name
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    reader = getattr(lockfile_module, f"_load_{kind}")
+
+    def read_after_manifest_change(path, environment, context_dir, manifest=None):
+        manifest_path.write_text("[packages]\n", encoding="utf-8")
+        try:
+            return reader(path, environment, context_dir, manifest)
+        finally:
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    monkeypatch.setattr(lockfile_module, f"_load_{kind}", read_after_manifest_change)
+    selection = load_lockfile(context, Path(lock_name), PY311)
+
+    assert _selected(selection) == EXPECTED_311
+    roots, _ = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+@pytest.mark.parametrize("operation", ["preflight", "load", "verify"])
+def test_lock_manifest_link_cannot_leave_context_or_dangle(tmp_path, kind, target_kind, operation):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    manifest = context / manifest_name
+    target = tmp_path / "outside" / manifest_name
+    target.parent.mkdir()
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        if operation == "preflight":
+            preflight_lockfile(context, Path(lock_name))
+        elif operation == "load":
+            load_lockfile(context, Path(lock_name), PY311)
+        else:
+            verify_locked_installation(selection, context, tmp_path / "site", PY311)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_manifest_link_within_context_is_supported(tmp_path, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    manifest = context / manifest_name
+    target = context / "nested" / manifest_name
+    target.parent.mkdir()
+    manifest.rename(target)
+    _symlink_or_skip(manifest, target)
+
+    preflight_lockfile(context, Path(lock_name))
+    assert _selected(load_lockfile(context, Path(lock_name), PY311)) == EXPECTED_311
+
+
+def test_nested_lock_accepts_manifest_link_elsewhere_in_context(tmp_path):
+    context = _copy(tmp_path, "uv")
+    nested = context / "nested"
+    nested.mkdir()
+    shutil.copy2(context / "uv.lock", nested / "uv.lock")
+    _symlink_or_skip(nested / "pyproject.toml", context / "pyproject.toml")
+
+    preflight_lockfile(context, Path("nested/uv.lock"))
+    assert _selected(load_lockfile(context, Path("nested/uv.lock"), PY311)) == EXPECTED_311
+
+
+@pytest.mark.parametrize("kind", ["uv", "pipenv"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+def test_build_rejects_external_or_dangling_lock_manifest(
+    tmp_path, monkeypatch, kind, dry_run, target_kind
+):
+    context = _copy(tmp_path, kind)
+    manifest = context / FORMATS[kind][1]
+    target = tmp_path / "outside" / manifest.name
+    target.parent.mkdir()
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+    monkeypatch.setattr("pycontainer.builder.install_requirements", lambda *args, **kwargs: pytest.fail("pip ran"))
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, dry_run=dry_run,
+        include_paths=[], cmd=["python", "app.py"],
+    )
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        builder.build()
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+@pytest.mark.parametrize("detector", ["detect_python_version", "detect_entrypoint"])
+def test_project_manifest_detectors_reject_unsafe_links(tmp_path, target_kind, detector):
+    from pycontainer import project
+
+    context = _copy(tmp_path, "uv")
+    manifest = context / "pyproject.toml"
+    target = tmp_path / "outside.toml"
+    manifest.rename(target)
+    if target_kind == "dangling":
+        target.unlink()
+    _symlink_or_skip(manifest, target)
+
+    with pytest.raises(ValueError, match="inside the build context|dangling"):
+        getattr(project, detector)(context)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+@pytest.mark.parametrize(
+    "environment",
+    [PY311, target_environment("linux", "arm", "3.11", "3.11.8", variant="v7")],
+    ids=["amd64", "arm-v7"],
+)
+def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind, environment):
     context = _copy(tmp_path, kind)
     lock_name = FORMATS[kind][0]
 
     assert detect_lockfile(context) == lock_name
-    selection = load_lockfile(context, Path(lock_name), PY311)
+    selection = load_lockfile(context, Path(lock_name), environment)
 
     # Host-only (win32), dev-group and older-Python packages are excluded.
     assert _selected(selection) == EXPECTED_311
@@ -88,7 +238,7 @@ def test_real_lockfiles_select_target_transitive_closure(tmp_path, kind):
     assert "--index-url https://pypi.org/simple\n" in sets[0][1]
     assert "extra-index-url" not in sets[0][1]
     assert "iniconfig==2.0.0 --hash=sha256:" in sets[0][1]
-    assert sets == load_lockfile(context, Path(lock_name), PY311).requirement_sets()
+    assert sets == load_lockfile(context, Path(lock_name), environment).requirement_sets()
 
 
 @pytest.mark.parametrize("kind", ["uv", "pdm", "poetry"])
@@ -640,11 +790,169 @@ def test_pdm_multiple_indexes_fail_closed_including_preflight(tmp_path, prefligh
             load_lockfile(context, Path("pdm.lock"), PY311)
 
 
+PDM_ARTIFACT_URL = "https://one.example.invalid/secret-tenant/packages"
+
+
+def _pdm_with_recorded_urls(tmp_path, *, static_urls=True, package="anyio", package_url=False):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8")
+    if static_urls:
+        text = text.replace('strategy = ["inherit_metadata"]', 'strategy = ["inherit_metadata", "static_urls"]')
+    if package_url:
+        text = text.replace(
+            f'name = "{package}"\n', f'name = "{package}"\nurl = "{PDM_ARTIFACT_URL}/{package}.whl"\n', 1
+        )
+    else:
+        block = text.index(f'name = "{package}"\n')
+        start = text.index("{file = ", block)
+        end = text.index('", hash', start)
+        filename = text[start + len('{file = "'):end]
+        text = text[:start] + f'{{url = "{PDM_ARTIFACT_URL}/{filename}' + text[end:]
+    lock_path.write_text(text, encoding="utf-8")
+    return context
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"static_urls": False},
+        {"static_urls": False, "package": "pluggy"},
+        {"static_urls": False, "package": "pluggy", "package_url": True},
+    ],
+    ids=["generated", "url-without-strategy", "inactive-file-url", "inactive-package-url"],
+)
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_recorded_artifact_urls_fail_closed_without_echoing_them(tmp_path, options, preflight):
+    context = _pdm_with_recorded_urls(tmp_path, **options)
+
+    with pytest.raises(LockfileError, match="artifact URLs") as error:
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+    assert "example.invalid" not in str(error.value)
+    assert "secret-tenant" not in str(error.value)
+
+
+def test_pdm_static_urls_strategy_alone_fails_closed(tmp_path):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    lock_path.write_text(
+        lock_path.read_text(encoding="utf-8").replace(
+            'strategy = ["inherit_metadata"]', 'strategy = ["inherit_metadata", "static_urls"]'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="static_urls strategy"):
+        preflight_lockfile(context, Path("pdm.lock"))
+
+
+@pytest.mark.parametrize("name", [
+    "https://user:synthetic-secret@example.invalid/private",
+    "injected\nlog-line",
+    "injected\tlog-field",
+])
+@pytest.mark.parametrize("diagnostic", ["package-url", "file-url", "invalid-files"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_url_guard_diagnostics_do_not_echo_package_names(tmp_path, name, diagnostic, preflight):
+    context = _pdm_with_recorded_urls(
+        tmp_path, static_urls=False, package="pluggy", package_url=diagnostic == "package-url",
+    )
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8").replace('name = "pluggy"', f"name = {json.dumps(name)}")
+    if diagnostic == "invalid-files":
+        start = text.index("files = [\n", text.index(f"name = {json.dumps(name)}"))
+        text = text[:start] + 'files = [\n    "invalid",\n' + text[start + len("files = [\n"):]
+    lock_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError) as error:
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+    message = str(error.value)
+    assert name not in message
+    assert "synthetic-secret" not in message
+    assert "\n" not in message
+    assert "\t" not in message
+
+
+@pytest.mark.parametrize("malformed", ["strategy", "packages", "files"])
+def test_pdm_malformed_strategy_or_files_fail_closed(tmp_path, malformed):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8")
+    if malformed == "strategy":
+        text = text.replace('strategy = ["inherit_metadata"]', 'strategy = "inherit_metadata"', 1)
+    elif malformed == "packages":
+        text = 'package = ["invalid"]\n' + text[:text.index("[[package]]")]
+    else:
+        files = text.index("files = [\n", text.index('name = "pluggy"'))
+        text = text[:files] + 'files = [\n    "invalid",\n' + text[files + len("files = [\n"):]
+    lock_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="invalid"):
+        preflight_lockfile(context, Path("pdm.lock"))
+
+
+def test_pdm_filename_only_locks_are_unaffected(tmp_path):
+    context = _copy(tmp_path, "pdm")
+
+    preflight_lockfile(context, Path("pdm.lock"))
+    assert _selected(load_lockfile(context, Path("pdm.lock"), PY311)) == EXPECTED_311
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_pdm_recorded_artifact_urls_block_build_install_and_cache(tmp_path, monkeypatch, dry_run):
+    context = _pdm_with_recorded_urls(tmp_path)
+    (context / "app.py").write_text("print('ok')\n")
+    monkeypatch.setattr(
+        "pycontainer.builder.install_locked_requirements",
+        lambda *args, **kwargs: pytest.fail("wrong-origin dependency install ran"),
+    )
+    monkeypatch.setattr(
+        "pycontainer.builder.install_requirements",
+        lambda *args, **kwargs: pytest.fail("dependency install ran"),
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_cached_dependency_layer",
+        lambda *args, **kwargs: pytest.fail("dependency cache was consulted"),
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
+    )
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"),
+        cache_dir=str(tmp_path / "cache"), base_image="python:3.11-slim-bookworm",
+        include_deps=True, dry_run=dry_run, include_paths=["app.py"], cmd=["python", "app.py"],
+    ))
+    assert (builder.cache is None) is dry_run
+
+    with pytest.raises(LockfileError, match="artifact URLs"):
+        builder.build()
+
+
 def test_pdm_toml_index_settings_are_rejected(tmp_path):
     context = _copy(tmp_path, "pdm")
     (context / "pdm.toml").write_text(f'[pypi]\nurl = "{PRIVATE}"\n')
 
     with pytest.raises(LockfileError, match=r"pdm.toml \[pypi\]"):
+        load_lockfile(context, Path("pdm.lock"), PY311)
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+def test_pdm_toml_link_cannot_leave_context(tmp_path, target_kind):
+    context = _copy(tmp_path, "pdm")
+    target = tmp_path / "outside.toml"
+    if target_kind == "outside":
+        target.write_text("[other]\n")
+    _symlink_or_skip(context / "pdm.toml", target)
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
         load_lockfile(context, Path("pdm.lock"), PY311)
 
 
@@ -697,6 +1005,42 @@ def test_pipenv_rejects_missing_default_source(tmp_path):
 
     with pytest.raises(LockfileError, match="no default source"):
         load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+
+@pytest.mark.parametrize("name", ["", "invalid name", "bad\n--index-url https://example.invalid/simple"])
+def test_locked_package_names_cannot_inject_requirements(tmp_path, name):
+    context = _copy(tmp_path, "pipenv")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["default"][name] = {
+        "version": "==1.0", "hashes": ["sha256:" + "a" * 64], "index": "pypi",
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="invalid package name"):
+        load_lockfile(context, Path("Pipfile.lock"), PY311)
+
+
+@pytest.mark.parametrize(("kind", "missing"), [
+    ("pipenv", "click"),
+    ("pdm", "click"),
+    ("pdm", "socksio"),
+])
+def test_pipenv_and_pdm_reject_missing_locked_dependencies(tmp_path, kind, missing):
+    context = _copy(tmp_path, kind)
+    if kind == "pipenv":
+        lock_path = context / "Pipfile.lock"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        del lock["default"][missing]
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    else:
+        lock_path = context / "pdm.lock"
+        blocks = lock_path.read_text(encoding="utf-8").split("\n[[package]]\n")
+        blocks = [block for block in blocks if not block.startswith(f'name = "{missing}"\n')]
+        lock_path.write_text("\n[[package]]\n".join(blocks), encoding="utf-8")
+
+    with pytest.raises(LockfileError, match=rf"does not lock {missing}"):
+        load_lockfile(context, Path(FORMATS[kind][0]), PY311)
 
 
 def _write_uv_project(
@@ -760,6 +1104,27 @@ def test_index_credentials_must_be_placeholders(tmp_path):
     assert "--index-url https://${INDEX_USER}" in selection.requirement_sets()[0][1]
 
 
+@pytest.mark.parametrize("registry", [
+    "http://${INDEX_USER}:${INDEX_TOKEN}@example.com/simple",
+    "http://example.com/simple?token=${INDEX_TOKEN}",
+    "http://example.com/${INDEX_TOKEN}/simple",
+])
+def test_index_credentials_require_https(tmp_path, registry):
+    context = _write_uv_project(tmp_path / "context", registry=registry)
+    with pytest.raises(LockfileError, match="HTTPS"):
+        load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_plain_http_index_is_loopback_only(tmp_path):
+    remote = _write_uv_project(tmp_path / "remote", registry="http://example.com/simple")
+    with pytest.raises(LockfileError, match="only for loopback hosts"):
+        load_lockfile(remote, Path("uv.lock"), PY311)
+
+    loopback = _write_uv_project(tmp_path / "loopback", registry="http://127.0.0.1:8080/simple")
+    text = load_lockfile(loopback, Path("uv.lock"), PY311).requirement_sets()[0][1]
+    assert "--trusted-host 127.0.0.1" in text
+
+
 @pytest.mark.parametrize(
     "registry, message",
     [
@@ -774,6 +1139,35 @@ def test_index_urls_reject_query_secrets_and_injected_directives(tmp_path, regis
 
     with pytest.raises(LockfileError, match=message):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+@pytest.mark.parametrize("lock_format", ["uv", "poetry", "pipenv", "pdm"])
+@pytest.mark.parametrize(
+    "url, message",
+    [
+        (
+            "https://dl.cloudsmith.io/aB3dE5fG7hJ9kL1mN3pQ5rS/org/repo/python/simple",
+            "literal credentials",
+        ),
+        ("https://example.com/simple?${INDEX_KEY}=${INDEX_TOKEN}", "placeholder in a query name"),
+    ],
+)
+def test_recorded_index_urls_reject_path_tokens_and_query_name_placeholders(
+    tmp_path, monkeypatch, lock_format, url, message
+):
+    monkeypatch.setitem(globals(), "PRIVATE", url)
+    if lock_format == "uv":
+        context, lock = _write_uv_project(tmp_path / "ctx", registry=url), "uv.lock"
+    elif lock_format == "poetry":
+        context, lock = _poetry_with_source(tmp_path, "supplemental"), "poetry.lock"
+    elif lock_format == "pipenv":
+        context, lock = _pipenv_sources(tmp_path), "Pipfile.lock"
+    else:
+        context, lock = _pdm_with_sources(tmp_path, ("pypi", url)), "pdm.lock"
+
+    with pytest.raises(LockfileError, match=message) as error:
+        load_lockfile(context, Path(lock), PY311)
+    assert "aB3dE5fG7hJ9kL1mN3pQ5rS" not in str(error.value)
 
 
 def test_uv_lock_missing_root_dependency_edge_fails(tmp_path):
@@ -900,8 +1294,8 @@ class _SimpleIndex:
                     links = [
                         f'<a href="/files/{wheel.name}#sha256={hashlib.sha256(wheel.read_bytes()).hexdigest()}">'
                         f"{wheel.name}</a>"
-                        for name, wheel in index.wheels.items()
-                        if name == parts[1]
+                        for wheel in index.wheels.values()
+                        if wheel.name.split("-", 1)[0].replace("_", "-") == parts[1]
                     ]
                     if links:
                         body = ("<html><body>" + "".join(links) + "</body></html>").encode()
@@ -926,7 +1320,7 @@ class _SimpleIndex:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def add(self, wheel):
-        self.wheels[wheel.name.split("-", 1)[0].replace("_", "-")] = wheel
+        self.wheels[wheel.name] = wheel
 
     def close(self):
         self.server.shutdown()
@@ -946,15 +1340,16 @@ def indexes():
         server.close()
 
 
-def _named_wheel(directory, name, requires=(), extras=()):
+def _named_wheel(directory, name, requires=(), extras=(), *, stub_only=False):
     module = name.replace("-", "_")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{module}-1.0-py3-none-any.whl"
     metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
     metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
     metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
+    module_file = "__init__.pyi" if stub_only else "__init__.py"
     files = {
-        f"{module}/__init__.py": b"",
+        f"{module}/{module_file}": b"",
         f"{module}-1.0.dist-info/METADATA": (metadata + "\n").encode(),
         f"{module}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
@@ -976,16 +1371,808 @@ def _ambient_pip(monkeypatch, tmp_path, rogue_url, wheelhouse):
     monkeypatch.setenv("pip_no_index", "1")
 
 
+def test_uv_dynamic_dependencies_fail_before_installation(tmp_path):
+    context = _write_uv_project(tmp_path / "ctx")
+    manifest = context / "pyproject.toml"
+    text = manifest.read_text(encoding="utf-8")
+    text = text.replace(
+        'dependencies = ["fixture-dep==1.0", "colorama>=0.4; sys_platform == \'win32\'"]',
+        'dynamic = ["dependencies"]',
+    )
+    manifest.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Dynamic dependencies are unsupported"):
+        preflight_lockfile(context, Path("uv.lock"))
+
+
 def _layer_names(layer):
     with tarfile.open(layer.tar_path) as archive:
         return archive.getnames()
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_build_arguments_preserve_locked_staging_and_redact_paths(
+    tmp_path, monkeypatch, capsys, indexes, dry_run
+):
+    value = "private-lock-context"
+    context = tmp_path / "context"
+    project = context / value
+    wheel = _write_wheel(project / "wheelhouse")
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, project / "wheelhouse")
+    _write_uv_project(project, wheel, registry=recorded.url)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        build_args={"DIRECTORY": value}, workdir="/${DIRECTORY}", dry_run=dry_run,
+        lockfile=f"{value}/uv.lock",
+    )
+
+    builder.build()
+
+    output = capsys.readouterr().out
+    assert value not in output
+    assert "<redacted>" in output
+    if dry_run:
+        assert "Dependency Source: lock" in output
+        assert not recorded.requests
+    else:
+        assert "Staging 1 locked packages" in output
+        assert "fixture-dep" in {name for name, _ in builder._staged_packages}
+        assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+        assert any(
+            f"{value}/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+            for layer in builder.layers
+        )
+    assert not rogue.requests
+
+
+def _write_pipenv_project(context, *, requires=(), extras=(), registry="https://pypi.org/simple"):
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root", requires=requires, extras=extras)
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    extra_text = ", extras = [" + ", ".join(f'"{extra}"' for extra in extras) + "]" if extras else ""
+    pipfile = (
+        f'[[source]]\nname = "pypi"\nurl = "{registry}"\nverify_ssl = true\n'
+        f'\n[packages]\nmarker-root = {{version = "==1.0"{extra_text}}}\n'
+    )
+    (context / "Pipfile").write_text(pipfile, encoding="utf-8")
+    lock = {
+        "_meta": {
+            "pipfile-spec": 6,
+            "hash": {"sha256": pipfile_hash(tomllib.loads(pipfile))},
+            "requires": {},
+            "sources": [{"name": "pypi", "url": registry, "verify_ssl": True}],
+        },
+        "default": {
+            "marker-root": {"version": "==1.0", "hashes": [f"sha256:{digest}"], "index": "pypi"},
+        },
+    }
+    (context / "Pipfile.lock").write_text(json.dumps(lock), encoding="utf-8")
+    return context
+
+
+@pytest.mark.parametrize("kind", ["uv", "pipenv"])
+def test_build_rechecks_manifest_link_after_installation(tmp_path, monkeypatch, indexes, kind):
+    context = tmp_path / "context"
+    context.mkdir()
+    if kind == "uv":
+        wheel = _write_wheel(context / "wheelhouse")
+        _write_uv_project(context, wheel, registry=indexes(wheel).url)
+    else:
+        index = indexes()
+        _write_pipenv_project(context, registry=index.url)
+        index.add(context / "wheelhouse" / "marker_root-1.0-py3-none-any.whl")
+    manifest = context / FORMATS[kind][1]
+    target = tmp_path / manifest.name
+
+    def install_and_replace_manifest(*args, **kwargs):
+        install_locked_requirements(*args, **kwargs)
+        manifest.rename(target)
+        _symlink_or_skip(manifest, target)
+
+    monkeypatch.setattr("pycontainer.builder.install_locked_requirements", install_and_replace_manifest)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        include_paths=[], cmd=["python", "app.py"],
+    )
+    with pytest.raises(LockfileError, match="inside the build context"):
+        builder.build()
+
+
+def test_pipenv_build_rejects_missing_target_transitive_dependency(tmp_path, monkeypatch, indexes):
+    index = indexes()
+    context = _write_pipenv_project(
+        tmp_path / "context",
+        requires=["missing-child>=1.0; platform_machine == 'x86_64'"],
+        registry=index.url,
+    )
+    index.add(context / "wheelhouse" / "marker_root-1.0-py3-none-any.whl")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        builder.build()
+
+
+@pytest.mark.parametrize(("arch", "requirement", "message"), [
+    ("arm64", "missing-child>=1; platform_machine == 'x86_64'", None),
+    ("amd64", "missing-child>=1; platform_machine == 'x86_64'", "marker-root.*missing-child"),
+    ("amd64", "missing-child; platform_release >= '6'", "platform_release is unknown"),
+])
+def test_pipenv_staged_wheel_closure_uses_target_markers(tmp_path, arch, requirement, message):
+    context = _write_pipenv_project(tmp_path / "context")
+    environment = target_environment("linux", arch, "3.11", "3.11.8")
+    selection = load_lockfile(context, Path("Pipfile.lock"), environment)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        f"Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\nRequires-Dist: {requirement}\n\n",
+        encoding="utf-8",
+    )
+
+    if message:
+        with pytest.raises(LockfileError, match=message):
+            verify_locked_installation(selection, context, site, environment)
+    else:
+        verify_locked_installation(selection, context, site, environment)
+
+
+def test_staged_wheel_closure_allows_an_extra_with_no_dependencies(tmp_path):
+    context = _write_pipenv_project(tmp_path / "context", extras=["feature"])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\nProvides-Extra: feature\n\n",
+        encoding="utf-8",
+    )
+
+    verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize(
+    ("operator", "literal", "expected"),
+    [
+        ("==", "Speed_Ups", True),
+        ("!=", "Speed_Ups", False),
+        ("in", "other,Speed_Ups", True),
+        ("not in", "other,Speed_Ups", False),
+    ],
+)
+def test_extra_markers_normalize_with_legacy_packaging(monkeypatch, operator, literal, expected):
+    marker_type = lockfile_module.Marker
+
+    class LegacyMarker:
+        def __init__(self, expression):
+            self.expression = expression
+            self._markers = marker_type(expression)._markers
+            self._markers[0][2].value = literal
+
+        def __str__(self):
+            return self.expression
+
+        def evaluate(self, values):
+            extra, value = values["extra"], self._markers[0][2].value
+            return {
+                "==": extra == value,
+                "!=": extra != value,
+                "in": extra in value,
+                "not in": extra not in value,
+            }[operator]
+
+    monkeypatch.setattr(lockfile_module, "Marker", LegacyMarker)
+
+    assert lockfile_module._marker_applies(
+        f"extra {operator} '{literal}'", PY311, "wheel metadata", "speed-ups"
+    ) is expected
+
+
+def test_lock_marker_rejects_unrecognized_packaging_structure(monkeypatch):
+    class UnsupportedMarker:
+        def __init__(self, expression):
+            self._markers = [object()]
+
+        def __str__(self):
+            return "extra == 'feature'"
+
+        def evaluate(self, values):
+            return True
+
+    monkeypatch.setattr(lockfile_module, "Marker", UnsupportedMarker)
+
+    with pytest.raises(LockfileError, match="Cannot inspect environment marker"):
+        lockfile_module._marker_applies("extra == 'feature'", PY311, "wheel metadata", "feature")
+
+
+def test_extra_marker_normalization_does_not_change_platform_values():
+    assert not lockfile_module._marker_applies(
+        "sys_platform == 'LINUX' or extra == 'Speed_Ups'", PY311, "wheel metadata", "other"
+    )
+
+
+@pytest.mark.parametrize(
+    ("marker", "extra", "expected"),
+    [
+        ('extra in "other,Speed_Ups"', "speed-ups", True),
+        ('"Speed" in extra', "speed-ups", True),
+        ('extra not in "other,Speed_Ups"', "speed-ups", False),
+        ('extra in "a,b"', "", True),
+    ],
+)
+def test_locked_extra_markers_keep_substring_semantics(marker, extra, expected):
+    assert lockfile_module._marker_applies(marker, PY311, "wheel metadata", extra) is expected
+
+
+def test_locked_extra_marker_evaluation_failure_is_explicit(monkeypatch):
+    marker_type = lockfile_module.Marker
+
+    class InvalidVersionMarker:
+        def __init__(self, expression):
+            self._markers = marker_type(expression)._markers
+
+        def evaluate(self, values):
+            raise lockfile_module.InvalidVersion("synthetic invalid version")
+
+    monkeypatch.setattr(lockfile_module, "Marker", InvalidVersionMarker)
+    with pytest.raises(LockfileError, match="Cannot evaluate environment marker"):
+        lockfile_module._marker_applies('extra == "1.0"', PY311, "wheel metadata", "1.0")
+
+
+def test_staged_wheel_closure_checks_normalized_requested_extras(tmp_path):
+    context = _write_pipenv_project(tmp_path / "context", extras=["speed-ups"])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\n"
+        "Requires-Dist: missing-child; extra == 'Speed_Ups'\n\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_staged_wheel_closure_rejects_only_applicable_direct_urls(tmp_path, requested):
+    context = _write_pipenv_project(tmp_path / "context", extras=["feature"] if requested else [])
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: marker-root\nVersion: 1.0\n"
+        "Requires-Dist: optional @ https://example.invalid/optional.whl ; extra == 'feature'\n\n",
+        encoding="utf-8",
+    )
+
+    if requested:
+        with pytest.raises(LockfileError, match="Direct URL requirement optional"):
+            verify_locked_installation(selection, context, site, PY311)
+    else:
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize(("root_dependency", "middle_dependency", "message"), [
+    ("middle[feature]>=1.0", "missing-child>=1.0; extra == 'feature'", "middle.*missing-child"),
+    ("middle>=2.0", "missing-child; extra == 'feature'", "marker-root.*middle"),
+])
+def test_pipenv_staged_wheel_closure_checks_versions_and_transitive_extras(
+    tmp_path, root_dependency, middle_dependency, message
+):
+    context = _write_pipenv_project(tmp_path / "context")
+    lock_path = context / "Pipfile.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["default"]["middle"] = {
+        "version": "==1.0", "hashes": ["sha256:" + "a" * 64], "index": "pypi",
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    for name, dependency in (
+        ("marker-root", root_dependency),
+        ("middle", middle_dependency),
+    ):
+        metadata = site / f"{name.replace('-', '_')}-1.0.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\nRequires-Dist: {dependency}\n\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(LockfileError, match=message):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("headers", [
+    "Name: marker-root\nName: other\nVersion: 1.0\n",
+    "Name: marker-root\nVersion: 1.0\nRequires-Python: >=3.10\nRequires-Python: >=3.12\n",
+    "Name: marker-root\nVersion: 1.0\nRequires-Dist missing-colon\n",
+])
+def test_staged_wheel_closure_rejects_malformed_metadata(tmp_path, headers):
+    context = _write_pipenv_project(tmp_path / "context")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "marker_root-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(f"Metadata-Version: 2.1\n{headers}\n", encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="Invalid staged package metadata"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["oversized", "mismatched-directory", "unsupported-version", "missing"]
+)
+def test_staged_wheel_closure_checks_metadata_bounds_and_identity(tmp_path, monkeypatch, invalid):
+    context = _write_pipenv_project(tmp_path / "context")
+    selection = load_lockfile(context, Path("Pipfile.lock"), PY311)
+    site = tmp_path / "site-packages"
+    directory = "other-1.0.dist-info" if invalid == "mismatched-directory" else "marker_root-1.0.dist-info"
+    metadata = site / directory / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    if invalid != "missing":
+        metadata_version = "3.0" if invalid == "unsupported-version" else "2.1"
+        metadata.write_text(
+            f"Metadata-Version: {metadata_version}\nName: marker-root\nVersion: 1.0\n\n",
+            encoding="utf-8",
+        )
+    if invalid == "oversized":
+        monkeypatch.setattr("pycontainer.dependencies.MAX_METADATA_BYTES", 16)
+
+    with pytest.raises(LockfileError, match="Invalid staged package metadata"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+@pytest.mark.parametrize("kind", ["uv", "uv-extra", "poetry", "poetry-legacy"])
+def test_staged_wheel_closure_rejects_unrecorded_dependencies(tmp_path, kind):
+    context = tmp_path / "context"
+    if kind in {"uv", "uv-extra"}:
+        _write_uv_project(context)
+        lock_name = "uv.lock"
+        if kind == "uv-extra":
+            manifest = context / "pyproject.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace("fixture-dep==1.0", "fixture-dep[feature]==1.0"),
+                encoding="utf-8",
+            )
+            lock_path = context / lock_name
+            lock_path.write_text(
+                lock_path.read_text(encoding="utf-8")
+                .replace('{ name = "fixture-dep" },', '{ name = "fixture-dep", extra = ["feature"] },', 1)
+                .replace(
+                    '{ name = "fixture-dep", specifier = "==1.0" }',
+                    '{ name = "fixture-dep", extras = ["feature"], specifier = "==1.0" }',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+    else:
+        context.mkdir()
+        if kind == "poetry":
+            manifest = (
+                '[project]\nname = "demo"\nversion = "1.0"\nrequires-python = ">=3.10"\n'
+                'dependencies = ["fixture-dep[feature]==1.0"]\n'
+            )
+        else:
+            manifest = (
+                '[tool.poetry]\nname = "demo"\nversion = "1.0"\n'
+                '[tool.poetry.dependencies]\npython = ">=3.10"\n'
+                'fixture-dep = {version = "1.0", extras = ["feature"]}\n'
+            )
+        (context / "pyproject.toml").write_text(manifest, encoding="utf-8")
+        (context / "poetry.lock").write_text(
+            f'''[[package]]
+name = "fixture-dep"
+version = "1.0"
+python-versions = ">=3.10"
+groups = ["main"]
+files = [{{file = "fixture_dep-1.0-py3-none-any.whl", hash = "sha256:{"a" * 64}"}}]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.10"
+content-hash = "{poetry_content_hash(tomllib.loads(manifest))}"
+''',
+            encoding="utf-8",
+        )
+        lock_name = "poetry.lock"
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    site = tmp_path / "site-packages"
+    metadata = site / "fixture_dep-1.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    marker = "" if kind == "uv" else "; extra == 'feature'"
+    metadata.write_text(
+        "Metadata-Version: 2.1\nName: fixture-dep\nVersion: 1.0\n"
+        f"Requires-Dist: missing-child>=1.0{marker}\n\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="fixture-dep.*missing-child"):
+        verify_locked_installation(selection, context, site, PY311)
+
+
+def test_pdm_build_rejects_missing_extra_dependency_from_wheel_metadata(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse, "marker-root",
+        requires=["missing-child>=1.0; extra == 'feature'"], extras=["feature"],
+    )
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    index = indexes(wheel)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    manifest = (
+        '[project]\nname = "demo"\nversion = "1.0"\nrequires-python = ">=3.10"\n'
+        'dependencies = ["marker-root[feature]==1.0"]\n'
+        f'[[tool.pdm.source]]\nname = "pypi"\nurl = "{index.url}"\n'
+    )
+    (context / "pyproject.toml").write_text(manifest, encoding="utf-8")
+    (context / "pdm.lock").write_text(
+        f'''[metadata]
+lock_version = "4.5.1"
+strategy = ["inherit_metadata"]
+content_hash = "sha256:{pdm_content_hash(tomllib.loads(manifest))}"
+
+[[package]]
+name = "marker-root"
+version = "1.0"
+groups = ["default"]
+files = [{{file = "{wheel.name}", hash = "sha256:{digest}"}}]
+''',
+        encoding="utf-8",
+    )
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(LockfileError, match="marker-root.*missing-child"):
+        builder.build()
+
+
+def _write_target_marker_uv_project(context, registry="https://pypi.org/simple"):
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(
+        wheelhouse,
+        "fixture-dep",
+        requires=[
+            'marker-trans-amd; platform_machine == "x86_64"',
+            'marker-trans-arm; platform_machine == "aarch64"',
+            'marker-trans-armv7; platform_machine == "armv7l"',
+            'marker-trans-win; sys_platform == "win32"',
+        ],
+    )
+    names = (
+        "marker-root-amd", "marker-root-arm", "marker-trans-amd", "marker-trans-arm",
+        "marker-root-armv7", "marker-trans-armv7", "marker-trans-win",
+    )
+    for name in names:
+        tag = "py3-none-manylinux2014_armv7l" if name == "marker-root-armv7" else "py3-none-any"
+        _write_named_wheel(wheelhouse, name, tag=tag)
+    _write_uv_project(context, wheelhouse / "fixture_dep-1.0-py3-none-any.whl", registry=registry)
+    manifest = context / "pyproject.toml"
+    text = manifest.read_text(encoding="utf-8")
+    text = text.replace(
+        '"colorama>=0.4; sys_platform == \'win32\'"]',
+        '"colorama>=0.4; sys_platform == \'win32\'", '
+        '"marker-root-amd==1.0; platform_machine == \'x86_64\'", '
+        '"marker-root-arm==1.0; platform_machine == \'aarch64\'", '
+        '"marker-root-armv7==1.0; platform_machine == \'armv7l\'"]',
+    )
+    manifest.write_text(text, encoding="utf-8")
+
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8").replace(
+        '    { name = "fixture-dep" },\n]',
+        '    { name = "fixture-dep" },\n'
+        '    { name = "marker-root-amd", marker = "platform_machine == \'x86_64\'" },\n'
+        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'" },\n'
+        '    { name = "marker-root-armv7", marker = "platform_machine == \'armv7l\'" },\n]',
+        1,
+    ).replace(
+        '    { name = "fixture-dep", specifier = "==1.0" },\n]',
+        '    { name = "fixture-dep", specifier = "==1.0" },\n'
+        '    { name = "marker-root-amd", marker = "platform_machine == \'x86_64\'", specifier = "==1.0" },\n'
+        '    { name = "marker-root-arm", marker = "platform_machine == \'aarch64\'", specifier = "==1.0" },\n'
+        '    { name = "marker-root-armv7", marker = "platform_machine == \'armv7l\'", specifier = "==1.0" },\n]',
+        1,
+    )
+    before, package = text.split('name = "fixture-dep"\nversion = "1.0"\n', 1)
+    package = package.replace(
+        f'source = {{ registry = "{registry}" }}\n',
+        f'source = {{ registry = "{registry}" }}\n'
+        'dependencies = [\n'
+        '    { name = "marker-trans-amd", marker = "platform_machine == \'x86_64\'" },\n'
+        '    { name = "marker-trans-arm", marker = "platform_machine == \'aarch64\'" },\n'
+        '    { name = "marker-trans-armv7", marker = "platform_machine == \'armv7l\'" },\n'
+        '    { name = "marker-trans-win", marker = "sys_platform == \'win32\'" },\n'
+        ']\n',
+        1,
+    )
+    text = before + 'name = "fixture-dep"\nversion = "1.0"\n' + package
+    for name in names:
+        tag = "py3-none-manylinux2014_armv7l" if name == "marker-root-armv7" else "py3-none-any"
+        wheel = wheelhouse / f"{name.replace('-', '_')}-1.0-{tag}.whl"
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        text += (
+            f'\n[[package]]\nname = "{name}"\nversion = "1.0"\n'
+            f'source = {{ registry = "{registry}" }}\n'
+            f'wheels = [{{ url = "https://example.invalid/{wheel.name}", hash = "sha256:{digest}" }}]\n'
+        )
+    lock.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("variant", [None, "v6"])
+def test_locked_target_rejects_arm_without_v7(variant):
+    with pytest.raises(LockfileError, match="linux/arm"):
+        target_environment("linux", "arm", "3.11", "3.11.9", variant=variant)
+
+
+def test_locked_build_stages_root_and_transitive_markers_for_each_target(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    index = indexes()
+    _write_target_marker_uv_project(context, registry=index.url)
+    for wheel in (context / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    for arch, suffix in (("amd64", "amd"), ("arm64", "arm")):
+        layers = tmp_path / f"layers-{arch}"
+        layers.mkdir()
+        layer = builder._create_deps_layer(
+            layers, base_config={**BASE_CONFIG, "architecture": arch}, os_name="linux", arch=arch
+        )
+        names = _layer_names(layer)
+        assert f"app/.python/site-packages/marker_root_{suffix}/__init__.py" in names
+        assert f"app/.python/site-packages/marker_trans_{suffix}/__init__.py" in names
+        other = "arm" if suffix == "amd" else "amd"
+        assert not any(f"marker_root_{other}/" in name or f"marker_trans_{other}/" in name for name in names)
+        assert not any("marker_trans_win/" in name for name in names)
+
+
+@pytest.mark.parametrize("location", ["root", "transitive"])
+def test_locked_build_rejects_unknown_target_markers_before_pip(tmp_path, monkeypatch, location):
+    context = tmp_path / "context"
+    _write_target_marker_uv_project(context)
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8")
+    if location == "root":
+        manifest = context / "pyproject.toml"
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                "platform_machine == 'x86_64'", "platform_release >= '6'"
+            ),
+            encoding="utf-8",
+        )
+        text = text.replace(
+            "platform_machine == 'x86_64'", "platform_release >= '6'", 2
+        )
+    else:
+        before, package = text.split('name = "fixture-dep"\nversion = "1.0"\n', 1)
+        package = package.replace("platform_machine == 'x86_64'", "platform_release >= '6'", 1)
+        text = before + 'name = "fixture-dep"\nversion = "1.0"\n' + package
+    lock.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip must not run for an unknown target marker"),
+    )
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+
+    with pytest.raises(LockfileError, match="platform_release is unknown"):
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG)
+
+
+def test_lock_selection_cache_distinguishes_target_python_versions(tmp_path, monkeypatch):
+    context = _copy(tmp_path, "uv")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:latest")
+    python312 = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.12.4"]},
+    }
+
+    first = builder._lock_selection(BASE_CONFIG, "linux", "amd64", base_image_tag_verified=True)
+    second = builder._lock_selection(python312, "linux", "amd64", base_image_tag_verified=True)
+
+    assert _selected(first)["iniconfig"] == "2.0.0"
+    assert _selected(second)["iniconfig"] == "2.1.0"
+
+
+def test_lock_selection_cache_distinguishes_target_python_patch_versions(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    _write_target_marker_uv_project(context)
+    for filename in ("pyproject.toml", "uv.lock"):
+        path = context / filename
+        text = path.read_text(encoding="utf-8")
+        for machine, marker in (
+            ("x86_64", "python_full_version < '3.11.9'"),
+            ("aarch64", "python_full_version >= '3.11.9'"),
+        ):
+            text = text.replace(f"platform_machine == '{machine}'", marker, 2)
+        path.write_text(text, encoding="utf-8")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    python3119 = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11.9"]},
+    }
+
+    first = builder._lock_selection(BASE_CONFIG, "linux", "amd64", base_image_tag_verified=True)
+    second = builder._lock_selection(python3119, "linux", "amd64", base_image_tag_verified=True)
+
+    assert "marker-root-amd" in _selected(first)
+    assert "marker-root-arm" in _selected(second)
+
+
+def test_repeated_build_rechecks_lockfile_freshness(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    wheel = _write_wheel(context / "wheelhouse")
+    index = indexes(wheel)
+    _write_uv_project(context, wheel, registry=index.url)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    builder.build()
+    manifest = context / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("fixture-dep==1.0", "fixture-dep==1.1"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="out of date"):
+        builder.build()
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"), [("amd64", "marker-amd"), ("arm64", "marker-arm")]
+)
+def test_locked_requirements_use_target_marker_bootstrap(tmp_path, arch, expected):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    for name in ("marker-amd", "marker-arm"):
+        _write_named_wheel(wheelhouse, name)
+    requirements = context / "requirements.txt"
+    lines = ["--no-index", "--find-links ./wheelhouse"]
+    for name, machine in (("marker-amd", "x86_64"), ("marker-arm", "aarch64")):
+        wheel = wheelhouse / f"{name.replace('-', '_')}-1.0-py3-none-any.whl"
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        lines.append(f'{name}==1.0; platform_machine == "{machine}" --hash=sha256:{digest}')
+    requirements.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    destination = tmp_path / "stage" / "site-packages"
+
+    install_requirements(
+        requirements, destination, context, "linux", arch, "3.11", "python:3.11-slim-bookworm",
+        BASE_CONFIG, locked=True, base_image_tag_verified=True,
+    )
+
+    assert {name for name, _ in staged_packages(destination)} == {expected}
+
+
+def test_locked_requirements_fail_closed_for_unknown_target_marker(tmp_path):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    _write_named_wheel(wheelhouse, "marker-root")
+    wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    requirements = context / "requirements.txt"
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f'marker-root==1.0; platform_release >= "1" --hash=sha256:{digest}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="refusing to stage.*platform_release"):
+        install_requirements(
+            requirements, tmp_path / "stage" / "site-packages", context, "linux", "amd64",
+            "3.11", "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [("--platform=win_amd64", "cannot override"), ("-r ../outside.txt", "inside the build context")],
+)
+def test_generated_locked_requirements_validate_options_before_pip(tmp_path, monkeypatch, line, message):
+    context = tmp_path / "context"
+    stage = tmp_path / "stage"
+    context.mkdir()
+    stage.mkdir()
+    (tmp_path / "outside.txt").write_text("outside==1.0\n", encoding="utf-8")
+    requirements = context / "locked-requirements.txt"
+    requirements.write_text(line + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip must not run for invalid generated requirements"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        install_requirements(
+            requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize("invalid", ["oversized", "outside-context"])
+def test_generated_locked_requirements_enforce_size_and_location(tmp_path, monkeypatch, invalid):
+    context = tmp_path / "context"
+    stage = tmp_path / "stage"
+    context.mkdir()
+    stage.mkdir()
+    requirements = (
+        context / "locked-requirements.txt"
+        if invalid == "oversized"
+        else stage / "locked-requirements.txt"
+    )
+    requirements.write_text("fixture-dep==1.0 --hash=sha256:" + "a" * 64, encoding="utf-8")
+    if invalid == "oversized":
+        monkeypatch.setattr("pycontainer.dependencies.MAX_REQUIREMENTS_BYTES", 32)
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip must not run for invalid generated requirements"),
+    )
+    message = "combined .* limit" if invalid == "oversized" else "inside the build context"
+
+    with pytest.raises(ValueError, match=message):
+        install_requirements(
+            requirements, stage / "site-packages", context, "linux", "amd64", "3.11",
+            "python:3.11-slim-bookworm", BASE_CONFIG, locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize("installation_fails", [False, True])
+@pytest.mark.parametrize("include_paths", [
+    ["."],
+    [".pycontainer-lockfile-concurrent/requirements.txt", "app.py"],
+])
+def test_locked_build_keeps_generated_requirements_inside_context_and_cleans_up(
+    tmp_path, monkeypatch, installation_fails, include_paths
+):
+    context = _write_uv_project(tmp_path / "context")
+    other_build = context / ".pycontainer-lockfile-concurrent" / "requirements.txt"
+    other_build.parent.mkdir()
+    other_build.write_text("temporary requirements from another build\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    builder = _builder(
+        tmp_path, monkeypatch, context=Path("context"), include_deps=True,
+        include_paths=include_paths, exclude_defaults=False,
+    )
+    requirements_paths = []
+
+    def install(requirements, destination, context_dir, *args, **kwargs):
+        requirements_paths.append(requirements)
+        assert requirements.is_absolute()
+        assert requirements.resolve().is_relative_to(context_dir.resolve())
+        assert "--hash=sha256:" in requirements.read_text(encoding="utf-8")
+        assert kwargs["locked"] is True
+        if installation_fails:
+            raise RuntimeError("installation failed")
+        destination.mkdir(parents=True)
+        (destination / "fixture_dep.py").write_text("value = 1\n", encoding="utf-8")
+        metadata = destination / "fixture_dep-1.0.dist-info" / "METADATA"
+        metadata.parent.mkdir()
+        metadata.write_text("Metadata-Version: 2.1\nName: fixture-dep\nVersion: 1.0\n\n", encoding="utf-8")
+
+    monkeypatch.setattr("pycontainer.dependencies.install_requirements", install)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    if installation_fails:
+        with pytest.raises(RuntimeError, match="installation failed"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG)
+    else:
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG)
+        app_layer = builder._create_app_layer(layers, builder.context_include_paths)
+        assert not any(".pycontainer-lockfile-" in name for name in _layer_names(app_layer))
+
+    assert len(requirements_paths) == 1
+    assert not requirements_paths[0].exists()
+    assert not requirements_paths[0].parent.exists()
+    assert other_build.exists()
+
+
 @pytest.mark.parametrize(
     ("base_image", "environment", "wheel_tag"),
     [
-        ("python:3.11-slim", [], "cp311-cp311-manylinux2014_x86_64"),
-        ("python:3.11-alpine", [], "cp311-cp311-musllinux_1_2_x86_64"),
+        ("python:3.11-slim-bookworm", [], "cp311-cp311-manylinux2014_x86_64"),
+        ("python:3.11-alpine3.20", [], "cp311-cp311-musllinux_1_2_x86_64"),
         (
             "python:3.11-slim@sha256:" + "a" * 64,
             ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_LIBC=musl-1.2"],
@@ -1005,19 +2192,82 @@ def test_locked_build_uses_verified_base_abi_and_libc(
         **BASE_CONFIG,
         "config": {
             **BASE_CONFIG["config"],
-            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+            "Env": ["PYTHON_VERSION=3.11.8", *environment],
         },
     }
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
     )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    def pull(*args):
+        builder._base_image_tag_verified = "@" not in base_image
+        return [], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
 
     builder.build()
 
     assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[0])
     assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
     assert not rogue.requests
+
+
+@pytest.mark.parametrize(
+    ("base_image", "version", "family"),
+    [
+        ("python:3.11-slim", "3.11", "glibc"),
+        ("python:3.8.0-alpine", "3.8", "musl"),
+        ("python:3.4-wheezy", "3.4", "glibc"),
+    ],
+)
+def test_locked_requirements_reject_unproven_base_libc_before_pip(
+    tmp_path, monkeypatch, base_image, version, family
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fixture-dep==1.0 --hash=sha256:" + "a" * 64)
+    monkeypatch.setattr(
+        "pycontainer.dependencies.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("pip ran without validated target libc"),
+    )
+
+    with pytest.raises(ValueError, match=f"Cannot validate target {family}"):
+        install_requirements(
+            requirements, tmp_path / "stage", tmp_path, "linux", "amd64", version,
+            base_image, {"config": {"Env": [f"PYTHON_VERSION={version}.0"]}},
+            locked=True, base_image_tag_verified=True,
+        )
+
+
+@pytest.mark.parametrize(("wheel_minor", "success"), [(28, True), (31, False)])
+def test_locked_build_uses_libc_derived_from_verified_base_layers(
+    tmp_path, monkeypatch, indexes, wheel_minor, success
+):
+    context = tmp_path / "context"
+    wheel = _write_wheel(
+        context / "wheelhouse", tag=f"cp311-cp311-manylinux_2_{wheel_minor}_x86_64"
+    )
+    _write_uv_project(context, wheel, registry=indexes(wheel).url)
+    layer = _base_metadata_layer(tmp_path, [("var/lib/dpkg/status", _dpkg_libc("2.28-1"))])
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True, base_image="python:3.11-slim"
+    )
+    base_config = {
+        **BASE_CONFIG,
+        "config": {**BASE_CONFIG["config"], "Env": ["PYTHON_VERSION=3.11.8"]},
+    }
+
+    def pull(*args):
+        builder._base_image_tag_verified = True
+        return [layer], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
+
+    if not success:
+        with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+            builder.build()
+        return
+
+    builder.build()
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(builder.layers[1])
 
 
 @pytest.mark.parametrize(
@@ -1040,13 +2290,17 @@ def test_locked_build_rejects_unverified_base_before_pip(
         **BASE_CONFIG,
         "config": {
             **BASE_CONFIG["config"],
-            "Env": [*BASE_CONFIG["config"]["Env"], *environment],
+            "Env": ["PYTHON_VERSION=3.11.8", *environment],
         },
     }
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True, base_image=base_image
     )
-    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: ([], base_config))
+    def pull(*args):
+        builder._base_image_tag_verified = "@" not in base_image
+        return [], base_config
+
+    monkeypatch.setattr(builder, "_pull_base_image", pull)
     monkeypatch.setattr(
         "pycontainer.dependencies.subprocess.Popen",
         lambda *args, **kwargs: pytest.fail("pip ran before validating the base image"),
@@ -1063,11 +2317,14 @@ def test_locked_build_installs_only_from_recorded_index_reproducibly(tmp_path, m
     _ambient_pip(monkeypatch, tmp_path, rogue.url, context / "wheelhouse")
     _write_uv_project(context, wheel, registry=recorded.url)
     (context / "requirements.txt").write_text("unrelated-package==9.9\n")
+    monkeypatch.chdir(tmp_path)
 
     digests = []
     for run in range(2):
         builder = _builder(
-            tmp_path / f"run-{run}", monkeypatch, context=context, include_deps=True, generate_sbom=True
+            tmp_path / f"run-{run}", monkeypatch,
+            context=Path("context") if run == 0 else context,
+            include_deps=True, generate_sbom=True,
         )
         builder.build()
         digests.append(builder.layers[0].digest)
@@ -1127,8 +2384,8 @@ def test_locked_packages_install_from_their_own_indexes(tmp_path, monkeypatch, i
     site_packages.parent.mkdir()
 
     install_locked_requirements(
-        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim", None,
-        base_image_tag_verified=True,
+        selection.requirement_sets(), site_packages, tmp_path, "linux", "amd64", "3.11", "python:3.11-slim",
+        {"config": {"Env": ["PYTHON_LIBC=glibc-2.36"]}}, base_image_tag_verified=True,
     )
 
     assert {path.name for path in site_packages.iterdir()} >= {"fixture_dep", "other_dep"}
@@ -1178,13 +2435,13 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
 
     install_locked_requirements(
         requirements, site_packages, tmp_path, "linux", "arm64", "3.9",
-        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18"]}},
+        "python:3.9-slim", {"config": {"Env": ["PYTHON_VERSION=3.9.18", "PYTHON_LIBC=glibc-2.36"]}},
         base_image_tag_verified=True,
     )
 
     bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
     assert len(commands) == 2
-    assert all(command[1:3] == ["-c", bootstrap] for command in commands)
+    assert all(command[1:5] == ["-E", "-P", "-c", bootstrap] for command in commands)
     assert all(
         {"--isolated", "--no-deps", "--require-hashes"} <= set(command)
         for command in commands
@@ -1203,14 +2460,18 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
 
 
 @pytest.mark.parametrize(
-    ("arch", "selected_arch", "excluded_arch"),
+    ("arch", "selected_arch", "excluded_arch", "missing_transitive", "strip_type_stubs"),
     [
-        ("amd64", "amd-dep", "arm-dep"),
-        ("arm64", "arm-dep", "amd-dep"),
+        pytest.param("amd64", "amd-dep", "arm-dep", False, False, id="amd64"),
+        pytest.param("amd64", "amd-dep", "arm-dep", True, False, id="amd64-missing"),
+        pytest.param("arm64", "arm-dep", "amd-dep", False, False, id="arm64"),
+        pytest.param("arm64", "arm-dep", "amd-dep", True, False, id="arm64-missing"),
+        pytest.param("arm64", "arm-dep", "amd-dep", False, True, id="arm64-strip-stubs"),
     ],
 )
 def test_locked_build_selects_target_transitive_markers_across_indexes(
-    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch
+    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch,
+    missing_transitive, strip_type_stubs,
 ):
     wheelhouse = tmp_path / "wheels"
     wheels = {
@@ -1224,12 +2485,16 @@ def test_locked_build_selects_target_transitive_markers_across_indexes(
                 "arm-dep==1.0; platform_machine == 'aarch64'",
                 "win-dep==1.0; sys_platform == 'win32'",
                 "feature-dep==1.0; extra == 'feature' and sys_platform == 'linux'",
+                *(["types-root==1.0; platform_machine == 'aarch64'"] if strip_type_stubs else []),
             ],
             extras=["feature"],
         ),
     }
     for name in ("common-dep", "newpy-dep", "amd-dep", "arm-dep", "win-dep", "feature-dep"):
-        wheels[name] = _named_wheel(wheelhouse, name)
+        requires = ["missing-dep>=1.0; sys_platform == 'linux'"] if missing_transitive and name == "feature-dep" else ()
+        wheels[name] = _named_wheel(wheelhouse, name, requires=requires)
+    if strip_type_stubs:
+        wheels["types-root"] = _named_wheel(wheelhouse, "types-root", stub_only=True)
     index_a, index_b, rogue = (indexes(*wheels.values()) for _ in range(3))
     _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
 
@@ -1272,7 +2537,10 @@ dependencies = [
     { name = "amd-dep", marker = "platform_machine == 'x86_64'" },
     { name = "arm-dep", marker = "platform_machine == 'aarch64'" },
     { name = "win-dep", marker = "sys_platform == 'win32'" },
-]
+"""
+            if strip_type_stubs:
+                lock += """    { name = "types-root", marker = "platform_machine == 'aarch64'" },\n"""
+            lock += """]
 
 [package.optional-dependencies]
 feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
@@ -1280,12 +2548,29 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
     (context / "uv.lock").write_text(lock)
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True,
-        generate_sbom=True, platform=f"linux/{arch}",
+        generate_sbom=True, platform=f"linux/{arch}", strip_type_stubs=strip_type_stubs,
     )
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
         lambda self, layers_dir, os_name, target_arch: ([], {**BASE_CONFIG, "architecture": target_arch}),
     )
+    commands = []
+    if strip_type_stubs:
+        popen = subprocess.Popen
+
+        def record_pip(command, *args, **kwargs):
+            commands.append(command)
+            return popen(command, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", record_pip)
+
+    if missing_transitive:
+        with pytest.raises(LockfileError, match="feature-dep.*missing-dep"):
+            builder.build()
+        assert any("root-dep" in path for path in index_a.requests)
+        assert any("feature-dep" in path for path in index_b.requests)
+        assert not rogue.requests
+        return
 
     builder.build()
 
@@ -1299,10 +2584,19 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
     assert {(package["name"], package["versionInfo"]) for package in sbom["packages"]} == {
         (name, "1.0") for name in expected
     }
+    if strip_type_stubs:
+        assert not any(name.endswith(".pyi") or "types_root" in name for name in names)
+        bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
+        assert len(commands) == 2
+        assert all(command[1:5] == ["-E", "-P", "-c", bootstrap] for command in commands)
+        assert all(
+            json.loads(command[5])["environment"]["platform_machine"] == "aarch64"
+            for command in commands
+        )
     requested_a = {path.split("/")[2] for path in index_a.requests if path.startswith("/simple/")}
     requested_b = {path.split("/")[2] for path in index_b.requests if path.startswith("/simple/")}
     assert requested_a == {"root-dep", "common-dep"}
-    assert requested_b == {"feature-dep", selected_arch}
+    assert requested_b == {"feature-dep", selected_arch} | ({"types-root"} if strip_type_stubs else set())
     assert excluded_arch not in requested_a | requested_b
     assert "win-dep" not in requested_a | requested_b
     assert rogue.requests == []
@@ -1333,6 +2627,263 @@ def test_merging_index_installs_rejects_conflicting_files(tmp_path):
     (source / "namespace" / "__init__.py").write_text("different")
     with pytest.raises(RuntimeError, match="different indexes both install namespace/__init__.py"):
         _merge_site_packages(source, destination)
+
+
+def test_locked_build_requires_a_matching_wheel_hash_for_each_target(tmp_path, monkeypatch, indexes):
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    amd = _write_wheel(wheelhouse, tag="cp311-cp311-manylinux2014_x86_64")
+    arm = _write_wheel(wheelhouse, tag="cp311-cp311-manylinux2014_aarch64")
+    amd_hash = hashlib.sha256(amd.read_bytes()).hexdigest()
+    arm_hash = hashlib.sha256(arm.read_bytes()).hexdigest()
+    index = indexes(amd, arm)
+    _write_uv_project(context, digest=amd_hash, registry=index.url)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    base = {**BASE_CONFIG, "architecture": "arm64"}
+
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    with pytest.raises(RuntimeError, match="must match their recorded hashes"):
+        builder._create_deps_layer(layers, base_config=base, os_name="linux", arch="arm64")
+
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            f'hash = "sha256:{amd_hash}" }}]',
+            f'hash = "sha256:{amd_hash}" }}, '
+            f'{{ url = "https://example.invalid/{arm.name}", hash = "sha256:{arm_hash}" }}]',
+        ),
+        encoding="utf-8",
+    )
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    layer = builder._create_deps_layer(layers, base_config=base, os_name="linux", arch="arm64")
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+
+
+def _bypass_locked_pip_isolation(monkeypatch, key):
+    """Negative control: disable every locked isolation layer so host settings reach pip."""
+    from pycontainer import dependencies
+
+    monkeypatch.setattr(
+        dependencies,
+        "_locked_pip_environment",
+        lambda temporary_dir, _source_environment=None: {
+            **os.environ,
+            **{name: str(temporary_dir) for name in ("TMP", "TEMP", "TMPDIR")},
+        },
+    )
+    monkeypatch.setattr(
+        dependencies,
+        "_PIP_LOCKED_CONFIG_ALLOWED",
+        [*dependencies._PIP_LOCKED_CONFIG_ALLOWED, key],
+    )
+    popen = dependencies.subprocess.Popen
+    monkeypatch.setattr(
+        dependencies.subprocess,
+        "Popen",
+        lambda command, *args, **kwargs: popen(
+            [arg for arg in command if arg != "--isolated"], *args, **kwargs
+        ),
+    )
+
+
+def _locked_index_project(context, indexes):
+    wheel = _write_wheel(context / "wheelhouse")
+    _write_uv_project(context, wheel, registry=indexes(wheel).url)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_lock_stages_wheels_without_copying_conda_prefix(
+    tmp_path, monkeypatch, indexes, caplog, explicit
+):
+    from pycontainer.history import BuildHistory
+
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    (context / "environment.yml").write_text("name: host-env\n")
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "host-package.txt").write_text("host-only\n")
+    (context / "requirements.txt").write_text("unrelated-package==9.9\n")
+    history = tmp_path / "history"
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile="uv.lock" if explicit else None,
+        include_paths=["app.py", "environment.yml", ".venv"],
+        exclude_defaults=False,
+        record_history=True, history_dir=str(history),
+    )
+
+    builder.build()
+
+    assert "Conda inputs ignored" in caplog.text
+    names = [name for layer in builder.layers for name in _layer_names(layer)]
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("host-package.txt" in name or "conda-meta" in name for name in names)
+    record = BuildHistory(history).list()[0]
+    assert record["status"] == "success"
+    assert {"base_image", "dependencies", "application"} <= record["phases_ns"].keys()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_explicit_lock_inside_conda_prefix_fails_before_pull(tmp_path, monkeypatch, dry_run):
+    context = tmp_path / "context"
+    prefix = context / ".venv"
+    (prefix / "conda-meta").mkdir(parents=True)
+    (prefix / "uv.lock").write_text("not a supported source\n")
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        lockfile=".venv/uv.lock", dry_run=dry_run,
+    )
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base image pulled"))
+
+    with pytest.raises(ValueError, match="Conda"):
+        builder.build()
+
+
+def _host_pip_setting(monkeypatch, tmp_path, source, key, value, *, bypass):
+    from pycontainer import dependencies
+
+    config = tmp_path / "pip.ini"
+    if source == "environment":
+        monkeypatch.setenv(f"PIP_{key.upper()}", value)
+        config.write_text("")
+    else:
+        config.write_text(f"[install]\n{key} = {value}\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    if bypass:
+        # Negative control: allowlisting the key must let it reach pip.
+        monkeypatch.setattr(
+            dependencies,
+            "_PIP_ENVIRONMENT_ALLOWED",
+            dependencies._PIP_ENVIRONMENT_ALLOWED | {f"PIP_{key.upper()}"},
+        )
+        monkeypatch.setattr(
+            dependencies, "_PIP_CONFIG_ALLOWED", [*dependencies._PIP_CONFIG_ALLOWED, key]
+        )
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_requirement_injection(
+    tmp_path, monkeypatch, indexes, source, bypass
+):
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    extra_wheels = tmp_path / "extra-wheels"
+    _write_named_wheel(extra_wheels, "injected-dep")
+    injected = extra_wheels / "injected_dep-1.0-py3-none-any.whl"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(
+        f"--find-links {extra_wheels.as_uri()}\n"
+        f"injected-dep==1.0 --hash=sha256:{hashlib.sha256(injected.read_bytes()).hexdigest()}\n"
+    )
+    _host_pip_setting(monkeypatch, tmp_path, source, "requirement", str(extra), bypass=False)
+    if bypass:
+        _bypass_locked_pip_isolation(monkeypatch, "requirement")
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    if bypass:
+        with pytest.raises(LockfileError, match="Unexpected or duplicate staged package injected-dep"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+        return
+    layer = builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+    names = _layer_names(layer)
+    assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+    assert not any("injected_dep" in name for name in names)
+
+
+@pytest.mark.parametrize("source", ["environment", "pip-config"])
+def test_locked_build_ignores_host_target_platform_override(tmp_path, monkeypatch, source):
+    # Allowlisting platform trips _pip_target's self-test; test_private_index proves raw pip honors it.
+    context = tmp_path / "context"
+    wheelhouse = context / "wheelhouse"
+    wheel = _write_wheel(wheelhouse, tag="py3-none-win_amd64")
+    _write_uv_project(context, wheel)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    _host_pip_setting(monkeypatch, tmp_path, source, "platform", "win_amd64", bypass=False)
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    with pytest.raises(RuntimeError, match="Only wheels compatible with linux/amd64"):
+        builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+
+
+@pytest.mark.parametrize("scope", ["global", "site"])
+@pytest.mark.parametrize("bypass", [False, True])
+def test_locked_build_filters_global_and_site_pip_config(
+    tmp_path, monkeypatch, indexes, scope, bypass
+):
+    context = tmp_path / "context"
+    _locked_index_project(context, indexes)
+    extra_wheels = tmp_path / "extra-wheels"
+    _write_named_wheel(extra_wheels, "injected-dep")
+    injected = extra_wheels / "injected_dep-1.0-py3-none-any.whl"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(
+        f"--find-links {extra_wheels.as_uri()}\n"
+        f"injected-dep==1.0 --hash=sha256:{hashlib.sha256(injected.read_bytes()).hexdigest()}\n"
+    )
+
+    env_dir = tmp_path / "builder-env"
+    venv.EnvBuilder(with_pip=False).create(env_dir)
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    python = env_dir / scripts / ("python.exe" if os.name == "nt" else "python")
+    site = (
+        env_dir / "Lib" / "site-packages"
+        if os.name == "nt"
+        else env_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    import pip
+    shutil.copytree(Path(pip.__file__).parent, site / "pip")
+    config = (
+        env_dir / ("pip.ini" if os.name == "nt" else "pip.conf")
+        if scope == "site" else tmp_path / "global-pip.conf"
+    )
+    config.write_text(f"[install]\nrequirement = {extra}\n")
+    # Redirect global discovery to a temporary file; preserve pip's real site path.
+    (site / "sitecustomize.py").write_text(
+        "import pip._internal.configuration as c\n"
+        "_original = c.get_configuration_files\n"
+        "def _files():\n"
+        "    files = _original()\n"
+        f"    files['global'] = {[str(config)] if scope == 'global' else []!r}\n"
+        "    files['user'] = []\n"
+        "    return files\n"
+        "c.get_configuration_files = _files\n"
+    )
+    for name in list(os.environ):
+        if name.upper().startswith(("PIP_", "_PIP_")):
+            monkeypatch.delenv(name)
+    probe = subprocess.run(
+        [
+            str(python), "-E", "-P", "-c",
+            "from pip._internal.configuration import Configuration; "
+            "c=Configuration(isolated=False); c.load(); print(c.get_value('install.requirement'))",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == str(extra)
+
+    if bypass:
+        _bypass_locked_pip_isolation(monkeypatch, "requirement")
+    monkeypatch.setattr(sys, "executable", str(python))
+    layers = tmp_path / "layers"
+    layers.mkdir()
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+    if bypass:
+        with pytest.raises(LockfileError, match="Unexpected or duplicate staged package injected-dep"):
+            builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+    else:
+        layer = builder._create_deps_layer(layers, base_config=BASE_CONFIG, os_name="linux", arch="amd64")
+        names = _layer_names(layer)
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in names
+        assert not any("injected_dep" in name for name in names)
 
 
 def _source(tmp_path, context, **options):
@@ -1380,6 +2931,22 @@ def test_dry_run_reports_dependency_source(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Dependency Source: lock (uv.lock)" in output
     assert "including uv marker freshness" in output
+
+
+def test_repeated_dry_run_redetects_new_lockfile(tmp_path, capsys):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "requirements.txt").write_text("fixture-dep==1.0\n", encoding="utf-8")
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "out"), include_deps=True, dry_run=True
+    ))
+    builder.build()
+    assert "Dependency Source: requirements (requirements.txt)" in capsys.readouterr().out
+
+    _write_uv_project(context)
+    builder.build()
+
+    assert "Dependency Source: lock (uv.lock)" in capsys.readouterr().out
 
 
 def test_dry_run_can_preview_without_dependencies(tmp_path, capsys):
@@ -1448,7 +3015,8 @@ def test_requirements_hash_pinning_detection(tmp_path, lines, pinned):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("\n".join(lines) + "\n")
 
-    assert validate_requirements(requirements, tmp_path) is pinned
+    _, _, hash_pinned = _scan_requirements(requirements, tmp_path)
+    assert hash_pinned is pinned
 
 
 @pytest.mark.parametrize(
@@ -1465,7 +3033,9 @@ def test_requirements_also_used_as_constraints_still_need_hashes(tmp_path, monke
         requirements.stat().st_size + shared.stat().st_size,
     )
 
-    assert not validate_requirements(requirements, tmp_path)
+    roots, _, hash_pinned = _scan_requirements(requirements, tmp_path)
+    assert roots == ["fixture-dep==1.0"]
+    assert not hash_pinned
 
 
 def test_unhashed_requirements_warn_that_layer_is_not_reproducible(tmp_path, monkeypatch, caplog):

@@ -88,7 +88,8 @@ def encode_group_bundle(
 
 
 def decode_group_bundle(
-    content: bytes, selection_key: str, plan: GroupPlan, selection: LockSelection
+    content: bytes, selection_key: str, plan: GroupPlan, selection: LockSelection,
+    *, strip_type_stubs: bool = False,
 ) -> Optional[Tuple[list, List[Tuple[str, str]]]]:
     try:
         document = json.loads(content.decode("utf-8"))
@@ -104,22 +105,6 @@ def decode_group_bundle(
         or not isinstance(document.get("packages"), list)
     ):
         return None
-    layers = document["layers"]
-    expected_groups = [
-        group for group in GROUPS if any(value == group for _, value in plan.assignments)
-    ]
-    if len(layers) != len(expected_groups):
-        return None
-    for item, group in zip(layers, expected_groups):
-        if (
-            not isinstance(item, dict)
-            or item.get("group") != group
-            or not isinstance(item.get("key"), str)
-            or not _GROUP_KEY.fullmatch(item["key"])
-            or not isinstance(item.get("digest"), str)
-            or not _DIGEST.fullmatch(item["digest"])
-        ):
-            return None
     expected_packages = {package.name: package for package in selection.packages}
     packages = []
     seen = set()
@@ -143,8 +128,29 @@ def decode_group_bundle(
             return None
         seen.add(normalized)
         packages.append((name, version))
-    if seen != set(expected_packages):
+    missing = set(expected_packages) - seen
+    if missing and (
+        not strip_type_stubs
+        or any(not (name.startswith("types-") or name.endswith("-stubs")) for name in missing)
+    ):
         return None
+    layers = document["layers"]
+    expected_groups = [
+        group for group in GROUPS
+        if any(name in seen and value == group for name, value in plan.assignments)
+    ]
+    if len(layers) != len(expected_groups):
+        return None
+    for item, group in zip(layers, expected_groups):
+        if (
+            not isinstance(item, dict)
+            or item.get("group") != group
+            or not isinstance(item.get("key"), str)
+            or not _GROUP_KEY.fullmatch(item["key"])
+            or not isinstance(item.get("digest"), str)
+            or not _DIGEST.fullmatch(item["digest"])
+        ):
+            return None
     return layers, packages
 
 

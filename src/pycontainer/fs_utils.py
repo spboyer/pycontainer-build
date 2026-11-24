@@ -2,8 +2,10 @@ import errno
 import fnmatch
 import hashlib
 import os
+import stat
 import time
 from contextlib import contextmanager
+from itertools import dropwhile
 from pathlib import Path, PureWindowsPath
 
 
@@ -52,6 +54,24 @@ def relative_context_path(path):
     ):
         raise ValueError(f"Context paths must be relative and stay inside the context: {path!r}")
     return relative
+
+
+def context_file_path(context_dir, path):
+    """Reject file links that escape the context or have no target."""
+    context = Path(context_dir)
+    path = Path(path)
+    try:
+        resolved = path.resolve(strict=True)
+        resolved_context = context.resolve(strict=True)
+    except FileNotFoundError as exc:
+        if path.is_symlink():
+            raise ValueError(f"{path.name} is a dangling link; it must resolve inside the build context.") from exc
+        return path
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Unable to resolve {path.name} inside the build context: {exc}") from exc
+    if not resolved.is_relative_to(resolved_context):
+        raise ValueError(f"{path.name} must resolve inside the build context.")
+    return path
 
 
 def _glob_matches(path_parts, pattern_parts):
@@ -104,6 +124,39 @@ def _raise_walk_error(error):
     raise error
 
 
+def _conda_prefix_in_context(base, relative):
+    """Check context-relative ancestors and resolved link targets."""
+    for parent in (relative, *relative.parents):
+        candidate = base / parent
+        if (candidate / "conda-meta").is_dir():
+            return candidate.absolute()
+    absolute = (base / relative).absolute()
+    try:
+        resolved = absolute.resolve()
+    except RuntimeError:
+        raise ValueError(
+            f"Context symlink {relative.as_posix()!r} is cyclic."
+        ) from None
+    if resolved != absolute:
+        for parent in (resolved, *resolved.parents):
+            if (parent / "conda-meta").is_dir():
+                return parent
+    return None
+
+
+def conda_prefix(base, relative):
+    """Find a Conda prefix containing a context path without reading metadata."""
+    base = Path(base)
+    relative = relative_context_path(relative)
+    prefix = _conda_prefix_in_context(base, relative)
+    if prefix is not None:
+        return prefix
+    for parent in base.absolute().parents:
+        if (parent / "conda-meta").is_dir():
+            return parent
+    return None
+
+
 def context_exclude_paths(
     context_dir,
     *,
@@ -129,17 +182,80 @@ def context_exclude_paths(
     return tuple(dict.fromkeys(excludes))
 
 
+def _is_directory_link(path):
+    """Detect directory symlinks and Windows junctions (mount points)."""
+    if not path.is_dir():
+        return False
+    reparse_tag = getattr(path.lstat(), "st_reparse_tag", 0)
+    return path.is_symlink() or reparse_tag == getattr(
+        stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003
+    )
+
+
+def _check_root_links(base, relative):
+    """Reject context paths reached through, or naming, a directory link."""
+    current = Path(base)
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if _is_directory_link(current) or (
+            current.is_symlink() and index < len(relative.parts) - 1
+        ):
+            raise ValueError(
+                f"Context path {relative.as_posix()!r} traverses a symlink or "
+                "junction directory; directory links are never followed."
+            )
+
+
+def _check_selected_link(base, path, relative):
+    """Require a selected file symlink to resolve to a file inside the context."""
+    link_target = os.readlink(path)
+    windows_target = PureWindowsPath(link_target)
+    if os.path.isabs(link_target) or windows_target.drive or windows_target.root:
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} must use a relative target."
+        )
+    try:
+        target = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} is dangling or cyclic."
+        ) from None
+    if not target.is_relative_to(Path(base).resolve()) or not target.is_file():
+        raise ValueError(
+            f"Selected symlink {relative.as_posix()!r} must point to a file inside "
+            "the build context."
+        )
+
+
 def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=True):
-    """Yield unique context files, pruning excluded directories during traversal."""
+    """Yield unique context files, pruning excluded directories during traversal.
+
+    Directory symlinks and junctions are never followed: an include path that
+    names or traverses one is rejected and nested ones are pruned. Selected
+    file symlinks must use a relative target resolving to a file inside the
+    context.
+    """
     base = Path(base)
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
     if exclude_paths is not None:
         excludes.extend(exclude_paths)
 
+    def selected(path, relative):
+        if path.is_symlink():
+            if _conda_prefix_in_context(base, relative) is not None:
+                return False
+            _check_selected_link(base, path, relative)
+        return path.is_file()
+
     seen = set()
     for relative_path in relative_paths:
         relative = relative_context_path(relative_path)
+        if path_is_excluded(relative, excludes):
+            continue
+        if conda_prefix(base, relative) is not None:
+            continue
         absolute = base / relative
+        _check_root_links(base, relative)
         if absolute.is_dir():
             for root, directories, filenames in os.walk(
                 absolute, topdown=True, onerror=_raise_walk_error
@@ -150,27 +266,72 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     directory
                     for directory in directories
                     if not path_is_excluded(root_relative / directory, excludes)
+                    and not _is_directory_link(root_path / directory)
+                    and _conda_prefix_in_context(base, root_relative / directory) is None
                 )
                 for filename in sorted(filenames):
                     child = root_path / filename
                     child_relative = child.relative_to(base)
                     relative_name = child_relative.as_posix()
                     if (
-                        child.is_file()
-                        and relative_name not in seen
+                        relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)
+                        and selected(child, child_relative)
                     ):
                         seen.add(relative_name)
                         yield child, child_relative
-        elif absolute.is_file():
+        elif absolute.is_file() or absolute.is_symlink():
             child_relative = absolute.relative_to(base)
             relative_name = child_relative.as_posix()
             if (
                 relative_name not in seen
                 and not path_is_excluded(child_relative, excludes)
+                and selected(absolute, child_relative)
             ):
                 seen.add(relative_name)
                 yield absolute, child_relative
+
+
+def select_context_files(base, include_paths, excludes):
+    """Return the deterministic (absolute, relative) application file selection.
+
+    ``excludes`` must already contain any default patterns. A selected file
+    symlink must target another selected file, so exclusions win over links.
+    """
+    files = list(
+        iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
+    )
+    # Lexical membership keeps the link valid inside the image. A ``..`` after
+    # a descending component could climb out of a pruned directory link that
+    # the image lacks, so targets may only climb first and then descend, and
+    # never above the context root, which the image root mirrors.
+    lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
+    resolved_paths = {
+        os.path.normcase(os.path.realpath(path))
+        for path, _ in files
+        if not path.is_symlink()
+    }
+    for path, relative in files:
+        if path.is_symlink():
+            text = os.readlink(path)
+            parts = [
+                part
+                for part in text.replace(os.altsep or os.sep, os.sep).split(os.sep)
+                if part not in ("", ".")
+            ]
+            climbs = len(parts) - len(list(dropwhile(lambda part: part == "..", parts)))
+            target = path.parent / text
+            if (
+                ".." in parts[climbs:]
+                or climbs >= len(relative.parts)
+                or os.path.normcase(os.path.abspath(target)) not in lexical_paths
+                or os.path.normcase(os.path.realpath(target)) not in resolved_paths
+            ):
+                raise ValueError(
+                    f"Selected symlink {relative.as_posix()!r} must target "
+                    "another selected file."
+                )
+    return files
 
 
 @contextmanager

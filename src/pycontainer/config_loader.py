@@ -3,8 +3,10 @@ import types
 import tomllib
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
-from .config import BuildConfig
+from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
+from .config import BuildConfig, canonical_registry
+from .build_args import redact_values, resolve_arguments
+from .metadata import validate_metadata
 
 
 BUILD_TABLE = "[build]"
@@ -14,7 +16,32 @@ PLUGIN_ONLY_HINTS = {
 }
 
 
-def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
+class ConfigValidationError(ValueError):
+    """One or more source-qualified configuration diagnostics."""
+
+    def __init__(self, diagnostics: List[str], redaction_values=()):
+        self.diagnostics = list(diagnostics)
+        self._redaction_values = tuple(redaction_values)
+        super().__init__("\n".join(self.diagnostics))
+
+    def redact(self, message: str) -> str:
+        return redact_values(message, self._redaction_values)
+
+
+def _declared_default_values(config: Dict[str, Any]) -> List[str]:
+    """Return declared build-argument defaults from raw, possibly invalid, settings."""
+    values = []
+    for key, declarations in config.items():
+        if key.replace('-', '_') != 'build_args' or not isinstance(declarations, dict):
+            continue
+        for declaration in declarations.values():
+            value = declaration.get("default") if isinstance(declaration, dict) else declaration
+            if isinstance(value, str):
+                values.append(value)
+    return values
+
+
+def _load_config_table(path: Path, required: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Return the label and contents of the single configuration table in path."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -40,6 +67,11 @@ def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
         raise ValueError(
             f"{path} defines both [build] and [tool.pycontainer]; keep exactly one "
             "pycontainer configuration table."
+        )
+    if not found and required:
+        raise ValueError(
+            f"Config file {path} defines neither [build] nor [tool.pycontainer]; "
+            "add one of these tables (check the table name for typos)."
         )
     return found[0] if found else (BUILD_TABLE, {})
 
@@ -104,7 +136,7 @@ def _format_type(expected_type: Any) -> str:
 
 
 def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
-    valid_fields = {field.name for field in fields(BuildConfig)}
+    valid_fields = {field.name for field in fields(BuildConfig) if field.init}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))
@@ -118,6 +150,22 @@ def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
 
     type_hints = get_type_hints(BuildConfig)
     for key, value in config.items():
+        if key == "validate":
+            nested_table = f"{table[:-1]}.validate]"
+            if not isinstance(value, dict):
+                raise ValueError(f"Invalid value for {nested_table}: expected a table.")
+            unknown = sorted(set(value) - {"ignore"})
+            if unknown:
+                raise ValueError(f"Unknown {nested_table} setting(s): {', '.join(unknown)}.")
+            ignores = value.get("ignore", [])
+            if not isinstance(ignores, list) or any(not isinstance(item, str) for item in ignores):
+                raise ValueError(f"Invalid value for {nested_table}.ignore: expected list[str].")
+            from .image_validation import validate_ignores
+            try:
+                validate_ignores(ignores)
+            except ValueError as exc:
+                raise ValueError(f"{nested_table}.ignore: {exc}") from None
+            continue
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):
             raise ValueError(
@@ -131,23 +179,66 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
     merged = _normalize_config_keys(file_config, "Config file")
     cli_args = _normalize_config_keys(cli_args, "CLI options")
 
+    metadata_fields = ("labels", "manifest_annotations", "index_annotations")
+    for source, values in (("Config file", merged), ("CLI options", cli_args)):
+        for key in metadata_fields:
+            if key in values:
+                validate_metadata(
+                    values[key], f"{source} {key}", protect_reference=key != "labels"
+                )
+
     for key, value in cli_args.items():
         if value is not None:
             if (
-                key in ('env', 'labels')
+                key in ('env', *metadata_fields)
                 and isinstance(value, dict)
                 and isinstance(merged.get(key), dict)
             ):
                 merged[key] = {**merged[key], **value}
+            elif (
+                key == 'registry_mirrors'
+                and isinstance(value, dict)
+                and isinstance(merged.get(key), dict)
+            ):
+                # A CLI upstream replaces that upstream's file list; others are kept.
+                cli_keys = {canonical_registry(k) for k in value}
+                merged[key] = {
+                    **{
+                        k: v
+                        for k, v in merged[key].items()
+                        if canonical_registry(k) not in cli_keys
+                    },
+                    **value,
+                }
             else:
                 merged[key] = value
 
     return merged
 
 
-def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
+def load_explicit_file_config(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Return the table label and normalized settings from an explicit path.
+
+    An explicitly named file must define [build] or [tool.pycontainer]; a missing
+    or misspelled table is an error rather than a silent fall-back to defaults.
+    """
+    table, file_config = _load_config_table(path, required=True)
+    try:
+        normalized = _normalize_config_keys(file_config, f"Config file {table}")
+    except ValueError as exc:
+        values = _declared_default_values(file_config)
+        raise ConfigValidationError([redact_values(str(exc), values)], values) from None
+    return table, normalized
+
+
+def config_from_file(
+    path: Path,
+    cli_overrides: Optional[Dict] = None,
+    build_arg_overrides: Optional[List[str]] = None,
+) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
     table, file_config = _load_config_table(path)
     config = merge_configs(file_config, cli_overrides or {})
     _validate_config(config, table)
+    config["build_args"] = resolve_arguments(config.get("build_args", {}), build_arg_overrides)
     return BuildConfig(**config)

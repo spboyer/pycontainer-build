@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from pycontainer import cli
+from pycontainer import cli, effective_config
 from pycontainer.security import KUBERNETES_FRAGMENT, render_security_fragments
 
 
@@ -30,6 +30,7 @@ def _capture_config(monkeypatch, argv):
 
 def test_cli_preserves_config_values_when_options_are_omitted(tmp_path, monkeypatch):
     context = tmp_path / "configured-context"
+    context.mkdir()
     context_value = context.as_posix()
     config_path = tmp_path / "pycontainer.toml"
     logging_levels = []
@@ -65,7 +66,52 @@ generate-sbom = true
     assert logging_levels == [logging.DEBUG]
 
 
+def test_scan_config_preserved_and_cli_policy_override(tmp_path, monkeypatch):
+    path = tmp_path / "scan.toml"
+    path.write_text("""
+[build]
+scan = true
+scan-threshold = "critical"
+scan-unknown = "ignore"
+scan-report-format = "sarif"
+scan-offline = true
+scan-db-max-age-hours = 24
+""")
+    config = _capture_config(monkeypatch, ["build", "--config", str(path)])
+    assert config.scan and config.scan_offline
+    assert config.scan_threshold == "critical"
+    assert config.scan_report_format == "sarif"
+    assert config.scan_db_max_age_hours == 24
+    config = _capture_config(monkeypatch, [
+        "build", "--config", str(path), "--scan-threshold", "low", "--scan-unknown", "fail",
+    ])
+    assert config.scan_threshold == "low"
+    assert config.scan_unknown == "fail"
+
+
+@pytest.mark.parametrize("category,exit_code", [("findings", 3), ("scanner", 4), ("database", 4)])
+def test_cli_scan_failure_blocks_push_and_has_distinct_exit(monkeypatch, category, exit_code):
+    from pycontainer.scanning import ScanError
+
+    class FailingBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            raise ScanError(category, "fixture failure")
+
+        def push(self, **kwargs):
+            pytest.fail("push after scan failure")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FailingBuilder)
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--scan", "--push"])
+    assert error.value.code == exit_code
+
+
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "from-cli").mkdir()
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         """
@@ -235,7 +281,7 @@ frequent-dependencies = ["frequent-from-file"]
 
 
 def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
-    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.12")
+    monkeypatch.setattr(effective_config, "detect_python_version", lambda context: "3.12")
 
     config = _capture_config(monkeypatch, ["build"])
 
@@ -292,7 +338,7 @@ def test_cli_forwards_basic_credentials_without_logging_them(monkeypatch, capsys
             pushed.append(kwargs)
 
     monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
-    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.11")
+    monkeypatch.setattr(effective_config, "detect_python_version", lambda context: "3.11")
     _run_cli(
         monkeypatch,
         [

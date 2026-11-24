@@ -16,14 +16,19 @@ import pytest
 
 import pycontainer.builder as builder_module
 import pycontainer.dependency_cache as dependency_cache_module
+import pycontainer.dependencies as dependencies_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
+from pycontainer.lockfiles import LockfileError
 from test_dependency_staging import BASE_CONFIG
 from test_lockfiles import indexes  # noqa: F401 - pytest fixture
 
 
-def _wheel(directory, name, version, *, files=None, requires=(), entrypoint=None, script_name=None):
+def _wheel(
+    directory, name, version, *, files=None, requires=(), entrypoint=None,
+    script_name=None, stub_only=False,
+):
     module = name.replace("-", "_")
     dist = f"{module}-{version}.dist-info"
     contents = {
@@ -35,6 +40,8 @@ def _wheel(directory, name, version, *, files=None, requires=(), entrypoint=None
         ).encode(),
         f"{dist}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
+    if stub_only:
+        del contents[f"{module}/__init__.py"]
     contents.update(files or {})
     if entrypoint:
         contents[f"{dist}/entry_points.txt"] = (
@@ -125,6 +132,24 @@ def _fixture(tmp_path, indexes, *, collision=False):
     return context, wheels, index
 
 
+def _allow_frequent_updates(context, version):
+    manifest = context / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            f"frequent-dep=={version}", "frequent-dep>=1.0"
+        ),
+        encoding="utf-8",
+    )
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            f'{{ name = "frequent-dep", specifier = "=={version}" }}',
+            '{ name = "frequent-dep", specifier = ">=1.0" }',
+        ),
+        encoding="utf-8",
+    )
+
+
 def _builder(tmp_path, monkeypatch, context, name, **options):
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image", lambda self, *_args: ([], BASE_CONFIG)
@@ -162,6 +187,7 @@ def test_grouped_lock_preserves_image_and_reuses_unchanged_groups(
     tmp_path, monkeypatch, indexes, capsys
 ):
     context, wheels, index = _fixture(tmp_path, indexes)
+    _allow_frequent_updates(context, "1.0")
     options = dict(
         dependency_layer_strategy="explicit",
         stable_dependencies=["stable-dep"],
@@ -227,6 +253,7 @@ def test_grouped_lock_preserves_image_and_reuses_unchanged_groups(
     assert warm.layers[-1].digest != app.digest
 
     monkeypatch.setattr(builder_module, "install_locked_requirements", original_install)
+    capsys.readouterr()
     wheels["frequent-dep"] = _wheel(
         context / "wheelhouse", "frequent-dep", "2.0",
         files={"shared_namespace/frequent.py": b"value = 'changed'\n"},
@@ -234,11 +261,12 @@ def test_grouped_lock_preserves_image_and_reuses_unchanged_groups(
     )
     index.add(wheels["frequent-dep"])
     _write_project(context, index.url, wheels, "2.0")
+    _allow_frequent_updates(context, "2.0")
     changed = _builder(tmp_path, monkeypatch, context, "changed", **options)
     changed.build()
     assert changed.layers[0].digest == stable.digest
     assert changed.layers[1].digest != frequent.digest
-    assert "group cache hit" in capsys.readouterr().out.lower()
+    assert "group cache hit (stable" in capsys.readouterr().out.lower()
 
 
 @pytest.mark.parametrize("strategy", ["single", "explicit"])
@@ -416,6 +444,381 @@ def test_grouping_preserves_target_markers_extras_and_target_cache_identity(
     assert arm.layers[1].digest != amd.layers[1].digest
 
 
+def _project_with_feature(context, wheels, index, feature_dependency):
+    wheels["stable-dep"] = _wheel(
+        context / "wheelhouse",
+        "stable-dep",
+        "1.0",
+        files={
+            "stable_dep-1.0.dist-info/METADATA": (
+                "Metadata-Version: 2.1\nName: stable-dep\nVersion: 1.0\n"
+                "Provides-Extra: feature\nRequires-Dist: shared-dep>=1.0\n"
+                f"Requires-Dist: {feature_dependency}>=1.0; extra == 'feature'\n\n"
+            ).encode(),
+        },
+    )
+    index.add(wheels["stable-dep"])
+    _write_project(context, index.url, wheels)
+
+
+def _enable_feature_root(context):
+    manifest = context / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "stable-dep==1.0", "stable-dep[feature]==1.0"
+        ),
+        encoding="utf-8",
+    )
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8")
+        .replace('{ name = "stable-dep" }', '{ name = "stable-dep", extra = ["feature"] }', 1)
+        .replace(
+            '{ name = "stable-dep", specifier = "==1.0" }',
+            '{ name = "stable-dep", extras = ["feature"], specifier = "==1.0" }',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_grouping_rechecks_wheel_closure_when_root_extra_changes(
+    tmp_path, monkeypatch, indexes, use_cache
+):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    _project_with_feature(context, wheels, index, "missing-dep")
+    options = dict(
+        dependency_layer_strategy="explicit",
+        stable_dependencies=["stable-dep"],
+        use_cache=use_cache,
+    )
+    _builder(tmp_path, monkeypatch, context, "initial", **options).build()
+    _enable_feature_root(context)
+
+    with pytest.raises(LockfileError, match="missing-dep"):
+        _builder(tmp_path, monkeypatch, context, "changed", **options).build()
+
+
+def test_group_cache_keys_include_full_verification_roots(tmp_path, monkeypatch, indexes):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    _project_with_feature(context, wheels, index, "shared-dep")
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            '[[package]]\nname = "frequent-dep"',
+            '[package.optional-dependencies]\nfeature = [{ name = "shared-dep" }]\n\n'
+            '[[package]]\nname = "frequent-dep"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    calls = []
+    original = builder_module.install_locked_requirements
+
+    def install(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    first = _builder(tmp_path, monkeypatch, context, "first-roots", **options)
+    first.build()
+    cache_index = tmp_path / "cache" / "index.json"
+    initial_keys = {
+        key for key in json.loads(cache_index.read_text(encoding="utf-8"))
+        if key.startswith("deps-group-v")
+    }
+    assert len(initial_keys) == 2
+
+    _enable_feature_root(context)
+    changed = _builder(tmp_path, monkeypatch, context, "changed-roots", **options)
+    with monkeypatch.context() as cache_miss:
+        cache_miss.setattr(ImageBuilder, "_cached_group_bundle", lambda *_args: None)
+        changed.build()
+    changed_keys = {
+        key for key in json.loads(cache_index.read_text(encoding="utf-8"))
+        if key.startswith("deps-group-v")
+    }
+    assert len(calls) == 2
+    assert len(changed_keys - initial_keys) == 2
+    assert [layer.digest for layer in changed.layers] == [layer.digest for layer in first.layers]
+
+    _builder(tmp_path, monkeypatch, context, "warm-roots", **options).build()
+    assert len(calls) == 2
+
+
+def test_grouping_keeps_verification_roots_with_selected_graph(tmp_path, monkeypatch, indexes):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    _project_with_feature(context, wheels, index, "missing-dep")
+    manifest = context / "pyproject.toml"
+    lock = context / "uv.lock"
+    plain_manifest = manifest.read_text(encoding="utf-8")
+    plain_lock = lock.read_text(encoding="utf-8")
+    _enable_feature_root(context)
+    feature_manifest = manifest.read_text(encoding="utf-8")
+    feature_lock = lock.read_text(encoding="utf-8")
+    original = ImageBuilder._dependency_cache_key
+    switched = []
+
+    def key_during_change(builder, *args, **kwargs):
+        if switched:
+            return original(builder, *args, **kwargs)
+        switched.append(True)
+        manifest.write_text(plain_manifest, encoding="utf-8")
+        lock.write_text(plain_lock, encoding="utf-8")
+        try:
+            return original(builder, *args, **kwargs)
+        finally:
+            manifest.write_text(feature_manifest, encoding="utf-8")
+            lock.write_text(feature_lock, encoding="utf-8")
+
+    monkeypatch.setattr(ImageBuilder, "_dependency_cache_key", key_during_change)
+    builder = _builder(
+        tmp_path, monkeypatch, context, "racing-roots",
+        dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"],
+    )
+    with pytest.raises((LockfileError, RuntimeError), match="missing-dep|changed|stale"):
+        builder.build()
+    assert switched
+
+
+def test_grouping_installs_with_the_keyed_environment(tmp_path, monkeypatch, indexes):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+    original_key = ImageBuilder._dependency_cache_key
+    original_popen = dependencies_module.subprocess.Popen
+    switched = []
+    install_environments = []
+
+    def key_before_change(builder, *args, **kwargs):
+        result = original_key(builder, *args, **kwargs)
+        if not switched:
+            switched.append(True)
+            monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        return result
+
+    def capture_install(command, *args, **kwargs):
+        if "--require-hashes" in command:
+            install_environments.append(kwargs["env"].copy())
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(ImageBuilder, "_dependency_cache_key", key_before_change)
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", capture_install)
+    builder = _builder(
+        tmp_path, monkeypatch, context, "racing-environment",
+        dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"],
+    )
+    builder.build()
+    assert switched
+    assert install_environments
+    assert all(not environment.get("HTTP_PROXY") for environment in install_environments)
+
+
+def test_grouping_checks_wheel_closure_against_target_markers(tmp_path, monkeypatch, indexes):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    wheels["stable-dep"] = _wheel(
+        context / "wheelhouse",
+        "stable-dep",
+        "1.0",
+        requires=("shared-dep>=1.0", "missing-dep>=1.0; platform_machine == 'aarch64'"),
+    )
+    index.add(wheels["stable-dep"])
+    _write_project(context, index.url, wheels)
+    options = dict(
+        dependency_layer_strategy="explicit",
+        stable_dependencies=["stable-dep"],
+        use_cache=False,
+    )
+    _builder(tmp_path, monkeypatch, context, "amd", **options).build()
+
+    arm = _builder(tmp_path, monkeypatch, context, "arm", platform="linux/arm64", **options)
+    arm_base = {**BASE_CONFIG, "architecture": "arm64"}
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda self, *_args: ([], arm_base))
+    with pytest.raises(LockfileError, match="missing-dep"):
+        arm.build()
+
+
+def test_group_bundle_rechecks_manifest_containment_after_lookup(tmp_path, monkeypatch, indexes):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    _builder(tmp_path, monkeypatch, context, "before-symlink", **options).build()
+    manifest = context / "pyproject.toml"
+    external = tmp_path / "external-pyproject.toml"
+    lookup = ImageBuilder._cached_group_bundle
+
+    def replace_manifest_after_lookup(builder, *args, **kwargs):
+        layers = lookup(builder, *args, **kwargs)
+        if layers is not None:
+            manifest.rename(external)
+            try:
+                manifest.symlink_to(external)
+            except (OSError, NotImplementedError) as error:
+                pytest.skip(f"Cannot create a file symlink: {error}")
+        return layers
+
+    monkeypatch.setattr(ImageBuilder, "_cached_group_bundle", replace_manifest_after_lookup)
+    with pytest.raises(LockfileError, match="inside the build context"):
+        _builder(tmp_path, monkeypatch, context, "after-symlink", **options).build()
+
+
+@pytest.mark.parametrize("source", ["credentials", "query", "proxy"])
+def test_group_cache_ineligible_sources_are_explicit_misses(
+    tmp_path, monkeypatch, indexes, capsys, source
+):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    monkeypatch.setenv("NETRC", os.devnull)
+    monkeypatch.setenv("GROUP_TEST_USER", "synthetic-user")
+    monkeypatch.setenv("GROUP_TEST_TOKEN", "synthetic-token")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    if source == "credentials":
+        registry = "https://${GROUP_TEST_USER}:${GROUP_TEST_TOKEN}@example.invalid/simple"
+        _write_project(context, registry, wheels)
+    elif source == "query":
+        registry = "https://example.invalid/simple?feed=${GROUP_TEST_TOKEN}"
+        _write_project(context, registry, wheels)
+    else:
+        monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+        monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setattr(dependency_cache_module, "_system_proxies", lambda: {})
+
+    calls = []
+
+    def install(_requirements, destination, *_args, **_kwargs):
+        calls.append(True)
+        destination.mkdir(parents=True, exist_ok=True)
+        for wheel in wheels.values():
+            with zipfile.ZipFile(wheel) as archive:
+                archive.extractall(destination)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    _builder(tmp_path, monkeypatch, context, "ineligible-first", **options).build()
+    _builder(tmp_path, monkeypatch, context, "ineligible-second", **options).build()
+
+    output = capsys.readouterr().out
+    expected = {"credentials": "credentials can change", "query": "query string", "proxy": "a proxy"}
+    assert output.count(expected[source]) == 2
+    assert "synthetic-token" not in output
+    assert len(calls) == 2
+
+
+def test_grouping_strips_stubs_and_caches_the_result(tmp_path, monkeypatch, indexes):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    for name in ("stable-dep", "frequent-dep"):
+        files = {"stable_dep/__init__.pyi": b"value: int\n"} if name == "stable-dep" else {}
+        wheels[name] = _wheel(
+            context / "wheelhouse", name, "1.0", files=files,
+            requires=("types-test>=1.0",),
+        )
+        index.add(wheels[name])
+    wheels["shared-dep"] = _wheel(
+        context / "wheelhouse", "types-test", "1.0", stub_only=True,
+        files={"types_test/__init__.pyi": b"value: int\n"},
+    )
+    index.add(wheels["shared-dep"])
+    _write_project(context, index.url, wheels)
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace("shared-dep", "types-test"),
+        encoding="utf-8",
+    )
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["types-test"])
+    original = builder_module.install_locked_requirements
+    installs = []
+
+    def install(*args, **kwargs):
+        installs.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    unstripped = _builder(tmp_path, monkeypatch, context, "unstripped", **options)
+    unstripped.build()
+    stripped = _builder(
+        tmp_path, monkeypatch, context, "stripped", strip_type_stubs=True, **options
+    )
+    stripped.build()
+    assert len(unstripped.layers) == 3
+    assert len(stripped.layers) == 2
+    assert any(name.endswith(".pyi") for name in _layer_files(unstripped.layers))
+    assert not any(name.endswith(".pyi") for name in _layer_files(stripped.layers))
+    inventory = json.loads((Path(stripped.config.output_dir) / "sbom.json").read_text())
+    assert {item["name"] for item in inventory["packages"]} == {"stable-dep", "frequent-dep"}
+
+    warm = _builder(tmp_path, monkeypatch, context, "stripped-warm", strip_type_stubs=True, **options)
+    warm.build()
+    unstripped_warm = _builder(tmp_path, monkeypatch, context, "unstripped-warm", **options)
+    unstripped_warm.build()
+    assert len(installs) == 2
+    assert [layer.digest for layer in warm.layers] == [layer.digest for layer in stripped.layers]
+    assert [layer.digest for layer in unstripped_warm.layers] == [
+        layer.digest for layer in unstripped.layers
+    ]
+
+
+def test_grouped_layers_can_be_squashed(tmp_path, monkeypatch, indexes):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    plain = _builder(tmp_path, monkeypatch, context, "grouped-plain", **options)
+    plain.build()
+    squashed = _builder(tmp_path, monkeypatch, context, "grouped-squashed", squash=True, **options)
+    squashed.build()
+
+    assert len(plain.layers) == 3
+    assert len(squashed.layers) == 1
+    assert _layer_files(squashed.layers) == _layer_files(plain.layers)
+    manifest = _image_json(squashed, squashed.manifest_digest)
+    config = _image_json(squashed, squashed.config_digest)
+    assert manifest["layers"] == [squashed.layers[0].to_descriptor()]
+    assert config["rootfs"]["diff_ids"] == [squashed.layers[0].digest]
+
+
+def test_grouped_multi_platform_build_uses_each_target_and_cache(tmp_path, monkeypatch, indexes):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    _add_target_and_extra(context, wheels, index)
+    installs = []
+    original = builder_module.install_locked_requirements
+
+    def install(*args, **kwargs):
+        installs.append((args[4], kwargs["variant"]))
+        return original(*args, **kwargs)
+
+    def pull(_builder, _layers_dir, _os_name, arch):
+        config = {**BASE_CONFIG, "architecture": arch}
+        if arch == "arm":
+            config["variant"] = "v7"
+        return [], config
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull)
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "multi"),
+        cache_dir=str(tmp_path / "cache"), include_paths=["app.py"], include_deps=True,
+        platform="linux/amd64,linux/arm64,linux/arm/v7",
+        dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"],
+    ))
+    builder.build()
+    assert installs == [("amd64", None), ("arm64", None), ("arm", "v7")]
+    for image in builder.platform_images:
+        manifest = _image_json(builder, image.manifest_digest)
+        config = _image_json(builder, image.config_digest)
+        assert manifest["layers"] == [layer.to_descriptor() for layer in image.layers]
+        assert config["rootfs"]["diff_ids"] == [layer.digest for layer in image.layers]
+        files = _layer_files(image.layers)
+        arm_only = "app/.python/site-packages/arm_only/__init__.py"
+        assert (arm_only in files) == (image.platform["architecture"] == "arm64")
+    initial = builder.index_digest
+    builder.build()
+    assert len(installs) == 3
+    assert builder.index_digest == initial
+
+
 @pytest.mark.parametrize("change", ["installer", "marker_environment"])
 def test_group_cache_invalidates_for_target_marker_backend(
     tmp_path, monkeypatch, indexes, change
@@ -442,12 +845,14 @@ def test_group_cache_invalidates_for_target_marker_backend(
         original = dependency_cache_module._target_marker_environment
         monkeypatch.setattr(
             dependency_cache_module, "_target_marker_environment",
-            lambda *args: {**original(*args), "implementation_version": "3.11.99"},
+            lambda *args, **kwargs: {
+                **original(*args, **kwargs), "implementation_version": "3.11.99"
+            },
         )
 
     _builder(tmp_path, monkeypatch, context, "changed", **options).build()
     assert len(calls) == 2
-    assert all(call["base_image_tag_verified"] for call in calls)
+    assert all(not call["base_image_tag_verified"] for call in calls)
 
 
 @pytest.mark.parametrize("base_image", ["oci:local-base:python:3.11-slim", "python:3.11-slim@sha256:" + "a" * 64])
@@ -567,6 +972,8 @@ def test_group_cache_recovers_when_verified_blob_changes_during_reuse(
     tmp_path, monkeypatch, indexes, changed_lock, damage
 ):
     context, wheels, index = _fixture(tmp_path, indexes)
+    if changed_lock:
+        _allow_frequent_updates(context, "1.0")
     options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
     first = _builder(tmp_path, monkeypatch, context, "before-race", **options)
     first.build()
@@ -577,6 +984,7 @@ def test_group_cache_recovers_when_verified_blob_changes_during_reuse(
         )
         index.add(wheels["frequent-dep"])
         _write_project(context, index.url, wheels, "2.0")
+        _allow_frequent_updates(context, "2.0")
 
     original = ImageBuilder._publish_cached_layer
     interrupted = []

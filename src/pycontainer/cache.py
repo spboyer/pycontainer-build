@@ -19,7 +19,7 @@ from .fs_utils import file_lock
 
 logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 1024 * 1024
-_CACHE_KEY_VERSION = 3
+_CACHE_KEY_VERSION = 4
 
 
 def app_layer_arcname(workdir: str, relative_path: Path) -> str:
@@ -155,6 +155,8 @@ class LayerCache:
         workdir: str = "/app",
         reproducible: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
+        *,
+        namespace: Optional[str] = None,
     ) -> str:
         file_records = []
         ordered_files = ordered_app_files(files, reproducible)
@@ -174,7 +176,7 @@ class LayerCache:
             if stat.S_ISLNK(metadata.st_mode):
                 record["kind"] = "symlink"
                 record["content"] = hashlib.sha256(
-                    os.fsencode(os.readlink(abs_path))
+                    os.fsencode(os.readlink(abs_path).replace(os.sep, "/"))
                 ).hexdigest()
             elif stat.S_ISREG(metadata.st_mode):
                 record["kind"] = "file"
@@ -197,6 +199,8 @@ class LayerCache:
             "reproducible": bool(reproducible),
             "files": file_records,
         }
+        if namespace is not None:
+            identity["namespace"] = namespace
         serialized = json.dumps(
             identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -315,12 +319,15 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
     ) -> Optional[Tuple[str, Path]]:
         if not self.enabled:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
-        return self.get_entry(self._compute_files_digest(files, workdir, reproducible))
+        return self.get_entry(self._compute_files_digest(
+            files, workdir, reproducible, namespace=namespace
+        ))
 
     def get_entry(self, key: str) -> Optional[Tuple[str, Path]]:
         """Return a verified ``(digest, blob path)`` for ``key``; discard missing or corrupt blobs."""
@@ -375,16 +382,20 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
+        record_source_files: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
     ) -> Path:
         layer_path = Path(layer_path)
         if not self.enabled:
             return layer_path
         return self.store_entry(
-            self._compute_files_digest(files, workdir, reproducible, hardlinks),
+            self._compute_files_digest(
+                files, workdir, reproducible, hardlinks, namespace=namespace
+            ),
             digest,
             layer_path,
-            [self._relative_path(relative) for _, relative in files],
+            [self._relative_path(relative) for _, relative in files] if record_source_files else [],
         )
 
     def store_entry(
