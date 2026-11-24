@@ -3,6 +3,7 @@ import re
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Union
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
@@ -210,6 +211,13 @@ class BuildConfig:
     _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
+        from .image_validation import SIZE_THRESHOLDS
+
+        if isinstance(self.validate, dict):
+            self.validate = {
+                name: str(value) if name in SIZE_THRESHOLDS and isinstance(value, Decimal) else value
+                for name, value in self.validate.items()
+            }
         if self.build_args is not None:
             self._resolved_build_args = resolve_arguments(self.build_args)
             for name in EXPANDABLE_FIELDS:

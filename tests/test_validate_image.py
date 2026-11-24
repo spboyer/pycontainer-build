@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from pycontainer import builder, cache, cli, config_loader, effective_config, image_validation, registry_client
+from pycontainer.config import BuildConfig
 from pycontainer.fs_utils import output_directory_lock
 
 
@@ -1459,6 +1460,40 @@ def test_exact_toml_thresholds_preserve_unrelated_float_types(tmp_path):
     assert config["validate"]["max_image_size_mb"] == Decimal("0.00000095367431640624999999999999999999")
     assert config["other"]["numbers"] == [0.1, 0.0, float("inf")]
     assert all(type(value) is float for value in config["other"]["numbers"])
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("literal", [
+    "1e-400", "1e1000", "1e-1000",
+    "0.00000095367431640624999999999999999999",
+])
+def test_exact_threshold_build_config_json_round_trip(tmp_path, table, name, literal):
+    from dataclasses import asdict, fields, replace
+    from fractions import Fraction
+
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f"[{table}.validate]\n{name} = {literal}\n")
+    original = config_loader.config_from_file(settings)
+    snapshot = json.loads(json.dumps(asdict(original)))
+    restored = BuildConfig(**{
+        field.name: snapshot[field.name] for field in fields(BuildConfig) if field.init
+    })
+    for config in (original, replace(original), restored):
+        assert isinstance(config.validate[name], str)
+        assert image_validation.parse_size_threshold(config.validate[name], name) == Decimal(literal)
+        boundary = Decimal("0.00000095367431640624999999999999999999")
+        if Decimal(literal) == boundary:
+            assert Fraction(image_validation.parse_size_threshold(config.validate[name], name)) * MIB < 1
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+def test_snapshot_threshold_strings_are_not_accepted_in_toml(tmp_path, table, name):
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f'[{table}.validate]\n{name} = "1E-400"\n')
+    with pytest.raises(ValueError, match="expected a number"):
+        config_loader.config_from_file(settings)
 
 
 @pytest.mark.parametrize("format_", ["text", "json"])

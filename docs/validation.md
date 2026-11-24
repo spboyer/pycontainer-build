@@ -121,6 +121,13 @@ ignoring PCB006 or PCB007 does not suppress it.
   Text finding messages use the same exact decimal notation.
 - `note`: the stored-size accounting caveat.
 
+`BuildConfig.validate` also stores loaded decimal thresholds as exact strings,
+so `json.dumps(dataclasses.asdict(config))` needs no custom decimal encoder.
+Restore the JSON object's constructor fields into `BuildConfig` (omit fields
+whose dataclass `init` is false); threshold parsing preserves their exact value.
+This internal snapshot representation does not change the TOML contract:
+thresholds in TOML must be numbers, never quoted strings.
+
 These are **stored blob sizes**. Base layers pulled from a registry usually
 keep their compressed media types, so they count compressed bytes, while
 pycontainer writes dependency and application layers as uncompressed tar, so

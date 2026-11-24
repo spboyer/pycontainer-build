@@ -1004,6 +1004,8 @@ the flags above or `max_image_size_mb` / `max_layer_size_mb` under
 CLI and TOML thresholds retain exact decimal precision; JSON reports them as
 decimal strings (or `null` when unset), not rounded floats. Excessive precision
 or magnitudes are rejected with exit 2; see the validation limits below.
+`BuildConfig` JSON snapshots retain decimal thresholds as exact strings too;
+TOML still requires numeric literals, not quoted strings.
 
 Validation exits 0 below the requested severity threshold, 1 for findings at or
 above it, and 2 for usage, layout or integrity errors. Base-image provenance
