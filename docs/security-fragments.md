@@ -30,8 +30,9 @@ that are no longer configured are removed; other files in `security/` are left
 alone. `--dry-run` lists the fragments it would write and writes nothing.
 Invalid settings fail the build before any base image is pulled.
 Multi-platform index builds also write one set of fragments beside the layout,
-not inside the platform images. Choose profiles appropriate for each target
-runtime where the fragments will be applied.
+not inside the platform images. Python-version matrix builds write a set beside
+each `pyX.Y` layout. Choose profiles appropriate for each target runtime where
+the fragments will be applied.
 
 ## Configuration
 

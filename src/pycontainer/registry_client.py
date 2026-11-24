@@ -69,7 +69,16 @@ _QUOTA_TEXT = re.compile(
 class RegistryRequestError(RuntimeError):
     """Raised when a registry request fails operationally."""
 
-    status: Optional[int] = None
+    def __init__(self, message: str, *, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+class RegistryHTTPError(RegistryRequestError):
+    """A registry returned an explicit unsuccessful HTTP response."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message, status=status)
 
 
 class RegistryConnectionError(RegistryRequestError):
@@ -89,16 +98,18 @@ class RegistryAuthenticationConnectionError(
 class RegistryRateLimitError(RegistryRequestError):
     """Raised when a registry rejects requests because of a rate limit."""
 
-    def __init__(self, message: str, retry_after_seconds: Optional[float] = None):
-        super().__init__(message)
+    def __init__(self, message: str, retry_after_seconds: Optional[float] = None,
+                 *, status: Optional[int] = None):
+        super().__init__(message, status=status)
         self.retry_after_seconds = retry_after_seconds
 
 
 class RegistryQuotaError(RegistryRequestError):
     """Raised when a registry rejects an upload for size or storage quota."""
 
-    def __init__(self, message: str, blob_size: Optional[int] = None):
-        super().__init__(message)
+    def __init__(self, message: str, blob_size: Optional[int] = None,
+                 *, status: Optional[int] = None):
+        super().__init__(message, status=status)
         self.blob_size = blob_size
 
 
@@ -512,9 +523,7 @@ def _registry_error(
             " Authenticate to the registry (Docker Hub grants higher limits to "
             "signed-in users), wait for the reset, or use a registry mirror."
         )
-        error = RegistryRateLimitError(message, retry_after)
-        error.status = status
-        return error
+        return RegistryRateLimitError(message, retry_after, status=status)
 
     if (
         status in QUOTA_STATUSES
@@ -529,9 +538,7 @@ def _registry_error(
             "quota; free space in the repository, raise its quota, or reduce "
             "the image size."
         )
-        error = RegistryQuotaError(message, blob_size)
-        error.status = status
-        return error
+        return RegistryQuotaError(message, blob_size, status=status)
 
     if status in (401, 403) or codes & {"DENIED", "UNAUTHORIZED"}:
         target = ""
@@ -543,9 +550,9 @@ def _registry_error(
             f" Check that the credentials have {permission} permission{target}; "
             "some registries also report exhausted quotas as DENIED."
         )
-    error = error_class(message)
-    error.status = status
-    return error
+    if error_class is RegistryRequestError:
+        return RegistryHTTPError(status, message)
+    return error_class(message, status=status)
 
 
 def _next_link(header: Optional[str]) -> Optional[str]:
@@ -1012,7 +1019,7 @@ class RegistryClient:
             if error.blob_size is not None:
                 raise
             raise RegistryQuotaError(
-                f"{error} Upload size: {_format_size(size)}.", size
+                f"{error} Upload size: {_format_size(size)}.", size, status=error.status
             ) from error
         final_url = _append_digest(upload_url, digest)
         headers = {

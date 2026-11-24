@@ -35,6 +35,9 @@ CLI_FLAGS = {
     "verbose": "--verbose",
     "dry_run": "--dry-run",
     "platform": "--platform",
+    "python_versions": "--python-version",
+    "default_python_version": "--default-python-version",
+    "output_dir": "--output",
     "reproducible": "--no-reproducible",
     "generate_sbom": "--sbom",
     "system_packages": "--system-package",
@@ -196,7 +199,8 @@ def resolve_build_config(
         raise ConfigValidationError(
             [redact_values(error, arguments.values()) for error in errors], arguments.values()
         ) from None
-    if config_path is None and "base_image" not in overrides:
+    # Matrix versions select their own bases, so the local interpreter is irrelevant.
+    if config_path is None and "base_image" not in overrides and not cfg.python_versions:
         try:
             version = detect_python_version(cfg.context_dir)
         except (AttributeError, OSError, TypeError, ValueError) as exc:

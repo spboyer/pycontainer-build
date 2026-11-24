@@ -107,6 +107,9 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,val
         b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
+        b.add_argument("--python-version",help="Comma-separated CPython minors, each built in a separate pyX.Y layout")
+        b.add_argument("--default-python-version",help="Matrix version receiving unsuffixed aliases (default: first requested version)")
+        b.add_argument("--output",dest="output_dir",help="OCI output directory (matrix layouts use pyX.Y subdirectories)")
     if platform:
         b.add_argument("--platform",help="Target platform (e.g., linux/amd64), or a comma-separated list of linux/amd64, linux/arm64 and linux/arm/v7 to build an OCI image index")
     b.add_argument("--no-reproducible",dest="reproducible",action="store_false",default=None,help="Disable reproducible builds")
@@ -261,6 +264,7 @@ def main():
             registry_mirrors.setdefault(upstream,[]).append(mirror)
 
     tag_args=getattr(args,"tag",None)
+    python_version=getattr(args,"python_version",None)
     cli_overrides={
         'tag': tag_args[0] if tag_args else None,
         'tags': tag_args[1:] if tag_args else None,
@@ -283,6 +287,9 @@ def main():
         'verbose': args.verbose,
         'dry_run': getattr(args,"dry_run",None),
         'platform': getattr(args,"platform",None),
+        'python_versions': python_version.split(",") if python_version is not None else None,
+        'default_python_version': getattr(args,"default_python_version",None),
+        'output_dir': getattr(args,"output_dir",None),
         'reproducible': args.reproducible,
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
@@ -367,6 +374,8 @@ def main():
 
     if devloop:
         try:
+            if cfg.python_versions:
+                raise DevLoopError("Python version matrices are not supported by Skaffold or Tilt builds.")
             source="--platform" if args.cmd=="tilt-build" and args.platform is not None else "platform"
             platform=single_platform(cfg.platform,source)
             if not platform: raise DevLoopError("platform must specify a single target platform.")
@@ -394,7 +403,7 @@ def main():
             parser.exit(1,f"Build history error: {cfg.redact(str(exc))}\n")
         print("Built:", cfg.redact(str(out)))
 
-        if push:
+        if push and not cfg.dry_run:
             if username and not password:
                 password=os.getenv('REGISTRY_PASSWORD')
             if args.cmd=="tilt-build" and push_target is None:

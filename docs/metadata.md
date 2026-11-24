@@ -83,7 +83,8 @@ key setting has no effect.
 - The release-notes label overrides a base-image label with the same key. When
   the key is `framework`, it replaces the detected framework default unless
   `framework` is explicitly labeled, which is a collision error.
-- The file is read once when the builder is created; repeated `build()` calls
+- The file is read once when the builder is created; Python matrix versions
+  share that snapshot. Repeated `build()` calls
   on that builder reuse the same text. Line-ending normalization makes CRLF and
   LF copies produce identical config and manifest digests.
 

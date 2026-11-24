@@ -381,6 +381,73 @@ cat dist/image/index.json | jq .
 
 ## 🎯 Common Local Use Cases
 
+### Python matrix configuration and publication
+
+```powershell
+python -m pycontainer.cli build --python-version 3.11,3.12 --default-python-version 3.12 --tag myapp:v1.2.3 --latest --semver-tags --output dist\matrix --dry-run
+```
+
+CLI `--python-version` overrides TOML `python_versions` (a list of minor-version
+strings). `--default-python-version` overrides `default_python_version`; when
+omitted, the first version receives unsuffixed aliases. `--output` overrides
+`output_dir`. Each layout is isolated under `<output_dir>/pyX.Y`, with no
+top-level index combining Python versions. The whole output parent is excluded
+from application inputs, including sibling version layouts.
+
+```toml
+[build]
+tag = "myapp:v1.2.3"
+python_versions = ["3.11", "3.12"]
+default_python_version = "3.12"
+output_dir = "dist/matrix"
+platform = "linux/amd64,linux/arm64"
+latest_tag = true
+semver_tags = true
+
+[build.python_matrix]
+"3.11" = "oci:fixtures/python-eleven"
+"3.12" = "registry.example/team/python:twelve"
+```
+
+An unpinned official minor tag such as `python:3.11-slim` can supply the matrix
+automatically by rewriting its minor and retaining `-slim`. All other bases
+require the explicit version map. The pulled base metadata, not an application
+environment override, must establish the requested `PYTHON_VERSION` for each
+platform; custom bases also provide `PYTHON_IMPLEMENTATION=CPython`.
+
+With `--include-deps`, each minor and platform resolves its own lockfile
+markers and hash-pinned wheels. Lock staging needs a full base
+`PYTHON_VERSION` such as `3.11.9` and a matching wheel for each selected
+package. Digest-pinned and local bases need explicit Python and libc metadata.
+
+Explicit tags are suffixed `-py3.11`/`-py3.12`; unsuffixed tags and generated
+semver/latest aliases belong only to the default version. Adding `--push`
+builds and validates all layouts first, prepares all remote blobs and
+manifests/indexes by digest, then publishes version tags followed by aliases.
+Failures stop immediately with confirmed/failed/unknown/unattempted operation
+reporting, even with `--no-progress`. Remote tag updates are non-atomic:
+previous updates or untagged uploaded content may remain. Ambiguous writes
+are unknown, never assumed unchanged. There is no rollback, deletion or
+retry-overwrite, which could destroy a concurrent writer's update.
+
+For Python API callers, `ImageBuilder.push(registry_url="mirror.example/team/app:v9")`
+changes the destination repository and primary tag, returning that normalized
+reference. Matrix version tags use `v9-pyX.Y`; the unsuffixed `v9` belongs to
+the default version. Configured additional tags and generated aliases are
+retained at the destination, as in non-matrix pushes, without regenerating
+semver aliases from the override. Local layout tags remain unchanged. Invalid
+generated tags or version/alias collisions fail before any remote publication.
+
+Python matrices reject vulnerability scanning and Git-derived tags
+(`tag_from_git`) at configuration and again before build or publication;
+set an explicit tag or build each Python version separately.
+
+Hermetic tests do not establish real per-version/per-architecture startup.
+
+Declared build arguments expand once before matrix layouts are derived. Each
+child preserves literal dollar expressions and the parent's diagnostic
+redaction and cache context; version suffixes are applied to the resolved tags.
+
 ### Use Case 1: Testing Config Changes
 
 ```bash

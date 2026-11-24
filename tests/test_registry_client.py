@@ -23,6 +23,7 @@ from pycontainer.registry_client import (
     TRANSFER_CHUNK_SIZE,
     RegistryAuthenticationError,
     RegistryClient,
+    RegistryHTTPError,
     RegistryQuotaError,
     RegistryRateLimitError,
     RegistryRequestError,
@@ -144,6 +145,43 @@ def test_parse_image_reference():
         "team/app",
         digest,
     )
+
+
+@pytest.mark.parametrize("method", ["push_manifest", "push_index"])
+@pytest.mark.parametrize(("status", "body", "error_type"), [
+    (403, b"denied", RegistryHTTPError),
+    (429, b"", RegistryRateLimitError),
+    (413, b"", RegistryQuotaError),
+    (503, b'{"errors":[{"code":"QUOTA_EXCEEDED","message":"quota"}]}', RegistryQuotaError),
+    (503, b"uncertain server outcome", RegistryHTTPError),
+])
+def test_publication_rejections_preserve_http_status_and_never_retry(
+    monkeypatch, method, status, body, error_type
+):
+    calls = []
+
+    def reject(request, timeout):
+        calls.append(request.get_method())
+        raise _http_error(request.full_url, status, body=body)
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(client._opener, "open", reject)
+    with pytest.raises(error_type) as caught:
+        getattr(client, method)("latest", b"{}")
+    assert caught.value.status == status
+    assert calls == ["PUT"]
+
+
+def test_unknown_manifest_write_is_not_retry_overwritten(monkeypatch):
+    calls = []
+
+    def timeout(request, timeout):
+        calls.append(request.get_method())
+        raise TimeoutError("possibly committed")
+    client = RegistryClient("registry.example", "team/app")
+    monkeypatch.setattr(client._opener, "open", timeout)
+    with pytest.raises(RegistryRequestError, match="TimeoutError"):
+        client.push_manifest("latest", b"{}")
+    assert calls == ["PUT"]
 
 
 @pytest.mark.parametrize(
@@ -1075,6 +1113,7 @@ def test_upload_quota_errors_name_blob_size(
     with pytest.raises(RegistryQuotaError) as error:
         client.upload_blob_monolithic(digest, blob)
 
+    assert error.value.status == status
     assert error.value.blob_size == 2048
     assert "2048 bytes (2.0 KiB)" in str(error.value)
     assert "quota" in str(error.value).lower()

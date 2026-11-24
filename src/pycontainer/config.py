@@ -15,6 +15,14 @@ MULTI_PLATFORM_SCAN_ERROR = (
     "Vulnerability scanning is not supported for multi-platform images; "
     "build and scan each platform separately."
 )
+MATRIX_SCAN_ERROR = (
+    "Vulnerability scanning is not supported for Python version matrices; "
+    "build and scan each Python version separately."
+)
+MATRIX_GIT_TAG_ERROR = (
+    "Git-derived tags (tag_from_git) are not supported for Python version matrices; "
+    "set an explicit tag or build each Python version separately."
+)
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
@@ -182,6 +190,9 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    python_versions: List[str] = field(default_factory=list)
+    python_matrix: Dict[str, str] = field(default_factory=dict)
+    default_python_version: Optional[str] = None
     squash: bool = False
     analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
@@ -272,6 +283,14 @@ class BuildConfig:
 
             resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
         platforms = normalize_platforms(self.platform)
+        if self.python_versions or self.python_matrix or self.default_python_version:
+            if self.scan:
+                raise ValueError(MATRIX_SCAN_ERROR)
+            if getattr(self, "tag_from_git", False):
+                raise ValueError(MATRIX_GIT_TAG_ERROR)
+            from .python_matrix import matrix_targets
+
+            matrix_targets(self)
         if len(platforms) > 1:
             unsupported = [p for p in platforms if p not in MULTI_PLATFORM_TARGETS]
             if unsupported:

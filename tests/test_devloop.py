@@ -655,6 +655,32 @@ def test_devloop_cli_rejects_multi_platform_from_config(tmp_path, monkeypatch, r
     assert recording == []
 
 
+@pytest.mark.parametrize("mode", ["skaffold", "tilt-expected", "tilt-output"])
+def test_devloop_rejects_python_matrix_before_build_or_push(
+    tmp_path, monkeypatch, recording, capsys, mode
+):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text('[build]\npython_versions = ["3.11", "3.12"]\n')
+    if mode == "skaffold":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        args = ["skaffold-build"]
+    elif mode == "tilt-expected":
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+        args = ["tilt-build"]
+    else:
+        args = ["tilt-build", "--image", "localhost:5000/a",
+                "--output-ref", str(tmp_path / "ref")]
+
+    with pytest.raises(SystemExit) as error:
+        run_cli(monkeypatch, *args, "--config", str(config))
+    assert error.value.code == 2
+    assert "Python version matrices are not supported" in capsys.readouterr().err
+    assert recording == []
+    assert not (tmp_path / "ref").exists()
+
+
 def test_tilt_cli_image_requires_output_ref(tmp_path, monkeypatch, recording):
     with pytest.raises(SystemExit) as exit_info:
         run_cli(monkeypatch, "tilt-build", "--image", "localhost:5000/a", "--context", str(tmp_path))

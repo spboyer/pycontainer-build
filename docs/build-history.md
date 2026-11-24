@@ -53,7 +53,8 @@ has an `initialization` phase. For normal `ImageBuilder.build()` calls, total
 time includes output locking and image assembly but excludes successful builder
 initialization, history persistence, and any subsequent registry push.
 For multi-platform builds, repeated phase timings are summed across targets;
-the shared application layer is timed once.
+the shared application layer is timed once. A Python-version matrix records
+one build, summing phase timings across versions and their target platforms.
 
 No project names or paths, image or registry tags, registry URLs, credentials,
 environment keys or values, labels, command lines, or exception messages are

@@ -29,6 +29,8 @@ v2.25.0 (`skaffold/v4beta14` schema) and Tilt v0.37.9.
 - **One platform.** An empty `PLATFORMS` or a single `os/arch[/variant]` is
   honored. More than one platform is rejected until multi-platform manifests
   land in [#29](https://github.com/spboyer/pycontainer-build/issues/29).
+- **One Python version.** Python version matrix configurations are rejected;
+  each tool requires exactly one image reference per build.
 - **Explicit registries.** References must be tagged, carry no digest, and name
   their registry host (`localhost:5000/app:tag`, `example.azurecr.io/app:tag`).
   Bare names are rejected instead of being pushed to Docker Hub implicitly.

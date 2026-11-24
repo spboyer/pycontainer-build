@@ -492,6 +492,13 @@ class ImageBuilder:
         if self.config.include_deps:
             self._check_conda_dependencies()
         if self.dry_run:
+            if self.config.python_versions:
+                from .python_matrix import PythonMatrixBuilder
+
+                self._python_matrix=PythonMatrixBuilder(
+                    self.config, release_notes_snapshot=self.release_notes_labels
+                )
+                return self._python_matrix.build()
             logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
             self._show_build_plan()
             return self.config.tag
@@ -504,24 +511,33 @@ class ImageBuilder:
                     self._history.validate_location(
                         self.config.context_dir, self.config.output_dir
                     )
-                with output_directory_lock(self.config.output_dir):
-                    security_fragments=render_security_fragments(
-                        self.config.security, self.config.context_dir
-                    )
-                    result = self._build_image()
-                    if self.config.scan:
-                        from .scanning import scanned_image
+                if self.config.python_versions:
+                    from .python_matrix import PythonMatrixBuilder
 
-                        with scanned_image(
-                            Path(self.config.output_dir), self.manifest_digest, self.config
+                    self._python_matrix=PythonMatrixBuilder(
+                        self.config, history_timer=self._history_timer,
+                        release_notes_snapshot=self.release_notes_labels,
+                    )
+                    result=self._python_matrix.build()
+                else:
+                    with output_directory_lock(self.config.output_dir):
+                        security_fragments=render_security_fragments(
+                            self.config.security, self.config.context_dir
+                        )
+                        result = self._build_image()
+                        if self.config.scan:
+                            from .scanning import scanned_image
+
+                            with scanned_image(
+                                Path(self.config.output_dir), self.manifest_digest, self.config
+                            ):
+                                logger.info(self.config.redact(
+                                    f"Vulnerability gate passed for {self.manifest_digest}"
+                                ))
+                        for fragment_path in write_security_fragments(
+                            Path(self.config.output_dir), security_fragments
                         ):
-                            logger.info(self.config.redact(
-                                f"Vulnerability gate passed for {self.manifest_digest}"
-                            ))
-                    for fragment_path in write_security_fragments(
-                        Path(self.config.output_dir), security_fragments
-                    ):
-                        logger.info(self.config.redact(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)"))
+                            logger.info(self.config.redact(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)"))
             except BaseException:
                 if timing:
                     self._record_failed_history(timing, self.config)
@@ -670,6 +686,12 @@ class ImageBuilder:
             validate_target_platform(os_name, arch, parse_platform_variant(platform))
         with self._time_history_phase("base_image"):
             base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
+        if hasattr(self, "expected_python_version"):
+            from .python_matrix import verify_python_version
+
+            verify_python_version(
+                self.config.base_image, base_config, self.expected_python_version, platform
+            )
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(platform)
@@ -1094,6 +1116,10 @@ class ImageBuilder:
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
         """Push built image to registry."""
+        if hasattr(self, "_python_matrix"):
+            return self._python_matrix.push(
+                registry_url, auth_token, username, password, show_progress
+            )
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
         if self.config.scan:
