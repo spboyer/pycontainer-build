@@ -1084,13 +1084,14 @@ variables. Only explicit interpolation into persisted image fields (including
 labels, environment, command or workdir) stores a value in image metadata.
 Configuration/source files selected for the app layer are still copied normally;
 exclude files containing defaults if they should not be shipped.
-Diagnostic output redacts nonempty argument values. Cache metadata contains
-hashed resolved configuration/target/backend identity, not argument values;
-argument builds omit source-path metadata. Unused argument changes do not
-invalidate the app-layer cache. The cache stores actual layer contents, not
-encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
-scoped interface; imported values escape dollars to preserve their runtime
-meaning when loaded. Build arguments do not introduce stages or conditions.
+Diagnostic output redacts nonempty resolved argument values even if a direct
+caller later changes `build_args`. Cache metadata contains hashed resolved
+configuration/target/backend identity, not argument values; argument builds
+omit source-path metadata. Unused argument changes do not invalidate the
+app-layer cache. The cache stores actual layer contents, not encrypted data.
+Dockerfile `import --build-arg` remains a separate, Dockerfile-scoped interface;
+imported values escape dollars to preserve their runtime meaning when loaded.
+Build arguments do not introduce stages or conditions.
 
 ---
 

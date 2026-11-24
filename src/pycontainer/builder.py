@@ -451,7 +451,10 @@ class ImageBuilder:
         self.remote_cache_from=None
         self.remote_cache_to=None
         if not self.dry_run:
-            log_options={"log_redact": self.config.redact} if self.config.build_args else {}
+            log_options=(
+                {"log_redact": self.config.redact}
+                if self.config._needs_build_argument_redaction() else {}
+            )
             if config.cache_from and config.use_cache:
                 self.remote_cache_from=RegistryLayerCache(
                     parse_cache_spec(config.cache_from, "cache_from"),
@@ -782,7 +785,10 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
         client=RegistryClient(
             registry,
             repo,
@@ -804,7 +810,10 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1071,7 +1080,10 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = (
+            {"log_redact": self.config.redact}
+            if self.config._needs_build_argument_redaction() else {}
+        )
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1588,7 +1600,9 @@ class ImageBuilder:
                 workdir=self.config.workdir,
                 reproducible=self.config.reproducible,
                 identity=identity,
-                record_source_files=not bool(self.config.build_args),
+                record_source_files=not (
+                    self.config.build_args or self.config._needs_build_argument_redaction()
+                ),
             )
         return OCILayer("application/vnd.oci.image.layer.v1.tar", digest, size, str(path))
 
@@ -1628,7 +1642,7 @@ class ImageBuilder:
             message=self.config.redact(
                 f"Could not verify the application layer against its input identity: {error}"
             )
-            if not self.config.build_args:
+            if not self.config._needs_build_argument_redaction():
                 raise RemoteCacheError(message) from error
         if message is not None:
             # Do not retain an unredacted exception in a build-argument traceback.
@@ -1693,7 +1707,9 @@ class ImageBuilder:
                     reproducible=self.config.reproducible,
                     identity=identity if uses_remote_cache else None,
                     namespace=None if uses_remote_cache else self.config.cache_identity(),
-                    record_source_files=not bool(self.config.build_args),
+                    record_source_files=not (
+                        self.config.build_args or self.config._needs_build_argument_redaction()
+                    ),
                     hardlinks=None if uses_remote_cache else hardlinks,
                 )
 

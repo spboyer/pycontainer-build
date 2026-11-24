@@ -349,6 +349,52 @@ def test_remote_cache_preserves_build_argument_namespace_and_private_paths(
     assert rebuilt.digest == cold.digest
 
 
+def test_remote_cache_keeps_retained_argument_paths_out_of_local_indexes(
+    tmp_path, registry, monkeypatch
+):
+    value = "private-retained-module"
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / f"{value}.py").write_text("print('hello')\n")
+
+    def builder(name, option):
+        config = BuildConfig(
+            context_dir=str(context), output_dir=str(tmp_path / f"{name}-out"),
+            cache_dir=str(tmp_path / f"{name}-cache"),
+            include_paths=["${MODULE}.py"], build_args={"MODULE": value},
+            **{option: CACHE_SPEC},
+        )
+        config.build_args.clear()
+        return ImageBuilder(config)
+
+    writer = builder("writer", "cache_to")
+    cold = _app_layer(writer, tmp_path, "writer")
+    reader = builder("reader", "cache_from")
+    with monkeypatch.context() as patch:
+        _forbid_tar_build(patch)
+        warm = _app_layer(reader, tmp_path, "reader")
+    assert warm.digest == cold.digest
+    for build in (writer, reader):
+        metadata = build.cache.index_file.read_text(encoding="utf-8")
+        assert value not in metadata
+        assert all(entry["source_files"] == [] for entry in json.loads(metadata).values())
+
+
+def test_remote_cache_keeps_empty_argument_build_paths_out_of_local_indexes(
+    tmp_path, registry, monkeypatch
+):
+    writer = _builder(tmp_path, "writer", build_args={"EMPTY": ""}, cache_to=CACHE_SPEC)
+    cold = _app_layer(writer, tmp_path, "writer")
+    reader = _builder(tmp_path, "reader", build_args={"EMPTY": ""}, cache_from=CACHE_SPEC)
+    with monkeypatch.context() as patch:
+        _forbid_tar_build(patch)
+        warm = _app_layer(reader, tmp_path, "reader")
+    assert warm.digest == cold.digest
+    for build in (writer, reader):
+        metadata = build.cache.index_file.read_text(encoding="utf-8")
+        assert all(entry["source_files"] == [] for entry in json.loads(metadata).values())
+
+
 @pytest.mark.parametrize("option", ["cache_from", "cache_to"])
 def test_remote_cache_redacts_build_arguments_in_diagnostics(
     tmp_path, registry, monkeypatch, caplog, option
@@ -374,6 +420,65 @@ def test_remote_cache_redacts_build_arguments_in_diagnostics(
         assert not [request for request in registry.requests if request[1] in ("POST", "PUT", "PATCH", "DELETE")]
     else:
         assert "<redacted>" in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["import", "export"])
+def test_remote_cache_redacts_retained_build_argument_diagnostics(
+    tmp_path, registry, monkeypatch, caplog, operation
+):
+    value = "sample-marker-165"
+    config = BuildConfig(
+        context_dir=str(tmp_path), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"), cache_from=CACHE_SPEC,
+        cache_to=CACHE_SPEC, build_args={"VALUE": value},
+    )
+    config.build_args.clear()
+    assert config.redact(value) == "<redacted>"
+    builder = ImageBuilder(config)
+
+    def fail_lookup(*args, **kwargs):
+        raise RegistryRequestError(f"synthetic lookup failure: {value}")
+
+    monkeypatch.setattr(RegistryClient, "pull_manifest", fail_lookup)
+    with caplog.at_level(logging.WARNING):
+        if operation == "import":
+            assert builder.remote_cache_from.fetch("a" * 64, tmp_path / "layers") is None
+        else:
+            data = b"synthetic layer"
+            layer = tmp_path / "layer.tar"
+            layer.write_bytes(data)
+            with pytest.raises(RemoteCacheError) as error:
+                builder.remote_cache_to.store("a" * 64, _digest(data), layer, len(data))
+
+    assert value not in caplog.text
+    if operation == "import":
+        assert "<redacted>" in caplog.text
+    else:
+        assert "<redacted>" in str(error.value)
+        assert value not in "".join(traceback.format_exception(error.value))
+        assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize("arguments", [None, {"EMPTY": ""}])
+def test_remote_cache_preserves_failure_cause_without_redactable_values(
+    tmp_path, registry, monkeypatch, arguments
+):
+    config = BuildConfig(
+        context_dir=str(tmp_path), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"), cache_to=CACHE_SPEC, build_args=arguments,
+    )
+    builder = ImageBuilder(config)
+
+    def fail_lookup(*args, **kwargs):
+        raise RegistryRequestError("synthetic lookup failure")
+
+    monkeypatch.setattr(RegistryClient, "pull_manifest", fail_lookup)
+    data = b"synthetic layer"
+    layer = tmp_path / "layer.tar"
+    layer.write_bytes(data)
+    with pytest.raises(RemoteCacheError) as error:
+        builder.remote_cache_to.store("a" * 64, _digest(data), layer, len(data))
+    assert isinstance(error.value.__cause__, RegistryRequestError)
 
 
 def test_remote_cache_success_redacts_build_arguments(tmp_path, registry, monkeypatch, caplog):
@@ -418,11 +523,14 @@ def test_remote_cache_azure_auth_redacts_build_arguments(
     assert all(host not in warning and "<redacted>" in warning for warning in warnings)
 
 
+@pytest.mark.parametrize("retain_values", [False, True])
 def test_cached_layer_verification_redacts_build_arguments(
-    tmp_path, registry, monkeypatch, caplog
+    tmp_path, registry, monkeypatch, caplog, retain_values
 ):
     value = "private-cache-path"
     builder = _builder(tmp_path, "redaction", build_args={"VALUE": value})
+    if retain_values:
+        builder.config.build_args.clear()
 
     def fail_identity(*_args, **_kwargs):
         raise OSError(f"Could not read {value}")
@@ -437,6 +545,21 @@ def test_cached_layer_verification_redacts_build_arguments(
         builder._verify_app_layer_identity(tmp_path / "layer", [], "identity")
     assert value not in "".join(traceback.format_exception(error.value))
     assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize("arguments", [None, {"EMPTY": ""}])
+def test_cache_verification_preserves_failure_cause_without_redactable_values(
+    tmp_path, registry, monkeypatch, arguments
+):
+    builder = _builder(tmp_path, "redaction", build_args=arguments)
+
+    def fail_identity(*args, **kwargs):
+        raise OSError("synthetic verification failure")
+
+    monkeypatch.setattr(cache_module.LayerCache, "app_layer_identity", fail_identity)
+    with pytest.raises(RemoteCacheError) as error:
+        builder._verify_app_layer_identity(tmp_path / "layer", [], "identity")
+    assert isinstance(error.value.__cause__, OSError)
 
 
 def test_locked_build_remote_cache_excludes_concurrent_staging(

@@ -257,8 +257,9 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
 
 
 @pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("retain_values", [False, True])
 def test_build_arguments_redact_mirror_logs_and_progress(
-    tmp_path, mirror_auth, caplog, capsys, fallback
+    tmp_path, mirror_auth, caplog, capsys, fallback, retain_values
 ):
     value = "private-base-reference"
     with _serve() as (upstream, up), _serve() as (mirror, mir):
@@ -269,6 +270,8 @@ def test_build_arguments_redact_mirror_logs_and_progress(
             tmp_path, upstream, [mirror], base_ref="team/base:${VERSION}",
             build_args={"VERSION": value}, verbose=True,
         )
+        if retain_values:
+            builder.config.build_args.clear()
         with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_mirrors"):
             layers, _ = _pull(builder, tmp_path)
 

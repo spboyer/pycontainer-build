@@ -304,6 +304,10 @@ class BuildConfig:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
 
+    def _needs_build_argument_redaction(self) -> bool:
+        """Return whether resolved arguments have nonempty values to redact."""
+        return any(self._resolved_build_args.values())
+
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""
         return redact_values(message, self._resolved_build_args.values())
