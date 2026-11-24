@@ -12,6 +12,22 @@ from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 SBOM_FORMATS = ("spdx", "cyclonedx")
 SIGNING_PROVIDERS = ("cosign", "notation")
 NOTATION_SIGNATURE_FORMATS = ("jws", "cose")
+MIN_PORT, MAX_PORT = 1, 65535
+
+
+def validate_exposed_ports(ports):
+    """Reject non-integer, out-of-range or duplicate exposed ports."""
+    if not isinstance(ports, list):
+        raise ValueError("exposed_ports must be a list of integers.")
+    seen = set()
+    for port in ports:
+        if type(port) is not int:
+            raise ValueError(f"exposed port {port!r} is not an integer.")
+        if not MIN_PORT <= port <= MAX_PORT:
+            raise ValueError(f"exposed port {port} is outside {MIN_PORT}-{MAX_PORT}.")
+        if port in seen:
+            raise ValueError(f"exposed port {port} is listed more than once.")
+        seen.add(port)
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 MULTI_PLATFORM_SCAN_ERROR = (

@@ -37,9 +37,11 @@ def _metadata_argument(value: str) -> tuple[str, str]:
         raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
     return key, item
 
-def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None, redact=str):
+def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None,
+                      redact=str, base_exposed_ports=None):
     try:
-        report=validate_image(output, tag=tag, platform=platform, ignores=ignores)
+        report=validate_image(output, tag=tag, platform=platform, ignores=ignores,
+                              base_exposed_ports=base_exposed_ports, redact=redact)
     except (OSError, ValueError) as exc:
         print(f"error: {redact(str(exc))}", file=sys.stderr)
         return 2
@@ -569,7 +571,7 @@ def main():
                         Path(builder.config.output_dir),
                         "@" + builder.manifest_digest if multi else builder.config.tag,
                         platform, ignores, "text", "warning", expected_digest=image.manifest_digest,
-                        redact=cfg.redact,
+                        redact=cfg.redact, base_exposed_ports=image.base_exposed_ports,
                     )
                     if code:
                         raise SystemExit(code)
