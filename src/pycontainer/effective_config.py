@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
 from .build_args import EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
-from .config import BuildConfig
+from .config import BuildConfig, validate_exposed_ports
 from .config_loader import (
     BUILD_TABLE,
     ConfigValidationError,
@@ -114,6 +114,7 @@ def semantic_errors(cfg: BuildConfig, origin) -> List[str]:
         check("platform", parse_platform, platform)
     check("base_image", lambda value: parse_local_image_reference(value) or parse_image_reference(value), cfg.base_image)
     check("tag", lambda _: cfg.all_tags(), cfg.tag)
+    check("exposed_ports", validate_exposed_ports, cfg.exposed_ports)
     check("include_paths", relative_context_path, *(cfg.include_paths or []))
     check("exclude_paths", relative_context_path, *cfg.exclude_paths)
     context = Path(cfg.context_dir)
