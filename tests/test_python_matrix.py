@@ -812,11 +812,11 @@ def test_target_wheel_staging_uses_each_minor_and_architecture(tmp_path, monkeyp
                        ("3.12", "linux", "amd64"), ("3.12", "linux", "arm64")]
 
 
-def _write_matrix_lock_project(context, *, include_stubs=False):
+def _write_matrix_lock_project(context, registry, *, include_stubs=False):
     from test_dependency_staging import _write_named_wheel
     from test_lockfiles import _write_target_marker_uv_project
 
-    _write_target_marker_uv_project(context)
+    _write_target_marker_uv_project(context, registry=registry)
     for path in (context / "pyproject.toml", context / "uv.lock"):
         text = path.read_text(encoding="utf-8")
         for machine, condition in (("x86_64", "< '3.12'"), ("aarch64", ">= '3.12'")):
@@ -869,9 +869,22 @@ def _write_matrix_lock_project(context, *, include_stubs=False):
     original.unlink()
 
 
+def _locked_index(request):
+    from test_lockfiles import _SimpleIndex
+
+    index = _SimpleIndex()
+    request.addfinalizer(index.close)
+    return index
+
+
+def _serve_wheelhouse(index, context):
+    for wheel in (context / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
+
+
 @pytest.mark.parametrize("strip_type_stubs", [False, True])
 def test_locked_matrix_selects_target_markers_wheels_and_override(
-    tmp_path, monkeypatch, strip_type_stubs
+    tmp_path, monkeypatch, request, strip_type_stubs
 ):
     build, _, pulls = matrix(
         tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
@@ -881,9 +894,9 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
         labels={"literal": "${VALUE}", "escaped": "$${VALUE}"},
     )
     context = Path(build.config.context_dir)
-    _write_matrix_lock_project(context, include_stubs=True)
-    monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    index = _locked_index(request)
+    _write_matrix_lock_project(context, index.url, include_stubs=True)
+    _serve_wheelhouse(index, context)
     base_auth = []
 
     def pull_auth(host, *, include_generic_environment, log_redact):
@@ -898,7 +911,9 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
         pull_clients.append((host, kwargs["auth_token"], kwargs["username"], kwargs["password"]))
         return original_client(host, repository, **kwargs)
 
-    real_install = builder_module.install_requirements
+    import pycontainer.dependencies as dependencies_module
+
+    real_install = dependencies_module.install_requirements
     installs = []
 
     def install(requirements, site, ctx, os_name, arch, version, base, config, **kwargs):
@@ -908,7 +923,7 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
 
     monkeypatch.setattr(builder_module, "get_registry_auth", pull_auth)
     monkeypatch.setattr(builder_module, "RegistryClient", pull_client)
-    monkeypatch.setattr(builder_module, "install_requirements", install)
+    monkeypatch.setattr(dependencies_module, "install_requirements", install)
     build.build()
 
     assert installs == [
@@ -1078,20 +1093,20 @@ def test_locked_matrix_checks_base_minor_before_resolving_lock(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("failure", ["missing", "hash-mismatch"])
-def test_locked_matrix_wheel_failure_prevents_all_publication(tmp_path, monkeypatch, failure):
+def test_locked_matrix_wheel_failure_prevents_all_publication(tmp_path, monkeypatch, request, failure):
     build, _, _ = matrix(
         tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
     )
     context = Path(build.config.context_dir)
-    _write_matrix_lock_project(context)
+    index = _locked_index(request)
+    _write_matrix_lock_project(context, index.url)
     wheel = context / "wheelhouse" / "fixture_dep-1.0-cp312-cp312-manylinux2014_armv7l.whl"
     if failure == "missing":
         wheel.unlink()
     else:
         wheel.write_bytes(b"corrupt")
-    monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    _serve_wheelhouse(index, context)
 
     with pytest.raises(RuntimeError, match="linux/arm/v7"):
         build.build()
