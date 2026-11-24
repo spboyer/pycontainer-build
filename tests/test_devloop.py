@@ -530,6 +530,115 @@ def test_devloop_remote_cache_failure_stops_push(tmp_path, monkeypatch, recordin
     assert recording[0].pushes == []
 
 
+def test_devloop_remote_cache_failure_redacts_build_arguments(
+    tmp_path, monkeypatch, recording, capsys
+):
+    value = "private-cache-value"
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(f'[build.build-args]\nVALUE = "{value}"\n')
+    monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    def fail_build(_self):
+        raise cli.RemoteCacheError(f"synthetic cache failure: {value}")
+
+    monkeypatch.setattr(RecordingBuilder, "build", fail_build)
+    with pytest.raises(SystemExit) as error:
+        run_cli(
+            monkeypatch, "tilt-build", "--config", str(config),
+            "--context", str(tmp_path), "--cache-to", "type=registry,ref=cache.example/team/app",
+        )
+
+    assert error.value.code == 1
+    assert value not in capsys.readouterr().err
+    assert recording[0].pushes == []
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_build_arguments_preserve_tool_reference(
+    tmp_path, monkeypatch, recording, capsys, command,
+):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(
+        '[build]\nlabels = {version = "${VERSION}"}\nplatform = "${PLATFORM}"\n'
+        '[build.build-args]\nVERSION = "default"\nPLATFORM = "linux/amd64"\n'
+    )
+    reference = "localhost:5000/a:1"
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", reference)
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        extra = []
+    else:
+        monkeypatch.setenv("EXPECTED_REF", reference)
+        extra = ["--context", str(tmp_path), "--platform", "${PLATFORM}"]
+
+    run_cli(
+        monkeypatch, command, "--config", str(config), "--no-progress",
+        "--build-arg", "VERSION=private-v2", "--build-arg", "PLATFORM=linux/arm64",
+        *extra,
+    )
+    (builder,) = recording
+    assert builder.config.labels == {"version": "private-v2"}
+    assert builder.config.env == {}
+    assert builder.config.platform == "linux/arm64"
+    assert builder.pushes[0][0] == reference
+    assert "private-v2" not in capsys.readouterr().out
+
+
+def test_tilt_output_reference_path_redacts_build_arguments(tmp_path, monkeypatch, recording, capsys):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text('[build.build-args]\nVALUE = "private-ref"\n')
+    output = tmp_path / "private-ref.txt"
+    run_cli(
+        monkeypatch, "tilt-build", "--config", str(config),
+        "--image", "localhost:5000/a", "--output-ref", str(output),
+        "--context", str(tmp_path),
+    )
+
+    assert output.read_text().strip() == "localhost:5000/a:tilt-" + "a" * 64
+    assert "private-ref" not in capsys.readouterr().out
+    assert recording[0].pushes[0][0] == output.read_text().strip()
+
+
+def test_devloop_redacts_invalid_interpolated_platform(tmp_path, monkeypatch, recording, capsys):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text('[build]\nplatform = "${PLATFORM}"\n[build.build-args]\nPLATFORM = {}\n')
+    monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+    value = "linux/amd64, linux/arm64"
+    with pytest.raises(SystemExit) as error:
+        run_cli(
+            monkeypatch, "tilt-build", "--config", str(config),
+            "--build-arg", f"PLATFORM={value}",
+        )
+
+    assert error.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert "multiple platforms" in diagnostic
+    assert value not in diagnostic
+    assert "<redacted>" in diagnostic
+    assert recording == []
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_skaffold_request_errors_redact_build_arguments(tmp_path, monkeypatch, recording, capsys, override):
+    config = tmp_path / "pycontainer.toml"
+    default = "fallback" if override else "invalid-private"
+    config.write_text(f'[build.build-args]\nVALUE = "{default}"\n')
+    monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+    monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+    monkeypatch.setenv("PUSH_IMAGE", "invalid-private")
+    extra = ["--build-arg", "VALUE=invalid-private"] if override else []
+    with pytest.raises(SystemExit) as error:
+        run_cli(monkeypatch, "skaffold-build", "--config", str(config), *extra)
+
+    assert error.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert "PUSH_IMAGE must" in diagnostic
+    assert "invalid-private" not in diagnostic
+    assert "<redacted>" in diagnostic
+    assert recording == []
+
+
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
 def test_devloop_cli_runtime_metadata_overrides(tmp_path, monkeypatch, recording, command):
     config = tmp_path / "pycontainer.toml"

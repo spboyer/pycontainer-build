@@ -2,7 +2,7 @@
 import json, base64, logging, os, re, subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Callable, Optional, Dict, Tuple
 from abc import ABC, abstractmethod
 
 GHCR_HOST='ghcr.io'
@@ -144,7 +144,16 @@ class DockerConfigAuthProvider(AuthProvider):
 
 class AzureCLIAuthProvider(AuthProvider):
     """Get credentials from Azure CLI for ACR."""
-    
+
+    def __init__(self, *, log_redact: Optional[Callable[[str], str]] = None):
+        self._log_redact = log_redact
+
+    def _warning(self, message: str, *args) -> None:
+        rendered = message % args
+        if self._log_redact is not None:
+            rendered = self._log_redact(rendered)
+        logger.warning("%s", rendered)
+
     def get_credentials(self, registry: str) -> Optional[Tuple[str, str]]:
         registry_name=_acr_registry_name(registry)
         if not registry_name: return None
@@ -157,10 +166,10 @@ class AzureCLIAuthProvider(AuthProvider):
         except FileNotFoundError:
             return None
         except (OSError, subprocess.SubprocessError) as error:
-            logger.warning("Azure CLI authentication failed for %s: %s", registry, error)
+            self._warning("Azure CLI authentication failed for %s: %s", registry, error)
             return None
         if result.returncode!=0:
-            logger.warning(
+            self._warning(
                 "Azure CLI authentication failed for %s (exit code %s).",
                 registry, result.returncode
             )
@@ -168,17 +177,17 @@ class AzureCLIAuthProvider(AuthProvider):
         try:
             data=json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError):
-            logger.warning("Azure CLI returned invalid credentials for %s.", registry)
+            self._warning("Azure CLI returned invalid credentials for %s.", registry)
             return None
         if not isinstance(data, dict):
-            logger.warning("Azure CLI returned invalid credentials for %s.", registry)
+            self._warning("Azure CLI returned invalid credentials for %s.", registry)
             return None
         if _https_registry_host(data.get('loginServer'))!=_https_registry_host(registry):
-            logger.warning("Azure CLI returned a different or invalid login server for %s.", registry)
+            self._warning("Azure CLI returned a different or invalid login server for %s.", registry)
             return None
         token=data.get('accessToken')
         if not isinstance(token, str) or not token:
-            logger.warning("Azure CLI returned an invalid token for %s.", registry)
+            self._warning("Azure CLI returned an invalid token for %s.", registry)
             return None
         return ('00000000-0000-0000-0000-000000000000', token)
     
@@ -206,7 +215,8 @@ class ChainAuthProvider(AuthProvider):
         return None
 
 def get_default_auth_provider(
-    *, include_generic_environment: bool = True
+    *, include_generic_environment: bool = True,
+    log_redact: Optional[Callable[[str], str]] = None,
 ) -> AuthProvider:
     """Return default auth provider chain."""
     return ChainAuthProvider([
@@ -214,7 +224,7 @@ def get_default_auth_provider(
             include_generic_environment=include_generic_environment
         ),
         DockerConfigAuthProvider(),
-        AzureCLIAuthProvider()
+        AzureCLIAuthProvider(log_redact=log_redact)
     ])
 
 
@@ -224,6 +234,7 @@ def get_registry_auth(
     bearer_token: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    log_redact: Optional[Callable[[str], str]] = None,
     include_generic_environment: bool = True,
 ) -> RegistryAuth:
     """Resolve registry credentials without treating a password as a bearer token."""
@@ -236,8 +247,9 @@ def get_registry_auth(
     if password:
         return RegistryAuth(bearer_token=password)
 
+    options = {"log_redact": log_redact} if log_redact is not None else {}
     provider=get_default_auth_provider(
-        include_generic_environment=include_generic_environment
+        include_generic_environment=include_generic_environment, **options
     )
 
     token=provider.get_token(registry)
@@ -257,7 +269,9 @@ def get_registry_auth(
     return RegistryAuth()
 
 
-def get_mirror_auth(host: str) -> RegistryAuth:
+def get_mirror_auth(
+    host: str, *, log_redact: Optional[Callable[[str], str]] = None
+) -> RegistryAuth:
     """Resolve credentials scoped to exactly one mirror host.
 
     Host-agnostic REGISTRY_* environment variables are deliberately ignored:
@@ -267,7 +281,7 @@ def get_mirror_auth(host: str) -> RegistryAuth:
     host = host.lower()
     creds = DockerConfigAuthProvider().get_credentials(host)
     if not creds and _acr_registry_name(host):
-        creds = AzureCLIAuthProvider().get_credentials(host)
+        creds = AzureCLIAuthProvider(log_redact=log_redact).get_credentials(host)
     if not creds and _is_ghcr_registry(host) and os.getenv("GITHUB_TOKEN"):
         return RegistryAuth(bearer_token=os.getenv("GITHUB_TOKEN"))
     if creds:

@@ -732,7 +732,9 @@ shared; the dependency layer and base image are not cached remotely. Records
 are OCI artifacts tagged `app-<key>` in the cache repository, where the key is
 a SHA-256 over the record schema, layer format, tar settings, builder Python
 version, and the same file identity used by the local cache (file content,
-relative paths, modes, hard-link topology, workdir and reproducibility).
+relative paths, modes, hard-link topology, workdir, reproducibility and a
+namespace for expanded configuration). Storage paths and unused build
+arguments do not affect that namespace.
 Remote caching requires reproducible builds. The same settings
 are available in `[build]` as `cache-from` and `cache-to`; `ref` must not include
 a tag or digest. Only
@@ -764,9 +766,10 @@ from the cache registry's own provider, and control-plane redirects strip
 credentials. A registry can direct credential exchange to its advertised token
 service, so trust both the cache registry and its token service. Every blob
 redirect hop must contain no URL credentials and use HTTPS; the only exception
-is an exact-host `--insecure-registry` redirecting over HTTP to its own origin. When remote caching is enabled,
-generated and cached tars are checked against the original source identity and
-sources are rechecked; mismatched cached layers are rebuilt. Export verifies
+is an exact-host `--insecure-registry` redirecting over HTTP to its own origin.
+When remote caching is enabled, generated and cached tars are checked against
+the original source identity and sources are rechecked; mismatched cached
+layers are rebuilt. Export verifies
 blob presence even when the tag is current, then uploads any missing blobs
 before publishing a new tag. Identical concurrent writers produce identical
 records; differing tag publications are last-write-wins. An interrupted export
@@ -985,6 +988,68 @@ how to apply them.
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
 
+### Build arguments
+
+Declare inputs in either configuration table, then pass repeatable overrides:
+
+```toml
+[build]
+tag = "myapp:${VERSION}"
+workdir = "/app"
+entrypoint = ["python", "-m", "app"]
+
+[build.build-args]
+VERSION = "1.0.0"                 # string default
+ENVIRONMENT = {}                   # required, including an explicitly empty value
+OPTION = { default = "" }          # optional default table
+
+[build.labels]
+version = "${VERSION}"
+literal = "$${VERSION}"            # persists the literal ${VERSION}
+
+[build.env]
+APP_ENV = "${ENVIRONMENT}"         # explicit runtime persistence
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg ENVIRONMENT=production --build-arg VERSION=1.2.3
+```
+
+For `pyproject.toml`, use `[tool.pycontainer.build-args]` instead.
+The `skaffold-build` and `tilt-build` commands accept the same overrides
+when using a configuration file.
+Names match `[A-Za-z_][A-Za-z0-9_]*`; values are strings. Overrides split on
+the first `=` (so `OPTION=a=b` is valid), and the last occurrence wins.
+Ordinary explicit CLI settings override file settings before interpolation.
+Malformed or undeclared arguments, missing required values, invalid/unclosed
+references, and C0/C1/DEL control characters fail before building, including
+in dry-run mode. Defaults are checked even when overridden.
+
+`${NAME}` expands **once**, only in `tag`, `tags`, `base_image`, `context_dir`,
+`workdir`, `entrypoint`, `cmd`, `user`, `include_paths`, `exclude_paths`,
+`output_dir`, `cache_dir`, `requirements_file`, `platform`, `stop_signal`,
+`volumes`, and the **values**
+of `env` and `labels`. Hyphenated setting aliases work too. Dictionary keys,
+SBOM formats, system-package declarations and other settings do not expand.
+`$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
+are not rescanned, defaults do not reference other arguments, and no host
+environment lookup, expression evaluation or shell execution occurs.
+Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
+without it, existing literal dollar expressions are preserved.
+
+Arguments are **not secrets** and are not automatically runtime environment
+variables. Only explicit interpolation into persisted image fields (including
+labels, environment, command or workdir) stores a value in image metadata.
+Configuration/source files selected for the app layer are still copied normally;
+exclude files containing defaults if they should not be shipped.
+Diagnostic output redacts nonempty argument values. Cache metadata contains
+hashed resolved configuration/target/backend identity, not argument values;
+argument builds omit source-path metadata. Unused argument changes do not
+invalidate the app-layer cache. The cache stores actual layer contents, not
+encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
+scoped interface; imported values escape dollars to preserve their runtime
+meaning when loaded. Build arguments do not introduce stages or conditions.
+
 ---
 
 ## 🗺️ Roadmap
@@ -1097,8 +1162,9 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
 platform is built in isolation: it selects its own base manifest, stages its own
-wheel-only dependency layer, and shares the byte-identical application layer
-(its cache key needs no platform input; dependency layers are never cached).
+wheel-only dependency layer, and shares the byte-identical application layer.
+The cache namespace includes the requested platform configuration; dependency
+layers are never cached.
 Virtualenv closure is verified separately against each target base. Explicit
 dependencies and detected lockfiles take precedence over virtualenvs; otherwise,
 exclude a virtualenv (for example, `--exclude .venv`) to select `requirements.txt`.

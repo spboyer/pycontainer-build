@@ -219,16 +219,23 @@ class RegistryLayerCache:
         client: Optional[RegistryClient] = None,
         *,
         client_factory: Optional[Callable[[str, str, RegistryAuth], RegistryClient]] = None,
+        log_redact: Optional[Callable[[str], str]] = None,
     ):
         self.ref = ref
         self._client = client
         self._client_factory = client_factory
+        self._log_redact = log_redact
+        self._redact = log_redact if log_redact is not None else str
 
     @property
     def client(self) -> RegistryClient:
         if self._client is None:
+            log_options = (
+                {"log_redact": self._log_redact}
+                if self._log_redact is not None else {}
+            )
             auth = get_registry_auth(
-                self.ref.registry, include_generic_environment=False
+                self.ref.registry, include_generic_environment=False, **log_options
             )
             if self._client_factory is not None:
                 self._client = self._client_factory(
@@ -241,6 +248,7 @@ class RegistryLayerCache:
                     auth_token=auth.bearer_token,
                     username=auth.username,
                     password=auth.password,
+                    **log_options,
                 )
         return self._client
 
@@ -261,25 +269,25 @@ class RegistryLayerCache:
             destination = Path(layers_dir) / digest_filename(digest)
             self.client.pull_blob(digest, destination, layer["size"])
         except RegistryNotFoundError:
-            logger.debug("Remote cache miss: %s has no record %s", self.ref, tag)
+            logger.debug("%s", self._redact(f"Remote cache miss: {self.ref} has no record {tag}"))
             return None
         except RemoteCacheRecordError as error:
             logger.warning(
-                "Remote cache miss: rejected record %s in %s: %s", tag, self.ref, error
+                "%s", self._redact(f"Remote cache miss: rejected record {tag} in {self.ref}: {error}")
             )
             return None
         except (
             RegistryRequestError, BlobIntegrityError, ValueError, OSError, RecursionError
         ) as error:
             logger.warning(
-                "Remote cache miss: could not import %s from %s (%s: %s)",
-                tag,
-                self.ref,
-                type(error).__name__,
-                error,
+                "%s",
+                self._redact(
+                    f"Remote cache miss: could not import {tag} from {self.ref} "
+                    f"({type(error).__name__}: {error})"
+                ),
             )
             return None
-        logger.info("Remote cache hit: %s from %s", digest, self.ref)
+        logger.info("%s", self._redact(f"Remote cache hit: {digest} from {self.ref}"))
         return digest, destination, layer["size"]
 
     def _pull_config(self, descriptor: Dict) -> Dict:
@@ -298,8 +306,10 @@ class RegistryLayerCache:
         """Publish layer and config blobs, then the record. Return False if current."""
         if size > MAX_CACHED_LAYER_BYTES:
             raise RemoteCacheError(
-                f"Application layer is {size} bytes; remote cache records are "
-                f"limited to {MAX_CACHED_LAYER_BYTES} bytes."
+                self._redact(
+                    f"Application layer is {size} bytes; remote cache records are "
+                    f"limited to {MAX_CACHED_LAYER_BYTES} bytes."
+                )
             )
         tag = cache_tag(key)
         config_bytes, manifest_bytes = build_record(key, digest, size)
@@ -313,16 +323,21 @@ class RegistryLayerCache:
                 config_path.write_bytes(config_bytes)
                 self.client.push_blob(config_digest, config_path)
             if current:
-                logger.info("Remote cache record %s in %s is current", tag, self.ref)
+                logger.info("%s", self._redact(f"Remote cache record {tag} in {self.ref} is current"))
                 return False
             # The record is published last so readers never see missing blobs.
             self.client.push_manifest(tag, manifest_bytes)
         except (RegistryRequestError, BlobIntegrityError, OSError) as error:
-            raise RemoteCacheError(
+            message = self._redact(
                 f"Failed to export remote cache record {tag} to {self.ref}: {error}"
-            ) from error
-        logger.info("Exported remote cache record %s to %s", tag, self.ref)
-        return True
+            )
+            if self._log_redact is None:
+                raise RemoteCacheError(message) from error
+        else:
+            logger.info("%s", self._redact(f"Exported remote cache record {tag} to {self.ref}"))
+            return True
+        # Raise outside the handler so tracebacks cannot retain an unredacted cause.
+        raise RemoteCacheError(message)
 
     def _current_record_digest(self, tag: str) -> Optional[str]:
         try:
@@ -331,6 +346,6 @@ class RegistryLayerCache:
             return None
         except (RegistryRequestError, BlobIntegrityError, RecursionError) as error:
             # An unreadable record is replaced; push failures still surface below.
-            logger.debug("Replacing unreadable remote cache record %s: %s", tag, error)
+            logger.debug("%s", self._redact(f"Replacing unreadable remote cache record {tag}: {error}"))
             return None
         return digest

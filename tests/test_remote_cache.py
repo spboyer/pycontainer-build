@@ -8,6 +8,7 @@ import os
 import subprocess
 import tarfile
 import threading
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -225,7 +226,9 @@ def _app_layer(builder, tmp_path, name):
 
 def _key_for(builder):
     files = [(Path(builder.config.context_dir) / "app.py", Path("app.py"))]
-    identity = builder.cache.files_identity(files, "/app", True)
+    identity = builder.cache.files_identity(
+        files, "/app", True, namespace=builder.config.cache_identity()
+    )
     return app_layer_cache_key(identity)
 
 
@@ -295,6 +298,138 @@ def test_cold_export_then_warm_import_skips_rebuild(tmp_path, registry, monkeypa
     local = _app_layer(reader, tmp_path, "reader-local")
     assert local.digest == cold.digest
     assert registry.requests == []
+
+
+def test_remote_cache_preserves_build_argument_namespace_and_private_paths(
+    tmp_path, registry, monkeypatch
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "private-module.py").write_text("print('hello')\n")
+
+    def builder(name, version, unused, **options):
+        return _builder(
+            tmp_path, name,
+            include_paths=["${MODULE}.py"],
+            labels={"version": "${VERSION}"},
+            build_args={"MODULE": "private-module", "VERSION": version, "UNUSED": unused},
+            **options,
+        )
+
+    writer = builder("writer", "release-one", "unused-one", cache_to=CACHE_SPEC)
+    cold = _app_layer(writer, tmp_path, "writer")
+    reader = builder("reader", "release-one", "unused-two", cache_from=CACHE_SPEC)
+    with monkeypatch.context() as patch:
+        _forbid_tar_build(patch)
+        warm = _app_layer(reader, tmp_path, "reader")
+    assert warm.digest == cold.digest
+    for build in (writer, reader):
+        metadata = build.cache.index_file.read_text(encoding="utf-8")
+        assert "private-module" not in metadata
+        assert "release-one" not in metadata
+        assert all(entry["source_files"] == [] for entry in json.loads(metadata).values())
+
+    real_write = ImageBuilder._write_app_layer
+    writes = []
+
+    def record_write(self, *args, **kwargs):
+        writes.append(True)
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(ImageBuilder, "_write_app_layer", record_write)
+    changed = builder("changed", "release-two", "unused-two", cache_from=CACHE_SPEC)
+    rebuilt = _app_layer(changed, tmp_path, "changed")
+    assert writes == [True]
+    assert rebuilt.digest == cold.digest
+
+
+@pytest.mark.parametrize("option", ["cache_from", "cache_to"])
+def test_remote_cache_redacts_build_arguments_in_diagnostics(
+    tmp_path, registry, monkeypatch, caplog, option
+):
+    registry.fail[("GET", "manifests/")] = 403
+    if option == "cache_to":
+        registry.fail[("POST", "blobs/uploads/")] = 403
+    builder = _builder(
+        tmp_path, "redaction", build_args={"REGISTRY": CACHE_HOST},
+        **{option: CACHE_SPEC},
+    )
+    with caplog.at_level(logging.DEBUG):
+        if option == "cache_to":
+            with pytest.raises(RemoteCacheError) as error:
+                _app_layer(builder, tmp_path, "redaction")
+        else:
+            _app_layer(builder, tmp_path, "redaction")
+
+    assert CACHE_HOST not in caplog.text
+    assert "<redacted>" in caplog.text
+    if option == "cache_to":
+        assert CACHE_HOST not in str(error.value)
+        assert CACHE_HOST not in "".join(traceback.format_exception(error.value))
+        assert error.value.__context__ is None
+
+
+def test_remote_cache_success_redacts_build_arguments(tmp_path, registry, monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        writer = _builder(
+            tmp_path, "writer", build_args={"REGISTRY": CACHE_HOST}, cache_to=CACHE_SPEC
+        )
+        cold = _app_layer(writer, tmp_path, "writer")
+        reader = _builder(
+            tmp_path, "reader", build_args={"REGISTRY": CACHE_HOST}, cache_from=CACHE_SPEC
+        )
+        _forbid_tar_build(monkeypatch)
+        warm = _app_layer(reader, tmp_path, "reader")
+
+    assert warm.digest == cold.digest
+    assert "Exported remote cache record" in caplog.text
+    assert "Remote cache hit" in caplog.text
+    assert CACHE_HOST not in caplog.text
+
+
+def test_remote_cache_azure_auth_redacts_build_arguments(
+    tmp_path, registry, monkeypatch, caplog
+):
+    host = "private.azurecr.io"
+    monkeypatch.setattr(remote_cache, "get_registry_auth", auth_module.get_registry_auth)
+    monkeypatch.setattr(auth_module.Path, "home", lambda: tmp_path / "home")
+    for name in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD", "REGISTRY_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        auth_module.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 1, stdout=""),
+    )
+    builder = _builder(
+        tmp_path, "redaction", build_args={"REGISTRY": host},
+        cache_from=f"type=registry,ref={host}/{CACHE_REPO}",
+    )
+    with caplog.at_level(logging.WARNING):
+        _app_layer(builder, tmp_path, "redaction")
+
+    warnings = [record.getMessage() for record in caplog.records if record.name == auth_module.__name__]
+    assert warnings
+    assert all(host not in warning and "<redacted>" in warning for warning in warnings)
+
+
+def test_cached_layer_verification_redacts_build_arguments(
+    tmp_path, registry, monkeypatch, caplog
+):
+    value = "private-cache-path"
+    builder = _builder(tmp_path, "redaction", build_args={"VALUE": value})
+
+    def fail_identity(*_args, **_kwargs):
+        raise OSError(f"Could not read {value}")
+
+    monkeypatch.setattr(cache_module.LayerCache, "app_layer_identity", fail_identity)
+    with caplog.at_level(logging.WARNING):
+        assert not builder._cached_app_layer_matches(tmp_path / "layer", [], "identity")
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+    with pytest.raises(RemoteCacheError) as error:
+        builder._verify_app_layer_identity(tmp_path / "layer", [], "identity")
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert error.value.__context__ is None
 
 
 def test_locked_build_remote_cache_excludes_concurrent_staging(tmp_path, registry, monkeypatch):
@@ -439,7 +574,8 @@ def test_remote_export_rejects_transient_content_change(
     assert not registry.manifest_puts()
     if writer.cache:
         assert writer.cache.get_layer(
-            [(source, Path("app.py"))], workdir="/app", reproducible=True
+            [(source, Path("app.py"))], workdir="/app", reproducible=True,
+            namespace=writer.config.cache_identity(),
         ) is None
 
 
@@ -468,6 +604,7 @@ def test_remote_cache_rebuilds_mismatched_cached_layer(
         writer.cache.store_layer(
             files, mismatched.digest, Path(mismatched.tar_path),
             workdir="/app", reproducible=True,
+            namespace=writer.config.cache_identity(),
         )
     else:
         RegistryLayerCache(parse_cache_spec(CACHE_SPEC)).store(
@@ -481,7 +618,10 @@ def test_remote_cache_rebuilds_mismatched_cached_layer(
         assert archive.extractfile("app/app.py").read() == content
     assert rebuilt.digest != mismatched.digest
     assert "cached application layer" in caplog.text
-    assert writer.cache.get_layer(files, workdir="/app", reproducible=True)[0] == rebuilt.digest
+    assert writer.cache.get_layer(
+        files, workdir="/app", reproducible=True,
+        namespace=writer.config.cache_identity(),
+    )[0] == rebuilt.digest
     if export:
         record = json.loads(registry.manifests[cache_tag(_key_for(writer))])
         assert record["layers"][0]["digest"] == rebuilt.digest
@@ -508,7 +648,8 @@ def test_remote_cache_rejects_new_source_during_emission(
 
     assert not registry.manifest_puts()
     assert writer.cache.get_layer(
-        [(context / "app.py", Path("app.py"))], workdir="/app", reproducible=True
+        [(context / "app.py", Path("app.py"))], workdir="/app", reproducible=True,
+        namespace=writer.config.cache_identity(),
     ) is None
 
 
@@ -674,7 +815,8 @@ def test_remote_export_rebuilds_layer_with_invalid_tar_metadata(
         archive.addfile(info, io.BytesIO(content))
     digest = _digest(path.read_bytes())
     writer.cache.store_layer(
-        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True
+        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True,
+        namespace=writer.config.cache_identity(),
     )
     monkeypatch.setattr(cache_module, "_MAX_TAR_READ_BYTES", 16 * 1024)
 
@@ -701,7 +843,8 @@ def test_remote_cache_rebuilds_layer_with_trailing_tar_data(tmp_path, registry, 
         archive.write(b"unexpected trailing data")
     digest = _digest(path.read_bytes())
     writer.cache.store_layer(
-        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True
+        [(source, Path("app.py"))], digest, path, workdir="/app", reproducible=True,
+        namespace=writer.config.cache_identity(),
     )
 
     with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
@@ -1184,7 +1327,10 @@ def test_cache_registry_credentials_are_scoped_to_the_actual_host(
 def test_cache_ignores_generic_environment_credentials(
     tmp_path, registry, monkeypatch, option, generic_auth, scoped_cache_auth, image_registry
 ):
-    _export(tmp_path, registry)
+    writer = _builder(
+        tmp_path, "writer", tag=f"{image_registry}/team/app:latest", cache_to=CACHE_SPEC
+    )
+    _app_layer(writer, tmp_path, "writer")
     registry.requests.clear()
     if option == "cache_to":
         registry.manifests.clear()
@@ -1376,3 +1522,15 @@ def test_dry_run_plan_shows_remote_cache(tmp_path, capsys):
     builder.build()
     output = capsys.readouterr().out
     assert f"Cache From: {CACHE_SPEC}" in output and f"Cache To: {CACHE_SPEC}" in output
+
+
+def test_dry_run_redacts_build_arguments_in_cache_ref(tmp_path, capsys):
+    builder = _builder(
+        tmp_path, "plan", cache_from=CACHE_SPEC, cache_to=CACHE_SPEC,
+        build_args={"VALUE": CACHE_HOST}, dry_run=True,
+    )
+    builder.build()
+    output = capsys.readouterr().out
+    assert CACHE_HOST not in output
+    assert "Cache From: type=registry,ref=<redacted>/team/app-cache" in output
+    assert "Cache To: type=registry,ref=<redacted>/team/app-cache" in output

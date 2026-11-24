@@ -94,6 +94,19 @@ def test_rendered_toml_round_trips_and_validates():
     assert set(data) <= {f.name for f in fields(BuildConfig)}
 
 
+def test_import_preserves_runtime_dollars_when_loading_build_config(tmp_path):
+    from pycontainer.config_loader import config_from_file
+
+    result = import_dockerfile(
+        'FROM python:3.12\nENV PORT=8000\nCMD ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]\n'
+    )
+    path = tmp_path / "pyproject.toml"
+    path.write_text(render_toml(result.config))
+    config = config_from_file(path)
+    assert config.cmd == ["/bin/sh", "-c", "echo ${PORT} $$ $HOME"]
+    assert config.env == {"PORT": "8000"}
+
+
 def test_merge_replaces_only_pycontainer_tables():
     existing = '[project]\nname = "x"\n\n[tool.pycontainer]\ntag = "old"\n\n[tool.pycontainer.env]\nA = "1"\n\n[tool.ruff]\nline-length = 99\n'
     merged = merge_into_pyproject(existing, render_toml({"workdir": "/w"}))
@@ -414,6 +427,17 @@ def test_volume_maps_json_and_word_forms_and_warns_on_unsafe_paths():
     assert any("metadata" in n for n in result.notes)
     data = tomllib.loads(render_toml(result.config))["tool"]["pycontainer"]
     assert data["volumes"] == ["/srv/uploads", "/data", "/logs"]
+
+
+def test_imported_volume_literal_dollar_survives_config_loading(tmp_path):
+    from pycontainer.config_loader import config_from_file
+
+    result = import_dockerfile('FROM python:3.12\nVOLUME ["/cost$5"]\n')
+    path = tmp_path / "pyproject.toml"
+    path.write_text(render_toml(result.config))
+
+    assert result.config["volumes"] == ["/cost$5"]
+    assert config_from_file(path).volumes == ["/cost$5"]
 
 
 def test_existing_import_output_is_unchanged_without_new_instructions():

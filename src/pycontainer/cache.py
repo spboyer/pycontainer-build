@@ -165,6 +165,8 @@ class LayerCache:
         workdir: str = "/app",
         reproducible: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
+        *,
+        namespace: Optional[str] = None,
     ) -> str:
         file_records = []
         ordered_files = ordered_app_files(files, reproducible)
@@ -201,11 +203,14 @@ class LayerCache:
                 record["gid"] = getattr(metadata, "st_gid", 0)
             file_records.append(record)
 
-        return self._identity_from_records(file_records, workdir, reproducible)
+        return self._identity_from_records(
+            file_records, workdir, reproducible, namespace=namespace
+        )
 
     @staticmethod
     def _identity_from_records(
-        file_records: List[Dict], workdir: str, reproducible: bool
+        file_records: List[Dict], workdir: str, reproducible: bool,
+        *, namespace: Optional[str] = None,
     ) -> str:
         identity = {
             "version": _CACHE_KEY_VERSION,
@@ -213,6 +218,8 @@ class LayerCache:
             "reproducible": bool(reproducible),
             "files": file_records,
         }
+        if namespace is not None:
+            identity["namespace"] = namespace
         serialized = json.dumps(
             identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -225,12 +232,16 @@ class LayerCache:
         reproducible: bool = True,
         *,
         hardlinks: Optional[Dict[str, str]] = None,
+        namespace: Optional[str] = None,
     ) -> str:
         """Return the versioned source identity used as the local cache key."""
-        return self._compute_files_digest(files, workdir, reproducible, hardlinks)
+        return self._compute_files_digest(
+            files, workdir, reproducible, hardlinks, namespace=namespace
+        )
 
     def app_layer_identity(
-        self, files: List[Tuple[Path, Path]], layer_path: Path, workdir: str = "/app"
+        self, files: List[Tuple[Path, Path]], layer_path: Path, workdir: str = "/app",
+        *, namespace: Optional[str] = None,
     ) -> str:
         """Return the source identity represented by a reproducible application tar."""
         records = []
@@ -325,7 +336,7 @@ class LayerCache:
                     raise ValueError("Application layer has an invalid tar trailer")
             if trailer_size < 2 * tarfile.BLOCKSIZE or trailer_size % tarfile.BLOCKSIZE:
                 raise ValueError("Application layer has an invalid tar trailer")
-        return self._identity_from_records(records, workdir, True)
+        return self._identity_from_records(records, workdir, True, namespace=namespace)
 
     @contextmanager
     def _index_lock(self):
@@ -441,13 +452,14 @@ class LayerCache:
         workdir: str = "/app",
         reproducible: bool = True,
         identity: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> Optional[Tuple[str, Path]]:
         if not self.enabled:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
         files_digest = identity or self._compute_files_digest(
-            files, workdir, reproducible
+            files, workdir, reproducible, namespace=namespace
         )
         with self._index_lock():
             entries = self._load_index()
@@ -483,6 +495,8 @@ class LayerCache:
         workdir: str = "/app",
         reproducible: bool = True,
         identity: Optional[str] = None,
+        namespace: Optional[str] = None,
+        record_source_files: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
     ) -> Path:
         layer_path = Path(layer_path)
@@ -498,7 +512,7 @@ class LayerCache:
                 f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
             )
         files_digest = identity or self._compute_files_digest(
-            files, workdir, reproducible, hardlinks
+            files, workdir, reproducible, hardlinks, namespace=namespace
         )
         blob_path = self._blob_path(digest)
 
@@ -512,7 +526,10 @@ class LayerCache:
                 size=size,
                 created=time.time(),
                 last_used=time.time(),
-                source_files=[self._relative_path(relative) for _, relative in files],
+                source_files=(
+                    [self._relative_path(relative) for _, relative in files]
+                    if record_source_files else []
+                ),
             )
             self._evict_if_needed(entries)
             self._save_index(entries)

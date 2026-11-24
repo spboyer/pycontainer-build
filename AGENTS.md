@@ -47,11 +47,15 @@ currently has no `__main__.py`.
 ## Cache behavior
 
 Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
-selects another location and `--no-cache` disables it. Cache keys include file
-content, normalized relative paths, workdir, and reproducibility settings, plus
+selects another location and `--no-cache` disables local caching and remote
+imports, but not explicit exports. Cache keys include file
+content, normalized relative paths, workdir, reproducibility settings, and a
+namespace for expanded configuration excluding storage paths, plus
 the context-relative hardlink targets `tarfile` emits (never inode numbers or
 absolute paths); key version 3 invalidated earlier keys that lacked them, and
 version 4 invalidated Windows entries whose symlink text kept backslashes.
+Unused build arguments do not affect the namespace; when arguments are present,
+local cache indexes omit source paths.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
