@@ -215,9 +215,8 @@ class ChainAuthProvider(AuthProvider):
         return None
 
 def get_default_auth_provider(
-    *,
+    *, include_generic_environment: bool = True,
     log_redact: Optional[Callable[[str], str]] = None,
-    include_generic_environment: bool = True,
 ) -> AuthProvider:
     """Return default auth provider chain."""
     return ChainAuthProvider([
@@ -270,7 +269,9 @@ def get_registry_auth(
     return RegistryAuth()
 
 
-def get_mirror_auth(host: str) -> RegistryAuth:
+def get_mirror_auth(
+    host: str, *, log_redact: Optional[Callable[[str], str]] = None
+) -> RegistryAuth:
     """Resolve credentials scoped to exactly one mirror host.
 
     Host-agnostic REGISTRY_* environment variables are deliberately ignored:
@@ -280,7 +281,7 @@ def get_mirror_auth(host: str) -> RegistryAuth:
     host = host.lower()
     creds = DockerConfigAuthProvider().get_credentials(host)
     if not creds and _acr_registry_name(host):
-        creds = AzureCLIAuthProvider().get_credentials(host)
+        creds = AzureCLIAuthProvider(log_redact=log_redact).get_credentials(host)
     if not creds and _is_ghcr_registry(host) and os.getenv("GITHUB_TOKEN"):
         return RegistryAuth(bearer_token=os.getenv("GITHUB_TOKEN"))
     if creds:

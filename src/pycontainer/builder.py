@@ -21,6 +21,7 @@ from .fs_utils import (
     context_exclude_paths,
     ensure_dir,
     output_directory_lock,
+    relative_context_path,
     select_context_files,
 )
 
@@ -45,6 +46,7 @@ IMAGE_CONFIG_MEDIA_TYPES = {
     "application/vnd.oci.image.config.v1+json",
     "application/vnd.docker.container.image.v1+json",
 }
+_LOCKFILE_STAGING_PREFIX = ".pycontainer-lockfile-"
 
 
 def _write_content_addressed_bytes(
@@ -210,11 +212,19 @@ from .dependencies import (
     reject_shipped_credentials,
     staged_packages,
     stage_virtualenv,
+    strip_type_stubs,
+    target_python_full_version,
     target_python_version,
     target_libc_config,
     target_wheel_platform,
     validate_target_platform,
 )
+from .lockfiles import (
+    detect_lockfile, load_lockfile, preflight_lockfile, target_environment,
+    verify_locked_installation,
+)
+
+DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
 logger=logging.getLogger(__name__)
 
@@ -380,7 +390,11 @@ class ImageBuilder:
             exclude_defaults=config.exclude_defaults,
         )
         self.ordinary_context_excludes=ordinary_excludes
-        self.context_excludes=ordinary_excludes+config._conditional_excludes
+        self.context_excludes=(
+            *ordinary_excludes,
+            *config._conditional_excludes,
+            f"{_LOCKFILE_STAGING_PREFIX}*",
+        )
         self.dependency_excludes=tuple(
             exclude
             for exclude in self.context_excludes
@@ -484,6 +498,7 @@ class ImageBuilder:
 
     def build(self):
         self.config.validate_metadata()
+        self._dependency_source_cache = None
         if self.config.scan and len(self.config.target_platforms()) > 1:
             raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
         timing = BuildTiming() if self._history else None
@@ -548,6 +563,9 @@ class ImageBuilder:
 
     def _build_image(self):
         self._image_entrypoint = self._entrypoint()
+        self._dependency_source_cache = None
+        self._lock_selection_cache = {}
+        self._requirement_files = []
         output=ensure_dir(self.config.output_dir)
         blobs=ensure_dir(output/'blobs')
         layers_dir=ensure_dir(blobs/'sha256')
@@ -559,7 +577,6 @@ class ImageBuilder:
         self._base_image_tag_verified=False
         self._local_base_snapshot=None
         self._app_layer=None
-        self._requirement_files=[]
         if len(platforms)>1:
             return self._build_multi_platform(output, layers_dir, refs_dir, platforms)
 
@@ -595,7 +612,7 @@ class ImageBuilder:
         self.layers=image.layers
         self.index_digest=None
         self.platform_images=[image]
-        
+
         if getattr(self.config, 'generate_sbom', False):
             sbom_path=output/'sbom.json'
             logger.info("Generating SBOM...")
@@ -611,7 +628,6 @@ class ImageBuilder:
                     package_inventory=getattr(self, "_staged_packages", []),
                 )
             logger.info(self.config.redact(f"✓ SBOM saved to {sbom_path}"))
-        
         return self.config.tag
 
     def _build_multi_platform(self, output: Path, layers_dir: Path, refs_dir: Path, platforms: List[str]):
@@ -674,21 +690,26 @@ class ImageBuilder:
             validate_target_platform(os_name, arch, parse_platform_variant(platform))
         with self._time_history_phase("base_image"):
             base_layers, base_config = self._pull_base_image(layers_dir, os_name, arch)
-        report_system_packages(self.config, base_layers, redact=self.config.redact)
         variant = (
             base_config.get("variant") if base_config else None
         ) or parse_platform_variant(platform)
+        locked_names = ()
+        if self.config.include_deps and self._uses_lockfile():
+            locked_names = tuple(
+                package.name
+                for package in self._lock_selection(
+                    base_config, os_name, arch, variant=variant,
+                    base_image_tag_verified=self._has_verified_base_image_tag(),
+                ).packages
+            )
+        report_system_packages(self.config, base_layers, locked_names, redact=self.config.redact)
         
         app_layers=[]
         if self.config.include_deps:
             with self._time_history_phase("dependencies"):
                 staging_config = target_libc_config(
                     os_name, arch, self.config.base_image, base_config, base_layers,
-                    base_image_tag_verified=(
-                        parse_local_image_reference(self.config.base_image) is None
-                        and "@" not in self.config.base_image
-                        and getattr(self, "_base_image_tag_verified", False)
-                    ),
+                    base_image_tag_verified=self._has_verified_base_image_tag(),
                     variant=variant,
                 )
                 deps_layer=self._create_deps_layer(
@@ -793,6 +814,8 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
+        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+
         def upstream_client():
             log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
             auth=get_registry_auth(
@@ -805,11 +828,11 @@ class ImageBuilder:
             return upstream_client()
 
         def mirror_client(host):
-            return lambda: self._registry_client(host, repo, get_mirror_auth(host))
+            return lambda: self._registry_client(host, repo, get_mirror_auth(host, **log_options))
 
         endpoints=[(host, mirror_client(host)) for host in mirrors]
         endpoints.append((registry, upstream_client))
-        return MirroredPullClient(registry, endpoints)
+        return MirroredPullClient(registry, endpoints, **log_options)
 
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
@@ -1171,6 +1194,20 @@ class ImageBuilder:
         if self.config.volumes:
             self._print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
         self._print(f"  Include Dependencies: {self.config.include_deps}")
+        if self.config.include_deps:
+            try:
+                kind, value = self._dependency_source()
+            except FileNotFoundError as error:
+                self._print(f"  Dependency Source: unresolved ({error})")
+            else:
+                if kind == "lock":
+                    preflight_lockfile(Path(self.config.context_dir), value)
+                described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
+                self._print(f"  Dependency Source: {kind} ({described})")
+                if kind == "lock":
+                    self._print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
+            if self.config.strip_type_stubs:
+                self._print("  Strip Type Stubs: True")
         if self.config.system_packages:
             self._print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         for name in render_security_fragments(self.config.security, self.config.context_dir):
@@ -1184,31 +1221,107 @@ class ImageBuilder:
             for _, relative in self.context_files:
                 self._print(f"    {relative.as_posix()}")
 
+    def _uses_lockfile(self) -> bool:
+        if self.config.lockfile:
+            return True
+        if self.config.requirements_file or not self.config.use_lockfile:
+            return False
+        return detect_lockfile(Path(self.config.context_dir)) is not None
+
+    def _has_verified_base_image_tag(self) -> bool:
+        # A local name or digest reference cannot establish registry tag provenance.
+        return (
+            parse_local_image_reference(self.config.base_image) is None
+            and "@" not in self.config.base_image
+            and getattr(self, "_base_image_tag_verified", False)
+        )
+
+    def _dependency_source(self):
+        """Choose the dependency source: lock, requirements file, or virtualenv."""
+        cached = getattr(self, "_dependency_source_cache", None)
+        if cached is not None:
+            return cached
+        ctx = Path(self.config.context_dir)
+        if self.config.lockfile:
+            source = ("lock", relative_context_path(self.config.lockfile))
+        elif self.config.requirements_file:
+            source = ("requirements", relative_context_path(self.config.requirements_file))
+        else:
+            detected = detect_lockfile(ctx) if self.config.use_lockfile else None
+            if detected:
+                self._print(f"Using lockfile {detected} for dependencies (disable with --no-lockfile).")
+                source = ("lock", Path(detected))
+            else:
+                deps_paths = find_dependencies(
+                    ctx,
+                    DEFAULT_REQUIREMENTS_FILE,
+                    exclude_paths=self.dependency_excludes,
+                    exclude_defaults=False,
+                    prefer_requirements=self._check_conda_dependencies(),
+                )
+                if not deps_paths:
+                    raise FileNotFoundError(
+                        "Dependency staging was requested, but no supported lockfile, "
+                        "virtualenv site-packages or requirements.txt was found."
+                    )
+                if any(relative == Path(DEFAULT_REQUIREMENTS_FILE) for _, relative in deps_paths):
+                    source = ("requirements", Path(DEFAULT_REQUIREMENTS_FILE))
+                else:
+                    source = ("venv", deps_paths)
+        if source[0] != "venv":
+            self._dependency_source_cache = source
+        return source
+
+    def _lock_selection(self, base_config, os_name, arch, *, variant=None, base_image_tag_verified=False):
+        _, relative = self._dependency_source()
+        environment = target_environment(
+            os_name,
+            arch,
+            target_python_version(
+                getattr(self, "_base_image_name", self.config.base_image), base_config,
+                base_image_tag_verified=base_image_tag_verified,
+            ),
+            target_python_full_version(base_config),
+            variant=variant,
+        )
+        key = (os_name, arch, variant, environment["python_version"], environment["python_full_version"])
+        cache = getattr(self, "_lock_selection_cache", None)
+        if cache is None:
+            cache = self._lock_selection_cache = {}
+        if key not in cache:
+            cache[key] = load_lockfile(Path(self.config.context_dir), relative, environment)
+        return cache[key]
+
     def _check_conda_dependencies(self):
         ctx = Path(self.config.context_dir)
-        relative = relative_context_path(self.config.requirements_file)
+        selected_lock = self.config.lockfile
+        if not selected_lock and not self.config.requirements_file and self.config.use_lockfile:
+            selected_lock = detect_lockfile(ctx)
+        relative = relative_context_path(
+            selected_lock or self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE
+        )
         signals = detect_conda_inputs(
             ctx, exclude_paths=self.dependency_excludes, exclude_defaults=False,
             selected_paths=self.context_include_paths,
         )
-        requirements = ctx / relative
-        requirements_exist = requirements.is_file()
-        conda_requirements = requirements_exist and (
+        selected = ctx / relative
+        selected_exists = selected.is_file()
+        conda_requirements = selected_exists and (
             relative.name in CONDA_FILES
-            or requirements.resolve().name in CONDA_FILES
+            or selected.resolve().name in CONDA_FILES
         )
-        requirements_prefix = (
-            conda_prefix(ctx, relative) if requirements_exist else None
+        selected_prefix = (
+            conda_prefix(ctx, relative) if selected_exists else None
         )
-        if conda_requirements or requirements_prefix is not None:
+        if conda_requirements or selected_prefix is not None:
             if relative not in signals:
                 signals.append(relative)
         if not signals:
             return False
         if (
             conda_requirements
-            or not requirements_exist
-            or requirements_prefix is not None
+            or not selected_exists
+            or selected_prefix is not None
         ):
             raise ValueError(
                 f"Conda inputs detected ({', '.join(path.as_posix() for path in signals)}). "
@@ -1218,13 +1331,14 @@ class ImageBuilder:
                 "--include-deps. Conda-only packages must be provided by the base "
                 "image; host Conda environments are never copied."
             )
-        if not requirements.resolve().is_relative_to(ctx.resolve()):
-            raise ValueError("Requirements file must stay inside the build context.")
+        if not selected.resolve().is_relative_to(ctx.resolve()):
+            raise ValueError("Dependency file must stay inside the build context.")
         if not getattr(self, "_conda_warning_emitted", False):
             logger.warning(
-                "Conda inputs ignored (%s); installing only pip requirements from %s. "
+                "Conda inputs ignored (%s); installing only %s from %s. "
                 "Conda-only packages are not staged.",
                 self.config.redact(", ".join(path.as_posix() for path in signals)),
+                "locked dependencies" if selected_lock else "pip requirements",
                 self.config.redact(relative.as_posix()),
             )
             self._conda_warning_emitted = True
@@ -1239,25 +1353,20 @@ class ImageBuilder:
         arch: Optional[str] = None,
         variant: Optional[str] = None,
     ) -> Optional[OCILayer]:
-        """Create a target-compatible dependency layer from a venv or requirements."""
+        """Create a target-compatible dependency layer from a lock, requirements, or venv."""
         ctx=Path(self.config.context_dir)
-        prefer_requirements = self._check_conda_dependencies()
-        deps_paths=find_dependencies(
-            ctx,
-            self.config.requirements_file,
-            exclude_paths=self.dependency_excludes,
-            exclude_defaults=False,
-            prefer_requirements=prefer_requirements,
-        )
-        requirements_relative = relative_context_path(self.config.requirements_file)
-        is_requirements = any(
-            relative == requirements_relative for _, relative in deps_paths
-        )
-        if not deps_paths:
-            raise FileNotFoundError(
-                "Dependency staging was requested, but no supported virtualenv "
-                f"site-packages or {self.config.requirements_file!r} was found."
-            )
+        self._check_conda_dependencies()
+        source_kind, source_value = self._dependency_source()
+        if source_kind == "venv":
+            deps_paths = source_value
+        elif source_kind == "requirements":
+            requirements_relative = source_value
+            if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
+                raise ValueError("Requirements path must be relative and stay inside the build context.")
+            if not (ctx / requirements_relative).is_file():
+                raise FileNotFoundError(
+                    f"Requirements file not found: {requirements_relative.as_posix()}"
+                )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
         if variant is None:
@@ -1277,11 +1386,7 @@ class ImageBuilder:
         # a resolved registry tag, so they cannot establish the Python ABI or libc.
         # Later platforms reuse the first pinned base snapshot; they inherit tag
         # provenance only when that snapshot was resolved from the initial tag pull.
-        base_image_tag_verified = (
-            parse_local_image_reference(self.config.base_image) is None
-            and "@" not in self.config.base_image
-            and getattr(self, "_base_image_tag_verified", False)
-        )
+        base_image_tag_verified = self._has_verified_base_image_tag()
         version = target_python_version(
             base_image_name, base_config,
             base_image_tag_verified=base_image_tag_verified,
@@ -1295,7 +1400,43 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
-            if is_requirements:
+            if source_kind == "lock":
+                selection = self._lock_selection(
+                    base_config, os_name, arch, variant=variant,
+                    base_image_tag_verified=base_image_tag_verified,
+                )
+                self._print(
+                    f"Staging {len(selection.packages)} locked packages from "
+                    f"{selection.path.as_posix()}..."
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix=_LOCKFILE_STAGING_PREFIX, dir=ctx.resolve()
+                ) as requirements_dir:
+                    locked_requirements = Path(requirements_dir) / "locked-requirements.txt"
+                    locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
+                    install_requirements(
+                        locked_requirements,
+                        site_packages,
+                        ctx,
+                        os_name,
+                        arch,
+                        version,
+                        base_image_name,
+                        base_config,
+                        variant=variant,
+                        locked=True,
+                        base_image_tag_verified=base_image_tag_verified,
+                    )
+                verify_locked_installation(
+                    selection,
+                    ctx,
+                    site_packages,
+                    target_environment(
+                        os_name, arch, version, target_python_full_version(base_config),
+                        variant=variant,
+                    ),
+                )
+            elif source_kind == "requirements":
                 self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,
@@ -1317,11 +1458,15 @@ class ImageBuilder:
                     arch,
                     base_config,
                     ctx,
-                    ctx / requirements_relative,
+                    ctx / DEFAULT_REQUIREMENTS_FILE,
                     variant=variant,
                 )
                 reject_credentialed_direct_urls(site_packages)
 
+            if self.config.strip_type_stubs:
+                removed = strip_type_stubs(site_packages)
+                if removed:
+                    print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
@@ -1390,7 +1535,7 @@ class ImageBuilder:
                 self.config._conditional_includes,
             )
         )
-        configured_requirements = ctx / self.config.requirements_file
+        configured_requirements = ctx / (self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE)
         reject_shipped_credentials(
             files,
             ctx,

@@ -373,6 +373,120 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
         assert not any(item.startswith("PYTHON_LIBC=") for item in config["config"]["Env"])
 
 
+@pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
+def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path, monkeypatch, source):
+    from test_lockfiles import _write_target_marker_uv_project
+
+    ctx = tmp_path / "ctx"
+    _write_target_marker_uv_project(ctx)
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(ctx / "wheelhouse"))
+    registry = FakeBaseRegistry(
+        platforms=("amd64", "arm64", "arm/v7"),
+        base_env=["PYTHON_VERSION=3.11.9"],
+        libc_by_arch={"amd64": "2.28", "arm64": "2.36", "arm": "2.28"},
+    )
+    if source == "unresolved-tag":
+        client_factory = registry.client
+
+        def unresolved_client(*args, **kwargs):
+            client = client_factory(*args, **kwargs)
+            pull = client.pull_manifest
+
+            def pull_manifest(reference, **expected):
+                manifest, digest = pull(reference, **expected)
+                return manifest, None if reference == "3.11-slim" else digest
+
+            client.pull_manifest = pull_manifest
+            return client
+
+        registry.client = unresolved_client
+    installs = []
+    real_install = builder_module.install_requirements
+
+    def install(*args, **kwargs):
+        installs.append((args[4], kwargs["locked"], kwargs["base_image_tag_verified"]))
+        return real_install(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "install_requirements", install)
+    base_image = "python:3.11-slim"
+    if source == "digest":
+        base_image += "@" + registry.index_digest
+    platforms = (
+        "linux/amd64,linux/arm64,linux/arm/v7"
+        if source == "verified-tag"
+        else "linux/arm/v7,linux/amd64,linux/arm64"
+    )
+    builder = _builder(
+        tmp_path, monkeypatch, registry, ctx=ctx, include_deps=True, base_image=base_image,
+        platform=platforms,
+        labels={"example.label": "explicit"}, manifest_annotations={"example.manifest": "value"},
+        index_annotations={"example.index": "value"},
+    )
+
+    if source != "verified-tag":
+        with pytest.raises(ValueError, match="unverified or custom base image"):
+            builder.build()
+        assert installs == []
+        assert not (tmp_path / "out" / "index.json").exists()
+        return
+
+    builder.build()
+    assert installs == [("amd64", True, True), ("arm64", True, True), ("arm", True, True)]
+    index = json.loads(_blob(tmp_path / "out", builder.index_digest))
+    assert index["annotations"]["example.index"] == "value"
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        suffix = {"amd64": "amd", "arm64": "arm", "arm": "armv7"}[arch]
+        manifest = json.loads(_blob(tmp_path / "out", image.manifest_digest))
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert manifest["annotations"]["example.manifest"] == "value"
+        assert config["config"]["Labels"]["example.label"] == "explicit"
+        assert len(config["rootfs"]["diff_ids"]) == len(manifest["layers"])
+        assert config["rootfs"]["diff_ids"][-2:] == [
+            layer.digest for layer in image.layers[-2:]
+        ]
+        with tarfile.open(image.layers[-2].tar_path) as archive:
+            names = archive.getnames()
+        for prefix in ("marker_root", "marker_trans"):
+            assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
+            for other in {"amd", "arm", "armv7"} - {suffix}:
+                assert not any(f"{prefix}_{other}/" in name for name in names)
+
+
+def test_locked_arm_v7_rejects_incompatible_platform_wheel(tmp_path, monkeypatch):
+    from test_dependency_staging import _write_named_wheel
+    from test_lockfiles import _write_target_marker_uv_project
+
+    ctx = tmp_path / "ctx"
+    _write_target_marker_uv_project(ctx)
+    wheelhouse = ctx / "wheelhouse"
+    arm_wheel = wheelhouse / "marker_root_armv7-1.0-py3-none-manylinux2014_armv7l.whl"
+    _write_named_wheel(wheelhouse, "marker-root-armv7", tag="py3-none-manylinux2014_x86_64")
+    foreign_wheel = wheelhouse / "marker_root_armv7-1.0-py3-none-manylinux2014_x86_64.whl"
+    lock = ctx / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            arm_wheel.name, foreign_wheel.name
+        ).replace(
+            hashlib.sha256(arm_wheel.read_bytes()).hexdigest(),
+            hashlib.sha256(foreign_wheel.read_bytes()).hexdigest(),
+        ),
+        encoding="utf-8",
+    )
+    arm_wheel.unlink()
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(platforms=("arm/v7",)),
+        ctx=ctx, include_deps=True, platform="linux/arm/v7",
+    )
+
+    with pytest.raises(RuntimeError, match="linux/arm/v7"):
+        builder.build()
+    assert not (tmp_path / "out" / "index.json").exists()
+
+
 def test_normalize_platforms_strips_and_dedupes():
     assert normalize_platforms(" linux/amd64 , linux/arm64,linux/amd64") == [
         "linux/amd64",
@@ -1162,6 +1276,38 @@ def test_push_order_is_blobs_manifests_index_then_tags(tmp_path, monkeypatch):
     assert [call[1] for call in client.calls if call[0] == "index"] == [builder.index_digest, "v1", "latest"]
     assert all(call[2] == builder.index_digest for call in client.calls if call[0] == "index")
     assert builder.pushed_refs == ["registry.example/team/app:v1", "registry.example/team/app:latest"]
+
+
+def test_build_arguments_select_platforms_label_each_image_and_redact_index_output(
+    tmp_path, monkeypatch, capsys,
+):
+    value = "private-team"
+    platforms = "linux/amd64,linux/arm64,linux/arm/v7"
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7")),
+        tag="registry.example/${TEAM}/app:v1", platform="${PLATFORMS}",
+        labels={"team": "${TEAM}"}, build_args={"TEAM": value, "PLATFORMS": platforms},
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+    assert index["manifests"][2]["platform"] == {
+        "architecture": "arm", "os": "linux", "variant": "v7",
+    }
+    _verify_index = builder_module._verify_image_index
+    _verify_index(
+        out / "blobs" / "sha256", builder.index_digest, builder.index_size,
+        builder.platform_images, check_diff_ids=True,
+    )
+    for descriptor in index["manifests"]:
+        manifest = json.loads(_blob(out, descriptor["digest"]))
+        config = json.loads(_blob(out, manifest["config"]["digest"]))
+        assert config["config"]["Labels"]["team"] == value
+    monkeypatch.setattr(builder_module, "RegistryClient", FakePushClient())
+    builder.push(show_progress=True)
+    output = capsys.readouterr()
+    assert "Pushing image index" in output.out
+    assert value not in output.out + output.err
 
 
 def test_failed_index_push_publishes_no_tags(tmp_path, monkeypatch):

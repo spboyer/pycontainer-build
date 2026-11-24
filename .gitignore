@@ -155,3 +155,7 @@ plugins/vscode-pycontainer/*.vsix
 plugins/*/dist/
 plugins/*/build/
 plugins/*/*.egg-info/
+
+# Lockfile fixtures used by tests
+!tests/fixtures/lockfiles/**/poetry.lock
+!tests/fixtures/lockfiles/**/Pipfile.lock

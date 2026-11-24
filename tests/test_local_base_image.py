@@ -14,13 +14,15 @@ import pytest
 from pycontainer.blob_store import BlobIntegrityError
 from pycontainer.builder import ImageBuilder, UnsupportedPlatformError
 from pycontainer.config import BuildConfig
-from pycontainer.dependencies import target_libc_config
+from pycontainer.dependencies import install_requirements, target_libc_config, target_python_version
 from pycontainer.local_image import (
     LocalImageError,
     OCI_GZIP_LAYER,
     OCI_TAR_LAYER,
     parse_local_image_reference,
 )
+from test_dependency_staging import _write_wheel
+from test_lockfiles import _write_uv_project
 
 
 def sha(data: bytes) -> str:
@@ -1236,6 +1238,70 @@ def test_local_source_name_does_not_establish_python_abi(
     )
     with patch("pycontainer.dependencies.subprocess.Popen") as pip:
         pip.return_value.wait.return_value = 0
+        with pytest.raises(ValueError, match=expected):
+            builder.build()
+        pip.assert_not_called()
+
+
+@pytest.mark.parametrize("transport", ["oci", "docker"])
+def test_local_source_lockfile_keeps_unverified_provenance(tmp_path, monkeypatch, offline, transport):
+    name = "docker.io/library/python:3.11-slim"
+    base_image = local_source_with_env(
+        tmp_path, transport, name,
+        ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=musl-1.2"],
+    )
+    context = tmp_path / "context"
+    wheel = _write_wheel(context / "wheelhouse", tag="cp311-cp311-musllinux_1_2_x86_64")
+    _write_uv_project(context, wheel)
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace("fixture_dep-1.0-py3-none-any.whl", wheel.name),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
+    builder = ImageBuilder(
+        BuildConfig(
+            tag="app:v1", base_image=base_image, context_dir=str(context),
+            output_dir=str(tmp_path / "out"), include_deps=True, use_cache=False,
+        )
+    )
+    with patch("pycontainer.builder.target_python_version", wraps=target_python_version) as version, patch(
+        "pycontainer.builder.install_requirements", wraps=install_requirements
+    ) as install:
+        builder.build()
+
+    assert version.call_args_list
+    assert all(
+        call.args[0] == name and call.kwargs["base_image_tag_verified"] is False
+        for call in version.call_args_list
+    )
+    assert install.call_args.args[6] == name
+    assert install.call_args.kwargs["base_image_tag_verified"] is False
+    assert install.call_args.kwargs["locked"] is True
+    with tarfile.open(builder.layers[1].tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+
+
+@pytest.mark.parametrize("transport", ["oci", "docker"])
+@pytest.mark.parametrize("env,expected", [
+    (["PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17"], "PYTHON_IMPLEMENTATION"),
+    (["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9"], "PYTHON_LIBC"),
+])
+def test_local_source_lockfile_requires_explicit_abi_and_libc(
+    tmp_path, offline, transport, env, expected
+):
+    base_image = local_source_with_env(
+        tmp_path, transport, "docker.io/library/python:3.11-slim", env
+    )
+    context = _write_uv_project(tmp_path / "context")
+    builder = ImageBuilder(
+        BuildConfig(
+            tag="app:v1", base_image=base_image, context_dir=str(context),
+            output_dir=str(tmp_path / "out"), include_deps=True, use_cache=False,
+        )
+    )
+    with patch("pycontainer.dependencies.subprocess.Popen") as pip:
         with pytest.raises(ValueError, match=expected):
             builder.build()
         pip.assert_not_called()

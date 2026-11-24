@@ -3,7 +3,9 @@ import codecs
 import configparser
 import csv
 import json
+import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -27,6 +29,7 @@ from .venv_markers import declared_roots, host_facts, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
+logger = logging.getLogger(__name__)
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 CLOSURE_TIMEOUT_SECONDS = 120
@@ -73,6 +76,9 @@ _DEBIAN_GLIBC_MINOR = {
 }
 _ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
+_LAUNCHER_RECORD_PATH = re.compile(
+    r"(?:\.\./\.\./Scripts|\.\./\.\./\.\./bin)/([^/:]+)", re.IGNORECASE
+)
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
     "--build",
@@ -169,10 +175,20 @@ def target_python_version(
         raise ValueError("Dependency staging supports CPython targets only.")
 
     value = environment.get("PYTHON_VERSION")
+    match = re.match(r"(\d+\.\d+)(?:\.(\d+))?(?:-|$)", image_tag)
     if value and re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value):
+        if official_python and match:
+            version_parts = tuple(int(part) for part in value.split("."))
+            tag_parts = tuple(int(part) for part in match.group(1).split("."))
+            if match.group(2) is not None:
+                tag_parts += (int(match.group(2)),)
+            if version_parts[:len(tag_parts)] != tag_parts[:len(version_parts)]:
+                raise ValueError(
+                    f"Verified base image tag {image_tag!r} conflicts with "
+                    f"PYTHON_VERSION={value} in its image config."
+                )
         return ".".join(value.split(".")[:2])
 
-    match = re.match(r"(\d+\.\d+)(?:\.\d+)?(?:-|$)", image_tag)
     if official_python and match:
         return match.group(1)
     raise ValueError(
@@ -180,6 +196,14 @@ def target_python_version(
         "use a verified tag-only official python:<major>.<minor> pull or a base image with "
         "PYTHON_VERSION metadata."
     )
+
+
+def target_python_full_version(base_config: Optional[dict]) -> Optional[str]:
+    """Return the base image's exact ``PYTHON_VERSION`` when it is a final release."""
+    value = _base_environment(base_config).get("PYTHON_VERSION")
+    if value and re.fullmatch(r"\d+\.\d+\.\d+", value):
+        return value
+    return None
 
 
 def _base_environment(base_config: Optional[dict]) -> dict:
@@ -429,6 +453,7 @@ def install_requirements(
     base_config: Optional[dict],
     variant: Optional[str] = None,
     *,
+    locked: bool = False,
     base_image_tag_verified: bool = False,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
@@ -437,10 +462,18 @@ def install_requirements(
         base_image_tag_verified=base_image_tag_verified,
         variant=variant,
     )
-    requirement_files = _scan_requirements(requirements, context_dir)[1]
+    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
+    if not locked and not hash_pinned:
+        logger.warning(
+            "%s is not fully pinned with ==versions and --hash values, so the "
+            "dependency layer is not reproducible. Use a lockfile or "
+            "`pip-compile --generate-hashes`.",
+            requirements.name,
+        )
     target = _target_text(os_name, arch, variant)
 
     destination.mkdir(parents=True, exist_ok=True)
+    locked_options = ["--no-deps", "--require-hashes"] if locked else []
     error_file = destination.parent / _MARKER_ERROR_FILE
     marker_config = {
         "environment": _target_marker_environment(
@@ -453,6 +486,7 @@ def install_requirements(
         sys.executable,
         # Ignore PYTHONPATH/PYTHONHOME so host modules cannot shadow the pinned pip.
         "-E",
+        "-P",
         "-c",
         _PIP_TARGET_SCRIPT.read_text(encoding="utf-8"),
         json.dumps(marker_config),
@@ -461,6 +495,7 @@ def install_requirements(
         "--no-input",
         "--no-cache-dir",
         "--no-compile",
+        *locked_options,
         # pip's conflict check evaluates markers of the host's installed packages.
         "--no-warn-conflicts",
         "--target",
@@ -521,6 +556,11 @@ def install_requirements(
             f"platform; refusing to use host markers. {details}"
         )
     if returncode:
+        hint = (
+            " Locked artifacts must match their recorded hashes."
+            if locked
+            else ""
+        )
         raise RuntimeError(
             _pip_failure_message(
                 redact(pip_output, secrets),
@@ -529,7 +569,7 @@ def install_requirements(
                 python_version,
                 redact(pip_debug, secrets),
                 variant,
-            )
+            ) + hint
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -725,16 +765,19 @@ def _scan_requirements(
     context_dir: Path,
     check_overrides: bool = True,
     constraints: Optional[List[str]] = None,
-) -> Tuple[List[str], List[Path]]:
-    """Validate a context-local requirements graph; return root lines and files."""
+) -> Tuple[List[str], List[Path], bool]:
+    """Validate a local requirements graph and report roots, files and hash pinning."""
     context_root = context_dir.resolve()
     pending = [(requirements.resolve(strict=True), False)]
     visited = set()
+    counted_files = set()
     total_bytes = 0
+    hash_pinned = True
     roots = []
     while pending:
         path, constraint = pending.pop()
-        if (path, constraint) in visited:
+        visit = (path, constraint)
+        if visit in visited:
             continue
         try:
             path.relative_to(context_root)
@@ -742,14 +785,15 @@ def _scan_requirements(
             raise ValueError(
                 f"Requirements include must stay inside the build context: {path}"
             ) from exc
-        visited.add((path, constraint))
-        size = path.stat().st_size
-        total_bytes += size
-        if total_bytes > MAX_REQUIREMENTS_BYTES:
-            raise ValueError(
-                "Requirements files exceed the combined "
-                f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-            )
+        visited.add(visit)
+        if path not in counted_files:
+            counted_files.add(path)
+            total_bytes += path.stat().st_size
+            if total_bytes > MAX_REQUIREMENTS_BYTES:
+                raise ValueError(
+                    "Requirements files exceed the combined "
+                    f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+                )
 
         text = _read_requirements_text(path)
         reject_literal_credentials(path, text, context_root)
@@ -771,6 +815,11 @@ def _scan_requirements(
                 raise ValueError(f"Invalid requirements syntax in {path}.") from exc
             if not options:
                 continue
+            if not options[0].startswith("-"):
+                if not constraint:
+                    hash_pinned = hash_pinned and _is_hash_pinned(options)
+            elif options[0] == "--editable" or options[0].startswith(("-e", "--editable=")):
+                hash_pinned = False
             for option in options:
                 name = option.split("=", 1)[0]
                 if check_overrides and name in _PIP_OVERRIDE_OPTIONS:
@@ -812,9 +861,25 @@ def _scan_requirements(
                     )
                 included_path = (path.parent / include).resolve(strict=True)
                 pending.append((included_path, include_constraint))
-    return roots, sorted({path for path, _ in visited})
+    return roots, sorted(counted_files), hash_pinned
 
 
+def _is_hash_pinned(options: List[str]) -> bool:
+    words = []
+    has_hash = False
+    skip_value = False
+    for option in options:
+        if skip_value:
+            skip_value = False
+        elif option == "--hash":
+            has_hash = skip_value = True
+        elif option.startswith("--hash="):
+            has_hash = True
+        elif not option.startswith("-"):
+            words.append(option)
+    specifier = " ".join(words).split(";", 1)[0].strip()
+    exact = re.fullmatch(r"[^=<>!~@,]+===?\s*[^\s,*]+", specifier) is not None
+    return exact and has_hash
 def reject_literal_credentials(path: Path, text: str, context_root: Path) -> None:
     findings = find_credentials(text)
     if not findings:
@@ -965,34 +1030,7 @@ def _verify_target_closure(
             "Cannot verify the target dependency closure of egg distributions: "
             f"{', '.join(legacy)}. Reinstall them as wheels or use a requirements file."
         )
-    distributions = []
-    for dist_info in sorted(site_packages.glob("*.dist-info")):
-        metadata = dist_info / "METADATA"
-        if not metadata.is_file() or metadata.is_symlink():
-            raise ValueError(f"Virtualenv package is missing METADATA: {dist_info.name}")
-        if metadata.stat().st_size > MAX_METADATA_BYTES:
-            raise ValueError(
-                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
-                f"{dist_info.name}"
-            )
-        try:
-            text = metadata.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
-        message = Parser().parsestr(text, headersonly=True)
-        if message.defects:
-            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
-        headers = {
-            name: [str(value) for value in message.get_all(name, [])]
-            for name in _CLOSURE_HEADERS
-        }
-        distributions.append(
-            {
-                "path": f"{dist_info.name}/METADATA",
-                "directory": dist_info.name[: -len(".dist-info")],
-                "headers": headers,
-            }
-        )
+    distributions = _read_staged_distributions(site_packages)
     if not distributions and not any(lines for _, _, lines in roots):
         return
 
@@ -1051,6 +1089,39 @@ def _verify_target_closure(
             + "; ".join(problems)
             + ". Use a requirements file so pip resolves dependencies for the target."
         )
+
+
+def _read_staged_distributions(site_packages: Path) -> List[dict]:
+    """Collect bounded wheel metadata without importing the staged packages."""
+    distributions = []
+    for dist_info in sorted(site_packages.glob("*.dist-info")):
+        metadata = dist_info / "METADATA"
+        if not metadata.is_file() or metadata.is_symlink():
+            raise ValueError(f"Package is missing METADATA: {dist_info.name}")
+        if metadata.stat().st_size > MAX_METADATA_BYTES:
+            raise ValueError(
+                f"Package metadata exceeds the {MAX_METADATA_BYTES}-byte limit: "
+                f"{dist_info.name}"
+            )
+        try:
+            text = metadata.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Package metadata is not valid UTF-8: {dist_info.name}") from exc
+        message = Parser().parsestr(text, headersonly=True)
+        if message.defects:
+            raise ValueError(f"Package metadata has malformed headers: {dist_info.name}")
+        headers = {
+            name: [str(value) for value in message.get_all(name, [])]
+            for name in _CLOSURE_HEADERS
+        }
+        distributions.append(
+            {
+                "path": f"{dist_info.name}/METADATA",
+                "directory": dist_info.name[: -len(".dist-info")],
+                "headers": headers,
+            }
+        )
+    return distributions
 
 
 def _validate_virtualenv_version(
@@ -1172,6 +1243,184 @@ def staged_packages(
                 f"Staged package metadata is missing Name or Version: {metadata}"
             )
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
+
+
+def strip_type_stubs(site_packages: Path) -> List[str]:
+    """Remove stub-only distributions and ``.pyi`` files; return removed names.
+
+    Every RECORD is validated and every deletion is resolved before anything
+    is changed, so invalid input raises without a partial rewrite.
+    """
+    if not site_packages.is_dir():
+        return []
+    root = site_packages.resolve()
+    records = {}
+    record_paths = {}
+    for info_dir in sorted(site_packages.glob("*.dist-info")):
+        if not info_dir.is_dir():
+            continue
+        record = info_dir / "RECORD"
+        rows = _read_record(record) if record.is_file() else None
+        records[info_dir] = rows
+        record_paths[info_dir] = [path for _, path in rows or () if path]
+
+    stub_dirs = []
+    for info_dir, rows in records.items():
+        name = _distribution_name(info_dir)
+        if not (name.startswith("types-") or name.endswith("-stubs")):
+            continue
+        if rows is None:
+            raise ValueError(
+                f"Cannot strip type stub distribution without a RECORD: {info_dir.name}"
+            )
+        paths = record_paths[info_dir]
+        escaping = [
+            path for path in paths
+            if _is_escaping_record_path(path) and not _is_launcher_record_path(path)
+        ]
+        if escaping:
+            raise ValueError(
+                f"RECORD path escapes site-packages in {info_dir.name}: {escaping[0]}"
+            )
+        if all(_is_stub_record_path(path, info_dir.name) for path in paths):
+            stub_dirs.append(info_dir)
+        else:
+            logger.warning(
+                "Keeping %s: it ships runtime files; only its .pyi files are removed.",
+                info_dir.name,
+            )
+
+    retained_keys = set()
+    for info_dir, paths in record_paths.items():
+        if info_dir in stub_dirs:
+            continue
+        for path in paths:
+            if _is_escaping_record_path(path):
+                if not _is_launcher_record_path(path):
+                    raise ValueError(
+                        f"RECORD path escapes site-packages in {info_dir.name}: {path}"
+                    )
+                continue
+            retained_keys.add(_record_key(path))
+
+    removals = {}
+    for path in site_packages.rglob("*.pyi"):
+        if path.is_file() or path.is_symlink():
+            relative = path.relative_to(site_packages).as_posix()
+            removals[_record_key(relative)] = relative
+    for info_dir in stub_dirs:
+        for path in record_paths[info_dir]:
+            normalized = _normalize_record_path(path)
+            key = _record_key(normalized)
+            in_metadata = os.path.normcase(normalized.split("/", 1)[0]) == os.path.normcase(
+                info_dir.name
+            )
+            if in_metadata or key in retained_keys:
+                continue
+            removals.setdefault(key, normalized)
+    files = []
+    for relative in sorted(removals.values()):
+        target = site_packages / relative
+        if not (target.is_file() or target.is_symlink()):
+            continue
+        if not target.parent.resolve().is_relative_to(root):
+            raise ValueError(f"Type stub path resolves outside site-packages: {relative}")
+        files.append(target)
+    for info_dir in stub_dirs:
+        if info_dir.is_symlink() or not info_dir.resolve().is_relative_to(root):
+            raise ValueError(
+                f"Type stub metadata resolves outside site-packages: {info_dir.name}"
+            )
+    rewrites = []
+    for info_dir, rows in records.items():
+        if info_dir in stub_dirs or rows is None:
+            continue
+        kept = [
+            line for line, path in rows
+            if path is None
+            or _is_escaping_record_path(path)
+            or _record_key(path) not in removals
+        ]
+        if len(kept) != len(rows):
+            rewrites.append((info_dir / "RECORD", b"".join(kept)))
+
+    for target in files:
+        target.unlink()
+    for info_dir in stub_dirs:
+        shutil.rmtree(info_dir)
+    for record, content in rewrites:
+        record.write_bytes(content)
+    parents = sorted(
+        {parent for target in files for parent in target.parents
+         if parent != site_packages and site_packages in parent.parents},
+        key=lambda directory: len(directory.parts),
+        reverse=True,
+    )
+    for directory in parents:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    return sorted(_distribution_name(info_dir) for info_dir in stub_dirs)
+
+
+def _read_record(record: Path) -> List[Tuple[bytes, Optional[str]]]:
+    """Return raw lines with their path; blank lines have no path."""
+    rows = []
+    for number, line in enumerate(record.read_bytes().splitlines(keepends=True), 1):
+        try:
+            text = line.decode("utf-8")
+            fields = next(csv.reader([text], strict=True)) if text.strip() else None
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise ValueError(f"Malformed RECORD {record} line {number}: {error}") from error
+        if fields is None:
+            rows.append((line, None))
+            continue
+        if len(fields) != 3 or not fields[0] or "\0" in fields[0]:
+            raise ValueError(f"Malformed RECORD {record} line {number}")
+        rows.append((line, fields[0]))
+    return rows
+
+
+def _distribution_name(info_dir: Path) -> str:
+    metadata = info_dir / "METADATA"
+    name = None
+    if metadata.is_file():
+        with metadata.open(encoding="utf-8", errors="replace") as stream:
+            name = Parser().parse(stream, headersonly=True).get("Name")
+    if not name:
+        name = info_dir.name[: -len(".dist-info")].split("-", 1)[0]
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _is_escaping_record_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return (
+        normalized.startswith("/")
+        or PureWindowsPath(path).drive != ""
+        or ".." in normalized.split("/")
+    )
+
+
+def _is_launcher_record_path(path: str) -> bool:
+    # Venv launchers: Lib/site-packages -> ../../Scripts, lib/pythonX.Y/site-packages -> ../../../bin.
+    match = _LAUNCHER_RECORD_PATH.fullmatch(path.replace("\\", "/"))
+    return bool(match) and match.group(1) not in {".", ".."} and not path.lower().endswith(".pyi")
+
+
+def _is_stub_record_path(path: str, info_name: str) -> bool:
+    parts = _normalize_record_path(path).split("/")
+    if os.path.normcase(parts[0]) == os.path.normcase(info_name):
+        return True
+    if parts[-1].endswith(".pyi") or parts[-1] == "py.typed":
+        return True
+    return len(parts) > 1 and parts[0].endswith("-stubs") and parts[-1] == "METADATA.toml"
+
+
+def _normalize_record_path(path: str) -> str:
+    return posixpath.normpath(path.replace("\\", "/"))
+
+
+def _record_key(path: str) -> str:
+    return os.path.normcase(_normalize_record_path(path))
 
 
 def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
