@@ -34,6 +34,7 @@ from pycontainer.registry_client import (
 trustme = pytest.importorskip("trustme")
 
 SERVER_TIMEOUT_SECONDS = 10
+SERVER_POLL_INTERVAL_SECONDS = 0.01
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 
 
@@ -135,7 +136,9 @@ def _serve(tls_context=None):
     server.timeout = SERVER_TIMEOUT_SECONDS
     if tls_context is not None:
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": SERVER_POLL_INTERVAL_SECONDS}, daemon=True
+    )
     thread.start()
     try:
         yield server.server_address[1], state

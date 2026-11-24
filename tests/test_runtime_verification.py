@@ -16,6 +16,12 @@ RUN_ID = "12345"
 RUN_ATTEMPT = "2"
 
 
+def test_ci_concurrency_cancels_only_superseded_pull_request_runs():
+    workflow = (WORKFLOWS / "tests.yml").read_text()
+    assert "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}" in workflow
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
+
+
 def load_script(name):
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
