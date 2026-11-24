@@ -145,6 +145,38 @@ def test_imported_empty_entrypoint_and_cmd_clear_base_values(tmp_path, monkeypat
 
 @pytest.mark.parametrize(
     ("entrypoint", "cmd", "expected_entrypoint", "expected_cmd"),
+    [
+        (None, ["python", "app.py"], ["docker-entrypoint.sh"], ["python", "app.py"]),
+        ([], [], None, None),
+        ([], None, None, ["python3"]),
+    ],
+)
+def test_locked_build_preserves_cmd_inheritance_and_explicit_clears(
+    tmp_path, monkeypatch, entrypoint, cmd, expected_entrypoint, expected_cmd
+):
+    from test_lockfiles import _offline_wheelhouse, _write_uv_project
+
+    context = tmp_path / "context"
+    wheel = _offline_wheelhouse(monkeypatch, context)
+    _write_uv_project(context, wheel)
+    base = copy.deepcopy(ENTRYPOINT_BASE)
+    base["config"]["Env"] = [
+        "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8", "PYTHON_LIBC=glibc-2.17",
+    ]
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "out"), use_cache=False,
+        base_image="python:3.11-slim-bookworm", include_deps=True,
+        entrypoint=entrypoint, cmd=cmd,
+    )
+
+    image = _built_config(tmp_path, monkeypatch, base, config)["config"]
+
+    assert image.get("Entrypoint") == expected_entrypoint
+    assert image.get("Cmd") == expected_cmd
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "cmd", "expected_entrypoint", "expected_cmd"),
     [(None, ["python", "app.py"], ["docker-entrypoint.sh"], ["python", "app.py"]),
      ([], [], None, None)],
     ids=["inherit-entrypoint", "clear-entrypoint-and-cmd"],

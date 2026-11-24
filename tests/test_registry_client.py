@@ -275,6 +275,35 @@ def test_head_manifest_verifies_signer_visible_descriptor(monkeypatch, mismatch)
         with pytest.raises(BlobIntegrityError, match="HEAD descriptor"):
             client.verify_manifest_descriptor(digest, digest, 42, media_type)
 
+def _manifest_with_header(monkeypatch, header):
+    client = RegistryClient("registry.example", "team/app")
+    body = json.dumps({"schemaVersion": 2, "mediaType": "application/test"}).encode()
+    monkeypatch.setattr(
+        client, "_make_request",
+        lambda *args, **kwargs: (200, body, {"Docker-Content-Digest": header(body)}),
+    )
+    return client, body
+
+
+def test_pull_manifest_verifies_sha512_digest_header(monkeypatch):
+    client, body = _manifest_with_header(
+        monkeypatch, lambda body: "sha512:" + hashlib.sha512(body).hexdigest()
+    )
+    _, digest = client.pull_manifest("latest")
+    assert digest == "sha512:" + hashlib.sha512(body).hexdigest()
+
+    forged = "sha512:" + hashlib.sha512(b"other").hexdigest()
+    client, _ = _manifest_with_header(monkeypatch, lambda body: forged)
+    with pytest.raises(BlobIntegrityError, match="digest does not match") as error:
+        client.pull_manifest("latest")
+    assert forged not in str(error.value)
+
+
+def test_pull_manifest_returns_unsupported_digest_header_opaquely(monkeypatch):
+    client, body = _manifest_with_header(monkeypatch, lambda body: "blake3:" + "0" * 64)
+    _, digest = client.pull_manifest("latest")
+    assert digest == "blake3:" + "0" * 64
+
 def test_registry_client_construction():
     """Test RegistryClient initialization."""
     client=RegistryClient("ghcr.io","user/repo")

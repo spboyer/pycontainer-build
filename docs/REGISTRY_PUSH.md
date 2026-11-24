@@ -426,6 +426,11 @@ shown, messages are truncated, control characters are removed, and credentials
 are replaced with `[REDACTED]`. Registry hosts and HTTP(S) URLs in error
 details omit userinfo and query strings.
 
+## Deleting and Pruning Images
+
+To delete images or prune old semantic versions from a registry, see the
+[Registry Cleanup Guide](REGISTRY_CLEANUP.md). Pruning is a dry run by default.
+
 ## Authentication Priority
 
 pycontainer tries authentication methods in this order:

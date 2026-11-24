@@ -107,6 +107,20 @@ gate passes and the release job re-verifies evidence for its own attempt. The
 release notes include the validated targets.
 Licensing and PyPI publication remain separate owner decisions (#79).
 
+For opt-in lockfile startup evidence, choose `dependency_fixture: lockfile`
+when manually dispatching `Runtime image check`, or add
+`--dependency-fixture lockfile` to the command above. The committed
+`tests/fixtures/runtime-lock` fixture contains offline wheels and a hashed
+uv lock. The script checks each selected wheel archive against the lock before
+staging; the started container separately checks distribution names and
+versions, imports, and installed module and METADATA hashes derived from those
+verified wheels. The platform-tagged wheels contain Python only and do not test
+native binaries. The evidence records the fixture path, lock digest,
+assertion-script digest, package hashes and the two checks separately. The lock
+gate compares these with its committed fixture and requires the same commit,
+run and attempt for both native targets. Manual lock runs do not replace the
+default requirements release gate.
+
 ## Overview
 
 This document defines the comprehensive testing strategy for pycontainer-build, ensuring quality, reliability, and correctness at every phase of development.
