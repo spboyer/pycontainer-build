@@ -997,8 +997,9 @@ pycontainer build --config pycontainer.toml
 ```
 
 The result is validated with the same loader and resolver `build --config`
-uses before it is published. An existing file is refused unless `--force` is
-passed (templates only), and cancellation never exposes a partial output file.
+uses before it is published. An existing regular file is refused unless
+`--force` is passed (templates only); links, directories and special files are
+rejected. Cancellation never exposes a partial output file.
 Creating without `--force` requires hard-link support for atomic no-clobber publication.
 Templates write configuration only; they do not add application code or new
 framework detection. See [configuration templates and wizard](docs/init-config.md).

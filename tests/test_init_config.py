@@ -2,10 +2,12 @@ import errno
 import io
 import os
 import socket
+import stat
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -203,6 +205,72 @@ def test_directory_and_symlink_targets_are_rejected(offline, monkeypatch):
     assert _run(monkeypatch, ["init", "-t", "generic", "-o", "link/pycontainer.toml"]) == 2
     assert _run(monkeypatch, ["init", "-t", "generic", "-o", "link.toml", "--force"]) == 2
     assert list(real.iterdir()) == [] and not (offline / "victim.toml").exists()
+
+
+@pytest.mark.parametrize("kind", [stat.S_IFIFO, stat.S_IFSOCK], ids=["fifo", "socket"])
+@pytest.mark.parametrize("force", [False, True])
+def test_nonregular_outputs_are_rejected(offline, monkeypatch, capsys, kind, force):
+    target = offline / "pycontainer.toml"
+    target.write_text("# existing\n")
+    real_lstat = Path.lstat
+
+    def special_lstat(path):
+        if path == target:
+            return SimpleNamespace(st_mode=kind | 0o600)
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", special_lstat)
+    args = ["init", "-t", "generic"] + (["--force"] if force else [])
+    assert _run(monkeypatch, args) == 2
+    assert "regular file" in capsys.readouterr().err
+    assert target.read_text() == "# existing\n"
+    assert _files(offline) == ["pycontainer.toml"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special files are required")
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+@pytest.mark.parametrize("force", [False, True])
+def test_real_special_outputs_are_preserved(offline, monkeypatch, capsys, kind, force):
+    target = offline / "pycontainer.toml"
+    listener = None
+    if kind == "fifo":
+        os.mkfifo(target, 0o600)
+    else:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(target.name)
+        listener.listen()
+    before = target.lstat()
+    try:
+        args = ["init", "-t", "generic"] + (["--force"] if force else [])
+        assert _run(monkeypatch, args) == 2
+        assert "regular file" in capsys.readouterr().err
+        after = target.lstat()
+        assert (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)) == (
+            before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)
+        )
+        if listener is not None:
+            assert listener.getsockname() == target.name
+        assert _files(offline) == ["pycontainer.toml"]
+    finally:
+        if listener is not None:
+            listener.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO is required")
+def test_force_rejects_fifo_created_during_validation(offline, monkeypatch):
+    target = offline / "pycontainer.toml"
+    real_resolve = init_config.resolve_build_config
+
+    def create_fifo(path, overrides):
+        result = real_resolve(path, overrides)
+        os.mkfifo(target, 0o600)
+        return result
+
+    monkeypatch.setattr(init_config, "resolve_build_config", create_fifo)
+    with pytest.raises(init_config.InitError, match="regular file"):
+        init_config.publish("[build]\n", target, force=True)
+    assert stat.S_ISFIFO(target.lstat().st_mode)
+    assert _files(offline) == ["pycontainer.toml"]
 
 
 def test_parent_swapped_for_link_after_validation_is_rejected(offline):
@@ -453,6 +521,71 @@ def test_cleanup_failure_reports_possible_output(offline, monkeypatch, capsys):
     assert stage_paths[0].read_bytes() == target.read_bytes()
     stage_paths[0].unlink()
     assert _files(offline) == ["pycontainer.toml"]
+
+
+@pytest.mark.parametrize("mode", ["template", "wizard"])
+@pytest.mark.parametrize("primary", ["collision", "interrupt"])
+def test_cleanup_failure_preserves_primary_error(offline, monkeypatch, capsys, mode, primary):
+    target = offline / "pycontainer.toml"
+    stage_paths = []
+    real_unlink = Path.unlink
+
+    def reject_staging_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".pycontainer-init-stage-"):
+            stage_paths.append(path)
+            raise PermissionError(errno.EACCES, "cleanup denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_link(source, destination):
+        if primary == "collision":
+            target.write_text("# concurrent\n")
+            raise FileExistsError(errno.EEXIST, "exists", str(destination))
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", reject_staging_cleanup)
+        patch.setattr(init_config.os, "link", fail_link)
+        if mode == "template":
+            code = _run(patch, ["init", "-t", "generic"])
+            err = capsys.readouterr().err
+        else:
+            code, _, _, err = _wizard(FASTAPI_ANSWERS)
+
+    try:
+        assert code == (1 if primary == "collision" else 130)
+        assert ("refusing to overwrite" if primary == "collision" else "Interrupted") in err
+        assert "cleanup denied" in err
+        assert len(stage_paths) == 1 and stage_paths[0].name in err
+        if primary == "collision":
+            assert target.read_text() == "# concurrent\n"
+        else:
+            assert not target.exists()
+    finally:
+        for path in stage_paths:
+            path.unlink(missing_ok=True)
+
+
+def test_probe_cleanup_failure_preserves_primary_error(offline, monkeypatch):
+    probe_paths = []
+    real_unlink = Path.unlink
+
+    def reject_probe_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".pycontainer-init-mode-"):
+            probe_paths.append(path)
+            raise PermissionError(errno.EACCES, "probe cleanup denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", reject_probe_cleanup)
+        patch.setattr(init_config.os, "fstat", lambda fd: (_ for _ in ()).throw(OSError("probe stat failed")))
+        try:
+            with pytest.raises(OSError, match="probe stat failed") as error:
+                init_config._output_creation_mode(offline)
+            assert any("probe cleanup denied" in note for note in error.value.__notes__)
+        finally:
+            patch.setattr(Path, "unlink", real_unlink)
+            for path in probe_paths:
+                path.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX umask controls file permissions")

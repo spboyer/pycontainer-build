@@ -96,8 +96,9 @@ registry credentials, tokens, environment variables or labels.
 - The output path must be relative to the current directory, end in `.toml`,
   use only letters, digits, `.`, `_` and `-` in each component, and stay
   inside the current directory. Absolute, drive-qualified or rooted paths,
-  `..`, links, directories, Windows reserved device names (`NUL`, `CON`,
-  `COM1`, ...), missing parent directories and `pyproject.toml`
+  `..`, links, directories, special files such as FIFOs and Unix sockets,
+  Windows reserved device names (`NUL`, `CON`, `COM1`, ...), missing parent
+  directories and `pyproject.toml`
   are rejected (exit 2); `init` never creates missing output directories or
   edits project metadata. The parent is checked again immediately before
   staging and publishing.
@@ -111,9 +112,10 @@ registry credentials, tokens, environment variables or labels.
   unavailable, publication fails explicitly (exit 2) rather than writing
   the output in place. The wizard never replaces files and asks for another
   path instead.
-- On POSIX, new output permissions respect the process umask. With `--force`,
-  existing permission bits are not broadened: the new file's mode is
-  intersected with the existing mode. Ownership and extended ACLs are not
+- On POSIX, the output mode matches normal `0644` creation in the output
+  directory, respecting the process umask unless a default ACL applies. With
+  `--force`, existing permission bits are not broadened: the new file's mode
+  is intersected with the existing mode. Ownership and extended ACLs are not
   preserved; concurrent changes to the target or its permissions are not
   synchronized. On Windows the staged file inherits the output directory ACL.
 - Path checks do not protect against a directory or staging file being replaced
@@ -121,8 +123,9 @@ registry credentials, tokens, environment variables or labels.
 - End of input or a declined confirmation (exit 1) publishes nothing. Ctrl+C
   (exit 130) before publication leaves the destination unchanged; an
   interruption during publication may leave the complete output, but never
-  a partial output file. If the OS prevents staging-file cleanup, the error is
-  reported and the staging file may remain.
+  a partial output file. An interrupt during temporary-file creation can leave
+  an empty temporary file. If the OS prevents cleanup, the cleanup error and
+  any original error are reported, and the temporary file may remain.
 - `context_dir` is written as given and resolved relative to the directory
   `build` runs in, not the configuration file's location; run `build` from the
   directory where you ran `init`.

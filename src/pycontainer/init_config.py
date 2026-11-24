@@ -185,17 +185,30 @@ def resolve_output_path(raw: str, cwd: Optional[Path] = None) -> Path:
 
 
 def _check_target(target: Path) -> None:
-    """Reject a target whose (already resolved) parent became a link, or a link/directory target."""
+    """Reject linked parents and existing targets that are not regular files."""
     if os.path.normcase(str(target.parent.resolve())) != os.path.normcase(str(target.parent)):
         raise InitError(f"output directory {target.parent} is a link; write to a real directory")
-    if target.is_symlink() or target.is_dir():
-        raise InitError(f"output path {target} is a link or directory")
+    try:
+        mode = target.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise InitError(f"output path {target} is not a regular file; links, directories and special files are rejected")
 
 
 def _write_staged(handle: BinaryIO, content: bytes) -> None:
     handle.write(content)
     handle.flush()
     os.fsync(handle.fileno())
+
+
+def _cleanup_temp(path: Path, failure: Optional[BaseException]) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        if failure is None:
+            raise
+        failure.add_note(f"cannot clean up temporary file {path}: {exc}")
 
 
 def _output_creation_mode(directory: Path) -> int:
@@ -205,11 +218,15 @@ def _output_creation_mode(directory: Path) -> int:
             handle = open(probe, "xb", opener=lambda path, flags: os.open(path, flags, 0o644))
         except FileExistsError:
             continue
+        failure = None
         try:
             with handle:
                 return stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
-            probe.unlink(missing_ok=True)
+            _cleanup_temp(probe, failure)
     raise FileExistsError(f"cannot create a unique permission probe in {directory}")
 
 
@@ -223,6 +240,7 @@ def publish(content: str, target: Path, force: bool = False) -> None:
     data = content.encode("utf-8")
     fd, staged_name = tempfile.mkstemp(prefix=".pycontainer-init-stage-", suffix=".tmp", dir=target.parent)
     staged = Path(staged_name)
+    failure = None
     try:
         try:
             handle = os.fdopen(fd, "wb")
@@ -259,8 +277,11 @@ def publish(content: str, target: Path, force: bool = False) -> None:
             raise OutputExistsError(f"refusing to overwrite existing {target}") from None
         except (OSError, NotImplementedError) as exc:
             raise InitError(f"cannot publish {target} atomically: hard link creation failed: {exc}") from exc
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        staged.unlink(missing_ok=True)
+        _cleanup_temp(staged, failure)
 
 
 def advisories(settings: Dict[str, Any]) -> List[str]:
@@ -298,6 +319,11 @@ def _finish(settings: Dict[str, Any], target: Path, template: str, out: TextIO) 
     print(f"Wrote {shown} ({template} template). Build with: pycontainer build --config {shown}", file=out)
 
 
+def _print_error_notes(exc: BaseException, err: TextIO) -> None:
+    for note in getattr(exc, "__notes__", ()):
+        print(f"error: {note}", file=err)
+
+
 def run_template(
     template: str,
     output: str,
@@ -317,20 +343,24 @@ def run_template(
         publishing = True
         publish(render_build_toml(settings, template), target, force)
         _finish(settings, target, template, out)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         message = ("\nInterrupted during publication; the complete output may already exist."
                    if publishing else "\nCancelled; no file written.")
         print(message, file=err)
+        _print_error_notes(exc, err)
         return EXIT_INTERRUPTED
     except OutputExistsError as exc:
         print(f"error: {exc}", file=err)
+        _print_error_notes(exc, err)
         return EXIT_REFUSED
     except InitError as exc:
         for line in str(exc).splitlines():
             print(f"error: {line}", file=err)
+        _print_error_notes(exc, err)
         return EXIT_INVALID
     except OSError as exc:
         print(f"error: cannot finish publishing configuration: {exc}; output may already exist", file=err)
+        _print_error_notes(exc, err)
         return EXIT_INVALID
     return EXIT_OK
 
@@ -449,19 +479,23 @@ def run_wizard(
     except EOFError:
         print("\nCancelled (end of input); no file written.", file=err)
         return EXIT_REFUSED
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         message = ("\nInterrupted during publication; the complete output may already exist."
                    if publishing else "\nCancelled; no file written.")
         print(message, file=err)
+        _print_error_notes(exc, err)
         return EXIT_INTERRUPTED
     except OutputExistsError as exc:
         print(f"error: {exc}", file=err)
+        _print_error_notes(exc, err)
         return EXIT_REFUSED
     except InitError as exc:
         for line in str(exc).splitlines():
             print(f"error: {line}", file=err)
+        _print_error_notes(exc, err)
         return EXIT_INVALID
     except OSError as exc:
         print(f"error: cannot finish publishing configuration: {exc}; output may already exist", file=err)
+        _print_error_notes(exc, err)
         return EXIT_INVALID
     return EXIT_OK
