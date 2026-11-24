@@ -1,11 +1,14 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
-import { base, groups, origin, repository } from './site.config.mjs';
+import { base, docsRedirect, groups, origin, repository } from './site.config.mjs';
 
 export default defineConfig({
   site: origin,
   base,
   trailingSlash: 'always',
+  redirects: {
+    [docsRedirect]: `${base}docs/start/quickstart/`,
+  },
   integrations: [
     starlight({
       title: 'pycontainer',

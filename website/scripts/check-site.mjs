@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fromHtml } from 'hast-util-from-html';
 import { visit } from 'unist-util-visit';
-import { base, origin, pages } from '../site.config.mjs';
+import { base, docsRedirect, origin, pages } from '../site.config.mjs';
 
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 
@@ -76,7 +76,9 @@ for (const page of pages) {
     errors.push(`Documentation missing from searchable HTML: ${page.slug}`);
   }
 }
-const publishedDocs = [...documents.keys()].filter((route) => route.startsWith('docs/'));
+const redirectRoute = docsRedirect.slice(1);
+if (!documents.has(redirectRoute)) errors.push(`Missing documentation redirect: ${docsRedirect}`);
+const publishedDocs = [...documents.keys()].filter((route) => route.startsWith('docs/') && route !== redirectRoute);
 if (publishedDocs.length !== pages.length) errors.push('Published documentation differs from the allowlist.');
 const search = JSON.parse(await readFile(path.join(dist, 'pagefind', 'pagefind-entry.json'), 'utf8'));
 const indexedPages = Object.values(search.languages).reduce((sum, language) => sum + language.page_count, 0);

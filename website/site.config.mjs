@@ -1,6 +1,7 @@
 export const base = '/pycontainer-build/';
 export const origin = 'https://spboyer.github.io';
 export const repository = 'https://github.com/spboyer/pycontainer-build';
+export const docsRedirect = '/docs/';
 
 export const groups = [
   {
