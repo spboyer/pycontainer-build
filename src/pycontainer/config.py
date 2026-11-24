@@ -196,6 +196,8 @@ class BuildConfig:
     sign_verify_key: Optional[str] = None
     sign_certificate_identity: Optional[str] = None
     sign_certificate_oidc_issuer: Optional[str] = None
+    squash: bool = False
+    analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
     index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False

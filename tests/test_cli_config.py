@@ -446,6 +446,7 @@ def test_cli_signing_settings_use_toml_and_explicit_overrides(tmp_path, monkeypa
             "--sign-timestamp-url", "https://tsa.example",
             "--sign-timestamp-root-cert", "root.pem",
             "--sign-signature-format", "cose",
+            "--squash", "--analyze-layers",
         ],
     )
     assert configs[-1].sign is True
@@ -454,6 +455,8 @@ def test_cli_signing_settings_use_toml_and_explicit_overrides(tmp_path, monkeypa
     assert configs[-1].sign_timestamp_url == "https://tsa.example"
     assert configs[-1].sign_timestamp_root_cert == "root.pem"
     assert configs[-1].sign_signature_format == "cose"
+    assert configs[-1].squash is True
+    assert configs[-1].analyze_layers is True
 
     _run_cli(monkeypatch, ["build", "--config", str(config_path), "--no-sign"])
     assert configs[-1].sign is False

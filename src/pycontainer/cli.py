@@ -130,6 +130,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,val
         default=None,
         help="Generate an SBOM (default format: spdx; formats: spdx, cyclonedx)",
     )
+    b.add_argument("--squash",action="store_true",default=None,help="Flatten builder-created dependency and application layers into one layer (base layers are unchanged; loses layer-level cache reuse)")
+    b.add_argument("--analyze-layers",action="store_true",default=None,help="Report per-platform layer sizes, repeated content and squash savings to layer-analysis.json")
     b.add_argument("--system-package",dest="system_packages",action="append",help="Declare a system package the base image must provide, e.g. libpq5 (repeatable); verified, not installed")
     b.add_argument("--no-detect-system-packages",dest="detect_system_packages",action="store_false",default=None,help="Disable inferring system packages from Python dependencies")
     b.add_argument("--label",dest="labels",action="append",type=_metadata_argument,metavar="KEY=VALUE",help="Set an image-config label (repeatable)")
@@ -307,6 +309,8 @@ def main():
         'sign_verify_key': getattr(args,"sign_verify_key",None),
         'sign_certificate_identity': getattr(args,"sign_certificate_identity",None),
         'sign_certificate_oidc_issuer': getattr(args,"sign_certificate_oidc_issuer",None),
+        'squash': args.squash,
+        'analyze_layers': args.analyze_layers,
         'labels': dict(args.labels) if args.labels is not None else None,
         'manifest_annotations': dict(args.manifest_annotations) if args.manifest_annotations is not None else None,
         'index_annotations': dict(args.index_annotations) if args.index_annotations is not None else None,

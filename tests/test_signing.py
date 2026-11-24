@@ -203,6 +203,56 @@ def test_signed_push_progress_redacts_build_argument_values(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_signed_push_publishes_squashed_subject(tmp_path, monkeypatch, platform):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    (context / "requirements.txt").write_text("example==1.0\n")
+    config = BuildConfig(
+        tag="registry.example/team/app:v1",
+        context_dir=str(context),
+        output_dir=str(tmp_path / "out"),
+        include_deps=True,
+        squash=True,
+        use_cache=False,
+        platform=platform,
+        sign=True,
+        sign_provider="cosign",
+        **COSIGN_KEYLESS,
+    )
+    def pull_base(self, layers_dir, os_name, arch):
+        return [], {"os": os_name, "architecture": arch, "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17",
+        ]}}
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull_base)
+
+    def install(requirements, site_packages, *args, **kwargs):
+        site_packages.mkdir(parents=True, exist_ok=True)
+        (site_packages / "example.py").write_text("value = 1\n")
+        return [requirements]
+
+    monkeypatch.setattr(builder_module, "install_requirements", install)
+    builder = ImageBuilder(config)
+    builder.build()
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+
+    builder.push(show_progress=False)
+
+    for image in builder.platform_images:
+        assert image.app_layer_count == 1
+        assert len(image.layers) == 1
+    digest = builder.index_digest or builder.manifest_digest
+    subject = f"registry.example/team/app@{digest}"
+    assert registry.events.index(("sign", subject)) < registry.events.index(("verify", subject))
+    assert registry.events.index(("verify", subject)) < registry.events.index(
+        ("index" if builder.index_digest else "manifest", "v1")
+    )
+    assert _digest(registry.manifests["v1"]) == digest
+
+
+@pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_unsigned_push_does_not_invoke_signer_or_signed_readback(
     tmp_path, monkeypatch, platform
 ):
