@@ -139,6 +139,22 @@ def resolve_build_config(
     table, file_config = None, {}
     if config_path is not None:
         table, file_config = load_explicit_file_config(config_path)
+    cfg = resolve_settings(
+        file_config, overrides, table, build_arg_overrides=build_arg_overrides,
+        detect_base_image=config_path is None,
+    )
+    return cfg, table
+
+
+def resolve_settings(
+    file_config: Dict[str, Any],
+    overrides: Dict[str, Any],
+    table: Optional[str],
+    *,
+    build_arg_overrides: Optional[List[str]] = None,
+    detect_base_image: bool = False,
+) -> BuildConfig:
+    """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
     origin = lambda field: _origin(field, overrides, table, file_config)
     declarations = merged.get("build_args") or {}
@@ -190,7 +206,7 @@ def resolve_build_config(
         raise ConfigValidationError(
             [redact_values(error, arguments.values()) for error in errors], arguments.values()
         ) from None
-    if config_path is None and "base_image" not in overrides:
+    if detect_base_image and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
         except (AttributeError, OSError, TypeError, ValueError) as exc:
@@ -204,4 +220,4 @@ def resolve_build_config(
     errors = semantic_errors(cfg, origin)
     if errors:
         raise ConfigValidationError([cfg.redact(error) for error in errors], arguments.values())
-    return cfg, table
+    return cfg

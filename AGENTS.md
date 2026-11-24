@@ -16,6 +16,8 @@ daemon without discussing the trade-off first.
   and the offline `validate config` command.
 - `image_validation.py`: offline all-reachable OCI descriptor verification and
   image-config linting; base-image provenance remains unknown.
+- `init_config.py`: offline `init` templates and TTY-only wizard; validates
+  output with the shared resolver and publishes without clobbering.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
