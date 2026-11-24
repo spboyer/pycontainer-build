@@ -2322,9 +2322,10 @@ def test_requirements_install_evaluates_root_and_transitive_markers_for_target(
     tmp_path, arch, expected
 ):
     wheelhouse = tmp_path / "context" / "wheelhouse"
-    # A context-local pip must not replace the builder's pip.
+    # Context-local modules must not replace the installer's imports.
     (tmp_path / "context").mkdir()
     (tmp_path / "context" / "pip.py").write_text("raise SystemExit('shadowed pip')\n")
+    (tmp_path / "context" / "json.py").write_text("raise SystemExit('shadowed json')\n")
     _write_named_wheel(
         wheelhouse,
         "marker-root",

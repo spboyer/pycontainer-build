@@ -21,7 +21,8 @@ daemon without discussing the trade-off first.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
-- `cache.py`: optional local application-layer cache.
+- `cache.py`: optional local application- and dependency-layer cache.
+- `dependency_cache.py`: dependency-layer cache key, eligibility and inventory.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
 - `registry_cleanup.py`: `registry delete`/`prune` planning and confirmation.
   Deletion is by manifest digest and removes every aliased tag; never select a
@@ -67,6 +68,46 @@ the same OS (`tests/test_cache_portability.py`); source modes are part of the
 key, so Windows and Linux caches are not interchangeable. The non-gating
 `cache-portability-*` CI jobs run `scripts/check_cache_portability.py` to record
 cross-OS restore outcomes.
+
+A staged dependency layer is reused only for a provably hash-pinned closure
+(lock selection, or fully `==`/`--hash` requirements including nested inputs);
+everything unprovable is an explicit `DependencyCacheMiss` with a secret-free
+reason. Keys hold target tags, Python, workdir, pip version, sanitized index
+identity (URLs with userinfo, credential-bearing paths or query values miss),
+the installer's exact target marker environment, locked manifest roots/extras
+and verifier backend, allowlisted ambient pip settings for plain requirements,
+type-stub stripping, and `INSTALLER_BACKEND`. Nonempty Python startup overrides (such as
+`PYTHONPATH`) are explicit misses even for locked installs; pip and the config
+probe ignore `PYTHONPATH`, but the builder process may not. A relative
+`PIP_CONFIG_FILE` is a miss for plain requirements. Plain requirements read
+pip's local configuration through the installed pip parser before lookup. The
+cache ignores `break-system-packages`, which the target installer's
+configuration filter already removes. Unknown settings still miss. On a
+miss, the installer uses private snapshots of keyed requirements, verified
+local find-links files, pip configuration and environment; snapshots are
+bounded by the staged size/file limits and removed after use. Unsupported or
+unsafe snapshots are explicit misses followed by uncached installs. Do not
+include their credentials in cache metadata or image layers. The snapshot
+protects cache identity, not all other image layers against concurrent context
+edits; see `README.md` for eligibility limits.
+
+HTTP(S), all-protocol and system proxies are explicit misses unless all hosts
+are bypassed; a configured pip proxy also makes plain requirements miss.
+Eligible locked installs use the key's captured no-proxy environment so a
+later proxy change cannot alter the installed source under that key.
+Netrc credentials, client certificates and explicit keyring providers are
+also misses; eligible installs disable netrc to prevent later authentication
+changes from altering the source selected under the key.
+
+A backend change that alters staged output or verification must bump
+`INSTALLER_BACKEND`; marker changes must also key the marker environment.
+Derive locked manifest roots and extras from the same manifest snapshot used
+for package selection; use those full-selection roots for cache keys and
+verification, including uncached installs. Recheck manifest containment
+before verification and after a cache hit. Preserve scanned requirement paths
+on hits for app-layer credential checks. The inventory entry is stored after
+the layer and must name its digest; a hit runs no pip install and makes no
+network requests.
 
 ## Setup and verified checks
 
@@ -368,6 +409,8 @@ markers for the target (never the host) and installs the selection through
 index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
 ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
+PDM `static_urls` locks and any package/file `url` rows (active or inactive)
+fail with `LockfileError` before selection, cache lookup or staging (#59, open).
 For `linux/arm/v7`, lock selection and staged-wheel closure use the
 `platform_machine=armv7l` marker and the same variant-specific wheel tags as
 ordinary requirements.
