@@ -133,6 +133,19 @@ def test_config_copy_with_new_arguments_keeps_existing_values_and_redaction():
 
 
 @pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_retains_redaction_after_in_place_argument_clear(copy_kind):
+    original = BuildConfig(build_args={"VALUE": "synthetic-copy-marker"})
+    original.build_args.clear()
+
+    if copy_kind == "replace":
+        copied = replace(original)
+    else:
+        copied = BuildConfig(**json.loads(json.dumps(asdict(original))))
+
+    assert copied.redact("synthetic-copy-marker") == "<redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
 def test_snapshot_equal_overrides_remain_literal_when_arguments_change(copy_kind):
     original = BuildConfig(
         build_args={"A": "${B}", "B": "old-value"},
