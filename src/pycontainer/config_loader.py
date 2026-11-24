@@ -16,7 +16,7 @@ PLUGIN_ONLY_HINTS = {
 }
 
 
-def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
+def _load_config_table(path: Path, required: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Return the label and contents of the single configuration table in path."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -42,6 +42,11 @@ def _load_config_table(path: Path) -> Tuple[str, Dict[str, Any]]:
         raise ValueError(
             f"{path} defines both [build] and [tool.pycontainer]; keep exactly one "
             "pycontainer configuration table."
+        )
+    if not found and required:
+        raise ValueError(
+            f"Config file {path} defines neither [build] nor [tool.pycontainer]; "
+            "add one of these tables (check the table name for typos)."
         )
     return found[0] if found else (BUILD_TABLE, {})
 
@@ -168,6 +173,17 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
                 merged[key] = value
 
     return merged
+
+
+def load_explicit_file_config(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Return the table label and normalized settings from an explicit path.
+
+    An explicitly named file must define [build] or [tool.pycontainer]; a missing
+    or misspelled table is an error rather than a silent fall-back to defaults.
+    """
+    table, file_config = _load_config_table(path, required=True)
+    file_config = _normalize_config_keys(file_config, f"Config file {table}")
+    return table, file_config
 
 
 def config_from_file(

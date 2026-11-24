@@ -1,11 +1,11 @@
 import argparse, json, os, logging, sys
 from pathlib import Path
-from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES, SIGNING_PROVIDERS, NOTATION_SIGNATURE_FORMATS
+from .config import SBOM_FORMATS, SCAN_SEVERITIES, SIGNING_PROVIDERS, NOTATION_SIGNATURE_FORMATS
 from .builder import ImageBuilder
-from .config_loader import config_from_file, load_config_file, merge_configs
+from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
-from .project import detect_python_version
 from .build_args import redact_values, resolve_arguments
+from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -62,8 +62,9 @@ def _run_registry(parser, args):
         print(f"Error: {exc}",file=sys.stderr)
         return 1
 
-def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
-    b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
+def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,validation=False):
+    if not validation:
+        b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
     b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
     if tagging:
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
@@ -94,13 +95,15 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
-    b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
+    if not validation:
+        b.add_argument("--no-progress",action="store_true",help="Suppress progress output")
     b.add_argument("--no-cache",dest="use_cache",action="store_false",default=None,help="Disable layer caching, force full rebuild")
     b.add_argument("--cache-dir",help="Custom cache directory (default: ~/.pycontainer/cache)")
-    history_options=b.add_mutually_exclusive_group()
-    history_options.add_argument("--record-history",dest="record_history",action="store_true",default=None,help="Record private local build timing history")
-    history_options.add_argument("--no-record-history",dest="record_history",action="store_false",default=None,help="Disable local build history")
-    b.add_argument("--history-dir",help="Local history directory (default: ~/.pycontainer/history; does not enable recording)")
+    if not validation:
+        history_options=b.add_mutually_exclusive_group()
+        history_options.add_argument("--record-history",dest="record_history",action="store_true",default=None,help="Record private local build timing history")
+        history_options.add_argument("--no-record-history",dest="record_history",action="store_false",default=None,help="Disable local build history")
+        b.add_argument("--history-dir",help="Local history directory (default: ~/.pycontainer/history; does not enable recording)")
     b.add_argument(
         "--include-deps",
         action="store_true",
@@ -111,7 +114,8 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
     b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
     b.add_argument("--strip-type-stubs",action="store_true",default=None,help="Remove .pyi files and stub-only distributions (types-*, *-stubs) from the dependency layer")
-    b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
+    if not validation:
+        b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
     if platform:
@@ -151,6 +155,13 @@ def main():
     sub=parser.add_subparsers(dest="cmd",required=True)
     b=sub.add_parser("build")
     _add_build_options(b)
+    val=sub.add_parser("validate",help="Validate configuration offline without building")
+    val_sub=val.add_subparsers(dest="validate_cmd",required=True)
+    vc=val_sub.add_parser("config",help="Validate effective configuration offline (exit 0 or 2)")
+    vc.add_argument("paths",nargs="*",metavar="PATH",help="Files to validate (default: build defaults)")
+    vc.add_argument("--config","-c",dest="config_paths",action="append",metavar="PATH")
+    _add_build_options(vc,push=False,validation=True)
+    vc.set_defaults(config=None,record_history=None,history_dir=None,verbose=None)
     sk=sub.add_parser("skaffold-build",help="Build and push for a Skaffold custom buildCommand (reads IMAGE, BUILD_CONTEXT, PUSH_IMAGE, PLATFORMS)")
     _add_build_options(sk,tagging=False,context=False,push=False,platform=False)
     ti=sub.add_parser("tilt-build",help="Build and push for a Tilt custom_build with skips_local_docker=True (reads EXPECTED_REF)")
@@ -243,7 +254,7 @@ def main():
         return
 
     devloop=args.cmd in ("skaffold-build","tilt-build")
-    push=devloop or args.push
+    push=devloop or getattr(args,"push",False)
     username=getattr(args,"username",None)
     password=getattr(args,"password",None)
     if push and username and not (password or os.getenv('REGISTRY_PASSWORD')):
@@ -318,6 +329,31 @@ def main():
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
+    if args.cmd=="validate":
+        if args.config_paths and (len(args.config_paths)>1 or args.paths):
+            vc.error("use positional paths or a single --config path, not both.")
+        sources=args.config_paths or args.paths or [None]
+        invalid=0
+        for path in sources:
+            label=path if path is not None else "defaults (no configuration file)"
+            try:
+                cfg,table=resolve_build_config(Path(path) if path is not None else None,cli_overrides,args.build_arg)
+            except (OSError,ValueError) as exc:
+                invalid+=1
+                if isinstance(exc,ConfigValidationError):
+                    label=exc.redact(label)
+                for line in str(exc).splitlines():
+                    print(f"error: {label}: {line}",file=sys.stderr)
+            else:
+                print(f"ok: {cfg.redact(label)}"+(f" {table}" if table else ""))
+        print("Not performed (offline validation does not prove a successful build):")
+        for check in NOT_PERFORMED:
+            print(f"  - {check}")
+        if invalid:
+            print(f"{invalid} of {len(sources)} configuration(s) invalid.",file=sys.stderr)
+            raise SystemExit(2)
+        return
+
     push_target=getattr(args,"registry",None)
     try:
         if args.cmd=="skaffold-build":
@@ -343,15 +379,8 @@ def main():
         cli_overrides.update(tags=[],semver_tags=False,latest_tag=False,dry_run=False)
 
     try:
-        if args.config:
-            cfg=config_from_file(Path(args.config), cli_overrides, args.build_arg)
-        else:
-            resolve_arguments({}, args.build_arg)
-            cfg=BuildConfig(**cli_overrides, build_args={})
-            if 'base_image' not in cli_overrides:
-                py_ver=detect_python_version(cfg.context_dir)
-                cfg.base_image=f"python:{py_ver}-slim"
-    except (FileNotFoundError, ValueError) as exc:
+        cfg,_=resolve_build_config(Path(args.config) if args.config else None,cli_overrides,args.build_arg)
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
     if cfg.sign and not push:
