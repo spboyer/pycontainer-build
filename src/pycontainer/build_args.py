@@ -1,4 +1,5 @@
 """Declared build inputs and non-recursive configuration interpolation."""
+from collections import Counter
 import json
 import re
 from typing import Dict, Iterable, List, Optional, Union
@@ -26,6 +27,17 @@ def redact_values(message: str, values: Iterable[str]) -> str:
     for value in sorted(representations, key=len, reverse=True):
         message = message.replace(value, "<redacted>")
     return message
+
+
+def known_argument_values(declarations) -> List[str]:
+    if not isinstance(declarations, dict):
+        return []
+    values = []
+    for declaration in declarations.values():
+        value = declaration.get("default") if isinstance(declaration, dict) else declaration
+        if isinstance(value, str):
+            values.append(value)
+    return values
 
 
 def _check_text(value: str, description: str) -> None:
@@ -96,11 +108,30 @@ def expand(value: str, arguments: Dict[str, str], field: str) -> str:
     return "".join(result)
 
 
-def expand_field(value, arguments: Dict[str, str], field: str):
+_NO_PREVIOUS_VALUE = object()
+
+
+def expand_field(value, arguments: Dict[str, str], field: str, previous=_NO_PREVIOUS_VALUE):
+    if previous is not _NO_PREVIOUS_VALUE and value == previous:
+        return value
     if isinstance(value, str):
         return expand(value, arguments, field)
     if isinstance(value, list):
-        return [expand(item, arguments, field) for item in value]
+        existing = Counter(
+            item for item in previous if isinstance(item, str)
+        ) if isinstance(previous, list) else Counter()
+        result = []
+        for item in value:
+            if isinstance(item, str) and existing[item]:
+                existing[item] -= 1
+                result.append(item)
+            else:
+                result.append(expand(item, arguments, field))
+        return result
     if isinstance(value, dict):
-        return {key: expand(item, arguments, field) for key, item in value.items()}
+        existing = previous if isinstance(previous, dict) else {}
+        return {
+            key: item if key in existing and item == existing[key] else expand(item, arguments, field)
+            for key, item in value.items()
+        }
     return value

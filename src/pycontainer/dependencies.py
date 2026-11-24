@@ -473,6 +473,7 @@ def install_requirements(
     *,
     locked: bool = False,
     base_image_tag_verified: bool = False,
+    log_redact=str,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
     target_options = _target_options(
@@ -483,10 +484,11 @@ def install_requirements(
     _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
         logger.warning(
-            "%s is not fully pinned with ==versions and --hash values, so the "
-            "dependency layer is not reproducible. Use a lockfile or "
-            "`pip-compile --generate-hashes`.",
-            requirements.name,
+            "%s", log_redact(
+                f"{requirements.name} is not fully pinned with ==versions and --hash values, "
+                "so the dependency layer is not reproducible. Use a lockfile or "
+                "`pip-compile --generate-hashes`."
+            ),
         )
     target = _target_text(os_name, arch, variant)
 
@@ -526,7 +528,7 @@ def install_requirements(
     environment = (
         _locked_pip_environment(destination.parent)
         if locked
-        else _pip_environment(destination.parent)
+        else _pip_environment(destination.parent, log_redact=log_redact)
     )
     # pip logs index HTTP failures only at debug level, so keep its debug log in
     # host temp space (never the tarred stage) to classify authentication errors.
@@ -606,7 +608,7 @@ def install_requirements(
     return requirement_files
 
 
-def _pip_environment(temporary_dir: Path) -> dict:
+def _pip_environment(temporary_dir: Path, *, log_redact=str) -> dict:
     environment = {}
     ignored = []
     for name, value in os.environ.items():
@@ -616,10 +618,10 @@ def _pip_environment(temporary_dir: Path) -> dict:
             continue
         environment[name] = value
     if ignored:
-        print(
+        print(log_redact(
             "Ignoring host pip settings that could change target dependency "
             f"selection: {', '.join(sorted(ignored))}"
-        )
+        ))
     environment.update(
         {
             "TMP": str(temporary_dir),
@@ -1392,7 +1394,7 @@ def staged_packages(
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
 
 
-def strip_type_stubs(site_packages: Path) -> List[str]:
+def strip_type_stubs(site_packages: Path, *, log_redact=str) -> List[str]:
     """Remove stub-only distributions and ``.pyi`` files; return removed names.
 
     Every RECORD is validated and every deletion is resolved before anything
@@ -1433,8 +1435,9 @@ def strip_type_stubs(site_packages: Path) -> List[str]:
             stub_dirs.append(info_dir)
         else:
             logger.warning(
-                "Keeping %s: it ships runtime files; only its .pyi files are removed.",
-                info_dir.name,
+                "%s", log_redact(
+                    f"Keeping {info_dir.name}: it ships runtime files; only its .pyi files are removed."
+                ),
             )
 
     retained_keys = set()

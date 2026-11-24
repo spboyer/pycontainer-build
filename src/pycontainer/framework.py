@@ -86,6 +86,7 @@ def _detect_framework(
     configured_cmd=None,
     configured_ports=False,
     configured_workdir=None,
+    log_redact=str,
 ):
     if include_paths is not None and not include_paths:
         return None
@@ -101,6 +102,7 @@ def _detect_framework(
                 exclude_paths=exclude_paths,
                 exclude_defaults=exclude_defaults,
                 requirements_file=requirements_file,
+                log_redact=log_redact,
             )
             if include_paths is None
             else include_paths
@@ -134,10 +136,10 @@ def _detect_framework(
         except ValueError:
             resolved = path.resolve()
             if not resolved.is_relative_to(ctx):
-                raise ValueError(f"Selected source is outside the build context: {path}")
+                raise ValueError(log_redact(f"Selected source is outside the build context: {path}"))
             relative = resolved.relative_to(ctx)
         if ".." in relative.parts:
-            raise ValueError(f"Selected source is outside the build context: {path}")
+            raise ValueError(log_redact(f"Selected source is outside the build context: {path}"))
         if path_is_excluded(relative, excludes):
             continue
         selected_path = ctx / relative
@@ -148,13 +150,15 @@ def _detect_framework(
                 if parent != Path(".")
             ):
                 logger.warning(
-                    "Skipping source %s: its directory symlink resolves outside the build context.",
-                    relative,
+                    "%s", log_redact(
+                        f"Skipping source {relative}: its directory symlink resolves outside "
+                        "the build context."
+                    ),
                 )
                 continue
-            raise ValueError(f"Selected source is outside the build context: {path}")
+            raise ValueError(log_redact(f"Selected source is outside the build context: {path}"))
         if not selected_path.is_file():
-            raise FileNotFoundError(f"Selected source file not found: {path}")
+            raise FileNotFoundError(log_redact(f"Selected source file not found: {path}"))
         available.add(relative)
         selected[relative.as_posix()] = selected_path
     selected_files = []
@@ -163,8 +167,9 @@ def _detect_framework(
         target = path.resolve().relative_to(ctx)
         if path_is_excluded(target, excludes) or not _selected_symlink_chain(path, ctx, available):
             logger.warning(
-                "Skipping source symlink %s: its target chain is excluded or not selected.",
-                name,
+                "%s", log_redact(
+                    f"Skipping source symlink {name}: its target chain is excluded or not selected."
+                ),
             )
             continue
         selected_files.append(path)
@@ -185,12 +190,13 @@ def _detect_framework(
         requirements_file,
         exclude_paths=exclude_paths,
         exclude_defaults=exclude_defaults,
+        log_redact=log_redact,
     )
     problems = {}
     unlaunched_gradio = []
     unparsed = []
     for path in python_files:
-        tree, hints = _parse_source(path, ctx, dependencies)
+        tree, hints = _parse_source(path, ctx, dependencies, log_redact)
         if tree is None:
             if hints:
                 unparsed.append((path.relative_to(ctx).as_posix(), hints))
@@ -292,7 +298,7 @@ def _detect_framework(
             "launch call; specify an explicit entrypoint or command."
         )
         if candidates["Gradio"]:
-            logger.warning("%s", message)
+            logger.warning("%s", log_redact(message))
         else:
             problems["Gradio"] = message
 
@@ -314,7 +320,7 @@ def _detect_framework(
             [JUPYTER_PORT],
         ))
     elif notebooks:
-        logger.debug("Notebooks found but no jupyterlab or notebook dependency is declared.")
+        logger.debug("%s", log_redact("Notebooks found but no jupyterlab or notebook dependency is declared."))
 
     present = [name for name in FRAMEWORK_PRIORITY if candidates[name] or name in problems]
     configured = configured_entrypoint is not None or configured_cmd is not None
@@ -337,7 +343,11 @@ def _detect_framework(
         normalized = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
         executable, command_arguments, _, _ = _configured_command(normalized)
         if executable == "celery" and _celery_subcommand(command_arguments) != "worker":
-            logger.warning("The configured Celery command is not a worker; no framework defaults applied.")
+            logger.warning(
+                "%s", log_redact(
+                    "The configured Celery command is not a worker; no framework defaults applied."
+                )
+            )
             return None
         matches = [
             candidate
@@ -353,31 +363,38 @@ def _detect_framework(
             and selected_match is None
         ):
             logger.warning(
-                "The configured command clears an image command field and does not "
-                "identify a detected application; no framework defaults applied."
+                "%s", log_redact(
+                    "The configured command clears an image command field and does not "
+                    "identify a detected application; no framework defaults applied."
+                )
             )
             return None
     if len(present) > 1:
         logger.warning(
-            "Multiple frameworks detected (%s); %s %s. "
-            "Specify an explicit entrypoint or command to choose another.",
-            ", ".join(present), chosen,
-            "matches the configured command" if selected_match else "takes precedence",
+            "%s", log_redact(
+                f"Multiple frameworks detected ({', '.join(present)}); {chosen} "
+                f"{'matches the configured command' if selected_match else 'takes precedence'}. "
+                "Specify an explicit entrypoint or command to choose another."
+            ),
         )
     if "Celery" in present and chosen != "Celery":
         logger.warning(
-            "Celery workers require a separate image or an explicit entrypoint."
+            "%s", log_redact(
+                "Celery workers require a separate image or an explicit entrypoint."
+            )
         )
     for name in present:
         if name != chosen and name in problems:
-            logger.warning("%s", problems[name])
+            logger.warning("%s", log_redact(problems[name]))
     if (
         chosen == "Gradio" and configured and not selected_match
         and any(candidate.port_problem for candidate in candidates["Gradio"])
     ):
         logger.warning(
-            "The configured command does not identify a Gradio app; "
-            "its listener defaults will not be applied."
+            "%s", log_redact(
+                "The configured command does not identify a Gradio app; "
+                "its listener defaults will not be applied."
+            )
         )
         return None
     if chosen == "Gradio" and not configured_ports:
@@ -386,11 +403,13 @@ def _detect_framework(
             (candidate.port_problem for candidate in relevant if candidate.port_problem), None
         )
         if port_problem:
-            raise FrameworkPortDetectionError(port_problem)
+            raise FrameworkPortDetectionError(log_redact(port_problem))
     if chosen in problems:
         if not configured:
-            raise FrameworkDetectionError(problems[chosen])
-        logger.warning("%s Using the configured entrypoint or command.", problems[chosen])
+            raise FrameworkDetectionError(log_redact(problems[chosen]))
+        logger.warning(
+            "%s", log_redact(f"{problems[chosen]} Using the configured entrypoint or command.")
+        )
         if selected_match:
             return selected_match
         return _Detection(chosen, [], list(FRAMEWORK_PORTS[chosen]))
@@ -590,7 +609,7 @@ def _matches_configured_command(detection, arguments, workdir):
     return False
 
 
-def _parse_source(path, context_dir, dependencies):
+def _parse_source(path, context_dir, dependencies, log_redact=str):
     markers = {"FastAPI": b"fastapi", "Flask": b"flask"}
     for package, framework in (
         ("streamlit", "Streamlit"), ("gradio", "Gradio"), ("celery", "Celery")
@@ -620,16 +639,18 @@ def _parse_source(path, context_dir, dependencies):
     relative = path.relative_to(context_dir).as_posix()
     if content is None:
         logger.warning(
-            "Cannot inspect %s: source exceeds the %s-byte limit.",
-            relative, MAX_FRAMEWORK_SOURCE_BYTES,
+            "%s", log_redact(
+                f"Cannot inspect {relative}: source exceeds the {MAX_FRAMEWORK_SOURCE_BYTES}-byte limit."
+            ),
         )
         return None, hints
     try:
         return ast.parse(bytes(content), filename=str(path)), hints
     except (SyntaxError, UnicodeError) as error:
         logger.warning(
-            "Cannot inspect %s: %s. Specify an explicit entrypoint if needed.",
-            relative, error,
+            "%s", log_redact(
+                f"Cannot inspect {relative}: {error}. Specify an explicit entrypoint if needed."
+            ),
         )
         return None, hints
 
@@ -938,13 +959,16 @@ def apply_framework_defaults(
             configured_cmd=configured_cmd,
             configured_ports=config.has_exposed_ports() and not generated_ports,
             configured_workdir=config.workdir,
+            log_redact=config.redact,
         )
     except FrameworkPortDetectionError:
         raise
     except FrameworkDetectionError as error:
         if configured_entrypoint is None and configured_cmd is None:
             raise
-        logger.warning("%s Using the configured entrypoint or command.", error)
+        logger.warning(
+            "%s", config.redact(f"{error} Using the configured entrypoint or command.")
+        )
         return config
     if not detection:
         if generated_entrypoint:
@@ -1030,6 +1054,6 @@ def apply_framework_defaults(
         config._framework_generated_labels = config.labels
     else:
         config._framework_generated_labels = None
-    logger.info("Detected framework: %s", framework.lower())
+    logger.info("%s", config.redact(f"Detected framework: {framework.lower()}"))
     
     return config

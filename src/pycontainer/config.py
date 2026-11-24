@@ -5,7 +5,10 @@ import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
-from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
+from .build_args import (
+    BuildArgument, EXPANDABLE_FIELDS, expand_field, known_argument_values,
+    redact_values, resolve_arguments,
+)
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
@@ -379,6 +382,9 @@ class BuildConfig:
     _framework_generated_state: Optional[Union[Dict[str, object], _FrameworkState]] = field(
         default=None, repr=False, compare=False
     )
+    _build_args_expansion_state: Optional[Dict[str, object]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def __setattr__(self, name, value):
         if (
@@ -399,18 +405,54 @@ class BuildConfig:
                 for field_name in _FRAMEWORK_FIELDS
             }
             return _FrameworkState(values, generated, self.labels, _is_generated_label(self))
+        if name == "_build_args_expansion_state":
+            instance = object.__getattribute__(self, "__dict__")
+            if not instance.get("_build_args_expanded", False):
+                return None
+            return {
+                "values": {
+                    field_name: deepcopy(object.__getattribute__(self, field_name))
+                    for field_name in EXPANDABLE_FIELDS
+                },
+                "redactions": list(instance["_build_args_redactions"]),
+            }
         return object.__getattribute__(self, name)
 
     def __post_init__(self):
+        state = self.__dict__["_build_args_expansion_state"]
+        if state is not None and (
+            not isinstance(state, dict)
+            or set(state) != {"values", "redactions"}
+            or not isinstance(state["values"], dict)
+            or set(state["values"]) != set(EXPANDABLE_FIELDS)
+            or not isinstance(state["redactions"], list)
+            or any(not isinstance(value, str) for value in state["redactions"])
+        ):
+            raise ValueError("Invalid serialized build-argument expansion state.")
+        redactions = ([] if state is None else state["redactions"])
         self._resolved_build_args: Dict[str, str] = {}
         if self.build_args is not None:
-            self._resolved_build_args = resolve_arguments(self.build_args)
-            for name in EXPANDABLE_FIELDS:
-                value = getattr(self, name)
-                expanded = expand_field(value, self._resolved_build_args, name)
-                if expanded != value:
-                    setattr(self, name, expanded)
+            try:
+                self._resolved_build_args = resolve_arguments(self.build_args)
+            except ValueError as exc:
+                raise ValueError(redact_values(
+                    str(exc), [*redactions, *known_argument_values(self.build_args)]
+                )) from None
+        self._build_args_redactions = tuple(dict.fromkeys(
+            value for value in [*redactions, *self._resolved_build_args.values()] if value
+        ))
+        self._build_args_expanded = state is not None or self.build_args is not None
+        self.__dict__["_build_args_expansion_state"] = None
         try:
+            if self.build_args is not None:
+                for name in EXPANDABLE_FIELDS:
+                    value = getattr(self, name)
+                    if state is None:
+                        expanded = expand_field(value, self._resolved_build_args, name)
+                    else:
+                        expanded = expand_field(value, self._resolved_build_args, name, state["values"][name])
+                    if expanded != value:
+                        setattr(self, name, expanded)
             self._validate()
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
@@ -566,7 +608,10 @@ class BuildConfig:
 
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""
-        return redact_values(message, self._resolved_build_args.values())
+        return redact_values(message, self._build_args_redactions)
+
+    def _has_build_argument_values(self) -> bool:
+        return bool(self.build_args or self._build_args_redactions)
 
     def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
         import hashlib

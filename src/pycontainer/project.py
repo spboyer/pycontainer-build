@@ -35,6 +35,7 @@ def declared_dependency_names(
     *,
     exclude_paths=None,
     exclude_defaults=True,
+    log_redact=str,
 ):
     """Read declared runtime dependency names without resolving or installing them."""
     from .dependencies import (
@@ -75,8 +76,10 @@ def declared_dependency_names(
                     "with `python -m pip freeze > requirements.txt` inside the build context."
                 )
             raise ValueError(
-                f"Dependency file is outside the build context: {display or relative}; "
-                "requirements must stay inside the build context."
+                log_redact(
+                    f"Dependency file is outside the build context: {display or relative}; "
+                    "requirements must stay inside the build context."
+                )
             )
         return path
 
@@ -84,13 +87,14 @@ def declared_dependency_names(
         nonlocal total_bytes
         relative = relative_context_path(relative)
         display = "<environment-based requirements file>" if environment_path else relative
+        shown = log_redact(str(display))
         path = selected_file(relative, display=display)
         if path is None:
             if required and not path_is_excluded(relative, excludes):
-                raise FileNotFoundError(f"Requirements file not found: {display}")
+                raise FileNotFoundError(f"Requirements file not found: {shown}")
             return
         if relative in ancestors:
-            raise ValueError(f"Requirements include cycle in {display}.")
+            raise ValueError(f"Requirements include cycle in {shown}.")
         if relative in visited:
             return
         if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
@@ -109,13 +113,13 @@ def declared_dependency_names(
                 "Requirements files exceed the combined "
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
-        for line_number, line in _logical_requirement_lines(path, display=display):
+        for line_number, line in _logical_requirement_lines(path, display=shown):
             expanded = _expand_requirement_variables(line)
             try:
                 parts = shlex.split(expanded, comments=True)
             except ValueError as error:
                 raise ValueError(
-                    f"Invalid requirement syntax in {display} at line {line_number}"
+                    f"Invalid requirement syntax in {shown} at line {line_number}"
                 ) from error
             if not parts:
                 continue
@@ -124,7 +128,7 @@ def declared_dependency_names(
             if first in ("-r", "--requirement"):
                 if len(parts) != 2:
                     raise ValueError(
-                        f"Invalid requirements include in {display} at line {line_number}"
+                        f"Invalid requirements include in {shown} at line {line_number}"
                     )
                 nested = parts[1]
             elif first.startswith("--requirement="):
@@ -134,12 +138,16 @@ def declared_dependency_names(
             if nested is not None:
                 if _REQUIREMENT_VARIABLE.search(nested):
                     logger.warning(
-                        "Cannot inspect an unresolved requirements include in %s at line %s",
-                        display, line_number,
+                        "%s", log_redact(
+                            f"Cannot inspect an unresolved requirements include in {display} "
+                            f"at line {line_number}"
+                        ),
                     )
                     continue
                 if "://" in nested:
-                    logger.warning("Cannot inspect a remote requirements include in %s", display)
+                    logger.warning(
+                        "%s", log_redact(f"Cannot inspect a remote requirements include in {display}")
+                    )
                 else:
                     nested_path = Path(nested)
                     windows_path = PureWindowsPath(nested)
@@ -150,7 +158,7 @@ def declared_dependency_names(
                         or windows_path.root
                     ):
                         raise ValueError(
-                            f"Invalid requirements include in {display} at line {line_number}"
+                            f"Invalid requirements include in {shown} at line {line_number}"
                         )
                     logical_path = Path(os.path.abspath(ctx / relative.parent / nested_path))
                     environment_include = environment_path or expanded != line
@@ -167,7 +175,7 @@ def declared_dependency_names(
                         raise
                     if not contained:
                         raise ValueError(
-                            f"Requirements include in {display} escapes the build context"
+                            f"Requirements include in {shown} escapes the build context"
                         )
                     read_requirements(
                         logical_path.relative_to(logical_root),
@@ -336,6 +344,7 @@ def default_include_paths(
     *,
     exclude_defaults=True,
     requirements_file="requirements.txt",
+    log_redact=str,
 ):
     ctx=Path(context_dir)
     excludes=list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
@@ -357,7 +366,8 @@ def default_include_paths(
     if not c:
         c.append(".")
     dependencies = declared_dependency_names(
-        ctx, requirements_file, exclude_paths=excludes, exclude_defaults=False
+        ctx, requirements_file, exclude_paths=excludes, exclude_defaults=False,
+        log_redact=log_redact,
     )
     include_notebooks = bool({"jupyterlab", "notebook"} & dependencies)
     if include_notebooks or logger.isEnabledFor(logging.DEBUG):
@@ -370,7 +380,9 @@ def default_include_paths(
                 c.append(relative.as_posix())
             elif not include_notebooks:
                 logger.debug(
-                    "Notebooks found but no jupyterlab or notebook dependency is declared."
+                    "%s", log_redact(
+                        "Notebooks found but no jupyterlab or notebook dependency is declared."
+                    )
                 )
                 break
     return c

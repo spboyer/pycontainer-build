@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 import tarfile
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 from pycontainer import cli
 from pycontainer import auth as auth_module
 from pycontainer import builder as builder_module
+from pycontainer import dependencies as dependencies_module
 from pycontainer.auth import RegistryAuth
 from pycontainer.build_args import resolve_arguments
 from pycontainer.builder import ImageBuilder
@@ -91,6 +93,102 @@ def test_interpolation_is_one_pass_and_does_not_read_environment(monkeypatch, te
     )
     assert config.labels == {"result": expected, "${A}": "unchanged-key"}
     assert config.env == {}
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_keeps_expanded_dollars_literal_and_expands_new_values(copy_kind):
+    original = BuildConfig(
+        build_args={"A": "${B}", "B": "expanded"},
+        cmd=["echo", "${A}", "$${B}"],
+        env={"VALUE": "${A}"},
+        labels={"literal": "$${B}"},
+    )
+    if copy_kind == "replace":
+        copied = replace(original, env={**original.env, "NEW": "${B}"})
+    else:
+        data = json.loads(json.dumps(asdict(original)))
+        data["env"]["NEW"] = "${B}"
+        copied = BuildConfig(**data)
+
+    assert copied.cmd == ["echo", "${B}", "${B}"]
+    assert copied.env == {"VALUE": "${B}", "NEW": "expanded"}
+    assert copied.labels == {"literal": "${B}"}
+    assert original.env == {"VALUE": "${B}"}
+    moved = replace(copied, cmd=["env", *copied.cmd])
+    assert moved.cmd == ["env", "echo", "${B}", "${B}"]
+
+
+def test_config_copy_with_new_arguments_keeps_existing_values_and_redaction():
+    original = BuildConfig(build_args={"A": "old-value"}, env={"VALUE": "${A}"})
+    copied = replace(original, build_args={"A": "new-value"}, cmd=["${A}"])
+
+    assert copied.env == {"VALUE": "old-value"}
+    assert copied.cmd == ["new-value"]
+    assert copied.redact("old-value and new-value") == "<redacted> and <redacted>"
+    cleared = replace(copied, build_args=None)
+    assert cleared.redact("old-value and new-value") == "<redacted> and <redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_snapshot_equal_overrides_remain_literal_when_arguments_change(copy_kind):
+    original = BuildConfig(
+        build_args={"A": "${B}", "B": "old-value"},
+        workdir="/${A}", cmd=["${A}"], env={"VALUE": "${A}"},
+    )
+    overrides = {
+        "build_args": {"B": "new-value"},
+        "workdir": "/${B}",
+        "cmd": ["${B}"],
+        "env": {"VALUE": "${B}"},
+    }
+    if copy_kind == "replace":
+        copied = replace(original, **overrides)
+    else:
+        data = json.loads(json.dumps(asdict(original)))
+        data.update(overrides)
+        copied = BuildConfig(**data)
+
+    assert copied.workdir == "/${B}"
+    assert copied.cmd == ["${B}"]
+    assert copied.env == {"VALUE": "${B}"}
+    assert copied.redact("old-value new-value ${B}") == "<redacted> <redacted> <redacted>"
+    cleared = replace(copied, build_args=None)
+    assert {"old-value", "new-value"} <= set(asdict(cleared)["_build_args_expansion_state"]["redactions"])
+
+    fresh = BuildConfig(**overrides)
+    assert (fresh.workdir, fresh.cmd, fresh.env) == (
+        "/new-value", ["new-value"], {"VALUE": "new-value"}
+    )
+
+
+def test_config_copy_expands_new_duplicate_list_entries():
+    original = BuildConfig(build_args={"A": "${B}", "B": "expanded"}, cmd=["${A}"])
+
+    copied = replace(original, cmd=[*original.cmd, "${B}"])
+
+    assert copied.cmd == ["${B}", "expanded"]
+
+
+@pytest.mark.parametrize("failure", ["retained-resolution", "current-resolution", "interpolation"])
+def test_config_copy_redacts_previous_arguments_from_construction_errors(failure):
+    original = BuildConfig(build_args={"SECRET": "private_input"})
+    value = "current_input" if failure == "current-resolution" else "private_input"
+
+    with pytest.raises(ValueError) as error:
+        if failure == "retained-resolution":
+            replace(original, build_args={"private_input": {}})
+        elif failure == "current-resolution":
+            replace(original, build_args={"current_input": {}, "OTHER": "current_input"})
+        else:
+            replace(original, build_args={}, cmd=["${private_input}"])
+
+    assert value not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_invalid_serialized_expansion_state_is_rejected():
+    with pytest.raises(ValueError, match="Invalid serialized build-argument expansion state"):
+        BuildConfig(build_args={}, _build_args_expansion_state={"values": {}})
 
 
 @pytest.mark.parametrize(
@@ -317,8 +415,106 @@ def test_security_fragment_output_path_redacts_build_arguments(tmp_path, monkeyp
     assert "<redacted>" in caplog.text
 
 
+def test_direct_build_redacts_framework_source_warnings_after_arguments_are_cleared(
+    tmp_path, caplog
+):
+    value = "private_module"
+    (tmp_path / f"{value}.py").write_text("from fastapi import FastAPI\napp = FastAPI(\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        cmd=["python"], use_cache=False, build_args={"SOURCE": value},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(replace(config, build_args=None))
+
+    assert "Cannot inspect" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+@pytest.mark.parametrize("include_paths", [None, ["app.py"]], ids=["default", "explicit"])
+def test_direct_build_redacts_requirements_discovery_warnings_after_arguments_are_cleared(
+    tmp_path, monkeypatch, caplog, include_paths
+):
+    value = "private_requirements"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    (tmp_path / f"{value}.txt").write_text("-r ${UNSET_REQUIREMENTS_FILE}\n")
+    monkeypatch.delenv("UNSET_REQUIREMENTS_FILE", raising=False)
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=include_paths,
+        requirements_file="${SOURCE}.txt", use_cache=False,
+        build_args={"SOURCE": value},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(replace(config, build_args=None))
+
+    assert "unresolved requirements include" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+def test_direct_build_redacts_framework_errors_after_arguments_are_cleared(tmp_path):
+    value = "private_module"
+    (tmp_path / f"{value}.py").write_text(
+        "from fastapi import FastAPI\ndef create():\n    return FastAPI()\n"
+    )
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        use_cache=False, build_args={"SOURCE": value},
+    )
+
+    with pytest.raises(ValueError, match="Cannot determine an importable FastAPI") as error:
+        ImageBuilder(replace(config, build_args=None))
+
+    assert value not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_direct_build_redacts_requirements_install_warning_after_arguments_are_cleared(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    value = "private_requirements"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    (tmp_path / f"{value}.txt").write_text("fixture-dep\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"],
+        requirements_file="${SOURCE}.txt", use_cache=False, include_deps=True,
+        build_args={"SOURCE": value, "PIP_SETTING": "PIP_TARGET"},
+    )
+    builder = ImageBuilder(replace(config, build_args=None))
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8",
+            "PYTHON_LIBC=glibc-2.17",
+        ]},
+    }
+
+    def fail_before_pip(*args, **kwargs):
+        raise OSError("pip start blocked by test")
+
+    monkeypatch.setenv("PIP_TARGET", str(tmp_path / "ignored"))
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", fail_before_pip)
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="Unable to start pip"):
+        builder._create_deps_layer(tmp_path, base_config=base_config)
+
+    assert "not fully pinned" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    output = capsys.readouterr().out
+    assert "Ignoring host pip settings" in output
+    assert "PIP_TARGET" not in output
+    assert "<redacted>" in output
+
+
 @pytest.mark.parametrize("operation", ["pull", "push"])
-def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, caplog, operation):
+@pytest.mark.parametrize("copy_args", ["original", "empty", "none"])
+def test_direct_build_redacts_registry_rate_limit_logs(
+    tmp_path, monkeypatch, caplog, capsys, operation, copy_args
+):
     value = "private-registry"
     config = BuildConfig(
         base_image="${REGISTRY}.example/team/base:v1",
@@ -328,6 +524,8 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
         output_dir=str(tmp_path / "out"),
         use_cache=False,
     )
+    if copy_args != "original":
+        config = replace(config, build_args={} if copy_args == "empty" else None)
     builder = ImageBuilder(config)
     monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
 
@@ -354,6 +552,7 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
 
     assert "rate limit" in caplog.text
     assert value not in caplog.text
+    assert value not in capsys.readouterr().out
 
 
 def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
@@ -475,6 +674,69 @@ def test_build_cache_identity_and_no_implicit_runtime_leakage(tmp_path, monkeypa
         [(tmp_path / "app.py", Path("app.py"))],
         workdir=first.workdir, namespace=first.cache_identity("other-backend"),
     ) is None
+
+
+@pytest.mark.parametrize("arguments", [{}, None])
+def test_cache_hides_source_paths_after_arguments_are_cleared(tmp_path, monkeypatch, arguments):
+    value = "private-source"
+    (tmp_path / f"{value}.py").write_text("print('hello')")
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    cache_dir = tmp_path / "cache"
+    original = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        output_dir=str(tmp_path / "image"), cache_dir=str(cache_dir),
+        build_args={"SOURCE": value},
+    )
+
+    ImageBuilder(replace(original, build_args=arguments)).build()
+
+    entries = json.loads((cache_dir / "index.json").read_text())
+    assert entries
+    assert all(entry["source_files"] == [] for entry in entries.values())
+    assert value not in json.dumps(entries)
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+@pytest.mark.parametrize("persist_explicit", [False, True])
+def test_retained_arguments_do_not_implicitly_persist_in_build_outputs(
+    tmp_path, monkeypatch, copy_kind, persist_explicit
+):
+    previous, current = "private-previous-value", "private-current-value"
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    output, cache, history = (tmp_path / name for name in ("image", "cache", "history"))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    original = BuildConfig(
+        context_dir=str(context), include_paths=["app.py"], output_dir=str(output),
+        cache_dir=str(cache), record_history=True, history_dir=str(history),
+        env={"EXPLICIT": "${VALUE}"} if persist_explicit else {},
+        build_args={"VALUE": previous},
+    )
+    changed = replace(original, build_args={"VALUE": current})
+    if copy_kind == "replace":
+        cleared = replace(changed, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(changed)))
+        data["build_args"] = None
+        cleared = BuildConfig(**data)
+
+    builder = ImageBuilder(cleared)
+    builder.build()
+
+    metadata = json.loads(
+        (output / "blobs" / "sha256" / builder.config_digest.split(":")[1]).read_bytes()
+    )
+    assert (f"EXPLICIT={previous}" in metadata["config"].get("Env", [])) is persist_explicit
+    for directory in (output, cache, history):
+        files = [path for path in directory.rglob("*") if path.is_file()]
+        assert files
+        contents = b"".join(path.read_bytes() for path in files)
+        assert current.encode() not in contents
+        assert (previous.encode() in contents) is (persist_explicit and directory == output)
+    assert json.loads((history / "history.json").read_text())["records"][-1]["status"] == "success"
+    entries = json.loads((cache / "index.json").read_text())
+    assert entries and all(entry["source_files"] == [] for entry in entries.values())
 
 
 def test_storage_locations_do_not_invalidate_equal_source_layer(tmp_path):

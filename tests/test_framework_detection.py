@@ -655,6 +655,48 @@ def test_serialized_generated_defaults_can_be_redetected(tmp_path, build_args):
     assert restored.labels["framework"] == "fastapi"
 
 
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+@pytest.mark.parametrize("declared_nested", [False, True])
+def test_framework_config_copies_do_not_reexpand_build_arguments(
+    tmp_path, copy_kind, declared_nested
+):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    arguments = {"A": "${B}"}
+    if declared_nested:
+        arguments["B"] = "expanded"
+    original = apply_framework_defaults(
+        BuildConfig(build_args=arguments, env={"VALUE": "${A}"}), tmp_path
+    )
+    assert original.env["VALUE"] == "${B}"
+
+    copied = (
+        replace(original) if copy_kind == "replace"
+        else BuildConfig(**json.loads(json.dumps(asdict(original))))
+    )
+    assert copied.env["VALUE"] == "${B}"
+    assert "${B}" not in copied.redact("failed ${B}")
+    write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+    apply_framework_defaults(copied, tmp_path)
+    assert copied.entrypoint[0] == "uvicorn"
+    assert copied.env["VALUE"] == "${B}"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_generated_framework_command_keeps_literal_dollars_when_copied(tmp_path, copy_kind):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "${APP}.py", "import streamlit\n")
+    original = apply_framework_defaults(BuildConfig(build_args={"APP": "other"}), tmp_path)
+    assert original.entrypoint[2] == "${APP}.py"
+
+    copied = (
+        replace(original) if copy_kind == "replace"
+        else BuildConfig(**json.loads(json.dumps(asdict(original))))
+    )
+    assert copied.entrypoint[2] == "${APP}.py"
+    assert apply_framework_defaults(copied, tmp_path).entrypoint[2] == "${APP}.py"
+
+
 @pytest.mark.parametrize("label", ["celery", "custom", ""])
 @pytest.mark.parametrize("copy_mode", ["same", "replace", "deepcopy", "serialized"])
 def test_explicit_framework_label_survives_redetection(tmp_path, label, copy_mode):

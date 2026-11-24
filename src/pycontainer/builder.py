@@ -432,6 +432,7 @@ class ImageBuilder:
                 exclude_paths=self.context_excludes,
                 exclude_defaults=config.exclude_defaults,
                 requirements_file=config.requirements_file,
+                log_redact=config.redact,
             )
         )
         self.dependency_excludes=tuple(
@@ -864,7 +865,7 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
         client=RegistryClient(
             registry,
             repo,
@@ -886,7 +887,7 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1153,7 +1154,7 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1495,6 +1496,7 @@ class ImageBuilder:
                     ),
                 )
             elif source_kind == "requirements":
+                log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
                 self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,
@@ -1506,6 +1508,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    **log_options,
                 )
             else:
                 stage_virtualenv(
@@ -1522,9 +1525,10 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                removed = strip_type_stubs(site_packages)
+                log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+                removed = strip_type_stubs(site_packages, **log_options)
                 if removed:
-                    print(f"Removed type stub distributions: {', '.join(removed)}")
+                    self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
@@ -1663,7 +1667,7 @@ class ImageBuilder:
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
                     namespace=self.config.cache_identity(),
-                    record_source_files=not bool(self.config.build_args),
+                    record_source_files=not self.config._has_build_argument_values(),
                     hardlinks=hardlinks,
                 )
 

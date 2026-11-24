@@ -348,7 +348,7 @@ def main():
 
     from .scanning import ScanError
     log_filter = _BuildArgumentLogFilter(cfg)
-    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    handlers = list(logging.getLogger().handlers) if cfg._has_build_argument_values() else []
     for handler in handlers:
         handler.addFilter(log_filter)
     try:
@@ -384,7 +384,7 @@ def main():
     except ScanError as exc:
         parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
     except (OSError, ValueError, RuntimeError) as exc:
-        if not cfg.build_args:
+        if not cfg._has_build_argument_values():
             raise
         parser.error(cfg.redact(str(exc)))
     finally:

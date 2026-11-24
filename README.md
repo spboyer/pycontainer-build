@@ -997,7 +997,15 @@ SBOM formats, system-package declarations and other settings do not expand.
 are not rescanned, defaults do not reference other arguments, and no host
 environment lookup, expression evaluation or shell execution occurs.
 Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
-without it, existing literal dollar expressions are preserved.
+without it, existing literal dollar expressions are preserved. Copying or
+serializing a config does not re-interpolate existing values, even if its
+arguments change. Changed values supplied during copying expand once; list
+entries are matched by value and count, preserving earlier matching entries.
+An override identical to an existing value is indistinguishable from an
+unchanged copy and remains literal. Construct a fresh config from unexpanded
+values to re-interpolate it. Serialized configs retain earlier and current
+argument values for diagnostic redaction, including after arguments are
+cleared.
 
 Arguments are **not secrets** and are not automatically runtime environment
 variables. Only explicit interpolation into persisted image fields (including
