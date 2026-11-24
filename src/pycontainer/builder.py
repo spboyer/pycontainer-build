@@ -950,7 +950,7 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
         client=RegistryClient(
             registry,
             repo,
@@ -972,7 +972,7 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1239,7 +1239,7 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1556,7 +1556,7 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
-            log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+            log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
             if source_kind == "lock":
                 selection = self._lock_selection(
                     base_config, os_name, arch, variant=variant,
@@ -1617,7 +1617,7 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
+                log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
                 removed = strip_type_stubs(site_packages, **log_options)
                 if removed:
                     self._print(f"Removed type stub distributions: {', '.join(removed)}")

@@ -234,12 +234,16 @@ def _base_environment(base_config: Optional[dict]) -> dict:
     return environment
 
 
+class UnsupportedLibcError(ValueError):
+    """The target base image's libc cannot be used for wheel staging."""
+
+
 def _parse_libc(libc: str) -> Tuple[str, int]:
     match = _LIBC_PATTERN.fullmatch(libc)
     family = match and (match.group(1) or match.group(3))
     minor = match and int(match.group(2) or match.group(4))
     if not match or (family == "glibc" and minor < _MIN_GLIBC_MINOR):
-        raise ValueError(
+        raise UnsupportedLibcError(
             f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
             f"supported values are {_SUPPORTED_LIBC_TEXT}."
         )

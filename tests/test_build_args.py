@@ -1,9 +1,11 @@
 """Build argument grammar, one-pass expansion and image/cache boundaries."""
+import configparser
 import errno
 import json
 import logging
 import sys
 import tarfile
+import tomllib
 import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -145,6 +147,173 @@ def test_config_copy_retains_redaction_after_in_place_argument_clear(copy_kind):
     assert copied.redact("synthetic-copy-marker") == "<redacted>"
 
 
+@pytest.mark.parametrize("mutation", ["assignment", "update", "nested-default"])
+def test_current_in_place_argument_updates_are_redacted_at_builder_boundary(
+    tmp_path, capsys, mutation
+):
+    previous, current = "previous-marker-205", "updated-marker-205"
+    declaration = {"default": previous} if mutation == "nested-default" else previous
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": declaration}
+    )
+    if mutation == "assignment":
+        config.build_args["VALUE"] = current
+    elif mutation == "update":
+        config.build_args.update({"VALUE": current})
+    else:
+        config.build_args["VALUE"]["default"] = current
+
+    builder = ImageBuilder(config)
+    builder._print(f"diagnostic {previous} {current}")
+    output = capsys.readouterr().out
+    assert previous not in output and current not in output
+    assert output.count("<redacted>") == 2
+    assert config.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+    config.build_args.clear()
+    assert config.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+
+@pytest.mark.parametrize("arguments", [None, {}, {"EMPTY": ""}])
+@pytest.mark.parametrize("phase", ["initialize", "build"])
+@pytest.mark.parametrize("kind", ["os", "ini", "toml"])
+def test_cli_preserves_unrelated_exception_causes_without_redactable_values(
+    tmp_path, monkeypatch, arguments, phase, kind
+):
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args=arguments)
+    cause = RuntimeError("original cause")
+    if kind == "toml":
+        with pytest.raises(tomllib.TOMLDecodeError) as parsed:
+            tomllib.loads("invalid = [")
+        failure = parsed.value
+    else:
+        failure = (
+            OSError("unrelated build failure") if kind == "os"
+            else configparser.Error("unrelated build failure")
+        )
+    failure.__cause__ = cause
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "__init__" if phase == "initialize" else "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(type(failure)) as error:
+        cli.main()
+    assert error.value is failure
+    assert error.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("phase", ["initialize", "build"])
+@pytest.mark.parametrize(
+    ("kind", "exit_code"),
+    [
+        ("operational", 2), ("configparser", 2), ("release-notes", 2),
+        ("history", 1), ("scanner", 3),
+    ],
+)
+def test_cli_redacts_unrelated_exception_after_build_arguments_are_cleared(
+    tmp_path, monkeypatch, capsys, phase, kind, exit_code
+):
+    from pycontainer.history import HistoryStorageError
+    from pycontainer.release_notes import ReleaseNotesError
+    from pycontainer.scanning import ScanError
+
+    marker = "retained-marker-205"
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": marker})
+    config.build_args.clear()
+
+    def fail(*args, **kwargs):
+        errors = {
+            "operational": OSError(f"failure {marker}"),
+            "configparser": configparser.Error(f"failure {marker}"),
+            "release-notes": ReleaseNotesError(f"failure {marker}"),
+            "history": HistoryStorageError(f"failure {marker}"),
+            "scanner": ScanError("findings", f"failure {marker}"),
+        }
+        raise errors[kind] from ValueError(f"cause {marker}")
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "__init__" if phase == "initialize" else "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == exit_code
+    stderr = capsys.readouterr().err
+    assert marker not in stderr
+    assert "<redacted>" in stderr
+    assert "Traceback" not in stderr
+    assert marker not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize("kind", ["release-notes", "history", "scanner"])
+def test_cli_known_error_exit_keeps_context_without_redactable_values(
+    tmp_path, monkeypatch, kind
+):
+    from pycontainer.history import HistoryStorageError
+    from pycontainer.release_notes import ReleaseNotesError
+    from pycontainer.scanning import ScanError
+
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""})
+    errors = {
+        "release-notes": ReleaseNotesError("failure"),
+        "history": HistoryStorageError("failure"),
+        "scanner": ScanError("findings", "failure"),
+    }
+    failure = errors[kind]
+    cause = RuntimeError("original cause")
+    failure.__cause__ = cause
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.__context__ is failure
+    assert error.value.__context__.__cause__ is cause
+    assert not error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_copy_with_cleared_arguments_retains_unobserved_in_place_update(copy_kind):
+    previous, current = "previous-marker-205", "updated-marker-205"
+    config = BuildConfig(build_args={"VALUE": previous})
+    config.build_args.update({"VALUE": current})
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = None
+        copied = BuildConfig(**data)
+
+    assert copied.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_argument_added_after_unexpanded_config_survives_copy_redaction(copy_kind):
+    config = BuildConfig(cmd=["${VALUE}"])
+    config.build_args = {"VALUE": "current-marker-205"}
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = None
+        copied = BuildConfig(**data)
+
+    assert copied.redact("current-marker-205") == "<redacted>"
+    assert copied.cmd == ["${VALUE}"]
+    assert replace(copied, build_args={"VALUE": "expanded"}).cmd == ["expanded"]
+
+
 @pytest.mark.parametrize("copy_kind", ["replace", "json"])
 def test_snapshot_equal_overrides_remain_literal_when_arguments_change(copy_kind):
     original = BuildConfig(
@@ -249,6 +418,55 @@ def test_config_copy_preserves_generated_literal_paths_when_commands_change(
 
     assert copied.entrypoint[2] == script
     assert copied.entrypoint[-1] == "new-value"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+@pytest.mark.parametrize("assign_arguments", [False, True])
+def test_new_arguments_do_not_reexpand_framework_defaults_generated_without_arguments(
+    tmp_path, copy_kind, assign_arguments
+):
+    script = "demo_${UNDECLARED}.py"
+    (tmp_path / script).write_text("import streamlit as st\nst.write('hello')\n")
+    (tmp_path / "requirements.txt").write_text("streamlit\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, env={"USER": "${VALUE}"},
+        labels={"user": "${VALUE}"},
+    )
+    ImageBuilder(config)
+    if assign_arguments:
+        config.build_args = {"VALUE": "current"}
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args={"VALUE": "current"})
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = {"VALUE": "current"}
+        copied = BuildConfig(**data)
+
+    assert copied.entrypoint[2] == script
+    assert copied.env["USER"] == "current"
+    assert copied.labels["user"] == "current"
+    assert copied.redact("current") == "<redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_new_arguments_expand_mutated_generated_command_entries(tmp_path, copy_kind):
+    script = "demo_${UNDECLARED}.py"
+    (tmp_path / script).write_text("import streamlit as st\nst.write('hello')\n")
+    (tmp_path / "requirements.txt").write_text("streamlit\n")
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False)
+    ImageBuilder(config)
+    config.entrypoint.append("${VALUE}")
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args={"VALUE": "current"})
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = {"VALUE": "current"}
+        copied = BuildConfig(**data)
+
+    assert copied.entrypoint[2] == script
+    assert copied.entrypoint[-1] == "current"
 
 
 @pytest.mark.parametrize("failure", ["retained-resolution", "current-resolution", "interpolation"])
@@ -804,6 +1022,28 @@ def test_direct_build_redacts_registry_rate_limit_logs(
     assert value not in capsys.readouterr().out
 
 
+def test_registry_redactor_observes_current_arguments_before_they_are_cleared(
+    tmp_path, caplog
+):
+    previous, current = "previous-registry-205", "current-registry-205"
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": previous}
+    )
+    config.build_args["VALUE"] = current
+    builder = ImageBuilder(config)
+
+    client = builder._registry_client("registry.example", "app", RegistryAuth())
+    config.build_args.clear()
+    with caplog.at_level(logging.WARNING):
+        client._observe_rate_limit(
+            {"ratelimit-limit": "100", "ratelimit-remaining": "0"},
+            f"https://{previous}-{current}.example",
+        )
+
+    assert previous not in caplog.text and current not in caplog.text
+    assert caplog.text.count("<redacted>") == 2
+
+
 @pytest.mark.parametrize("operation", ["pull", "mirror", "push"])
 @pytest.mark.parametrize("cleared", [False, True], ids=["configured", "cleared"])
 def test_direct_build_redacts_azure_auth_logs(
@@ -951,6 +1191,25 @@ def test_build_cache_identity_and_no_implicit_runtime_leakage(tmp_path, monkeypa
         [(tmp_path / "app.py", Path("app.py"))],
         workdir=first.workdir, namespace=first.cache_identity("other-backend"),
     ) is None
+
+
+def test_empty_build_argument_still_hides_cache_source_paths(tmp_path, monkeypatch):
+    source = "private-source.py"
+    (tmp_path / source).write_text("print('hello')")
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    cache_dir = tmp_path / "cache"
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[source], use_cache=True,
+        output_dir=str(tmp_path / "image"), cache_dir=str(cache_dir),
+        build_args={"EMPTY": ""},
+    )
+
+    ImageBuilder(config).build()
+
+    entries = json.loads((cache_dir / "index.json").read_text())
+    assert entries
+    assert all(entry["source_files"] == [] for entry in entries.values())
+    assert source not in json.dumps(entries)
 
 
 @pytest.mark.parametrize("arguments", [{}, None])

@@ -18,6 +18,14 @@ _REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
 _VCS_REQUIREMENT = re.compile(r"^(?:git|hg|svn|bzr)\+")
 
 
+class ProjectMetadataError(ValueError):
+    """Invalid dependency metadata discovered in the build context."""
+
+
+class MissingRequirementsFileError(FileNotFoundError):
+    """A requirements file referenced by project metadata is missing."""
+
+
 def requirement_name(requirement):
     requirement = requirement.strip()
     if _VCS_REQUIREMENT.match(requirement):
@@ -71,11 +79,11 @@ def declared_dependency_names(
             raise
         if not contained:
             if conda_prefix(ctx, relative) is not None:
-                raise ValueError(
+                raise ProjectMetadataError(
                     "Conda staging is unsupported. Export pip-compatible requirements "
                     "with `python -m pip freeze > requirements.txt` inside the build context."
                 )
-            raise ValueError(
+            raise ProjectMetadataError(
                 log_redact(
                     f"Dependency file is outside the build context: {display or relative}; "
                     "requirements must stay inside the build context."
@@ -91,14 +99,14 @@ def declared_dependency_names(
         path = selected_file(relative, display=display)
         if path is None:
             if required and not path_is_excluded(relative, excludes):
-                raise FileNotFoundError(f"Requirements file not found: {shown}")
+                raise MissingRequirementsFileError(f"Requirements file not found: {shown}")
             return
         if relative in ancestors:
-            raise ValueError(f"Requirements include cycle in {shown}.")
+            raise ProjectMetadataError(f"Requirements include cycle in {shown}.")
         if relative in visited:
             return
         if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
-            raise ValueError(
+            raise ProjectMetadataError(
                 f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
             )
         visited.add(relative)
@@ -109,7 +117,7 @@ def declared_dependency_names(
                 raise OSError("Cannot access an environment-based requirements file.") from None
             raise
         if total_bytes > MAX_REQUIREMENTS_BYTES:
-            raise ValueError(
+            raise ProjectMetadataError(
                 "Requirements files exceed the combined "
                 f"{MAX_REQUIREMENTS_BYTES}-byte limit."
             )
@@ -118,7 +126,7 @@ def declared_dependency_names(
             try:
                 parts = shlex.split(expanded, comments=True)
             except ValueError as error:
-                raise ValueError(
+                raise ProjectMetadataError(
                     f"Invalid requirement syntax in {shown} at line {line_number}"
                 ) from error
             if not parts:
@@ -127,7 +135,7 @@ def declared_dependency_names(
             nested = None
             if first in ("-r", "--requirement"):
                 if len(parts) != 2:
-                    raise ValueError(
+                    raise ProjectMetadataError(
                         f"Invalid requirements include in {shown} at line {line_number}"
                     )
                 nested = parts[1]
@@ -157,7 +165,7 @@ def declared_dependency_names(
                         or windows_path.drive
                         or windows_path.root
                     ):
-                        raise ValueError(
+                        raise ProjectMetadataError(
                             f"Invalid requirements include in {shown} at line {line_number}"
                         )
                     logical_path = Path(os.path.abspath(ctx / relative.parent / nested_path))
@@ -169,12 +177,12 @@ def declared_dependency_names(
                         )
                     except (OSError, RuntimeError):
                         if environment_include:
-                            raise ValueError(
+                            raise ProjectMetadataError(
                                 "Cannot access an environment-based requirements include."
                             ) from None
                         raise
                     if not contained:
-                        raise ValueError(
+                        raise ProjectMetadataError(
                             f"Requirements include in {shown} escapes the build context"
                         )
                     read_requirements(
@@ -195,28 +203,32 @@ def declared_dependency_names(
 
     pyproject = selected_file("pyproject.toml")
     if pyproject:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        content = pyproject.read_text(encoding="utf-8")
+        try:
+            data = tomllib.loads(content)
+        except tomllib.TOMLDecodeError as error:
+            raise ProjectMetadataError(f"Invalid pyproject.toml: {error}") from error
         project = data.get("project", {})
         if not isinstance(project, dict):
-            raise ValueError("[project] must be a TOML table.")
+            raise ProjectMetadataError("[project] must be a TOML table.")
         dependencies = project.get("dependencies", [])
         if not isinstance(dependencies, list) or not all(
             isinstance(item, str) for item in dependencies
         ):
-            raise ValueError("[project].dependencies must be a list of strings")
+            raise ProjectMetadataError("[project].dependencies must be a list of strings")
         for dependency in dependencies:
             name = requirement_name(dependency)
             if name:
                 names.add(name)
         tool = data.get("tool", {})
         if not isinstance(tool, dict):
-            raise ValueError("[tool] must be a TOML table.")
+            raise ProjectMetadataError("[tool] must be a TOML table.")
         poetry = tool.get("poetry", {})
         if not isinstance(poetry, dict):
-            raise ValueError("[tool.poetry] must be a TOML table.")
+            raise ProjectMetadataError("[tool.poetry] must be a TOML table.")
         poetry_dependencies = poetry.get("dependencies", {})
         if not isinstance(poetry_dependencies, dict):
-            raise ValueError("[tool.poetry.dependencies] must be a TOML table.")
+            raise ProjectMetadataError("[tool.poetry.dependencies] must be a TOML table.")
         for name, value in poetry_dependencies.items():
             if name != "python" and not (
                 isinstance(value, dict) and value.get("optional", False)
@@ -228,7 +240,11 @@ def declared_dependency_names(
     setup_cfg = selected_file("setup.cfg")
     if setup_cfg:
         parser = configparser.ConfigParser(interpolation=None)
-        parser.read_string(setup_cfg.read_text(encoding="utf-8"))
+        content = setup_cfg.read_text(encoding="utf-8")
+        try:
+            parser.read_string(content)
+        except configparser.Error as error:
+            raise ProjectMetadataError(f"Invalid setup.cfg: {error}") from error
         value = parser.get("options", "install_requires", fallback="")
         if value.strip().startswith("file:"):
             for included_file in value.strip()[len("file:"):].split(","):

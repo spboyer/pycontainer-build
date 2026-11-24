@@ -1299,16 +1299,17 @@ def test_cli_reports_ambiguity_without_a_traceback(tmp_path, monkeypatch, capsys
     assert "Traceback" not in stderr
 
 
-def test_cli_reports_build_time_errors_without_a_traceback(tmp_path, monkeypatch, capsys):
+def test_cli_propagates_unrelated_build_errors_without_redaction(tmp_path, monkeypatch):
     write_file(tmp_path, "app.py", "print('app')\n")
-    monkeypatch.setattr(ImageBuilder, "build", lambda self: (_ for _ in ()).throw(OSError("build failed")))
+    cause = RuntimeError("original cause")
+    failure = OSError("build failed")
+    failure.__cause__ = cause
+    monkeypatch.setattr(ImageBuilder, "build", lambda self: (_ for _ in ()).throw(failure))
     monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
-    with pytest.raises(SystemExit) as error:
+    with pytest.raises(OSError) as error:
         cli.main()
-    assert error.value.code == 2
-    stderr = capsys.readouterr().err
-    assert "build failed" in stderr
-    assert "Traceback" not in stderr
+    assert error.value is failure
+    assert error.value.__cause__ is cause
 
 
 def test_cli_reports_invalid_project_metadata_without_a_traceback(tmp_path, monkeypatch, capsys):
@@ -1319,6 +1320,43 @@ def test_cli_reports_invalid_project_metadata_without_a_traceback(tmp_path, monk
     assert error.value.code == 2
     stderr = capsys.readouterr().err
     assert "[project]" in stderr
+    assert "Traceback" not in stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "contents"),
+    [("pyproject.toml", "invalid = ["), ("setup.cfg", "install_requires = streamlit\n")],
+)
+def test_cli_reports_invalid_project_metadata_syntax_without_a_traceback(
+    tmp_path, monkeypatch, capsys, name, contents
+):
+    write_file(tmp_path, name, contents)
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False)
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert f"Invalid {name}" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_cli_reports_invalid_streamlit_port_without_a_traceback(tmp_path, monkeypatch, capsys):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    write_file(tmp_path, "app.py", "import streamlit\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, env={"STREAMLIT_SERVER_PORT": "invalid"}
+    )
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "STREAMLIT_SERVER_PORT" in stderr
     assert "Traceback" not in stderr
 
 

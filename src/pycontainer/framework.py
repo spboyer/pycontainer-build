@@ -895,9 +895,9 @@ def _environment_port(value, name):
     try:
         port = int(value)
     except (TypeError, ValueError) as error:
-        raise ValueError(f"{name} must be a port number from 1 to 65535.") from error
+        raise FrameworkPortDetectionError(f"{name} must be a port number from 1 to 65535.") from error
     if not 0 < port <= 65535:
-        raise ValueError(f"{name} must be a port number from 1 to 65535.")
+        raise FrameworkPortDetectionError(f"{name} must be a port number from 1 to 65535.")
     return port
 
 
@@ -1000,7 +1000,7 @@ def apply_framework_defaults(
             and len(config.exposed_ports) == 1
         ):
             if env_port is not None and requested_port != config.exposed_ports[0]:
-                raise ValueError(
+                raise FrameworkPortDetectionError(
                     "STREAMLIT_SERVER_PORT conflicts with the explicitly exposed port."
                 )
             requested_port = config.exposed_ports[0]

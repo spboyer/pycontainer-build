@@ -1035,23 +1035,26 @@ are not rescanned, defaults do not reference other arguments, and no host
 environment lookup, expression evaluation or shell execution occurs.
 Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
 without it, existing literal dollar expressions are preserved. Copying or
-serializing a config does not re-interpolate existing values, even if its
-arguments change. Changed values, including edits made after construction,
-expand once on a copy with arguments; copies without arguments defer their
-expansion. List entries are matched by value and count, preserving earlier
-matching entries.
+serializing a config does not re-interpolate already expanded or
+framework-generated values, even if its arguments change. Unexpanded user
+fields and changed values, including edits made after construction, expand once
+on a copy with arguments; copies without arguments defer their expansion. List
+entries are matched by value and count, preserving earlier matching entries.
 An override identical to an existing value is indistinguishable from an
 unchanged copy and remains literal. Construct a fresh config from unexpanded
-values to re-interpolate it. Serialized configs retain earlier and current
-argument values for diagnostic redaction, including after arguments are
-cleared.
+values to re-interpolate it. The config remembers nonempty argument values when
+it resolves them, redacts output, or is copied or serialized. An in-place value
+inserted and removed before any of these observations cannot be recovered.
+Serialized configs, including `dataclasses.asdict` and JSON snapshots, retain
+observed values for diagnostic redaction even after arguments are cleared;
+treat these snapshots as sensitive.
 
 Arguments are **not secrets** and are not automatically runtime environment
 variables. Only explicit interpolation into persisted image fields (including
 labels, environment, command or workdir) stores a value in image metadata.
 Configuration/source files selected for the app layer are still copied normally;
 exclude files containing defaults if they should not be shipped.
-Diagnostic output redacts nonempty argument values. Cache metadata contains
+Diagnostic output redacts known nonempty argument values. Cache metadata contains
 hashed resolved configuration/target/backend identity, not argument values;
 argument builds omit source-path metadata. Unused argument changes do not
 invalidate the app-layer cache. The cache stores actual layer contents, not

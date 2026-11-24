@@ -409,17 +409,22 @@ class BuildConfig:
             return _FrameworkState(values, generated, self.labels, _is_generated_label(self))
         if name == "_build_args_expansion_state":
             instance = object.__getattribute__(self, "__dict__")
-            if not instance.get("_build_args_expanded", False):
+            redactions = object.__getattribute__(self, "_remember_build_argument_values")()
+            expanded = instance.get("_build_args_expanded", False)
+            values = instance["_build_args_values"]
+            if not expanded and not redactions and not any(
+                value is not None for value in values.values()
+            ):
                 return None
             return {
                 "values": {
                     field_name: unchanged_field_values(
                         object.__getattribute__(self, field_name),
-                        instance["_build_args_values"][field_name],
+                        values[field_name],
                     )
                     for field_name in EXPANDABLE_FIELDS
                 },
-                "redactions": list(instance["_build_args_redactions"]),
+                "redactions": list(redactions),
             }
         return object.__getattribute__(self, name)
 
@@ -461,14 +466,13 @@ class BuildConfig:
             self._validate()
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
-        self._build_args_values = deepcopy(
-            state["values"] if self.build_args is None and state is not None
-            else {name: getattr(self, name) for name in EXPANDABLE_FIELDS}
-        )
+        if self.build_args is None:
+            values = state["values"] if state is not None else dict.fromkeys(EXPANDABLE_FIELDS)
+        else:
+            values = {name: getattr(self, name) for name in EXPANDABLE_FIELDS}
+        self._build_args_values = deepcopy(values)
 
     def _remember_generated_expansion(self):
-        if not self._build_args_expanded:
-            return
         for name in ("entrypoint", "cmd"):
             if _is_generated_field(self, name):
                 self._build_args_values[name] = list(getattr(self, name))
@@ -627,12 +631,23 @@ class BuildConfig:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
 
+    def _remember_build_argument_values(self):
+        self._build_args_redactions = tuple(dict.fromkeys(
+            value for value in [
+                *self._build_args_redactions, *known_argument_values(self.build_args)
+            ] if value
+        ))
+        return self._build_args_redactions
+
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""
-        return redact_values(message, self._build_args_redactions)
+        return redact_values(message, self._remember_build_argument_values())
 
     def _has_build_argument_values(self) -> bool:
         return bool(self.build_args or self._build_args_redactions)
+
+    def _needs_build_argument_redaction(self) -> bool:
+        return bool(self._remember_build_argument_values())
 
     def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
         import hashlib
