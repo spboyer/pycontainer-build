@@ -52,10 +52,13 @@ class MirroredPullClient:
         self,
         upstream: str,
         endpoints: Sequence[Tuple[str, Callable[[], RegistryClient]]],
+        *,
+        log_redact: Optional[Callable[[str], str]] = None,
     ):
         if not endpoints:
             raise ValueError("At least one registry endpoint is required.")
         self.upstream = upstream
+        self._log_redact = log_redact if log_redact is not None else str
         self._endpoints = list(endpoints)
         self._clients: Dict[int, RegistryClient] = {}
         self._unavailable: Set[int] = set()
@@ -83,15 +86,14 @@ class MirroredPullClient:
                 ):
                     self._unavailable.add(index)
                 logger.warning(
-                    "Registry mirror %s for %s failed for %s (%s); trying the "
-                    "next mirror or the upstream registry.",
-                    host,
-                    self.upstream,
-                    description,
-                    reason,
+                    "%s", self._log_redact(
+                        f"Registry mirror {host} for {self.upstream} failed for "
+                        f"{description} ({reason}); trying the next mirror or "
+                        "the upstream registry."
+                    ),
                 )
                 continue
-            logger.debug("Pulled %s from %s", description, host)
+            logger.debug("%s", self._log_redact(f"Pulled {description} from {host}"))
             if host not in self.serving_hosts:
                 self.serving_hosts.append(host)
             return result

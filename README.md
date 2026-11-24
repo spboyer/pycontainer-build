@@ -540,6 +540,25 @@ pycontainer build \
 - `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
   `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
   (`use-lockfile = false`) ignores auto-detected lockfiles.
+- `--strip-type-stubs` — Opt in (`[build] strip-type-stubs = true`) to drop
+  typing-only files from the dependency layer. Off by default; the default
+  layer is unchanged. It deletes every staged `*.pyi` file and removes
+  stub-only distributions (canonical names `types-*` or `*-stubs`) with their
+  `.dist-info`, rewrites each affected `RECORD`, and leaves them out of the
+  SBOM. A stub-named distribution is removed only if its `RECORD` lists
+  nothing but `.pyi`, `py.typed`, `*-stubs/METADATA.toml` and its own
+  metadata; one that also ships runtime code (for example `django-stubs`
+  with its mypy plugin) is kept, minus its `.pyi` files. Files also listed by
+  a retained distribution are preserved. A malformed `RECORD`, a stub
+  distribution without a `RECORD`, or any `RECORD` path outside
+  site-packages fails the build before anything is changed. The only outside
+  entries accepted are virtualenv launchers in retained distributions,
+  including stub-named packages with runtime files
+  (`../../Scripts/<name>` or `../../../bin/<name>`, not `.pyi`); they are never
+  deleted and stay byte-identical in the rewritten `RECORD`.
+  Identical inputs still give
+  identical layer digests. Leave it off if a dependency reads `.pyi` files
+  at runtime; there are no per-package exceptions.
 - **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
   `conda-lock.yml`, and `conda-meta/` directories in the context. With
   `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
@@ -924,6 +943,68 @@ how to apply them.
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
+
+### Build arguments
+
+Declare inputs in either configuration table, then pass repeatable overrides:
+
+```toml
+[build]
+tag = "myapp:${VERSION}"
+workdir = "/app"
+entrypoint = ["python", "-m", "app"]
+
+[build.build-args]
+VERSION = "1.0.0"                 # string default
+ENVIRONMENT = {}                   # required, including an explicitly empty value
+OPTION = { default = "" }          # optional default table
+
+[build.labels]
+version = "${VERSION}"
+literal = "$${VERSION}"            # persists the literal ${VERSION}
+
+[build.env]
+APP_ENV = "${ENVIRONMENT}"         # explicit runtime persistence
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg ENVIRONMENT=production --build-arg VERSION=1.2.3
+```
+
+For `pyproject.toml`, use `[tool.pycontainer.build-args]` instead.
+The `skaffold-build` and `tilt-build` commands accept the same overrides
+when using a configuration file.
+Names match `[A-Za-z_][A-Za-z0-9_]*`; values are strings. Overrides split on
+the first `=` (so `OPTION=a=b` is valid), and the last occurrence wins.
+Ordinary explicit CLI settings override file settings before interpolation.
+Malformed or undeclared arguments, missing required values, invalid/unclosed
+references, and C0/C1/DEL control characters fail before building, including
+in dry-run mode. Defaults are checked even when overridden.
+
+`${NAME}` expands **once**, only in `tag`, `tags`, `base_image`, `context_dir`,
+`workdir`, `entrypoint`, `cmd`, `user`, `include_paths`, `exclude_paths`,
+`output_dir`, `cache_dir`, `requirements_file`, `platform`, `stop_signal`,
+`volumes`, and the **values**
+of `env` and `labels`. Hyphenated setting aliases work too. Dictionary keys,
+SBOM formats, system-package declarations and other settings do not expand.
+`$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
+are not rescanned, defaults do not reference other arguments, and no host
+environment lookup, expression evaluation or shell execution occurs.
+Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
+without it, existing literal dollar expressions are preserved.
+
+Arguments are **not secrets** and are not automatically runtime environment
+variables. Only explicit interpolation into persisted image fields (including
+labels, environment, command or workdir) stores a value in image metadata.
+Configuration/source files selected for the app layer are still copied normally;
+exclude files containing defaults if they should not be shipped.
+Diagnostic output redacts nonempty argument values. Cache metadata contains
+hashed resolved configuration/target/backend identity, not argument values;
+argument builds omit source-path metadata. Unused argument changes do not
+invalidate the app-layer cache. The cache stores actual layer contents, not
+encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
+scoped interface; imported values escape dollars to preserve their runtime
+meaning when loaded. Build arguments do not introduce stages or conditions.
 
 ---
 
