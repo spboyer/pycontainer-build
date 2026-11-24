@@ -511,7 +511,9 @@ def test_cache_preserves_pip_configuration_precedence(tmp_path, monkeypatch, ind
         f"--hash=sha256:{_sha(config_wheel)} --hash=sha256:{_sha(env_wheel)}\n"
     )
     config = tmp_path / "pip.conf"
-    config.write_text(f"[install]\nindex-url = {config_index.url}\n")
+    config.write_text(
+        f"[global]\nbreak-system-packages = true\n[install]\nindex-url = {config_index.url}\n"
+    )
     monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
     monkeypatch.setenv("PIP_INDEX_URL", env_index.url)
     monkeypatch.setattr(dependency_cache, "ambient_pip_settings", ambient_pip_settings)
@@ -1776,7 +1778,10 @@ def test_real_ambient_pip_config_is_read_and_sanitized(tmp_path, monkeypatch):
 
 def test_shadowed_pip_config_query_is_an_explicit_miss(tmp_path, monkeypatch):
     config = tmp_path / "pip.conf"
-    config.write_text("[global]\nindex-url = https://example.invalid/simple?feed=private\n")
+    config.write_text(
+        "[global]\nbreak-system-packages = true\n"
+        "index-url = https://example.invalid/simple?feed=private\n"
+    )
     monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
     monkeypatch.setenv("PIP_INDEX_URL", "https://example.invalid/simple")
 
@@ -1788,7 +1793,9 @@ def test_shadowed_pip_config_query_is_an_explicit_miss(tmp_path, monkeypatch):
 
 def test_pip_config_proxy_is_a_secret_free_cache_miss(tmp_path, monkeypatch):
     config = tmp_path / "pip.conf"
-    config.write_text(f"[global]\nproxy = http://user:{SECRET}@proxy.invalid\n")
+    config.write_text(
+        f"[global]\nbreak-system-packages = true\nproxy = http://user:{SECRET}@proxy.invalid\n"
+    )
     monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
 
     with pytest.raises(DependencyCacheMiss, match="a proxy") as error:

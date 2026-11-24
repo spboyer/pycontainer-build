@@ -72,7 +72,9 @@ type-stub stripping, and `INSTALLER_BACKEND`. Nonempty Python startup overrides 
 `PYTHONPATH`) are explicit misses even for locked installs; pip and the config
 probe ignore `PYTHONPATH`, but the builder process may not. A relative
 `PIP_CONFIG_FILE` is a miss for plain requirements. Plain requirements read
-pip's local configuration through the installed pip parser before lookup. On a
+pip's local configuration through the installed pip parser before lookup. The
+cache ignores `break-system-packages`, which the target installer's
+configuration filter already removes. Unknown settings still miss. On a
 miss, the installer uses private snapshots of keyed requirements, verified
 local find-links files, pip configuration and environment; snapshots are
 bounded by the staged size/file limits and removed after use. Unsupported or

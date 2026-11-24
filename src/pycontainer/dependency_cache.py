@@ -65,6 +65,8 @@ _AMBIENT_KEYED = {
 }
 # Special-case source-routing settings before ignoring these options.
 _AMBIENT_IGNORED = {
+    # The target bootstrap removes this host-system installation override.
+    "break-system-packages",
     "cache-dir",
     "cert",
     "client-cert",
