@@ -562,8 +562,9 @@ def test_cache_verification_preserves_failure_cause_without_redactable_values(
     assert isinstance(error.value.__cause__, OSError)
 
 
+@pytest.mark.parametrize("squash", [False, True])
 def test_locked_build_remote_cache_excludes_concurrent_staging(
-    tmp_path, registry, monkeypatch, indexes
+    tmp_path, registry, monkeypatch, indexes, squash
 ):
     from test_dependency_staging import BASE_CONFIG as LOCKED_BASE_CONFIG, _write_wheel
     from test_lockfiles import _ambient_pip, _write_uv_project
@@ -585,11 +586,12 @@ def test_locked_build_remote_cache_excludes_concurrent_staging(
         "base_image": "python:3.11-slim-bookworm",
         "include_deps": True,
         "include_paths": ["."],
+        "squash": squash,
     }
 
     writer = _builder(tmp_path, "locked-writer", cache_to=CACHE_SPEC, **options)
     writer.build()
-    cold = writer.layers[-1]
+    cold = writer._app_layer
     with tarfile.open(cold.tar_path) as archive:
         names = archive.getnames()
     assert "app/uv.lock" in names
@@ -603,7 +605,8 @@ def test_locked_build_remote_cache_excludes_concurrent_staging(
     _forbid_tar_build(monkeypatch)
     reader = _builder(tmp_path, "locked-reader", cache_from=CACHE_SPEC, **options)
     reader.build()
-    assert reader.layers[-1].digest == cold.digest
+    assert reader._app_layer.digest == cold.digest
+    assert reader.layers[-1].digest == writer.layers[-1].digest
     assert any(
         method == "GET" and "/manifests/" in path
         for _, method, path, _ in registry.requests
@@ -611,7 +614,8 @@ def test_locked_build_remote_cache_excludes_concurrent_staging(
     assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
     assert not rogue.requests
     for builder in (writer, reader):
-        with tarfile.open(builder.layers[-2].tar_path) as archive:
+        layer = builder.layers[-1] if squash else builder.layers[-2]
+        with tarfile.open(layer.tar_path) as archive:
             assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
 
 
