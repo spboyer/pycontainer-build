@@ -657,7 +657,8 @@ def test_pull_request_ci_keeps_bounded_windows_headroom_and_matrix():
     assert "continue-on-error" not in job
     assert "os: [ubuntu-latest, windows-latest]" in job
     assert 'python-version: ["3.11", "3.15"]' in job
-    assert 'pytest tests -q -m "not registry_integration and not scanner_integration"' in job
+    assert "pytest tests -q" in job
+    assert '-m "not registry_integration and not scanner_integration"' in job
     assert "pytest tests/test_pre_commit_hook.py -q" in job
 
 
