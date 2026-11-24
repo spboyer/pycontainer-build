@@ -233,6 +233,61 @@ def test_history_and_security_fragments_are_both_preserved(tmp_path, monkeypatch
     assert "base_image" in record["phases_ns"]
 
 
+def test_history_records_phases_without_build_argument_values(tmp_path, monkeypatch):
+    _offline_base(monkeypatch)
+    value = "synthetic-build-argument"
+    config = _history_config(
+        tmp_path, tag="example:${VERSION}", build_args={"VERSION": value},
+        generate_sbom=True,
+    )
+
+    ImageBuilder(config).build()
+
+    content = (Path(config.history_dir) / "history.json").read_text()
+    assert value not in content
+    record = BuildHistory(config.history_dir).list()[0]
+    assert record["status"] == "success"
+    assert {"base_image", "application", "sbom"} <= record["phases_ns"].keys()
+
+
+def test_failed_history_log_redacts_build_argument_values(tmp_path, monkeypatch, caplog):
+    value = "synthetic-build-argument"
+    config = _history_config(tmp_path, build_args={"VALUE": value})
+    builder = ImageBuilder(config)
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("original build failure")
+
+    def fail_history(*args, **kwargs):
+        raise HistoryStorageError(f"storage failed at {value}")
+
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", fail_build)
+    monkeypatch.setattr(BuildHistory, "append", fail_history)
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="original build failure"):
+        builder.build()
+
+    assert "storage failed at <redacted>" in caplog.text
+    assert value not in caplog.text
+
+
+def test_cli_history_error_redacts_build_argument_values(tmp_path, monkeypatch, capsys):
+    value = "synthetic-build-argument"
+    config = tmp_path / "pycontainer.toml"
+    config.write_text('[build.build-args]\nVALUE = "synthetic-build-argument"\n')
+
+    def fail_builder(*args, **kwargs):
+        raise HistoryStorageError(f"storage failed at {value}")
+
+    monkeypatch.setattr(cli, "ImageBuilder", fail_builder)
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--config", str(config), "--record-history"])
+
+    assert error.value.code == 1
+    diagnostic = capsys.readouterr().err
+    assert "Build history error: storage failed at <redacted>" in diagnostic
+    assert value not in diagnostic
+
+
 def test_failed_build_records_partial_phase_without_error_text(tmp_path, monkeypatch):
     secret = "synthetic-failure-secret"
 

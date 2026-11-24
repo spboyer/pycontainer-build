@@ -14,7 +14,7 @@ import tomllib
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from .project import requirement_name
 
 logger = logging.getLogger(__name__)
@@ -323,8 +323,12 @@ def inspect_base_layers(layers: Iterable) -> Tuple[Optional[str], Optional[Set[s
     return family, installed
 
 
-def report_system_packages(config, base_layers, locked_names: Iterable[str] = ()) -> SystemPackageReport:
+def report_system_packages(
+    config, base_layers, locked_names: Iterable[str] = (),
+    *, redact: Optional[Callable[[str], str]] = None
+) -> SystemPackageReport:
     """Compare required system packages with the base image and log findings."""
+    redact_message = redact if redact is not None else str
     report = SystemPackageReport()
     explicit = validate_system_packages(config.system_packages)
     if not explicit and not config.detect_system_packages:
@@ -351,28 +355,26 @@ def report_system_packages(config, base_layers, locked_names: Iterable[str] = ()
 
     if installed is None:
         report.unverified = list(required)
-        logger.warning(
+        logger.warning("%s", redact_message(
             "Could not verify system packages in the base image (%s): %s. "
             "pycontainer-build does not install system packages; use a base "
-            "image that provides them.",
-            reason,
-            ", ".join(required),
-        )
+            "image that provides them."
+            % (reason, ", ".join(required))
+        ))
         return report
 
     for package in required:
         (report.satisfied if package in installed else report.missing).append(package)
     for package in report.missing:
         reason = report.reasons.get(package, "declared in system_packages")
-        logger.warning(
+        logger.warning("%s", redact_message(
             "System package %r (%s) is not installed in base image (%s). "
             "pycontainer-build cannot run %s; choose a base image that "
-            "includes it.",
-            package,
-            reason,
-            family,
-            "apt-get install" if family == DEBIAN else "apk add",
-        )
+            "includes it."
+            % (package, reason, family, "apt-get install" if family == DEBIAN else "apk add")
+        ))
     if report.satisfied:
-        logger.info("System packages present in base image: %s", ", ".join(report.satisfied))
+        logger.info(
+            "%s", redact_message("System packages present in base image: %s" % ", ".join(report.satisfied))
+        )
     return report

@@ -261,3 +261,23 @@ def test_dry_run_plan_reports_inherited_entrypoint(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Entrypoint: <inherited from base>" in out
     assert "Command: python app.py" in out
+
+
+def test_cmd_build_argument_preserves_base_entrypoint_and_redacts_plan(tmp_path, monkeypatch, capsys):
+    context = _context(tmp_path, framework=True)
+    options = {
+        "context_dir": str(context),
+        "output_dir": str(tmp_path / "out"),
+        "use_cache": False,
+        "cmd": ["python", "${ARG}"],
+        "build_args": {"ARG": "private-command"},
+    }
+    image = _built_config(tmp_path, monkeypatch, ENTRYPOINT_BASE, BuildConfig(**options))["config"]
+    assert image["Entrypoint"] == ["docker-entrypoint.sh"]
+    assert image["Cmd"] == ["python", "private-command"]
+
+    ImageBuilder(BuildConfig(**options, dry_run=True)).build()
+    out = capsys.readouterr().out
+    assert "Entrypoint: <inherited from base>" in out
+    assert "Command: python <redacted>" in out
+    assert "private-command" not in out

@@ -626,10 +626,11 @@ def test_dataclass_replace_preserves_explicit_empty_port_override(tmp_path):
 
 
 @pytest.mark.parametrize("copy_config", [replace, deepcopy])
-def test_config_copies_preserve_generated_defaults_for_redetection(tmp_path, copy_config):
+@pytest.mark.parametrize("build_args", [None, {}, {"APP": "unused"}])
+def test_config_copies_preserve_generated_defaults_for_redetection(tmp_path, copy_config, build_args):
     write_file(tmp_path, "requirements.txt", "celery\n")
     write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
-    original = apply_framework_defaults(BuildConfig(), tmp_path)
+    original = apply_framework_defaults(BuildConfig(build_args=build_args), tmp_path)
     copied = copy_config(original)
     write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
 
@@ -640,10 +641,11 @@ def test_config_copies_preserve_generated_defaults_for_redetection(tmp_path, cop
     assert original.labels["framework"] == "celery"
 
 
-def test_serialized_generated_defaults_can_be_redetected(tmp_path):
+@pytest.mark.parametrize("build_args", [None, {}, {"APP": "unused"}])
+def test_serialized_generated_defaults_can_be_redetected(tmp_path, build_args):
     write_file(tmp_path, "requirements.txt", "celery\n")
     write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
-    original = apply_framework_defaults(BuildConfig(), tmp_path)
+    original = apply_framework_defaults(BuildConfig(build_args=build_args), tmp_path)
     restored = BuildConfig(**json.loads(json.dumps(asdict(original))))
     write_file(tmp_path, "api.py", "from fastapi import FastAPI\napp = FastAPI()\n")
 

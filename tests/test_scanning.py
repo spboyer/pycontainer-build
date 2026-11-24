@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -374,10 +375,20 @@ def test_new_build_changes_scanned_digest(tmp_path, monkeypatch, scanner):
     assert report["source"]["target"]["manifestDigest"] == builder.manifest_digest
 
 
-def test_push_transfers_scanned_copy_even_if_output_changes(tmp_path, monkeypatch, scanner):
-    builder = make_builder(tmp_path, monkeypatch, scanner)
-    builder.build()
+@pytest.mark.parametrize("arguments", [False, True])
+def test_push_transfers_scanned_copy_even_if_output_changes(
+    tmp_path, monkeypatch, scanner, capsys, caplog, arguments,
+):
+    value = "private-registry"
+    options = {"build_args": {"REGISTRY": value}, "tag": "${REGISTRY}.example/app:latest"} if arguments else {}
+    builder = make_builder(tmp_path, monkeypatch, scanner, **options)
+    with caplog.at_level(logging.INFO):
+        builder.build()
     manifest = tmp_path / "output" / "blobs" / "sha256" / builder.manifest_digest.split(":")[1]
+    original = json.loads(manifest.read_text())
+    expected_blobs = [item["digest"] for item in original["layers"]] + [original["config"]["digest"]]
+    builder.layers = []
+    builder.config_digest = "sha256:" + "0" * 64
     scanner[1].write_text(json.dumps({"mutate_source": str(manifest)}))
     transferred = []
 
@@ -399,9 +410,13 @@ def test_push_transfers_scanned_copy_even_if_output_changes(tmp_path, monkeypatc
     monkeypatch.setattr("pycontainer.builder.RegistryClient", Client)
     monkeypatch.setattr("pycontainer.builder.get_registry_auth",
                         lambda *a, **kw: SimpleNamespace(bearer_token=None, username=None, password=None))
-    builder.push(show_progress=False)
+    builder.push()
+    assert transferred[:-1] == expected_blobs
     assert transferred[-1] == "latest"
     assert manifest.read_bytes() == b"changed source"
+    if arguments:
+        output = capsys.readouterr()
+        assert value not in output.out + output.err + caplog.text
 
 
 @pytest.mark.parametrize("severity", ["high", "critical", "unknown"])

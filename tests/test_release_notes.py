@@ -353,3 +353,62 @@ def test_cli_release_notes_label_overrides_file(tmp_path, monkeypatch, capsys):
     cli.main()
     assert builders[0].release_notes_labels == {"cli.notes": SECRET}
     assert SECRET not in capsys.readouterr().out
+
+
+def test_release_notes_and_argument_labels_keep_precedence_and_redact_plan(
+    tmp_path, monkeypatch, capsys,
+):
+    context = _context(tmp_path)
+    (context / "notes.md").write_text(SECRET, encoding="utf-8")
+    value = "private-notes-key"
+    settings = {
+        "release_notes_file": "notes.md",
+        "release_notes_label": value,
+        "build_args": {"VALUE": value},
+        "labels": {"version": "${VALUE}"},
+    }
+    base = {
+        "architecture": "amd64", "os": "linux",
+        "config": {"Env": [], "Labels": {value: "base notes", "version": "base"}},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }
+    _, image = _build(tmp_path, monkeypatch, base_config=base, **settings)
+    assert image["config"]["Labels"] == {value: SECRET, "version": value}
+
+    ImageBuilder(BuildConfig(context_dir=str(context), dry_run=True, **settings)).build()
+    output = capsys.readouterr()
+    assert "Release Notes: label <redacted>" in output.out
+    assert value not in output.out + output.err
+    assert SECRET not in output.out + output.err
+
+
+@pytest.mark.parametrize("failure", ["missing", "encoding", "collision"])
+def test_cli_release_notes_errors_redact_argument_values(
+    tmp_path, monkeypatch, capsys, failure,
+):
+    context = _context(tmp_path)
+    value = "private-notes-key"
+    filename = f"{value}.md"
+    if failure != "missing":
+        (context / filename).write_bytes(
+            SECRET.encode() + (b"\xff" if failure == "encoding" else b"")
+        )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[build]\ncontext-dir = "{context.as_posix()}"\ndry-run = true\n'
+        f'[build.build-args]\nVALUE = "{value}"\n'
+    )
+    arguments = [
+        "pycontainer", "build", "--config", str(config_path),
+        "--release-notes", filename, "--release-notes-label", value,
+    ]
+    if failure == "collision":
+        arguments += ["--label", f"{value}=explicit"]
+    monkeypatch.setattr(sys, "argv", arguments)
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert "<redacted>" in output.err
+    assert value not in output.out + output.err
+    assert SECRET not in output.out + output.err

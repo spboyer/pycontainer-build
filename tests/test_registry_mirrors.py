@@ -194,7 +194,7 @@ def mirror_auth(monkeypatch):
     """Give each mirror host its own synthetic token and the upstream basic auth."""
     resolved = []
 
-    def fake_mirror_auth(host):
+    def fake_mirror_auth(host, **kwargs):
         resolved.append(host)
         return RegistryAuth(bearer_token=f"mirror-token-{host}")
 
@@ -254,6 +254,31 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
     assert [path for _, path, _ in mir.requests][0] == "/v2/team/base/manifests/1"
     assert {auth for _, _, auth in mir.requests} == {f"Bearer mirror-token-{mirror}"}
     assert f"Served by: {mirror}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_build_arguments_redact_mirror_logs_and_progress(
+    tmp_path, mirror_auth, caplog, capsys, fallback
+):
+    value = "private-base-reference"
+    with _serve() as (upstream, up), _serve() as (mirror, mir):
+        up.serve_image(tag=value)
+        if not fallback:
+            mir.serve_image(tag=value)
+        builder = _builder(
+            tmp_path, upstream, [mirror], base_ref="team/base:${VERSION}",
+            build_args={"VERSION": value}, verbose=True,
+        )
+        with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_mirrors"):
+            layers, _ = _pull(builder, tmp_path)
+
+    assert len(layers) == 1
+    assert any(value in path for _, path, _ in mir.requests)
+    if fallback:
+        assert any(value in path for _, path, _ in up.requests)
+        assert "trying the next mirror" in caplog.text
+    assert value not in caplog.text + capsys.readouterr().out
+    assert "<redacted>" in caplog.text
 
 
 @pytest.mark.parametrize("trust_mirror", [True, False])
