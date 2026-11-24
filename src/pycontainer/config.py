@@ -196,6 +196,7 @@ class BuildConfig:
     sign_verify_key: Optional[str] = None
     sign_certificate_identity: Optional[str] = None
     sign_certificate_oidc_issuer: Optional[str] = None
+    validate: Dict[str, List[str]] = field(default_factory=dict)
     squash: bool = False
     analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None

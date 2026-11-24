@@ -1101,7 +1101,7 @@ class ImageBuilder:
             self._print(f"  Served by: {served}")
         return base_layers, base_config
     
-    def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
+    def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True, *, _output_locked: bool=False):
         """Push built image to registry."""
         if not hasattr(self, 'manifest_digest'):
             raise RuntimeError("Must call build() before push()")
@@ -1113,7 +1113,7 @@ class ImageBuilder:
                 raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
             from .scanning import scanned_image
 
-            with output_directory_lock(self.config.output_dir):
+            with nullcontext() if _output_locked else output_directory_lock(self.config.output_dir):
                 with scanned_image(
                     Path(self.config.output_dir), self.manifest_digest, self.config
                 ) as (snapshot, descriptor):
