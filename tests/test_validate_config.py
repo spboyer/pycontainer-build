@@ -76,7 +76,7 @@ def test_no_path_validates_build_defaults_with_local_detection(offline, monkeypa
     original = effective_config.resolve_build_config
     monkeypatch.setattr(
         cli, "resolve_build_config",
-        lambda path, overrides: resolved.append(original(path, overrides)) or resolved[-1],
+        lambda path, overrides, build_args=None: resolved.append(original(path, overrides, build_args)) or resolved[-1],
     )
 
     assert _run(monkeypatch, ["validate", "config"]) == 0
@@ -122,6 +122,88 @@ def test_cli_overrides_invalid_file_types_before_validation(offline, monkeypatch
 def test_validate_build_table_with_unrelated_scalar_tool(offline, monkeypatch):
     path = _write(offline / "config.toml", 'tool = "standalone"\n[build]\n')
     assert _run(monkeypatch, ["validate", "config", path]) == 0
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_build_argument_resolution_matches_build(offline, monkeypatch, table):
+    path = _write(
+        offline / "config.toml",
+        f'[{table}]\ntag = "app:${{VERSION}}"\nplatform = "${{TARGET}}"\n'
+        f'[{table}.build-args]\nVERSION = {{}}\nTARGET = "linux/amd64"\n',
+    )
+    configs = []
+    original = effective_config.resolve_build_config
+
+    def resolve(*args):
+        result = original(*args)
+        configs.append(result[0])
+        return result
+
+    class FakeBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "resolve_build_config", resolve)
+    monkeypatch.setattr(cli, "ImageBuilder", FakeBuilder)
+    overrides = ["--build-arg", "VERSION=old", "--build-arg", "VERSION=new",
+                 "--build-arg", "TARGET=linux/arm64"]
+    assert _run(monkeypatch, ["validate", "config", path, *overrides]) == 0
+    assert _run(monkeypatch, ["build", "--config", path, *overrides]) == 0
+    assert [(cfg.tag, cfg.platform) for cfg in configs] == [
+        ("app:new", "linux/arm64"), ("app:new", "linux/arm64"),
+    ]
+
+
+@pytest.mark.parametrize("extra", [[], ["--build-arg", "MISSING=value"]])
+def test_build_argument_errors_have_source_and_no_side_effects(offline, monkeypatch, capsys, extra):
+    path = _write(offline / "config.toml", "[build]\n[build.build-args]\nREQUIRED = {}\n")
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, [*command, *extra]) == 2
+        err = capsys.readouterr().err
+        assert ("CLI option --build-arg" if extra else "[build].build_args") in err
+
+
+def test_interpolated_diagnostics_are_redacted(offline, monkeypatch, capsys):
+    path = _write(
+        offline / "config.toml",
+        '[build]\ncontext-dir = "${PRIVATE}"\n[build.build-args]\nPRIVATE = "private-path"\n',
+    )
+    for command in (["validate", "config", path], ["build", "--config", path]):
+        assert _run(monkeypatch, command) == 2
+        err = capsys.readouterr().err
+        assert "private-path" not in err
+        assert "<redacted>" in err
+
+
+def test_validation_applies_security_after_platform_override_and_expansion(offline, monkeypatch, capsys):
+    path = _write(
+        offline / "config.toml",
+        '[build]\nplatform = "windows/amd64"\n'
+        '[build.build-args]\nTARGET = "linux/arm64"\n'
+        '[build.security.kubernetes]\nread-only-root-filesystem = true\n',
+    )
+    before = _tree(offline)
+    assert _run(monkeypatch, ["validate", "config", path, "--platform", "${TARGET}"]) == 0
+    capsys.readouterr()
+    assert _run(
+        monkeypatch, ["validate", "config", path, "--platform", "${TARGET}",
+                      "--build-arg", "TARGET=private-platform"],
+    ) == 2
+    err = capsys.readouterr().err
+    assert "private-platform" not in err
+    assert "<redacted>" in err
+    assert _tree(offline) == before
+
+
+@pytest.mark.parametrize("base", ["oci:missing-layout:latest", "docker-archive:missing.tar"])
+def test_validation_accepts_local_reference_syntax_without_reading_images(offline, monkeypatch, base):
+    assert _run(
+        monkeypatch, ["validate", "config", "--base-image", base,
+                      "--platform", "linux/amd64,linux/arm64"],
+    ) == 0
 
 
 @pytest.mark.parametrize(

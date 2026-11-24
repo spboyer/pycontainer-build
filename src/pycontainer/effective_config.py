@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
+from .build_args import EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 from .config import BuildConfig
 from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
 from .dependencies import validate_target_platform
@@ -15,6 +16,7 @@ from .fs_utils import relative_context_path
 from .project import detect_python_version
 from .registry_client import parse_image_reference
 from .tags import resolve_tags
+from .local_image import parse_local_image_reference
 
 CLI_FLAGS = {
     "tag": "--tag",
@@ -37,6 +39,7 @@ CLI_FLAGS = {
     "generate_sbom": "--sbom",
     "system_packages": "--system-package",
     "detect_system_packages": "--no-detect-system-packages",
+    "build_args": "--build-arg",
 }
 
 NOT_PERFORMED = (
@@ -67,6 +70,7 @@ CONSTRUCTOR_GROUPS = (
     ("system_packages",),
     ("generate_sbom",),
     ("tag", "tags", "semver_tags", "latest_tag"),
+    ("platform",),
 )
 
 
@@ -108,8 +112,9 @@ def semantic_errors(cfg: BuildConfig, origin) -> List[str]:
                 errors.append(f"{origin(field)}: {exc}")
                 return
 
-    check("platform", parse_platform, cfg.platform)
-    check("base_image", parse_image_reference, cfg.base_image)
+    for platform in cfg.target_platforms():
+        check("platform", parse_platform, platform)
+    check("base_image", lambda value: parse_local_image_reference(value) or parse_image_reference(value), cfg.base_image)
     check("tag", lambda _: cfg.all_tags(), cfg.tag)
     check("include_paths", relative_context_path, *(cfg.include_paths or []))
     check("exclude_paths", relative_context_path, *cfg.exclude_paths)
@@ -117,14 +122,16 @@ def semantic_errors(cfg: BuildConfig, origin) -> List[str]:
     if not context.is_dir():
         errors.append(f"{origin('context_dir')}: build context directory not found: {context}")
     if cfg.include_deps:
-        check("requirements_file", relative_context_path, cfg.requirements_file)
+        if cfg.requirements_file is not None:
+            check("requirements_file", relative_context_path, cfg.requirements_file)
         if not any(error.startswith(origin("platform")) for error in errors):
-            check("platform", lambda value: validate_target_platform(*parse_platform(value)), cfg.platform)
+            for platform in cfg.target_platforms():
+                check("platform", lambda value: validate_target_platform(*parse_platform(value)), platform)
     return errors
 
 
 def resolve_build_config(
-    config_path: Optional[Path], overrides: Dict[str, Any]
+    config_path: Optional[Path], overrides: Dict[str, Any], build_arg_overrides: Optional[List[str]] = None
 ) -> Tuple[BuildConfig, Optional[str]]:
     """Resolve defaults, an optional config file and CLI overrides; return config and table.
 
@@ -138,20 +145,41 @@ def resolve_build_config(
     _validate_config(merged, table or BUILD_TABLE)
     origin = lambda field: _origin(field, overrides, table, file_config)
     try:
+        arguments = resolve_arguments(merged.get("build_args") or {}, build_arg_overrides)
+    except ValueError as exc:
+        field_origin = "CLI option --build-arg" if "--build-arg" in str(exc) or str(exc).startswith("Undeclared build argument ") else origin("build_args")
+        raise ConfigValidationError([f"{field_origin}: {exc}"]) from None
+    expanded = dict(merged)
+    for field in EXPANDABLE_FIELDS:
+        if field in merged:
+            try:
+                expanded[field] = expand_field(merged[field], arguments, field)
+            except ValueError as exc:
+                raise ConfigValidationError([f"{origin(field)}: {redact_values(str(exc), arguments.values())}"]) from None
+    merged["build_args"] = arguments
+    try:
         cfg = BuildConfig(**merged)
     except ValueError as exc:
-        raise ConfigValidationError(_constructor_errors(merged, origin) or [str(exc)]) from None
+        errors = _constructor_errors(expanded, origin) or [str(exc)]
+        for field in ("include_paths", "exclude_paths"):
+            for value in expanded.get(field) or []:
+                try:
+                    relative_context_path(value)
+                except ValueError as path_error:
+                    errors.append(f"{origin(field)}: {path_error}")
+                    break
+        raise ConfigValidationError([redact_values(error, arguments.values()) for error in errors]) from None
     if config_path is None and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
         except (AttributeError, TypeError, ValueError) as exc:
             pyproject = Path(cfg.context_dir) / "pyproject.toml"
             raise ConfigValidationError(
-                [f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}"]
+                [cfg.redact(f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}")]
             ) from None
         cfg.base_image = f"python:{version}-slim"
 
     errors = semantic_errors(cfg, origin)
     if errors:
-        raise ConfigValidationError(errors)
+        raise ConfigValidationError([cfg.redact(error) for error in errors])
     return cfg, table

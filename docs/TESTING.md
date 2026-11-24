@@ -43,17 +43,77 @@ and runtime startup. Per-sample peak RSS includes Python startup/imports;
 build work, or the transfer. Compare only matching environments and fixture
 settings; no timing threshold is enforced.
 
-For an opt-in real OCI import and startup check on Linux/WSL, install Skopeo,
+The `registry-network-*` cases run a separate-process loopback registry with
+injected per-request delay (`--request-delay-ms`) and bandwidth
+(`--bandwidth-mbit`, `0` for unlimited, shared or `--bandwidth-scope
+per-connection`). For each `--layer-layouts` entry (`COUNTxMIB` or
+`MIB+MIB+...`) and `--network-repetitions` sample, they time the real
+sequential base pull, local build, cold push and repeat push, then interleave
+benchmark-only `RegistryClient` probes with one and `--probe-workers` workers.
+Every sample uses fresh repositories, so registry and local caches are cold;
+the sequential and both probe variants pull byte-identical base blobs from
+separate repositories. The projected saving is the paired 1-worker minus
+N-worker probe transfer time, with its share taken against the product pull,
+local build and push total. It is an estimate of concurrency headroom,
+not a measured product speedup. The delay approximates one round trip per HTTP
+request; real HTTPS without connection reuse pays several. Pass
+`--layer-layouts` with no value to skip these cases.
+
+Include client construction when comparing push lifecycles: TLS opener setup
+can dominate small or already-present uploads. The blob opener is initialized
+lazily under a per-client lock, so push-only clients avoid that setup while
+concurrent first blob pulls still share one opener and one verifying TLS
+context retained by the client. The product-path push
+timings include client construction; the probe push timings reuse a client
+constructed outside the timed region.
+
+For a real OCI import and startup check on Linux/WSL, install Skopeo,
 start a Docker daemon, and allow the builder to pull the selected registry base
 image. The script imports the generated OCI layout into Docker and starts a container:
 
 ```shell
-PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim
+PYTHONPATH=src timeout 600 python scripts/check_runtime_image.py --base-image python:3.11-slim --platform linux/amd64 --evidence runtime-evidence/linux-amd64.json
 ```
 
-This check is not part of default pytest or CI. It uses a unique temporary image
+This check is not part of default pytest. It uses a unique temporary image
 tag and removes that tag after execution; registry pulls and image startup are
-real runtime evidence, unlike the synthetic benchmark above.
+real runtime evidence, unlike the synthetic benchmark above. The target
+platform must match the Docker daemon, so emulated runs fail instead of
+producing evidence.
+
+Add `--multi-platform-index` to build an amd64/arm64 index, import the native
+target, verify its config digest and run the staged dependency. The tests
+workflow runs this check on both native targets and uploads separate
+`index-runtime-evidence-*` artifacts. These records are not release evidence;
+each target is validated only when its index check actually succeeds.
+
+The `Runtime image check` workflow runs it natively for `linux/amd64` and
+`linux/arm64` on same-repository pull requests, pushes to main and release
+tags. Its gate runs `scripts/verify_runtime_evidence.py`, which passes only
+when every required target has exactly one passing full import/startup record
+for the current commit, workflow run and attempt, and every startup job
+succeeded. Missing (runner unavailable, skipped or cancelled), failed,
+incomplete, emulated, dependency-layer-only, stale or duplicate evidence, or a
+failed evidence download, fails the gate and is listed under "Not validated"
+in the summary. Re-run all jobs rather than only failed jobs so every target
+produces evidence in the same attempt. A release cannot be created unless the
+gate passes and the release job re-verifies evidence for its own attempt. The
+release notes include the validated targets.
+Licensing and PyPI publication remain separate owner decisions (#79).
+
+For opt-in lockfile startup evidence, choose `dependency_fixture: lockfile`
+when manually dispatching `Runtime image check`, or add
+`--dependency-fixture lockfile` to the command above. The committed
+`tests/fixtures/runtime-lock` fixture contains offline wheels and a hashed
+uv lock. The script checks each selected wheel archive against the lock before
+staging; the started container separately checks distribution names and
+versions, imports, and installed module and METADATA hashes derived from those
+verified wheels. The platform-tagged wheels contain Python only and do not test
+native binaries. The evidence records the fixture path, lock digest,
+assertion-script digest, package hashes and the two checks separately. The lock
+gate compares these with its committed fixture and requires the same commit,
+run and attempt for both native targets. Manual lock runs do not replace the
+default requirements release gate.
 
 ## Overview
 

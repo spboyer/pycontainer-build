@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from pycontainer import cli, effective_config
+from pycontainer.security import KUBERNETES_FRAGMENT, render_security_fragments
 
 
 def _run_cli(monkeypatch, argv):
@@ -63,6 +64,49 @@ generate-sbom = true
     assert config.dry_run is True
     assert config.generate_sbom is True
     assert logging_levels == [logging.DEBUG]
+
+
+def test_scan_config_preserved_and_cli_policy_override(tmp_path, monkeypatch):
+    path = tmp_path / "scan.toml"
+    path.write_text("""
+[build]
+scan = true
+scan-threshold = "critical"
+scan-unknown = "ignore"
+scan-report-format = "sarif"
+scan-offline = true
+scan-db-max-age-hours = 24
+""")
+    config = _capture_config(monkeypatch, ["build", "--config", str(path)])
+    assert config.scan and config.scan_offline
+    assert config.scan_threshold == "critical"
+    assert config.scan_report_format == "sarif"
+    assert config.scan_db_max_age_hours == 24
+    config = _capture_config(monkeypatch, [
+        "build", "--config", str(path), "--scan-threshold", "low", "--scan-unknown", "fail",
+    ])
+    assert config.scan_threshold == "low"
+    assert config.scan_unknown == "fail"
+
+
+@pytest.mark.parametrize("category,exit_code", [("findings", 3), ("scanner", 4), ("database", 4)])
+def test_cli_scan_failure_blocks_push_and_has_distinct_exit(monkeypatch, category, exit_code):
+    from pycontainer.scanning import ScanError
+
+    class FailingBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            raise ScanError(category, "fixture failure")
+
+        def push(self, **kwargs):
+            pytest.fail("push after scan failure")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FailingBuilder)
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--scan", "--push"])
+    assert error.value.code == exit_code
 
 
 def test_cli_options_override_config_values(tmp_path, monkeypatch):
@@ -130,6 +174,30 @@ def test_cli_overrides_invalid_file_values_before_validation(tmp_path, monkeypat
     assert config.include_deps is True
 
 
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_cli_platform_override_is_used_for_security_validation(tmp_path, monkeypatch, capsys, table):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f"[{table}]\nplatform = 123\n"
+        f"[{table}.security.kubernetes]\nread-only-root-filesystem = true\n"
+    )
+
+    config = _capture_config(
+        monkeypatch, ["build", "--config", str(config_path), "--platform", "linux/arm64"]
+    )
+    assert config.platform == "linux/arm64"
+    assert render_security_fragments(config.security, str(tmp_path)) == {
+        KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
+    }
+
+    with pytest.raises(SystemExit) as error:
+        _capture_config(
+            monkeypatch, ["build", "--config", str(config_path), "--platform", "windows/amd64"]
+        )
+    assert error.value.code == 2
+    assert "Linux targets only" in capsys.readouterr().err
+
+
 def test_cli_build_config_ignores_unrelated_scalar_tool_key(tmp_path, monkeypatch):
     config_path = tmp_path / "config.toml"
     config_path.write_text('tool = "standalone"\n[build]\nbase_image = "python:3.12"\n')
@@ -180,7 +248,7 @@ def test_cli_uses_build_config_defaults_without_a_config_file(monkeypatch):
     assert config.base_image == "python:3.12-slim"
     assert config.platform == "linux/amd64"
     assert config.include_deps is False
-    assert config.requirements_file == "requirements.txt"
+    assert config.requirements_file is None
     assert config.verbose is False
     assert config.dry_run is False
     assert config.generate_sbom is False

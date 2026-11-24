@@ -1,4 +1,5 @@
 """Build and smoke-test wheel and sdist installs in temporary virtual environments."""
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +33,26 @@ def _metadata(artifact: Path) -> str:
         return member.read().decode("utf-8")
 
 
+def _check_lockfile_fixtures(sdist: Path) -> None:
+    fixtures = {
+        "pdm": ("pdm.lock", "pyproject.toml"),
+        "pipenv": ("Pipfile.lock", "Pipfile"),
+        "poetry": ("poetry.lock", "pyproject.toml"),
+        "uv": ("uv.lock", "pyproject.toml"),
+    }
+    prefix = f"{sdist.name.removesuffix('.tar.gz')}/tests/fixtures/lockfiles"
+    with tarfile.open(sdist, "r:gz") as source:
+        names = set(source.getnames())
+    missing = [
+        f"{kind}/{name}"
+        for kind, files in fixtures.items()
+        for name in files
+        if f"{prefix}/{kind}/{name}" not in names
+    ]
+    if missing:
+        raise RuntimeError(f"Source distribution is missing lockfile test fixtures: {', '.join(missing)}")
+
+
 def _isolated_environment():
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
@@ -61,6 +82,8 @@ def main() -> None:
         artifacts = sorted(distributions.iterdir())
         wheel = next(path for path in artifacts if path.suffix == ".whl")
         sdist = next(path for path in artifacts if path.name.endswith(".tar.gz"))
+
+        _check_lockfile_fixtures(sdist)
 
         for artifact in (wheel, sdist):
             if any(line.startswith("Requires-Dist:") for line in _metadata(artifact).splitlines()):
@@ -100,6 +123,28 @@ def main() -> None:
                 env=_isolated_environment(),
             )
             package_type = "wheel" if artifact.suffix == ".whl" else "sdist"
+            for kind in ("kubernetes", "compose"):
+                output = temp / f"{package_type}-{kind}"
+                subprocess.run(
+                    [
+                        str(executable), "generate", kind,
+                        "--image", "example/app:v1", "--port", "8000",
+                        "--output", str(output),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    env=_isolated_environment(),
+                )
+                document = output / "service.yaml" if kind == "kubernetes" else output
+                data = json.loads(document.read_text(encoding="utf-8"))
+                if kind == "kubernetes":
+                    valid = data["spec"]["ports"][0]["targetPort"] == 8000
+                else:
+                    valid = data["services"]["app"]["image"] == "example/app:v1"
+                if not valid:
+                    raise RuntimeError(f"{package_type} {kind} generation produced invalid output")
+            print(f"PASS: deployment generators in isolated {package_type} install")
+
             sbom_output = temp / f"{package_type}-sbom.json"
             subprocess.run(
                 [
