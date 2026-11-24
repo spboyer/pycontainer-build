@@ -1352,25 +1352,7 @@ def _check_uv_indexes(path: Path, lock: dict, settings: dict) -> None:
             raise _stale("uv.lock", "uv lock")
 
 
-def _load_uv(path: Path, environment, context_dir: Path, manifest=None):
-    lock = _read_toml(path)
-    pyproject = manifest if manifest is not None else _read_toml(
-        _manifest(path, "pyproject.toml", context_dir)
-    )
-    _project_requirements(pyproject, "pyproject.toml")
-    if lock.get("version") != 1:
-        raise LockfileError("uv.lock version is unsupported; relock with a current uv.")
-    if "manifest" in lock:
-        raise LockfileError("uv workspaces, constraints and overrides are unsupported for lockfile staging.")
-    uv_settings = pyproject.get("tool", {}).get("uv", {})
-    unsupported = sorted(
-        {"sources", "workspace", "override-dependencies", "constraint-dependencies"} & set(uv_settings)
-    )
-    if unsupported:
-        raise LockfileError(f"uv tool.uv.{unsupported[0]} is unsupported for lockfile staging.")
-    _check_uv_environments(lock, uv_settings, environment)
-    _check_uv_indexes(path, lock, uv_settings)
-
+def _uv_package_index(lock: dict) -> Tuple[Dict[str, List[dict]], dict]:
     by_name: Dict[str, List[dict]] = {}
     roots = []
     for entry in lock.get("package", []):
@@ -1380,15 +1362,12 @@ def _load_uv(path: Path, environment, context_dir: Path, manifest=None):
         by_name.setdefault(canonical_name(entry.get("name", "")), []).append(entry)
     if len(roots) != 1:
         raise LockfileError("uv.lock must contain exactly one root project package.")
-    root = roots[0]
-    project_name = pyproject.get("project", {}).get("name")
-    if not project_name or canonical_name(project_name) != canonical_name(root.get("name", "")):
-        raise _stale("uv.lock", "uv lock")
-    _check_uv_fresh(lock, root, pyproject, environment)
-    if environment is None:
-        return []
-    _require_python(lock.get("requires-python"), environment, "uv.lock")
+    return by_name, roots[0]
 
+
+def _uv_selected_graph(
+    by_name: Dict[str, List[dict]], root: dict, environment: Dict[str, Optional[str]]
+) -> Tuple[Dict[Tuple[str, str], dict], set]:
     selected: Dict[Tuple[str, str], dict] = {}
     pending = [(dependency, root.get("name")) for dependency in root.get("dependencies", [])]
     visited = set()
@@ -1424,6 +1403,38 @@ def _load_uv(path: Path, environment, context_dir: Path, manifest=None):
         optional = entry.get("optional-dependencies", {})
         for extra in extras:
             pending.extend((child, name) for child in optional.get(extra, ()))
+    return selected, visited
+
+
+def _load_uv(path: Path, environment, context_dir: Path, manifest=None):
+    lock = _read_toml(path)
+    pyproject = manifest if manifest is not None else _read_toml(
+        _manifest(path, "pyproject.toml", context_dir)
+    )
+    _project_requirements(pyproject, "pyproject.toml")
+    if lock.get("version") != 1:
+        raise LockfileError("uv.lock version is unsupported; relock with a current uv.")
+    if "manifest" in lock:
+        raise LockfileError("uv workspaces, constraints and overrides are unsupported for lockfile staging.")
+    uv_settings = pyproject.get("tool", {}).get("uv", {})
+    unsupported = sorted(
+        {"sources", "workspace", "override-dependencies", "constraint-dependencies"} & set(uv_settings)
+    )
+    if unsupported:
+        raise LockfileError(f"uv tool.uv.{unsupported[0]} is unsupported for lockfile staging.")
+    _check_uv_environments(lock, uv_settings, environment)
+    _check_uv_indexes(path, lock, uv_settings)
+
+    by_name, root = _uv_package_index(lock)
+    project_name = pyproject.get("project", {}).get("name")
+    if not project_name or canonical_name(project_name) != canonical_name(root.get("name", "")):
+        raise _stale("uv.lock", "uv lock")
+    _check_uv_fresh(lock, root, pyproject, environment)
+    if environment is None:
+        return []
+    _require_python(lock.get("requires-python"), environment, "uv.lock")
+
+    selected, visited = _uv_selected_graph(by_name, root, environment)
     _check_uv_complete(pyproject, environment, selected, visited)
 
     packages = []

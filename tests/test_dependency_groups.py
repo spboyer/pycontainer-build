@@ -20,9 +20,23 @@ import pycontainer.dependencies as dependencies_module
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
-from pycontainer.lockfiles import LockfileError
+from pycontainer.dependency_groups import plan_groups
+from pycontainer.lockfiles import LockedPackage, LockfileError, LockSelection
 from test_dependency_staging import BASE_CONFIG
 from test_lockfiles import indexes  # noqa: F401 - pytest fixture
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cache_environment(monkeypatch):
+    for name in tuple(os.environ):
+        if name.upper().startswith("PYTHON") or name.upper() in {
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        }:
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NETRC", os.devnull)
+    monkeypatch.setattr(dependency_cache_module, "_system_proxies", lambda: {})
 
 
 def _wheel(
@@ -664,7 +678,7 @@ def test_group_bundle_rechecks_manifest_containment_after_lookup(tmp_path, monke
         _builder(tmp_path, monkeypatch, context, "after-symlink", **options).build()
 
 
-@pytest.mark.parametrize("source", ["credentials", "query", "proxy"])
+@pytest.mark.parametrize("source", ["credentials", "query", "proxy", "pythonpath"])
 def test_group_cache_ineligible_sources_are_explicit_misses(
     tmp_path, monkeypatch, indexes, capsys, source
 ):
@@ -682,11 +696,13 @@ def test_group_cache_ineligible_sources_are_explicit_misses(
     elif source == "query":
         registry = "https://example.invalid/simple?feed=${GROUP_TEST_TOKEN}"
         _write_project(context, registry, wheels)
-    else:
+    elif source == "proxy":
         monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
         monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
         monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
         monkeypatch.setattr(dependency_cache_module, "_system_proxies", lambda: {})
+    else:
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path / "synthetic-token"))
 
     calls = []
 
@@ -703,7 +719,12 @@ def test_group_cache_ineligible_sources_are_explicit_misses(
     _builder(tmp_path, monkeypatch, context, "ineligible-second", **options).build()
 
     output = capsys.readouterr().out
-    expected = {"credentials": "credentials can change", "query": "query string", "proxy": "a proxy"}
+    expected = {
+        "credentials": "credentials can change",
+        "query": "query string",
+        "proxy": "a proxy",
+        "pythonpath": "the builder Python startup environment",
+    }
     assert output.count(expected[source]) == 2
     assert "synthetic-token" not in output
     assert len(calls) == 2
@@ -1062,6 +1083,35 @@ def test_group_bundle_with_mismatched_blob_binding_is_rebuilt(
     assert "group cache hit (frequent" in output
 
 
+@pytest.mark.parametrize("damage", ["duplicate", "swap"])
+def test_group_bundle_rejects_group_records_bound_to_other_layers(
+    tmp_path, monkeypatch, indexes, capsys, damage
+):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    options = dict(dependency_layer_strategy="explicit", stable_dependencies=["stable-dep"])
+    first = _builder(tmp_path, monkeypatch, context, "first", **options)
+    first.build()
+    expected = [layer.digest for layer in first.layers]
+    cache = LayerCache(tmp_path / "cache")
+    index = json.loads((tmp_path / "cache" / "index.json").read_text(encoding="utf-8"))
+    key = next(key for key in index if key.startswith("deps-group-bundle-"))
+    bundle = json.loads(cache.get_bytes(key, 1024 * 1024))
+    stable, frequent = bundle["layers"]
+    stable_binding = (stable["key"], stable["digest"])
+    frequent_binding = (frequent["key"], frequent["digest"])
+    stable["key"], stable["digest"] = frequent_binding
+    if damage == "swap":
+        frequent["key"], frequent["digest"] = stable_binding
+    cache.store_bytes(key, json.dumps(bundle).encode(), ["uv.lock"])
+    capsys.readouterr()
+
+    rebuilt = _builder(tmp_path, monkeypatch, context, "rebuilt", **options)
+    rebuilt.build()
+
+    assert [layer.digest for layer in rebuilt.layers] == expected
+    assert "bundle metadata is invalid" in capsys.readouterr().out.lower()
+
+
 def _concurrent_build(context, output, cache, barrier, queue):
     try:
         ImageBuilder._pull_base_image = lambda self, *_args: ([], BASE_CONFIG)
@@ -1135,6 +1185,201 @@ def _history_repository(context):
         context, "commit", "-m", "test: first lock snapshot", "-m",
         "Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>",
     )
+
+
+def _write_target_history_lock(context, index, wheels, amd_version, arm_version):
+    _write_project(context, index.url, wheels)
+    _allow_frequent_updates(context, "1.0")
+    lock = context / "uv.lock"
+    text = lock.read_text(encoding="utf-8").replace(
+        'dependencies = [{ name = "stable-dep" }, { name = "frequent-dep" }]',
+        'dependencies = [{ name = "stable-dep" }, '
+        f'{{ name = "frequent-dep", version = "{amd_version}", '
+        'marker = "platform_machine == \'x86_64\'" }, '
+        f'{{ name = "frequent-dep", version = "{arm_version}", '
+        'marker = "platform_machine == \'aarch64\'" }]',
+        1,
+    )
+    for version in sorted({amd_version, arm_version} - {"1.0"}):
+        wheel = wheels[version]
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        text += (
+            f'\n[[package]]\nname = "frequent-dep"\nversion = "{version}"\n'
+            f"source = {{ registry = {json.dumps(index.url)} }}\n"
+            'dependencies = [{ name = "shared-dep" }]\n'
+            f'wheels = [{{ url = "https://example.invalid/{wheel.name}", '
+            f'hash = "sha256:{digest}" }}]\n'
+        )
+    lock.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("amd_version", "arm_version", "expected_group"),
+    [("2.0", "1.0", "frequent"), ("1.0", "3.0", "stable")],
+)
+def test_history_groups_follow_the_target_graph(
+    tmp_path, monkeypatch, indexes, capsys, amd_version, arm_version, expected_group
+):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    for version in ("2.0", "3.0"):
+        wheels[version] = _wheel(
+            context / "wheelhouse", "frequent-dep", version, requires=("shared-dep>=1.0",)
+        )
+        index.add(wheels[version])
+    _write_target_history_lock(context, index, wheels, "1.0", "2.0")
+    _history_repository(context)
+    _write_target_history_lock(context, index, wheels, amd_version, arm_version)
+    _git(context, "add", "--", "uv.lock")
+    _git(context, "commit", "-m", "test: target lock snapshot")
+
+    _builder(
+        tmp_path, monkeypatch, context, "target-history",
+        dependency_layer_strategy="history", platform="linux/amd64",
+    ).build()
+
+    assert f"frequent-dep -> {expected_group} (" in capsys.readouterr().out
+
+
+def test_history_groups_treat_previously_unselected_target_packages_as_frequent(
+    tmp_path, monkeypatch, indexes, capsys
+):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    wheels["2.0"] = _wheel(
+        context / "wheelhouse", "frequent-dep", "2.0", requires=("shared-dep>=1.0",)
+    )
+    index.add(wheels["2.0"])
+    _write_target_history_lock(context, index, wheels, "1.0", "2.0")
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            "platform_machine == 'x86_64'", "platform_system == 'Windows'", 1
+        ),
+        encoding="utf-8",
+    )
+    _history_repository(context)
+    _write_target_history_lock(context, index, wheels, "1.0", "2.0")
+    _git(context, "add", "--", "uv.lock")
+    _git(context, "commit", "-m", "test: select dependency for target")
+
+    _builder(
+        tmp_path, monkeypatch, context, "target-history-absent",
+        dependency_layer_strategy="history", platform="linux/amd64",
+    ).build()
+
+    assert (
+        "frequent-dep -> frequent (absent from at least one history snapshot)"
+        in capsys.readouterr().out
+    )
+
+
+def test_history_rejects_unknown_historical_target_markers(
+    tmp_path, monkeypatch, indexes
+):
+    context, wheels, index = _fixture(tmp_path, indexes)
+    wheels["2.0"] = _wheel(
+        context / "wheelhouse", "frequent-dep", "2.0", requires=("shared-dep>=1.0",)
+    )
+    index.add(wheels["2.0"])
+    _write_target_history_lock(context, index, wheels, "1.0", "2.0")
+    lock = context / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            "platform_machine == 'x86_64'", "platform_release == 'unknown'", 1
+        ),
+        encoding="utf-8",
+    )
+    _history_repository(context)
+    _write_target_history_lock(context, index, wheels, "1.0", "2.0")
+    _git(context, "add", "--", "uv.lock")
+    _git(context, "commit", "-m", "test: valid target marker")
+    monkeypatch.setattr(
+        builder_module, "install_locked_requirements",
+        lambda *_args, **_kwargs: pytest.fail("unknown historical marker reached installation"),
+    )
+
+    with pytest.raises(LockfileError, match="platform_release"):
+        _builder(
+            tmp_path, monkeypatch, context, "target-history-unknown",
+            dependency_layer_strategy="history", platform="linux/amd64",
+        ).build()
+
+
+def test_standalone_group_planning_keeps_diagnostics(capsys, tmp_path):
+    selection = LockSelection(
+        "uv", Path("uv.lock"), (LockedPackage("present-dep", "1.0", ()),)
+    )
+
+    plan = plan_groups(
+        selection, "explicit", ["missing-dep"], [], tmp_path, None, "linux/amd64"
+    )
+
+    assert plan.assignments == (("present-dep", "frequent"),)
+    assert "Dependency group assignment skipped: missing-dep" in capsys.readouterr().out
+
+
+def test_explicit_group_diagnostics_redact_build_arguments_on_miss_hit_and_dry_run(
+    tmp_path, monkeypatch, indexes, capsys
+):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    secret = "synthetic-group-secret"
+    options = dict(
+        dependency_layer_strategy="explicit",
+        stable_dependencies=[secret],
+        build_args={"VALUE": secret},
+    )
+    _builder(tmp_path, monkeypatch, context, "redact-cold", **options).build()
+    cold = capsys.readouterr().out
+    assert secret not in cold
+    assert "Dependency group assignment skipped: <redacted>" in cold
+
+    monkeypatch.setattr(
+        builder_module, "install_locked_requirements",
+        lambda *_args, **_kwargs: pytest.fail("warm grouped build did not use its bundle"),
+    )
+    _builder(tmp_path, monkeypatch, context, "redact-warm", **options).build()
+    warm = capsys.readouterr().out
+    assert secret not in warm
+    assert "Dependency group assignment skipped: <redacted>" in warm
+    assert "Dependency group cache hit" in warm
+
+    _builder(tmp_path, monkeypatch, context, "redact-dry", dry_run=True, **options).build()
+    dry = capsys.readouterr().out
+    assert secret not in dry
+    assert "Stable Dependencies: <redacted>" in dry
+
+
+def test_history_group_diagnostics_redact_build_arguments_on_miss_hit_and_dry_run(
+    tmp_path, monkeypatch, indexes, capsys
+):
+    context, _wheels, _index = _fixture(tmp_path, indexes)
+    _history_repository(context)
+    lock = context / "uv.lock"
+    lock.write_text(lock.read_text(encoding="utf-8") + "\n# second snapshot\n", encoding="utf-8")
+    _git(context, "add", "--", "uv.lock")
+    _git(context, "commit", "-m", "test: second snapshot")
+    snapshot = _git(context, "rev-parse", "HEAD")
+    options = dict(
+        dependency_layer_strategy="history",
+        dependency_history_ref=snapshot,
+        build_args={"PACKAGE": "stable-dep", "SNAPSHOT": snapshot},
+    )
+
+    for name in ("redact-history-cold", "redact-history-warm"):
+        _builder(tmp_path, monkeypatch, context, name, **options).build()
+        output = capsys.readouterr().out
+        assert "stable-dep" not in output
+        assert snapshot not in output
+        assert "Dependency history: <redacted> ->" in output
+        assert "Dependency history snapshot: <redacted>" in output
+        if name.endswith("warm"):
+            assert "Dependency group cache hit" in output
+
+    _builder(tmp_path, monkeypatch, context, "redact-history-dry", dry_run=True, **options).build()
+    output = capsys.readouterr().out
+    assert "stable-dep" not in output
+    assert snapshot not in output
+    assert "Dependency History Ref: <redacted>" in output
+    assert "Dependency history snapshot: <redacted>" in output
 
 
 def test_history_groups_use_an_immutable_snapshot_and_explicit_overrides(

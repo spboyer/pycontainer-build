@@ -4,9 +4,17 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .lockfiles import LockSelection, MAX_LOCKFILE_BYTES, canonical_name
+from .lockfiles import (
+    LockSelection,
+    MAX_LOCKFILE_BYTES,
+    _check_uv_environments,
+    _require_python,
+    _uv_package_index,
+    _uv_selected_graph,
+    canonical_name,
+)
 
 
 MAX_HISTORY_SNAPSHOTS = 20
@@ -43,7 +51,9 @@ def _git(context: Path, *args: str, purpose: str, allow_missing: bool = False) -
     return result.stdout
 
 
-def _versions(blob: bytes) -> Dict[str, set]:
+def _versions(
+    blob: bytes, environment: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, set]:
     try:
         lock = tomllib.loads(blob.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
@@ -59,11 +69,26 @@ def _versions(blob: bytes) -> Dict[str, set]:
         if not isinstance(name, str) or not isinstance(version, str) or not name or not version:
             raise ValueError("Dependency history contains a package without a name or version.")
         versions.setdefault(canonical_name(name), set()).add(version)
+    if environment is not None:
+        if "manifest" in lock:
+            raise ValueError("Dependency history does not support uv workspace or override snapshots.")
+        _check_uv_environments(
+            lock, {"environments": lock.get("supported-markers")}, environment
+        )
+        _require_python(lock.get("requires-python"), environment, "historical uv.lock")
+        by_name, root = _uv_package_index(lock)
+        selected, _ = _uv_selected_graph(by_name, root, environment)
+        versions = {}
+        for name, version in selected:
+            if name in versions and version not in versions[name]:
+                raise ValueError(f"Dependency history selects multiple versions of {name} for the target.")
+            versions.setdefault(name, set()).add(version)
     return versions
 
 
 def read_dependency_history(
-    context: Path, lock_path: Path, history_ref: Optional[str]
+    context: Path, lock_path: Path, history_ref: Optional[str],
+    *, environment: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[str, Tuple[str, ...], List[Dict[str, set]]]:
     context = Path(context).resolve()
     root = Path(
@@ -139,7 +164,7 @@ def read_dependency_history(
         if len(blob) != int(size):
             raise ValueError("Dependency history returned an incomplete lockfile object.")
         blob_ids.add(blob_id)
-        histories.append(_versions(blob))
+        histories.append(_versions(blob, environment))
     if len(blob_ids) < 2:
         raise ValueError("Dependency history needs at least two distinct lockfile snapshots.")
 
@@ -147,15 +172,19 @@ def read_dependency_history(
 
 
 def analyze_dependency_history(
-    context: Path, selection: LockSelection, history_ref: Optional[str]
+    context: Path, selection: LockSelection, history_ref: Optional[str],
+    *, environment: Optional[Dict[str, Optional[str]]] = None,
+    report: Callable[[str], None] = print,
 ) -> Tuple[str, Tuple[str, ...], Dict[str, Tuple[str, str]]]:
     snapshot, commits, histories = read_dependency_history(
-        context, selection.path, history_ref
+        context, selection.path, history_ref, environment=environment
     )
     result = {}
     for package in selection.packages:
         versions = [history.get(package.name, set()) for history in histories]
-        if any(not entry for entry in versions):
+        if environment is None:
+            result[package.name] = ("frequent", "target environment unavailable for history classification")
+        elif any(not entry for entry in versions):
             result[package.name] = ("frequent", "absent from at least one history snapshot")
         elif any(entry != versions[0] for entry in versions[1:]):
             result[package.name] = ("frequent", "historical version set changed")
@@ -163,7 +192,7 @@ def analyze_dependency_history(
             result[package.name] = ("frequent", "current target version differs from history")
         else:
             result[package.name] = ("stable", f"unchanged in {len(commits)} lockfile snapshots")
-    print(
+    report(
         f"Dependency history snapshot: {snapshot}; first-parent lock commits: "
         + ", ".join(commits)
     )

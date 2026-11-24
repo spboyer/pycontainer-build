@@ -130,9 +130,11 @@ Alternatively, use `--dependency-layer-strategy history` with an optional
 `--dependency-history-ref REF`. The build reports the resolved commit and
 classification evidence. Explicit `--stable-dependency` and
 `--frequent-dependency` options override history; otherwise, absent or changed
-versions are frequent. History requires Git, a tracked clean lock, a complete
-non-shallow/non-partial repository, and at least two distinct lock snapshots.
-Ungrouped or shared transitives are frequent in explicit mode.
+target versions are frequent. Each historical lock graph is evaluated with the
+target's markers and selected dependency extras; an unsupported or ambiguous
+target graph fails explicitly. History requires Git, a tracked clean lock, a
+complete non-shallow/non-partial repository, and at least two distinct lock
+snapshots. Ungrouped or shared transitives are frequent in explicit mode.
 
 Only `uv.lock` is supported for grouping. Requirements, virtualenvs and other
 lock formats fail explicitly; they remain available with the default single

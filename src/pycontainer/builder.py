@@ -1281,12 +1281,12 @@ class ImageBuilder:
         if self.config.analyze_layers:
             self._print("  Layer Analysis: layer-analysis.json in the output directory")
         if self.config.include_deps:
-            print(f"  Dependency Layer Strategy: {self.config.dependency_layer_strategy}")
+            self._print(f"  Dependency Layer Strategy: {self.config.dependency_layer_strategy}")
             if self.config.dependency_layer_strategy != "single":
-                print(f"  Stable Dependencies: {', '.join(self.config.stable_dependencies) or '<none>'}")
-                print(f"  Frequent Dependencies: {', '.join(self.config.frequent_dependencies) or '<none>'}")
+                self._print(f"  Stable Dependencies: {', '.join(self.config.stable_dependencies) or '<none>'}")
+                self._print(f"  Frequent Dependencies: {', '.join(self.config.frequent_dependencies) or '<none>'}")
                 if self.config.dependency_layer_strategy == "history":
-                    print(f"  Dependency History Ref: {self.config.dependency_history_ref or 'HEAD'}")
+                    self._print(f"  Dependency History Ref: {self.config.dependency_history_ref or 'HEAD'}")
                 self._grouped_dependency_source()
             try:
                 kind, value = self._dependency_source()
@@ -1302,11 +1302,11 @@ class ImageBuilder:
                             Path(self.config.context_dir), value,
                             self.config.dependency_history_ref,
                         )
-                        print(
+                        self._print(
                             f"  Dependency history snapshot: {snapshot}; "
                             f"first-parent lock commits: {', '.join(commits)}"
                         )
-                        print("  Target-specific history assignments: checked during build.")
+                        self._print("  Target-specific history assignments: checked during build.")
                 described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
                 self._print(f"  Dependency Source: {kind} ({described})")
                 if kind == "lock":
@@ -1756,10 +1756,12 @@ class ImageBuilder:
             selection, self.config.dependency_layer_strategy,
             self.config.stable_dependencies, self.config.frequent_dependencies,
             ctx, self.config.dependency_history_ref, self._requested_platform(),
+            environment=environment, report=self._print,
         )
         assignments = dict(plan.assignments)
         cache_key = None
         verification_roots = None
+        scoped_keys = {}
         if self.cache:
             try:
                 cache_key, verification_roots = self._dependency_cache_key(
@@ -1767,10 +1769,31 @@ class ImageBuilder:
                     base_image_name, base_image_tag_verified,
                     variant=variant, selection_override=selection,
                 )
+                for group in GROUPS:
+                    packages = tuple(
+                        package for package in selection.packages
+                        if assignments[package.name] == group
+                    )
+                    if not packages:
+                        continue
+                    subset = LockSelection(
+                        selection.kind, selection.path, packages, selection.verification_roots
+                    )
+                    scoped, _ = self._dependency_cache_key(
+                        source_kind, source_value, base_config, os_name, arch, version,
+                        base_image_name, base_image_tag_verified,
+                        variant=variant, selection_override=subset,
+                        environment_snapshot=cache_key.environment,
+                    )
+                    scoped_keys[group] = scoped.layer
             except DependencyCacheMiss as miss:
+                cache_key = None
+                verification_roots = None
                 self._print(f"Dependency group cache miss: {miss}.")
             else:
-                cached = self._cached_group_bundle(layers_dir, cache_key, plan, selection)
+                cached = self._cached_group_bundle(
+                    layers_dir, cache_key, plan, selection, scoped_keys
+                )
                 if cached is not None:
                     _locked_verification_roots(selection, ctx, environment)
                     return cached
@@ -1813,23 +1836,12 @@ class ImageBuilder:
                     continue
                 key = None
                 if cache_key:
-                    subset = LockSelection(
-                        selection.kind, selection.path,
-                        tuple(package for package in selection.packages if assignments[package.name] == group),
-                        selection.verification_roots,
-                    )
-                    scoped, _ = self._dependency_cache_key(
-                        source_kind, source_value, base_config, os_name, arch, version,
-                        base_image_name, base_image_tag_verified,
-                        variant=variant, selection_override=subset,
-                        environment_snapshot=cache_key.environment,
-                    )
                     files_key = self.cache._compute_files_digest(
                         [(path, path.relative_to(stage_root)) for path in files],
                         workdir=f"{self.config.workdir.rstrip('/')}/.python",
                         reproducible=True,
                     )
-                    key = group_layer_key(scoped.layer, plan, group, files_key)
+                    key = group_layer_key(scoped_keys[group], plan, group, files_key)
                     cached = self.cache.get_entry(key)
                 else:
                     cached = None
@@ -1853,7 +1865,9 @@ class ImageBuilder:
                         )
                 layers.append(layer)
                 if key:
-                    bundle_layers.append({"group": group, "key": key, "digest": layer.digest})
+                    bundle_layers.append(
+                        {"group": group, "key": key, "digest": layer.digest, "files": files_key}
+                    )
             if cache_key and layers:
                 self.cache.store_bytes(
                     group_bundle_key(cache_key.layer, plan),
@@ -1862,13 +1876,13 @@ class ImageBuilder:
                 )
             return layers
 
-    def _cached_group_bundle(self, layers_dir, cache_key, plan, selection):
+    def _cached_group_bundle(self, layers_dir, cache_key, plan, selection, scoped_keys):
         content = self.cache.get_bytes(group_bundle_key(cache_key.layer, plan), MAX_INVENTORY_BYTES)
         if content is None:
             return None
         decoded = decode_group_bundle(
             content, cache_key.layer, plan, selection,
-            strip_type_stubs=self.config.strip_type_stubs,
+            scoped_keys=scoped_keys, strip_type_stubs=self.config.strip_type_stubs,
         )
         if decoded is None:
             self._print("Dependency group cache miss: bundle metadata is invalid.")

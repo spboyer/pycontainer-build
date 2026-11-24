@@ -690,12 +690,14 @@ layer.
 The `history` strategy examines up to 20 first-parent commits that changed
 `uv.lock`; `--dependency-history-ref REF` selects a commit or ref instead of
 `HEAD`. It prints the resolved commit, evidence, and assignment reasons.
-Packages with changed or missing versions are frequent; consistently present,
-unchanged versions are stable. Git must be available, the lock must be tracked
-and unmodified without `assume-unchanged` or `skip-worktree` flags, the
-repository must not be shallow or partial, and at least two distinct lock
-snapshots must be available. Missing evidence is an error, not an inferred
-classification.
+For each historical snapshot, the uv lock graph is evaluated for the target
+environment, including markers and requested dependency extras. Packages with
+changed or missing target versions are frequent; consistently present,
+unchanged versions are stable. A snapshot that cannot identify a valid target
+graph fails explicitly. Git must be available, the lock must be tracked and
+unmodified without `assume-unchanged` or `skip-worktree` flags, the repository
+must not be shallow or partial, and at least two distinct lock snapshots must
+be available. Missing evidence is an error, not an inferred classification.
 
 Grouping currently supports only `uv.lock`: Poetry, Pipenv, PDM, plain
 requirements, and virtualenv sources are rejected rather than silently grouped.
@@ -713,8 +715,8 @@ its wheel closure is verified again. An unchanged group may reuse its cached
 layer when the full roots are unchanged, and an unchanged layer digest can
 still reuse a registry blob. `--strip-type-stubs` applies before grouping, and
 `--squash` can flatten the grouped and application layers, at the cost of
-layer-level reuse. Grouping does not add build-time/dev dependency or project-extra selection
-([#25](https://github.com/spboyer/pycontainer-build/issues/25)).
+layer-level reuse. Grouping does not add build-time/dev dependency or
+project-extra selection ([#25](https://github.com/spboyer/pycontainer-build/issues/25)).
 
 ### Local base images
 

@@ -7,19 +7,20 @@ import re
 from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .lockfiles import LockSelection, SpecifierSet, canonical_name
 
 
 GROUPS = ("stable", "frequent")
 GROUP_POLICY_VERSION = 1
-GROUP_CACHE_VERSION = 1
+GROUP_CACHE_VERSION = 2
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 HASH_CHUNK_SIZE = 1024 * 1024
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_GROUP_KEY = re.compile(r"deps-group-v1:sha256:[0-9a-f]{64}")
+_GROUP_KEY = re.compile(rf"deps-group-v{GROUP_CACHE_VERSION}:sha256:[0-9a-f]{{64}}")
+_FILES_KEY = re.compile(r"v[1-9][0-9]*:sha256:[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ def encode_group_bundle(
 
 def decode_group_bundle(
     content: bytes, selection_key: str, plan: GroupPlan, selection: LockSelection,
-    *, strip_type_stubs: bool = False,
+    *, scoped_keys: Dict[str, str], strip_type_stubs: bool = False,
 ) -> Optional[Tuple[list, List[Tuple[str, str]]]]:
     try:
         document = json.loads(content.decode("utf-8"))
@@ -141,6 +142,7 @@ def decode_group_bundle(
     ]
     if len(layers) != len(expected_groups):
         return None
+    seen_keys, seen_digests = set(), set()
     for item, group in zip(layers, expected_groups):
         if (
             not isinstance(item, dict)
@@ -149,8 +151,16 @@ def decode_group_bundle(
             or not _GROUP_KEY.fullmatch(item["key"])
             or not isinstance(item.get("digest"), str)
             or not _DIGEST.fullmatch(item["digest"])
+            or not isinstance(item.get("files"), str)
+            or not _FILES_KEY.fullmatch(item["files"])
+            or group not in scoped_keys
+            or item["key"] != group_layer_key(scoped_keys[group], plan, group, item["files"])
+            or item["key"] in seen_keys
+            or item["digest"] in seen_digests
         ):
             return None
+        seen_keys.add(item["key"])
+        seen_digests.add(item["digest"])
     return layers, packages
 
 
@@ -162,6 +172,9 @@ def plan_groups(
     context: Path,
     history_ref: Optional[str],
     target: str,
+    *,
+    environment: Optional[Dict[str, Optional[str]]] = None,
+    report: Callable[[str], None] = print,
 ) -> GroupPlan:
     if selection.kind != "uv":
         raise ValueError(
@@ -174,7 +187,7 @@ def plan_groups(
     if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name) for name in names):
         raise ValueError("Grouped dependency selection contains an invalid distribution name.")
     for name in sorted((set(stable_names) | set(frequent_names)) - names):
-        print(f"Dependency group assignment skipped: {name} is not selected for this target.")
+        report(f"Dependency group assignment skipped: {name} is not selected for this target.")
 
     snapshot = None
     commits: Tuple[str, ...] = ()
@@ -183,7 +196,7 @@ def plan_groups(
         from .dependency_history import analyze_dependency_history
 
         snapshot, commits, history_groups = analyze_dependency_history(
-            context, selection, history_ref
+            context, selection, history_ref, environment=environment, report=report
         )
     assignments = []
     for name in sorted(names):
@@ -197,7 +210,7 @@ def plan_groups(
             group, reason = "frequent", "unassigned distributions use the frequent group"
         assignments.append((name, group))
         if strategy == "history":
-            print(f"Dependency history: {name} -> {group} ({reason}).")
+            report(f"Dependency history: {name} -> {group} ({reason}).")
     return GroupPlan(
         strategy, target, tuple(assignments), stable_names, frequent_names, snapshot, commits
     )
