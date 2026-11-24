@@ -1,0 +1,2 @@
+(1/1) Installing libpq (18.7-r0)
+OK: 8558 KiB in 17 packages

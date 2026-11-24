@@ -1004,6 +1004,118 @@ def test_validation_holds_output_lock_until_push(tmp_path, monkeypatch):
     assert called == [True]
 
 
+@pytest.mark.parametrize(("arm_user", "expected"), [("1000", 0), ("root", 1)])
+def test_build_validation_gates_every_platform(tmp_path, monkeypatch, capsys, arm_user, expected):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+
+    def base(self, layers_dir, os_name, arch):
+        return [], {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": arm_user if arch == "arm64" else "1000",
+                "Entrypoint": ["python", "app.py"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+         "--validate", "--push"],
+    ) == expected
+    assert len(pushes) == (1 if expected == 0 else 0)
+    if expected:
+        assert "PCB001" in capsys.readouterr().out
+
+
+def test_validation_and_scan_hold_output_lock_through_push(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from pycontainer import scanning
+
+    real_push = builder.ImageBuilder.push
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(builder.ImageBuilder, "push", real_push)
+    scans, pushes = [], []
+
+    @contextmanager
+    def scan(output, digest, config):
+        with pytest.raises(RuntimeError, match="concurrent writes"):
+            with output_directory_lock(output):
+                pytest.fail("the output lock must remain held during scanning")
+        scans.append(digest)
+        yield Path(output), {"digest": digest}
+
+    def push(self, *args):
+        with pytest.raises(RuntimeError, match="concurrent writes"):
+            with output_directory_lock(self.config.output_dir):
+                pytest.fail("the output lock must remain held during push")
+        pushes.append(True)
+        return self.config.tag
+
+    monkeypatch.setattr(scanning, "scanned_image", scan)
+    monkeypatch.setattr(builder.ImageBuilder, "_push_image", push)
+    assert _run(monkeypatch, ["build", "--config", str(config), "--scan", "--validate", "--push"]) == 0
+    assert len(scans) == 2
+    assert scans[0] == scans[1]
+    assert pushes == [True]
+
+
+def test_build_validation_redacts_arguments_in_layout_errors(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    config.write_text(
+        config.read_text().replace('output-dir = "output"', 'output-dir = "output-${NAME}"')
+        + '\n[build.build-args]\nNAME = "private-build-value"\n'
+    )
+
+    def fail(output, **kwargs):
+        raise ValueError(f"Cannot read {output}")
+
+    monkeypatch.setattr(cli, "validate_image", fail)
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 2
+    captured = capsys.readouterr()
+    assert "private-build-value" not in captured.out + captured.err
+    assert "<redacted>" in captured.err
+    assert not pushes
+
+
+def test_multi_platform_validation_rejects_replaced_index(tmp_path, monkeypatch):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+
+    def base(self, layers_dir, os_name, arch):
+        return [], {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+
+    original = builder.ImageBuilder.build
+
+    def replace_index(self):
+        result = original(self)
+        output = Path(self.config.output_dir)
+        index_path = output / "blobs" / "sha256" / self.manifest_digest.split(":", 1)[1]
+        index = json.loads(index_path.read_text())
+        index["annotations"] = {"changed": "true"}
+        replacement = _blob(output, index, INDEX)
+        replacement["annotations"] = {REF: self.config.tag}
+        _layout(output, [replacement])
+        return result
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    monkeypatch.setattr(builder.ImageBuilder, "build", replace_index)
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+         "--validate", "--push"],
+    ) == 2
+    assert not pushes
+
+
 def test_build_does_not_push_when_the_layout_was_replaced(tmp_path, monkeypatch, capsys):
     config, pushes = _build_fixture(tmp_path, monkeypatch)
     original = builder.ImageBuilder.build
