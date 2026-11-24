@@ -207,11 +207,11 @@ def _builder(tmp_path, name, **options):
     if not (context / "app.py").exists():
         (context / "app.py").write_text("print('hello')\n")
     options.setdefault("cache_dir", str(tmp_path / f"{name}-cache"))
+    options.setdefault("include_paths", ["app.py"])
     return ImageBuilder(
         BuildConfig(
             context_dir=str(context),
             output_dir=str(tmp_path / f"{name}-out"),
-            include_paths=["app.py"],
             **options,
         )
     )
@@ -295,6 +295,50 @@ def test_cold_export_then_warm_import_skips_rebuild(tmp_path, registry, monkeypa
     local = _app_layer(reader, tmp_path, "reader-local")
     assert local.digest == cold.digest
     assert registry.requests == []
+
+
+def test_locked_build_remote_cache_excludes_concurrent_staging(tmp_path, registry, monkeypatch):
+    from test_dependency_staging import BASE_CONFIG as LOCKED_BASE_CONFIG
+    from test_lockfiles import _offline_wheelhouse, _write_uv_project
+
+    context = tmp_path / "context"
+    wheel = _offline_wheelhouse(monkeypatch, context)
+    _write_uv_project(context, wheel)
+    staging = context / ".pycontainer-lockfile-concurrent" / "locked-requirements.txt"
+    staging.parent.mkdir()
+    staging.write_text("first\n", encoding="utf-8")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], LOCKED_BASE_CONFIG),
+    )
+    options = {
+        "base_image": "python:3.11-slim-bookworm",
+        "include_deps": True,
+        "include_paths": ["."],
+    }
+
+    writer = _builder(tmp_path, "locked-writer", cache_to=CACHE_SPEC, **options)
+    writer.build()
+    cold = writer.layers[-1]
+    with tarfile.open(cold.tar_path) as archive:
+        names = archive.getnames()
+    assert "app/uv.lock" in names
+    assert not any(".pycontainer-lockfile-" in name for name in names)
+    assert cold.digest in registry.blobs
+
+    staging.write_text("changed\n", encoding="utf-8")
+    registry.requests.clear()
+    _forbid_tar_build(monkeypatch)
+    reader = _builder(tmp_path, "locked-reader", cache_from=CACHE_SPEC, **options)
+    reader.build()
+    assert reader.layers[-1].digest == cold.digest
+    assert any(
+        method == "GET" and "/manifests/" in path
+        for _, method, path, _ in registry.requests
+    )
+    for builder in (writer, reader):
+        with tarfile.open(builder.layers[-2].tar_path) as archive:
+            assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
 
 
 def test_cache_key_distinguishes_hardlinks(tmp_path, registry):
