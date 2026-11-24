@@ -1603,7 +1603,7 @@ class ImageBuilder:
             if self.config.strip_type_stubs:
                 removed = strip_type_stubs(site_packages)
                 if removed:
-                    print(f"Removed type stub distributions: {', '.join(removed)}")
+                    self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,

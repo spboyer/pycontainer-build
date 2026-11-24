@@ -251,6 +251,31 @@ def test_builder_strip_type_stubs_is_opt_in_reproducible_and_updates_sbom(
     assert sbom_names(first) == ["Django_Stubs", "runtime-dep"]
 
 
+def test_builder_redacts_build_argument_values_in_removed_stub_names(
+    tmp_path, monkeypatch, capsys
+):
+    context = tmp_path / "context"
+    site = context / ".venv" / "Lib" / "site-packages"
+    _site_packages(site)
+    _distribution(
+        site, "types_six-1.0.dist-info", "types-six", {"six-stubs/__init__.pyi": ""}
+    )
+    (context / "app.py").write_text("print('app')\n")
+
+    _builder(tmp_path / "plain", monkeypatch, context, strip_type_stubs=True).build()
+    assert "Removed type stub distributions: types-requests, types-six" in (
+        capsys.readouterr().out
+    )
+
+    _builder(
+        tmp_path / "redacted", monkeypatch, context,
+        strip_type_stubs=True, build_args={"STUB": "types-requests"},
+    ).build()
+    output = capsys.readouterr().out
+    assert "types-requests" not in output
+    assert "Removed type stub distributions: <redacted>, types-six" in output
+
+
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
     configs = []
 
