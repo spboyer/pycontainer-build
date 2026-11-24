@@ -160,6 +160,48 @@ def test_hash_pinned_requirements_hit_reuses_identical_layer_without_pip(
     assert Path(second.layers[0].tar_path).read_bytes() == Path(first.layers[0].tar_path).read_bytes()
 
 
+def test_dependency_cache_hit_keeps_size_attribution(tmp_path, monkeypatch, capsys):
+    from pycontainer import image_validation
+
+    base_data = b"base-layer-bytes" * 64
+
+    def pull(self, layers_dir, os_name, arch):
+        digest = "sha256:" + hashlib.sha256(base_data).hexdigest()
+        path = Path(layers_dir) / digest.split(":", 1)[1]
+        path.write_bytes(base_data)
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config.setdefault("rootfs", {"type": "layers"})["diff_ids"] = ["sha256:" + "1" * 64]
+        layer = builder_module.OCILayer(
+            "application/vnd.oci.image.layer.v1.tar+gzip", digest, len(base_data), str(path)
+        )
+        return [layer], config
+
+    def size_report(name):
+        built = _builder(tmp_path, monkeypatch, context, name, generate_sbom=False)
+        monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull)
+        built.build()
+        image = built.platform_images[0]
+        return image_validation.validate_image(
+            tmp_path / name, expected_digest=built.manifest_digest,
+            base_layer_count=len(image.layers) - image.app_layer_count,
+        )["size"]
+
+    context = _project(tmp_path)
+    miss = size_report("miss")
+    assert "Dependency layer cache miss" in capsys.readouterr().out
+    _forbid_install(monkeypatch)
+    hit = size_report("hit")
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+
+    assert hit == miss
+    assert [layer["role"] for layer in hit["layers"]] == ["base", "application", "application"]
+    assert hit["contributions"] == {
+        "status": "determined",
+        "base_bytes": len(base_data),
+        "application_bytes": sum(layer["bytes"] for layer in hit["layers"][1:]),
+    }
+
+
 @pytest.mark.parametrize("initial_strip", [False, True])
 def test_cache_separates_type_stub_stripping(tmp_path, monkeypatch, capsys, initial_strip):
     context = _project(tmp_path)
