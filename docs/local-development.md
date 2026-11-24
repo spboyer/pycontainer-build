@@ -444,6 +444,10 @@ set an explicit tag or build each Python version separately.
 
 Hermetic tests do not establish real per-version/per-architecture startup.
 
+Declared build arguments expand once before matrix layouts are derived. Each
+child preserves literal dollar expressions and the parent's diagnostic
+redaction and cache context; version suffixes are applied to the resolved tags.
+
 ### Use Case 1: Testing Config Changes
 
 ```bash

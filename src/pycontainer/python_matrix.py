@@ -4,7 +4,7 @@ import re
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .auth import get_registry_auth
 from .blob_store import digest_filename
@@ -115,7 +115,10 @@ class PublicationOperation:
 
 
 class MatrixPublicationError(RuntimeError):
-    def __init__(self, operations: List[PublicationOperation], cause: Exception):
+    def __init__(
+        self, operations: List[PublicationOperation], cause: Exception,
+        redact: Optional[Callable[[str], str]] = None,
+    ):
         self.operations = operations
         groups = [
             f"{status}: " + (", ".join(
@@ -123,10 +126,11 @@ class MatrixPublicationError(RuntimeError):
             ) or "(none)")
             for status in ("confirmed", "failed", "unknown", "unattempted")
         ]
-        super().__init__(
+        message = (
             "Partial Python matrix publication; " + "; ".join(groups)
             + f". No rollback or retry-overwrite was attempted. Cause: {cause}"
         )
+        super().__init__(redact(message) if redact else message)
 
 
 class PythonMatrixBuilder:
@@ -154,7 +158,11 @@ class PythonMatrixBuilder:
                 python_versions=[], python_matrix={}, default_python_version=None,
                 record_history=False, release_notes_file=None,
                 exclude_paths=[*excludes, "**/.pycontainer-build-*.lock"],
+                build_args=None,
             )
+            # The parent already expanded these fields; retain diagnostics/cache context.
+            child_config.build_args = config.build_args
+            child_config._resolved_build_args = config._resolved_build_args.copy()
             child = ImageBuilder(child_config)
             child.release_notes_labels = notes.copy()
             if "framework" in notes and "framework" not in (config.labels or {}) and child.config.labels:
@@ -168,8 +176,10 @@ class PythonMatrixBuilder:
         _reject_unsupported(self.config)
         if self.config.dry_run:
             for version, child in self.children.items():
-                print(f"Python {version}: base={child.config.base_image}, output={child.config.output_dir}")
-                print(f"Tags: {', '.join(child.config.all_tags())}")
+                print(self.config.redact(
+                    f"Python {version}: base={child.config.base_image}, output={child.config.output_dir}"
+                ))
+                print(self.config.redact(f"Tags: {', '.join(child.config.all_tags())}"))
                 child.build()
             return self.config.tag
         with self._locks():
@@ -183,7 +193,9 @@ class PythonMatrixBuilder:
                 for path in write_security_fragments(
                     Path(child.config.output_dir), security_fragments
                 ):
-                    logger.info("Security fragment saved to %s (not enforced by the image)", path)
+                    logger.info(self.config.redact(
+                        f"Security fragment saved to {path} (not enforced by the image)"
+                    ))
             for version, child in self.children.items():
                 if version != self.default:
                     refs = Path(child.config.output_dir) / "refs" / "tags"
@@ -263,13 +275,17 @@ class PythonMatrixBuilder:
                     (version_tags if i < len(explicit) else aliases).append(operation)
             self.operations = blobs + manifests + indexes + version_tags + aliases
             try:
-                auth = get_registry_auth(registry, bearer_token=auth_token, username=username, password=password)
+                log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+                auth = get_registry_auth(
+                    registry, bearer_token=auth_token, username=username, password=password,
+                    **log_options,
+                )
                 client = self.children[self.default]._registry_client(registry, repo, auth)
             except (RuntimeError, OSError, ValueError) as error:
                 self.operations.insert(0, PublicationOperation(
                     "authentication", repository, Path(self.config.output_dir), "failed"
                 ))
-                raise MatrixPublicationError(self.operations, error) from error
+                raise MatrixPublicationError(self.operations, error, self.config.redact) from error
             for operation in self.operations:
                 reference = (
                     operation.reference.split("@", 1)[1] if "@" in operation.reference
@@ -289,8 +305,8 @@ class PythonMatrixBuilder:
                         and 400 <= error.status < 500 and error.status != 408
                         else "unknown"
                     )
-                    raise MatrixPublicationError(self.operations, error) from error
+                    raise MatrixPublicationError(self.operations, error, self.config.redact) from error
                 operation.outcome = "confirmed"
                 if show_progress:
-                    print(f"Confirmed {operation.kind}: {operation.reference}")
+                    print(self.config.redact(f"Confirmed {operation.kind}: {operation.reference}"))
         return f"{repository}:{tag}"

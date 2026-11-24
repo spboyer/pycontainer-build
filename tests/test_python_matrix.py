@@ -876,6 +876,8 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
         tmp_path, monkeypatch, platform="linux/amd64,linux/arm64,linux/arm/v7",
         base_platforms=("amd64", "arm64", "arm/v7"), include_deps=True,
         default_python_version="3.12", tags=["stable"], strip_type_stubs=strip_type_stubs,
+        build_args={"VALUE": "${NOT_AN_ARGUMENT}"},
+        labels={"literal": "${VALUE}", "escaped": "$${VALUE}"},
     )
     context = Path(build.config.context_dir)
     _write_matrix_lock_project(context, include_stubs=True)
@@ -883,7 +885,8 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
     monkeypatch.setenv("PIP_FIND_LINKS", str(context / "wheelhouse"))
     base_auth = []
 
-    def pull_auth(host, *, include_generic_environment):
+    def pull_auth(host, *, include_generic_environment, log_redact):
+        assert log_redact("${NOT_AN_ARGUMENT}") == "<redacted>"
         base_auth.append((host, include_generic_environment))
         return RegistryAuth(bearer_token="base-token")
 
@@ -922,6 +925,9 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
     machines = {"amd64": "x86_64", "arm64": "aarch64", "arm": "armv7l"}
     suffixes = {"amd64": "amd", "arm64": "arm", "arm": "armv7"}
     for version, child in build.children.items():
+        assert child.config.labels["literal"] == "${NOT_AN_ARGUMENT}"
+        assert child.config.labels["escaped"] == "${VALUE}"
+        assert child.config.redact("${NOT_AN_ARGUMENT}") == "<redacted>"
         for image in child.platform_images:
             arch = image.platform["architecture"]
             with tarfile.open(image.layers[-2].tar_path) as archive:
@@ -960,6 +966,7 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
     monkeypatch.setattr(builder_module, "RegistryClient", destination_client)
     destination = "mirror.example/team/app:v9"
     assert build.push(registry_url=destination, auth_token="explicit-token", show_progress=False) == destination
+    assert push_auth[0][1].pop("log_redact")("${NOT_AN_ARGUMENT}") == "<redacted>"
     assert push_auth == [("mirror.example", {
         "bearer_token": "explicit-token", "username": None, "password": None,
     })]
@@ -973,6 +980,38 @@ def test_locked_matrix_selects_target_markers_wheels_and_override(
     ]
     first_tag = next(i for i, op in enumerate(build.operations) if "@" not in op.reference)
     assert all("@" in op.reference for op in build.operations[:first_tag])
+
+
+def test_matrix_build_args_redact_dry_run_and_publication(tmp_path, monkeypatch, capsys, caplog):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, tag="registry.example/team/app:${VERSION}",
+        build_args={"VERSION": "sensitive-release"}, dry_run=True, semver_tags=False,
+    )
+    build.build()
+    assert "sensitive-release" not in capsys.readouterr().out + caplog.text
+    build.config.dry_run = False
+    build.build()
+    push = FakePushClient()
+    monkeypatch.setattr(builder_module, "RegistryClient", push)
+    auth_options = []
+
+    def auth(host, **kwargs):
+        auth_options.append(kwargs)
+        return RegistryAuth()
+
+    monkeypatch.setattr(matrix_module, "get_registry_auth", auth)
+    build.push()
+    assert "sensitive-release" not in capsys.readouterr().out + caplog.text
+    assert auth_options[0]["log_redact"]("sensitive-release") == "<redacted>"
+
+    def fail(host, **kwargs):
+        raise RuntimeError("sensitive-release authentication failed")
+
+    monkeypatch.setattr(matrix_module, "get_registry_auth", fail)
+    with pytest.raises(MatrixPublicationError) as error:
+        build.push()
+    assert "sensitive-release" not in str(error.value)
+    assert "<redacted>" in str(error.value)
 
 
 def test_locked_matrix_checks_base_minor_before_resolving_lock(tmp_path, monkeypatch):
