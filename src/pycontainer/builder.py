@@ -193,7 +193,7 @@ from .oci import (
     build_oci_layout,
 )
 from .project import (
-    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    CONDA_FILES, MissingRequirementsFileError, detect_conda_inputs, detect_entrypoint,
     default_include_paths, find_dependencies,
 )
 from .fs_utils import conda_prefix, relative_context_path
@@ -950,7 +950,6 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
         client=RegistryClient(
             registry,
             repo,
@@ -959,7 +958,7 @@ class ImageBuilder:
             password=auth.password,
             insecure=insecure,
             ca_file=self.config.registry_ca_file,
-            **log_options,
+            log_redact=self.config.redact,
         )
         warned=self.__dict__.setdefault('_warned_insecure_registries', set())
         if insecure and registry.lower() not in warned:
@@ -972,7 +971,7 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
+        log_options = {"log_redact": self.config.redact}
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1239,7 +1238,7 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
+        log_options = {"log_redact": self.config.redact}
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1518,7 +1517,7 @@ class ImageBuilder:
             if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
                 raise ValueError("Requirements path must be relative and stay inside the build context.")
             if not (ctx / requirements_relative).is_file():
-                raise FileNotFoundError(
+                raise MissingRequirementsFileError(
                     self.config.redact(
                         f"Requirements file not found: {requirements_relative.as_posix()}"
                     )
@@ -1556,7 +1555,7 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
-            log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
+            log_options = {"log_redact": self.config.redact}
             if source_kind == "lock":
                 selection = self._lock_selection(
                     base_config, os_name, arch, variant=variant,
@@ -1617,8 +1616,7 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                log_options = {"log_redact": self.config.redact} if self.config._needs_build_argument_redaction() else {}
-                removed = strip_type_stubs(site_packages, **log_options)
+                removed = strip_type_stubs(site_packages, log_redact=self.config.redact)
                 if removed:
                     self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")

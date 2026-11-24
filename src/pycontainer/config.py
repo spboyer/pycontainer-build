@@ -396,6 +396,10 @@ class BuildConfig:
             value = list(value)
         object.__setattr__(self, name, value)
 
+    def __getstate__(self):
+        self._remember_build_argument_values()
+        return self.__dict__.copy()
+
     def __getattribute__(self, name):
         if name == "_framework_generated_state":
             values = {

@@ -45,7 +45,8 @@ the image working directory, including an `env -C` directory change.
 Multiple FastAPI or Celery applications or multiple Streamlit or Gradio
 scripts cannot be selected safely: the build asks for an explicit entrypoint
 or command. A FastAPI app passed to another app's `mount(...)` is a
-sub-application, not a root candidate. Flask constructions share one
+sub-application, not a root candidate, including directly imported local
+applications. Flask constructions share one
 `flask run` entrypoint. Flask normally searches an `app` or `wsgi` module;
 other layouts or ambiguous apps may need `FLASK_APP` or an explicit command.
 An unlaunched Gradio application and a Celery app without an
@@ -70,8 +71,10 @@ requirements file (including local `-r` files inside the context),
 constraints, and markers are not resolved by detection. Optional dependency
 groups and remote requirements includes are not inspected. Local requirements
 includes support pip's `${NAME}` environment-variable syntax and must stay
-inside the build context; their combined size is limited to 1 MiB and nesting
-to 64 files. Local `file:` requirements in `setup.cfg` are also inspected.
+inside the build context; the combined bytes read are limited to 1 MiB,
+including repeated parses through different aliases or modes, and nesting
+is limited to 64 files. Local `file:` requirements in `setup.cfg` are also
+inspected.
 
 The normal include/exclude rules apply, including when a caller supplies a
 preselected file iterable. Test, virtualenv, and
@@ -79,7 +82,8 @@ preselected file iterable. Test, virtualenv, and
 opts out. With automatic file selection, notebook files outside excluded paths
 are included when Jupyter is declared; explicit includes remain authoritative.
 Source and notebook symlinks are skipped with a warning unless every target in
-the link chain is selected, not excluded, and a relative POSIX-style path.
+the link chain is selected, not excluded, and a relative path. Windows native
+separators are normalized in image links.
 Sources reached through a directory symlink outside the build context are also
 skipped with a warning, even when that directory is selected.
 Notebooks without a declared Jupyter dependency do not trigger detection, and

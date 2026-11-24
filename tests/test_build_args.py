@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tomllib
 import traceback
+from copy import copy, deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,7 @@ from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
 from pycontainer.project import declared_dependency_names
-from pycontainer.registry_client import RegistryClient
+from pycontainer.registry_client import RegistryClient, RegistryConnectionError
 from pycontainer.system_packages import report_system_packages
 
 
@@ -145,6 +146,16 @@ def test_config_copy_retains_redaction_after_in_place_argument_clear(copy_kind):
         copied = BuildConfig(**json.loads(json.dumps(asdict(original))))
 
     assert copied.redact("synthetic-copy-marker") == "<redacted>"
+
+
+@pytest.mark.parametrize("copier", [copy, deepcopy], ids=["shallow", "deep"])
+def test_copy_observes_updated_build_arguments_before_they_are_cleared(copier):
+    config = BuildConfig(build_args={"VALUE": "original-copy-marker"})
+    config.build_args["VALUE"] = "updated-copy-marker"
+    copied = copier(config)
+    copied.build_args.clear()
+
+    assert copied.redact("original-copy-marker updated-copy-marker") == "<redacted> <redacted>"
 
 
 @pytest.mark.parametrize("mutation", ["assignment", "update", "nested-default"])
@@ -827,6 +838,117 @@ def test_direct_build_redacts_missing_requirements_after_arguments_are_cleared(t
     assert "<redacted>" in str(error.value)
 
 
+@pytest.mark.parametrize("include_paths", [None, ["app.py"]], ids=["default", "explicit"])
+def test_invalid_requirements_path_redacts_retained_arguments_in_traceback(
+    tmp_path, include_paths
+):
+    value = "private_requirements_path"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=include_paths, use_cache=False,
+        requirements_file="${SOURCE}/../requirements.txt",
+        build_args={"SOURCE": value},
+    )
+    config.build_args.clear()
+
+    with pytest.raises(ValueError, match="Context paths must be relative") as error:
+        ImageBuilder(config)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_source_read_error_redacts_retained_arguments_in_traceback(tmp_path, monkeypatch):
+    value = "private_source_error_marker"
+    source = tmp_path / "app.py"
+    source.write_text("print('hello')\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"], use_cache=False,
+        build_args={"VALUE": value},
+    )
+    config.build_args.clear()
+    original_open = Path.open
+
+    def deny_source(path, *args, **kwargs):
+        if path == source:
+            raise PermissionError(errno.EACCES, f"Permission denied: {value}", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_source)
+    with pytest.raises(PermissionError) as error:
+        ImageBuilder(config)
+
+    assert error.value.errno == errno.EACCES
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_setup_cfg_parse_error_redacts_retained_arguments_in_traceback(tmp_path):
+    value = "private_setup_cfg_marker"
+    (tmp_path / "setup.cfg").write_text(f"[options]\n{value}\n")
+    config = BuildConfig(build_args={"VALUE": value})
+    config.build_args.clear()
+
+    with pytest.raises(ValueError, match="Invalid setup.cfg") as error:
+        declared_dependency_names(tmp_path, log_redact=config.redact)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_discovery_preserves_unredacted_requirement_read_error(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n")
+    failure = PermissionError(errno.EACCES, "Permission denied", str(requirements))
+    original_open = Path.open
+
+    def deny_requirements(path, *args, **kwargs):
+        if path == requirements:
+            raise failure
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_requirements)
+    with pytest.raises(PermissionError) as error:
+        declared_dependency_names(tmp_path)
+
+    assert error.value is failure
+
+
+@pytest.mark.parametrize("add_value", [False, True])
+def test_dependency_staging_redactor_observes_arguments_added_after_staging_begins(
+    tmp_path, monkeypatch, add_value
+):
+    value = "private_late_dependency_marker"
+    (tmp_path / "requirements.txt").write_text("example==1.0\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, include_deps=True,
+        build_args={"VALUE": ""},
+    )
+    builder = ImageBuilder(config)
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8",
+            "PYTHON_LIBC=glibc-2.17",
+        ]},
+    }
+
+    failure = OSError(f"Cannot start pip: {value}" if add_value else "Unrelated spawn failure")
+
+    def fail_pip(*args, **kwargs):
+        if add_value:
+            config.build_args["VALUE"] = value
+        raise failure
+
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", fail_pip)
+    with pytest.raises(RuntimeError, match="Unable to start pip") as error:
+        builder._create_deps_layer(tmp_path, base_config=base_config)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is (None if add_value else failure)
+
+
 def test_requirements_install_redacts_missing_include_after_arguments_are_cleared(tmp_path):
     value = "private_requirements"
     requirements = tmp_path / "requirements.txt"
@@ -1042,6 +1164,95 @@ def test_registry_redactor_observes_current_arguments_before_they_are_cleared(
 
     assert previous not in caplog.text and current not in caplog.text
     assert caplog.text.count("<redacted>") == 2
+
+
+@pytest.mark.parametrize("arguments", [None, {"EMPTY": ""}])
+def test_registry_redactor_observes_arguments_added_after_client_creation(
+    tmp_path, caplog, arguments
+):
+    value = "late-registry-value-205"
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args=arguments)
+    client = ImageBuilder(config)._registry_client("registry.example", "app", RegistryAuth())
+    if config.build_args is None:
+        config.build_args = {}
+    config.build_args["VALUE"] = value
+
+    with caplog.at_level(logging.WARNING):
+        client._observe_rate_limit(
+            {"ratelimit-limit": "100", "ratelimit-remaining": "0"},
+            f"https://{value}.example",
+        )
+
+    config.build_args.clear()
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert config.redact(value) == "<redacted>"
+
+
+def test_mirror_redactors_observe_arguments_added_after_client_creation(
+    tmp_path, monkeypatch, caplog
+):
+    value = "late-mirror-value-205"
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""},
+        registry_mirrors={"base.example": ["mirror.azurecr.io"]},
+    )
+    client = ImageBuilder(config)._base_image_client("base.example", "app")
+    config.build_args["VALUE"] = value
+    monkeypatch.setattr(
+        auth_module.DockerConfigAuthProvider, "get_credentials", lambda *args: None
+    )
+
+    def fail_auth(*args, **kwargs):
+        raise OSError(value)
+
+    def pull_manifest(registry, *args, **kwargs):
+        if registry.registry == "mirror.azurecr.io":
+            raise RegistryConnectionError("mirror unavailable")
+        return {}, None
+
+    monkeypatch.setattr(auth_module.subprocess, "run", fail_auth)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
+    monkeypatch.setattr(RegistryClient, "pull_manifest", pull_manifest)
+
+    with caplog.at_level(logging.WARNING):
+        client.pull_manifest(value)
+
+    config.build_args.clear()
+    assert "Azure CLI authentication failed" in caplog.text
+    assert "Registry mirror" in caplog.text
+    assert value not in caplog.text
+    assert caplog.text.count("<redacted>") >= 2
+    assert config.redact(value) == "<redacted>"
+
+
+def test_cli_logging_observes_arguments_added_after_filter_setup(
+    tmp_path, monkeypatch, caplog
+):
+    value = "late-cli-value-205"
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""}
+    )
+
+    class LoggingBuilder:
+        def __init__(self, config):
+            config.build_args["VALUE"] = value
+
+        def build(self):
+            logging.getLogger(__name__).warning("diagnostic %s", value)
+            return "app:latest"
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli, "ImageBuilder", LoggingBuilder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with caplog.at_level(logging.WARNING):
+        cli.main()
+
+    config.build_args.clear()
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert config.redact(value) == "<redacted>"
 
 
 @pytest.mark.parametrize("operation", ["pull", "mirror", "push"])

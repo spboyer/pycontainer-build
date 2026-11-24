@@ -195,6 +195,7 @@ def _detect_framework(
     problems = {}
     unlaunched_gradio = []
     unparsed = []
+    mounted_imports = set()
     for path in python_files:
         tree, hints = _parse_source(path, ctx, dependencies, log_redact)
         if tree is None:
@@ -204,6 +205,7 @@ def _detect_framework(
         relative = path.relative_to(ctx).as_posix()
         module = ".".join(path.relative_to(ctx).with_suffix("").parts)
         fastapi_variables, fastapi_constructed = _web_app_details(tree, "FastAPI")
+        mounted_imports.update(_mounted_fastapi_imports(tree, module, fastapi_variables))
         mounted = _mounted_names(tree)
         fastapi_variables = [name for name in fastapi_variables if name not in mounted]
         if fastapi_constructed and not fastapi_variables:
@@ -287,6 +289,17 @@ def _detect_framework(
                             source_root=source_root,
                         )
                     )
+
+    fastapi_candidates = candidates["FastAPI"]
+    candidates["FastAPI"] = [
+        candidate for candidate in fastapi_candidates
+        if tuple(candidate.entrypoint[1].split(":", 1)) not in mounted_imports
+    ]
+    if fastapi_candidates and not candidates["FastAPI"]:
+        problems["FastAPI"] = (
+            "Cannot determine a root FastAPI application; specify an explicit "
+            "entrypoint or command."
+        )
 
     unlaunched_gradio = [
         path for path, mounted in unlaunched_gradio
@@ -423,7 +436,7 @@ def _selected_symlink_chain(path, context_dir, available):
             return False
         seen.add(path)
         link = os.readlink(path)
-        if "\\" in link:
+        if "\\" in link and os.sep != "\\":
             return False
         target = Path(link)
         if target.is_absolute() or target.drive or target.root:
@@ -623,17 +636,25 @@ def _parse_source(path, context_dir, dependencies, log_redact=str):
     content = bytearray()
     tail = b""
     overlap = max(map(len, markers.values())) - 1
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
-            part = tail + chunk.lower()
-            hints.update(name for name, marker in markers.items() if marker in part)
-            tail = part[-overlap:]
-            if content is not None:
-                content.extend(chunk)
-                if len(content) > MAX_FRAMEWORK_SOURCE_BYTES:
-                    content = None
-            if content is None and len(hints) == len(markers):
-                break
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(64 * 1024):
+                part = tail + chunk.lower()
+                hints.update(name for name, marker in markers.items() if marker in part)
+                tail = part[-overlap:]
+                if content is not None:
+                    content.extend(chunk)
+                    if len(content) > MAX_FRAMEWORK_SOURCE_BYTES:
+                        content = None
+                if content is None and len(hints) == len(markers):
+                    break
+    except OSError as error:
+        from .dependencies import _redacted_os_error
+
+        redacted_error = _redacted_os_error(error, log_redact)
+        if redacted_error is not error:
+            raise redacted_error from None
+        raise
     if not hints:
         return None, hints
     relative = path.relative_to(context_dir).as_posix()
@@ -692,10 +713,21 @@ def _web_app_details(tree, constructor):
         for target in targets:
             if isinstance(target, ast.Name):
                 variables.append(target.id)
-    constructed = any(
-        _is_constructor(node, modules, classes, {constructor}) for node in ast.walk(tree)
-    )
-    return variables, constructed
+    if constructor == "Flask":
+        constructed = any(
+            _is_constructor(node.value, modules, classes, {constructor})
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+        ) or any(
+            any(_is_constructor(child, modules, classes, {constructor}) for child in ast.walk(node))
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in ("create_app", "make_app")
+        )
+    else:
+        constructed = any(
+            _is_constructor(node, modules, classes, {constructor}) for node in ast.walk(tree)
+        )
+    return list(dict.fromkeys(variables)), constructed
 
 
 def _mounted_names(tree):
@@ -712,6 +744,60 @@ def _mounted_names(tree):
         for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
             if isinstance(arg, ast.Name) and arg.id != owner:
                 mounted.add(arg.id)
+    return mounted
+
+
+def _mounted_fastapi_imports(tree, module, variables):
+    nodes = list(_module_scope_nodes(tree))
+    assigned = {
+        node.id for node in nodes
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    symbols = {}
+    modules = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                if name not in assigned:
+                    modules[name] = alias.name if alias.asname else name
+        elif isinstance(node, ast.ImportFrom):
+            imported = node.module
+            if node.level:
+                package = module.rpartition(".")[0].split(".")
+                if not package[0] or node.level > len(package):
+                    continue
+                prefix = package[:len(package) - node.level + 1]
+                imported = ".".join([*prefix, *([node.module] if node.module else [])])
+            if not imported:
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if alias.name != "*" and name not in assigned:
+                    symbols[name] = (imported, alias.name)
+                    modules[name] = f"{imported}.{alias.name}"
+
+    mounted = set()
+    for node in nodes:
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "mount"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in variables
+        ):
+            continue
+        for value in [*node.args, *(item.value for item in node.keywords)]:
+            if isinstance(value, ast.Name) and value.id in symbols:
+                mounted.add(symbols[value.id])
+            elif isinstance(value, ast.Attribute):
+                parts = []
+                while isinstance(value, ast.Attribute):
+                    parts.append(value.attr)
+                    value = value.value
+                if isinstance(value, ast.Name) and value.id in modules:
+                    parts.reverse()
+                    mounted.add((".".join([modules[value.id], *parts[:-1]]), parts[-1]))
     return mounted
 
 
@@ -774,13 +860,13 @@ def _celery_apps(tree, modules, classes):
         return _is_constructor(node, modules, classes, {"Celery"})
 
     variables = []
-    for node in tree.body:
+    for node in _module_scope_nodes(tree):
         if isinstance(node, ast.Assign) and is_app(node.value):
             variables.extend(target.id for target in node.targets if isinstance(target, ast.Name))
         elif isinstance(node, ast.AnnAssign) and is_app(node.value):
             if isinstance(node.target, ast.Name):
                 variables.append(node.target.id)
-    return variables, any(is_app(node) for node in ast.walk(tree))
+    return list(dict.fromkeys(variables)), any(is_app(node) for node in ast.walk(tree))
 
 
 def _module_name(path, context_dir):
@@ -988,7 +1074,11 @@ def apply_framework_defaults(
     framework = detection.name
     entrypoint = list(detection.entrypoint) if detection.entrypoint else None
     ports = list(detection.ports)
-    if framework == "Streamlit":
+    generate_entrypoint = generated_entrypoint or (
+        config.entrypoint is None and configured_cmd is None
+    )
+    generate_ports = generated_ports or not config.has_exposed_ports()
+    if framework == "Streamlit" and (generate_entrypoint or generate_ports):
         env_port = config.env.get("STREAMLIT_SERVER_PORT")
         requested_port = (
             _environment_port(env_port, "STREAMLIT_SERVER_PORT")
@@ -1010,7 +1100,7 @@ def apply_framework_defaults(
             address = config.env.get("STREAMLIT_SERVER_ADDRESS")
             if address is not None:
                 entrypoint[-2] = f"--server.address={address}"
-    elif framework == "Gradio" and not detection.port_from_source:
+    elif framework == "Gradio" and not detection.port_from_source and generate_ports:
         env_port = config.env.get("GRADIO_SERVER_PORT")
         if env_port is not None:
             ports = [_environment_port(env_port, "GRADIO_SERVER_PORT")]

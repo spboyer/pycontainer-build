@@ -454,7 +454,9 @@ def test_digest_pinned_base_requires_mirror_to_serve_same_digest(tmp_path, mirro
 def test_mirror_token_realm_failure_falls_back(
     tmp_path, mirror_auth, monkeypatch, realm_kind
 ):
-    monkeypatch.setattr(builder_module, "get_mirror_auth", lambda _host: RegistryAuth())
+    monkeypatch.setattr(
+        builder_module, "get_mirror_auth", lambda _host, *, log_redact=None: RegistryAuth()
+    )
     with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
         realm,
         realm_state,

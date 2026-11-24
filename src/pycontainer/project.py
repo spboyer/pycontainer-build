@@ -26,6 +26,14 @@ class MissingRequirementsFileError(FileNotFoundError):
     """A requirements file referenced by project metadata is missing."""
 
 
+def _read_pyproject(path):
+    content = path.read_text(encoding="utf-8")
+    try:
+        return tomllib.loads(content)
+    except tomllib.TOMLDecodeError as error:
+        raise ProjectMetadataError(f"Invalid pyproject.toml: {error}") from error
+
+
 def requirement_name(requirement):
     requirement = requirement.strip()
     if _VCS_REQUIREMENT.match(requirement):
@@ -52,6 +60,7 @@ def declared_dependency_names(
         _REQUIREMENT_VARIABLE,
         _expand_requirement_variables,
         _logical_requirement_lines,
+        _redacted_os_error,
     )
 
     ctx = Path(context_dir)
@@ -73,9 +82,19 @@ def declared_dependency_names(
             if not path.is_file():
                 return None
             contained = path.resolve().is_relative_to(root)
-        except (OSError, RuntimeError):
+        except OSError as error:
             if display is not None and display != relative:
                 raise OSError("Cannot access an environment-based requirements file.") from None
+            redacted_error = _redacted_os_error(error, log_redact)
+            if redacted_error is not error:
+                raise redacted_error from None
+            raise
+        except RuntimeError as error:
+            if display is not None and display != relative:
+                raise OSError("Cannot access an environment-based requirements file.") from None
+            message = log_redact(str(error))
+            if message != str(error):
+                raise RuntimeError(message) from None
             raise
         if not contained:
             if conda_prefix(ctx, relative) is not None:
@@ -93,7 +112,13 @@ def declared_dependency_names(
 
     def read_requirements(relative, *, required=False, environment_path=False, ancestors=frozenset()):
         nonlocal total_bytes
-        relative = relative_context_path(relative)
+        try:
+            relative = relative_context_path(relative)
+        except ValueError as error:
+            message = log_redact(str(error))
+            if message != str(error):
+                raise ValueError(message) from None
+            raise
         display = "<environment-based requirements file>" if environment_path else relative
         shown = log_redact(str(display))
         path = selected_file(relative, display=display)
@@ -110,18 +135,13 @@ def declared_dependency_names(
                 f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
             )
         visited.add(relative)
-        try:
-            total_bytes += path.stat().st_size
-        except OSError:
-            if environment_path:
-                raise OSError("Cannot access an environment-based requirements file.") from None
-            raise
-        if total_bytes > MAX_REQUIREMENTS_BYTES:
-            raise ProjectMetadataError(
-                "Requirements files exceed the combined "
-                f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-            )
-        for line_number, line in _logical_requirement_lines(path, display=shown):
+        size, lines = _logical_requirement_lines(
+            path, display=shown, log_redact=log_redact,
+            max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
+            environment_path=environment_path, size_error=ProjectMetadataError,
+        )
+        total_bytes += size
+        for line_number, line in lines:
             expanded = _expand_requirement_variables(line)
             try:
                 parts = shlex.split(expanded, comments=True)
@@ -203,11 +223,7 @@ def declared_dependency_names(
 
     pyproject = selected_file("pyproject.toml")
     if pyproject:
-        content = pyproject.read_text(encoding="utf-8")
-        try:
-            data = tomllib.loads(content)
-        except tomllib.TOMLDecodeError as error:
-            raise ProjectMetadataError(f"Invalid pyproject.toml: {error}") from error
+        data = _read_pyproject(pyproject)
         project = data.get("project", {})
         if not isinstance(project, dict):
             raise ProjectMetadataError("[project] must be a TOML table.")
@@ -244,7 +260,11 @@ def declared_dependency_names(
         try:
             parser.read_string(content)
         except configparser.Error as error:
-            raise ProjectMetadataError(f"Invalid setup.cfg: {error}") from error
+            message = f"Invalid setup.cfg: {error}"
+            redacted = log_redact(message)
+            if redacted != message:
+                raise ProjectMetadataError(redacted) from None
+            raise ProjectMetadataError(message) from error
         value = parser.get("options", "install_requires", fallback="")
         if value.strip().startswith("file:"):
             for included_file in value.strip()[len("file:"):].split(","):
@@ -346,8 +366,13 @@ def detect_python_version(context_dir):
 def detect_entrypoint(context_dir):
     ctx=Path(context_dir); py=context_file_path(ctx, ctx/'pyproject.toml')
     if py.exists():
-        data=tomllib.loads(py.read_text())
-        proj=data.get("project",{}); scripts=proj.get("scripts") or {}
+        data=_read_pyproject(py)
+        proj=data.get("project",{})
+        if not isinstance(proj, dict):
+            raise ProjectMetadataError("[project] must be a TOML table.")
+        scripts=proj.get("scripts", {})
+        if not isinstance(scripts, dict):
+            raise ProjectMetadataError("[project].scripts must be a TOML table.")
         if scripts:
             name,target=next(iter(scripts.items()))
             if isinstance(target,str) and ":" not in target:
@@ -387,20 +412,29 @@ def default_include_paths(
     )
     include_notebooks = bool({"jupyterlab", "notebook"} & dependencies)
     if include_notebooks or logger.isEnabledFor(logging.DEBUG):
-        for path, relative in iter_files(
-            ctx, ["."], exclude_paths=excludes, exclude_defaults=False
-        ):
+        noted_notebook = False
+
+        def select_notebook(path, relative):
+            nonlocal noted_notebook
             if path.suffix != ".ipynb":
-                continue
-            if include_notebooks and c != ["."]:
-                c.append(relative.as_posix())
-            elif not include_notebooks:
+                return False
+            if include_notebooks:
+                return True
+            if not noted_notebook:
                 logger.debug(
                     "%s", log_redact(
                         "Notebooks found but no jupyterlab or notebook dependency is declared."
                     )
                 )
-                break
+                noted_notebook = True
+            return False
+
+        for path, relative in iter_files(
+            ctx, ["."], exclude_paths=excludes, exclude_defaults=False,
+            file_filter=select_notebook,
+        ):
+            if c != ["."]:
+                c.append(relative.as_posix())
     return c
 
 def find_dependencies(

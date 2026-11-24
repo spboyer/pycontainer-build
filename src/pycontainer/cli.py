@@ -449,7 +449,7 @@ def main():
 
     from .scanning import ScanError
     log_filter = _BuildArgumentLogFilter(cfg)
-    handlers = list(logging.getLogger().handlers) if cfg._needs_build_argument_redaction() else []
+    handlers = list(logging.getLogger().handlers)
     for handler in handlers:
         handler.addFilter(log_filter)
     try:

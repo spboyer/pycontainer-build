@@ -277,7 +277,7 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, variant=None, *, base_image_tag_verified):
+                     base_image, base_config, variant=None, *, base_image_tag_verified, log_redact=str):
         installs.append((arch, variant, version, base_image_tag_verified))
         return []
 
@@ -338,7 +338,7 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, *, base_image_tag_verified, variant=None):
+                     base_image, base_config, *, base_image_tag_verified, variant=None, log_redact=str):
         installs.append((arch, base_config["config"]["Env"], base_image_tag_verified))
         return []
 

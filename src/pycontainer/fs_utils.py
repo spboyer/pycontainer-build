@@ -228,13 +228,15 @@ def _check_selected_link(base, path, relative):
         )
 
 
-def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=True):
+def iter_files(
+    base, relative_paths, *, exclude_paths=None, exclude_defaults=True, file_filter=None
+):
     """Yield unique context files, pruning excluded directories during traversal.
 
     Directory symlinks and junctions are never followed: an include path that
     names or traverses one is rejected and nested ones are pruned. Selected
     file symlinks must use a relative target resolving to a file inside the
-    context.
+    context. ``file_filter``, when provided, runs before file validation.
     """
     base = Path(base)
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
@@ -277,6 +279,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                     if (
                         relative_name not in seen
                         and not path_is_excluded(child_relative, excludes)
+                        and (file_filter is None or file_filter(child, child_relative))
                         and selected(child, child_relative)
                     ):
                         seen.add(relative_name)
@@ -287,6 +290,7 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
             if (
                 relative_name not in seen
                 and not path_is_excluded(child_relative, excludes)
+                and (file_filter is None or file_filter(absolute, child_relative))
                 and selected(absolute, child_relative)
             ):
                 seen.add(relative_name)

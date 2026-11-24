@@ -122,6 +122,42 @@ def test_notebook_without_jupyter_dependency_has_verbose_note(tmp_path, caplog):
     assert "dependency" in caplog.text.lower()
 
 
+@pytest.mark.parametrize("jupyter", [False, True])
+def test_notebook_discovery_ignores_unselected_non_notebook_symlinks(
+    tmp_path, caplog, jupyter
+):
+    context = tmp_path / "context"
+    write_file(context, "app.py", "print('hello')\n")
+    write_file(context, "requirements.txt", "jupyterlab\n" if jupyter else "requests\n")
+    write_file(context, "notebooks/research.ipynb", "{}")
+    outside = write_file(tmp_path, "outside.txt", "outside context")
+    try:
+        (context / "unselected.txt").symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    with caplog.at_level(logging.DEBUG):
+        detection = detect_framework(context)
+
+    assert (detection[0] if detection else None) == ("Jupyter" if jupyter else None)
+
+
+def test_verbose_notebook_note_does_not_validate_unselected_notebook_link(tmp_path, caplog):
+    context = tmp_path / "context"
+    write_file(context, "app.py", "print('hello')\n")
+    write_file(context, "requirements.txt", "requests\n")
+    outside = write_file(tmp_path, "outside.ipynb", "{}")
+    try:
+        (context / "unselected.ipynb").symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    with caplog.at_level(logging.DEBUG):
+        assert detect_framework(context) is None
+
+    assert "no jupyterlab or notebook dependency" in caplog.text
+
+
 def test_jupyter_default_selection_includes_notebooks_in_the_app_layer(tmp_path):
     context = tmp_path / "context"
     write_file(context, "requirements.txt", "jupyterlab\n")
@@ -340,6 +376,13 @@ def test_multiple_flask_instances_share_one_flask_run_entrypoint(tmp_path):
     assert detect_framework(tmp_path) == ("Flask", FLASK_RUN, [5000])
 
 
+def test_unrelated_flask_helper_does_not_override_celery_worker(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(tmp_path, "worker.py", "from celery import Celery\napp = Celery()\n")
+    write_file(tmp_path, "helper.py", "from flask import Flask\ndef helper():\n    return Flask('x')\n")
+    assert detect_framework(tmp_path)[0] == "Celery"
+
+
 def test_mounted_fastapi_sub_application_is_not_a_root_candidate(tmp_path):
     write_file(
         tmp_path, "main.py",
@@ -349,6 +392,85 @@ def test_mounted_fastapi_sub_application_is_not_a_root_candidate(tmp_path):
     framework, entrypoint, _ = detect_framework(tmp_path)
     assert framework == "FastAPI"
     assert entrypoint[1] == "main:app"
+
+
+@pytest.mark.parametrize(
+    ("import_line", "mounted"),
+    [
+        ("from child import child as subapp", "subapp"),
+        ("import child as module", "module.child"),
+    ],
+)
+def test_imported_mounted_fastapi_sub_application_is_not_a_root_candidate(
+    tmp_path, import_line, mounted
+):
+    write_file(tmp_path, "child.py", "from fastapi import FastAPI\nchild = FastAPI()\n")
+    write_file(
+        tmp_path, "main.py",
+        f"from fastapi import FastAPI\n{import_line}\n"
+        f"app = FastAPI()\napp.mount('/child', {mounted})\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "FastAPI"
+    assert entrypoint[1] == "main:app"
+
+
+def test_relative_imported_mounted_fastapi_sub_application(tmp_path):
+    write_file(tmp_path, "package/__init__.py", "")
+    write_file(tmp_path, "package/child.py", "from fastapi import FastAPI\nchild = FastAPI()\n")
+    write_file(
+        tmp_path, "package/main.py",
+        "from fastapi import FastAPI\nfrom .child import child as subapp\n"
+        "app = FastAPI()\napp.mount('/child', subapp)\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "FastAPI"
+    assert entrypoint[1] == "package.main:app"
+
+
+def test_reassigned_import_does_not_hide_a_fastapi_candidate(tmp_path):
+    write_file(tmp_path, "child.py", "from fastapi import FastAPI\nchild = FastAPI()\n")
+    write_file(
+        tmp_path, "main.py",
+        "from fastapi import FastAPI\nfrom child import child as subapp\n"
+        "subapp = object()\napp = FastAPI()\napp.mount('/child', subapp)\n",
+    )
+    with pytest.raises(ValueError, match="Multiple FastAPI"):
+        detect_framework(tmp_path)
+
+
+def test_fastapi_assignments_to_one_binding_are_one_candidate(tmp_path):
+    write_file(
+        tmp_path, "main.py",
+        "from fastapi import FastAPI\n"
+        "if setting:\n    app = FastAPI()\nelse:\n    app = FastAPI()\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "FastAPI"
+    assert entrypoint[1] == "main:app"
+
+
+def test_celery_assignments_to_one_binding_are_one_candidate(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(
+        tmp_path, "worker.py",
+        "from celery import Celery\napp = Celery('first')\napp = Celery('second')\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "Celery"
+    assert entrypoint[2] == "worker:app"
+
+
+def test_celery_conditional_module_bindings_are_detected(tmp_path):
+    write_file(tmp_path, "requirements.txt", "celery\n")
+    write_file(
+        tmp_path, "worker.py",
+        "from celery import Celery\n"
+        "if setting:\n    app = Celery('first')\nelse:\n    app = Celery('second')\n",
+    )
+    framework, entrypoint, _ = detect_framework(tmp_path)
+    assert framework == "Celery"
+    assert entrypoint[2] == "worker:app"
 
 
 def test_unmounted_fastapi_applications_remain_ambiguous(tmp_path):
@@ -988,6 +1110,19 @@ def test_selected_source_symlink_target_can_be_detected(tmp_path):
     assert detect_framework(tmp_path, files=[shortcut, target])[0] == "Streamlit"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native link separators")
+def test_windows_relative_source_symlink_uses_native_separators(tmp_path):
+    write_file(tmp_path, "requirements.txt", "streamlit\n")
+    target = write_file(tmp_path, "source/target.txt", "import streamlit\n")
+    shortcut = tmp_path / "shortcut.py"
+    try:
+        shortcut.symlink_to(r"source\target.txt")
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    assert detect_framework(tmp_path, files=[shortcut, target])[0] == "Streamlit"
+
+
 def test_source_symlink_requires_every_link_in_the_selected_chain(tmp_path, caplog):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
     target = write_file(tmp_path, "source.txt", "import streamlit\n")
@@ -1153,6 +1288,17 @@ def test_framework_dependency_discovery_rejects_oversized_requirements(tmp_path)
     (tmp_path / "nested.txt").write_bytes(b"#" * MAX_REQUIREMENTS_BYTES)
     with pytest.raises(ValueError, match="combined.*limit"):
         detect_framework(tmp_path)
+
+
+def test_cli_reports_oversized_requirements_without_a_traceback(tmp_path, monkeypatch, capsys):
+    (tmp_path / "requirements.txt").write_bytes(b"#" * (MAX_REQUIREMENTS_BYTES + 1))
+    monkeypatch.setattr(
+        sys, "argv", ["pycontainer", "build", "--context", str(tmp_path), "--dry-run"]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "combined" in capsys.readouterr().err
 
 
 def test_unparseable_source_does_not_silently_choose_a_fallback(tmp_path):
@@ -1343,6 +1489,53 @@ def test_cli_reports_invalid_project_metadata_syntax_without_a_traceback(
     assert "Traceback" not in stderr
 
 
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("invalid = [", "Invalid pyproject.toml"),
+        ('project = "not a table"\n', "[project]"),
+        ('[project]\nscripts = "not a table"\n', "[project].scripts"),
+    ],
+)
+def test_cli_reports_invalid_entrypoint_metadata_after_file_selection(
+    tmp_path, monkeypatch, capsys, contents, message
+):
+    write_file(tmp_path, "pyproject.toml", contents)
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[], use_cache=False,
+        output_dir=str(tmp_path / "out"), detect_system_packages=False,
+    )
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert message in stderr
+    assert "Traceback" not in stderr
+
+
+def test_cli_reports_missing_root_requirements_after_file_selection(
+    tmp_path, monkeypatch, capsys
+):
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[], use_cache=False,
+        include_deps=True, requirements_file="missing.txt",
+    )
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(
+        ImageBuilder, "build", lambda self: self._create_deps_layer(tmp_path)
+    )
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Requirements file not found" in capsys.readouterr().err
+
+
 def test_cli_reports_invalid_streamlit_port_without_a_traceback(tmp_path, monkeypatch, capsys):
     write_file(tmp_path, "requirements.txt", "streamlit\n")
     write_file(tmp_path, "app.py", "import streamlit\n")
@@ -1358,6 +1551,28 @@ def test_cli_reports_invalid_streamlit_port_without_a_traceback(tmp_path, monkey
     stderr = capsys.readouterr().err
     assert "STREAMLIT_SERVER_PORT" in stderr
     assert "Traceback" not in stderr
+
+
+@pytest.mark.parametrize(
+    ("framework", "source", "port_variable"),
+    [
+        ("streamlit", "import streamlit\n", "STREAMLIT_SERVER_PORT"),
+        ("gradio", "import gradio as gr\ndemo = gr.Blocks()\ndemo.launch()\n", "GRADIO_SERVER_PORT"),
+    ],
+)
+def test_explicit_command_and_ports_do_not_validate_unused_framework_port(
+    tmp_path, framework, source, port_variable
+):
+    write_file(tmp_path, "requirements.txt", f"{framework}\n")
+    write_file(tmp_path, "app.py", source)
+    config = BuildConfig(
+        entrypoint=["python", "custom.py"], exposed_ports=[1234],
+        env={port_variable: "not-a-port"},
+    )
+
+    result = apply_framework_defaults(config, tmp_path)
+    assert result.entrypoint == ["python", "custom.py"]
+    assert result.exposed_ports == [1234]
 
 
 @pytest.mark.parametrize(

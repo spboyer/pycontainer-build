@@ -194,7 +194,7 @@ def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified, variant=None):
+    def install(path, destination, *args, base_image_tag_verified, variant=None, log_redact=str):
         assert base_image_tag_verified is False
         assert variant is None
         installed.append(path)
@@ -525,7 +525,7 @@ def test_selected_source_conda_descriptor_prefers_pip_requirements(
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified, variant=None):
+    def install(path, destination, *args, base_image_tag_verified, variant=None, log_redact=str):
         assert base_image_tag_verified is False
         assert variant is None
         installed.append(path)
@@ -924,6 +924,71 @@ def test_repeated_symlink_target_does_not_skip_nested_requirement_validation(tmp
         pytest.skip(f"File symlinks unavailable: {error}")
     with pytest.raises(ValueError, match="cannot override target install option"):
         validate_requirements(requirements, tmp_path)
+
+
+def test_requirements_size_limit_counts_each_distinct_parse(tmp_path, monkeypatch):
+    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r shared.txt\n-c shared.txt\n")
+    (tmp_path / "shared.txt").write_text("#" * 60)
+
+    with pytest.raises(ValueError, match="combined"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_requirements_size_limit_counts_each_symlink_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r first.txt\n-r second.txt\n")
+    target = tmp_path / "shared.txt"
+    target.write_text("#" * 60)
+    try:
+        (tmp_path / "first.txt").symlink_to(target.name)
+        (tmp_path / "second.txt").symlink_to(target.name)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="combined"):
+        validate_requirements(requirements, tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["validation", "discovery"])
+def test_requirements_size_limit_uses_bytes_read_when_a_file_grows(
+    tmp_path, monkeypatch, operation
+):
+    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r nested.txt\n")
+    nested = tmp_path / "nested.txt"
+    nested.write_text("#" * 40)
+    original_open = Path.open
+
+    def grow_before_read(path, *args, **kwargs):
+        if path == nested:
+            with open(nested, "ab") as stream:
+                stream.write(b"#" * 50)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", grow_before_read)
+    with pytest.raises(ValueError, match="combined"):
+        if operation == "validation":
+            validate_requirements(requirements, tmp_path)
+        else:
+            declared_dependency_names(tmp_path)
+
+
+def test_requirements_validation_accepts_real_path_in_symlinked_context(tmp_path):
+    real_context = tmp_path / "real"
+    real_context.mkdir()
+    (real_context / "requirements.txt").write_text("-r nested.txt\n")
+    (real_context / "nested.txt").write_text("example==1.0\n")
+    context = tmp_path / "context"
+    try:
+        context.symlink_to(real_context, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Directory symlink unavailable: {error}")
+
+    assert validate_requirements(real_context / "requirements.txt", context) == ["example==1.0"]
 
 
 def test_recursive_requirements_include_is_rejected(tmp_path):

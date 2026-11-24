@@ -855,12 +855,16 @@ def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     return data.decode("utf-8-sig", errors)
 
 
-def _logical_requirement_lines(path, *, display=None, context_root=None, log_redact=str):
+def _logical_requirement_lines(
+    path, *, display=None, context_root=None, log_redact=str,
+    max_bytes=None, environment_path=False, size_error=ValueError,
+):
+    limit = MAX_REQUIREMENTS_BYTES if max_bytes is None else max_bytes
     try:
         with path.open("rb") as source:
-            data = source.read(MAX_REQUIREMENTS_BYTES + 1)
+            data = source.read(limit + 1)
     except OSError as error:
-        if display is not None and display != path:
+        if environment_path:
             if error.errno is not None:
                 arguments = [error.errno, "Cannot read requirements file", str(display)]
                 if getattr(error, "winerror", None) is not None:
@@ -871,8 +875,8 @@ def _logical_requirement_lines(path, *, display=None, context_root=None, log_red
         if redacted_error is not error:
             raise redacted_error from None
         raise
-    if len(data) > MAX_REQUIREMENTS_BYTES:
-        raise ValueError(
+    if len(data) > limit:
+        raise size_error(
             "Requirements files exceed the combined "
             f"{MAX_REQUIREMENTS_BYTES}-byte limit."
         )
@@ -880,20 +884,24 @@ def _logical_requirement_lines(path, *, display=None, context_root=None, log_red
     if context_root is not None:
         shown = None if display is None or display == path else str(display)
         reject_literal_credentials(path, text, context_root, shown=shown)
-    continuation = ""
-    start_line = 1
-    for line_number, raw_line in enumerate(text.splitlines(), start=1):
-        if not continuation:
-            start_line = line_number
-        if raw_line.rstrip().endswith("\\"):
-            continuation += raw_line.rstrip()[:-1] + " "
-        else:
-            yield start_line, continuation + raw_line
-            continuation = ""
-    if continuation:
-        raise ValueError(
-            f"Requirements file has an incomplete line continuation: {display or path}"
-        )
+
+    def lines():
+        continuation = ""
+        start_line = 1
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            if not continuation:
+                start_line = line_number
+            if raw_line.rstrip().endswith("\\"):
+                continuation += raw_line.rstrip()[:-1] + " "
+            else:
+                yield start_line, continuation + raw_line
+                continuation = ""
+        if continuation:
+            raise ValueError(
+                f"Requirements file has an incomplete line continuation: {display or path}"
+            )
+
+    return len(data), lines()
 
 
 def _expand_requirement_variables(line):
@@ -945,9 +953,11 @@ def _scan_requirements(
     """Validate a local requirements graph and report roots, files and hash pinning."""
     context_root = context_dir.resolve()
     logical_root = Path(os.path.abspath(context_dir))
-    pending = [(Path(os.path.abspath(requirements)), False, frozenset(), False)]
+    initial_path = Path(os.path.abspath(requirements))
+    if not initial_path.is_relative_to(logical_root) and initial_path.is_relative_to(context_root):
+        initial_path = logical_root / initial_path.relative_to(context_root)
+    pending = [(initial_path, False, frozenset(), False)]
     visited = set()
-    counted_files = set()
     total_bytes = 0
     hash_pinned = True
     roots = []
@@ -987,27 +997,13 @@ def _scan_requirements(
                 f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
             )
         visited.add((path, constraint))
-        try:
-            size = path.stat().st_size
-        except OSError as error:
-            if environment_path:
-                raise OSError("Cannot access an environment-based requirements file.") from None
-            redacted_error = _redacted_os_error(error, log_redact)
-            if redacted_error is not error:
-                raise redacted_error from None
-            raise
-        if resolved not in counted_files:
-            counted_files.add(resolved)
-            total_bytes += size
-            if total_bytes > MAX_REQUIREMENTS_BYTES:
-                raise ValueError(
-                    "Requirements files exceed the combined "
-                    f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-                )
-
-        for _, line in _logical_requirement_lines(
-            path, display=display, context_root=context_root, log_redact=log_redact
-        ):
+        size, lines = _logical_requirement_lines(
+            path, display=display, context_root=context_root, log_redact=log_redact,
+            max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
+            environment_path=environment_path,
+        )
+        total_bytes += size
+        for _, line in lines:
             expanded = _expand_requirement_variables(line)
             try:
                 options = shlex.split(expanded, comments=True)
