@@ -436,6 +436,56 @@ def test_builder_rejects_stub_error_constructors_that_regenerate_build_values(
         assert error.strerror == error.filename == error.filename2 == "<redacted>"
 
 
+@pytest.mark.parametrize(
+    "hidden_field", ["filename", "args", "detail", "slot_detail", "cause"]
+)
+def test_builder_redacts_stub_error_fields_hidden_from_formatted_tracebacks(
+    tmp_path, monkeypatch, hidden_field
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _stub_builder(tmp_path, monkeypatch, context, "synthetic-secret", False)
+    real_rmtree = shutil.rmtree
+
+    class HiddenError(OSError):
+        __slots__ = ("slot_detail",)
+
+        def __str__(self):
+            return "permission denied"
+
+    original = HiddenError(13, "permission denied")
+    if hidden_field == "cause":
+        original.__cause__ = HiddenError()
+        original.__cause__.filename = "synthetic-secret"
+    else:
+        setattr(
+            original, hidden_field,
+            ("synthetic-secret",) if hidden_field == "args" else "synthetic-secret",
+        )
+    assert "synthetic-secret" not in "".join(traceback.format_exception(original))
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise original
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(OSError) as caught:
+        builder.build()
+
+    error = caught.value
+    assert error is not original
+    assert "synthetic-secret" not in repr(error.args)
+    assert "synthetic-secret" not in repr(vars(error))
+    assert error.filename != "synthetic-secret"
+    assert "synthetic-secret" not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None and error.__context__ is None
+    if hidden_field == "filename":
+        assert error.errno == 13
+        assert error.filename == "<redacted>"
+
+
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
     configs = []
 

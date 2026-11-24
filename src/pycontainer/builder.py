@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
+from types import MemberDescriptorType
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry, validate_exposed_ports
 from .system_packages import report_system_packages
@@ -513,8 +514,30 @@ class ImageBuilder:
         try:
             return strip_type_stubs(site_packages, redact=redact)
         except (OSError, ValueError) as error:
-            formatted = "".join(traceback.format_exception(error))
-            if redact(formatted) == formatted:
+            diagnostics = ["".join(traceback.format_exception(error))]
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if current is None or id(current) in seen:
+                    continue
+                seen.add(id(current))
+                fields = tuple(
+                    getattr(current, name, None)
+                    for name in (
+                        "errno", "strerror", "filename", "filename2",
+                        "winerror", "characters_written",
+                    )
+                )
+                slots = tuple(
+                    getattr(current, name, None)
+                    for base in type(current).__mro__
+                    for name, descriptor in vars(base).items()
+                    if isinstance(descriptor, MemberDescriptorType)
+                )
+                diagnostics.append(repr((current.args, vars(current), fields, slots)))
+                pending.extend((current.__cause__, current.__context__))
+            if all(redact(value) == value for value in diagnostics):
                 raise
             if isinstance(error, OSError):
                 replacement = _redacted_os_error(error, redact)
