@@ -156,8 +156,10 @@ real Grype compatibility or OS/Python whiteout handling. A real Grype 0.119.0
 and macOS/arm64 scanner hosts remain unvalidated.
 
 The pull-request workflow runs hermetic tests on Linux and Windows with Python
-3.11 and 3.15. Distribution smoke checks build and install wheel/sdist artifacts
-in isolated virtual environments. `python benchmarks/run_build_benchmarks.py`
+3.11 and 3.15. The test-job timeout is 10 minutes on Linux and 20 minutes on
+Windows, including setup and pre-commit tests. Distribution smoke checks build
+and install wheel/sdist artifacts in isolated virtual environments.
+`python benchmarks/run_build_benchmarks.py`
 records repeatable synthetic app-only and local full-build trends; its synthetic
 base excludes registry pull/push and container startup. Benchmark timing is not
 a pass/fail gate. A passing layout assertion is not evidence that an image
