@@ -140,6 +140,11 @@ whose dataclass `init` is false); threshold parsing preserves their exact value.
 This internal snapshot representation does not change the TOML contract:
 thresholds in TOML must be numbers, never quoted strings.
 
+The `validate_image(..., thresholds=...)` API accepts `None` or a mapping with
+string keys naming the supported thresholds. Empty mappings and known keys with
+`None` values leave thresholds unset. Non-mapping inputs, non-string keys and
+unknown names raise `ValueError`, including when their values are `None`.
+
 These are **stored blob sizes**. Base layers pulled from a registry usually
 keep their compressed media types, so they count compressed bytes, while
 pycontainer writes dependency and application layers as uncompressed tar, so

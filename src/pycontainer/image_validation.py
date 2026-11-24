@@ -4,6 +4,7 @@ import hashlib
 import json
 import posixpath
 import re
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
@@ -890,12 +891,18 @@ def validate_image(
     if base_layer_count is not None and expected_digest is None:
         raise ValueError("Base layer attribution requires the expected manifest digest.")
     validate_ignores(ignores)
-    unknown = sorted(set(thresholds or {}) - set(SIZE_THRESHOLDS))
+    if thresholds is None:
+        thresholds = {}
+    elif not isinstance(thresholds, Mapping):
+        raise ValueError("Image size thresholds must be a mapping or None.")
+    if any(not isinstance(name, str) for name in thresholds):
+        raise ValueError("Image size threshold names must be strings.")
+    unknown = sorted(set(thresholds) - set(SIZE_THRESHOLDS))
     if unknown:
         raise ValueError(f"Unknown image size threshold(s): {', '.join(unknown)}.")
     thresholds = {
         name: parse_size_threshold(value, name)
-        for name, value in (thresholds or {}).items() if value is not None
+        for name, value in thresholds.items() if value is not None
     }
     layout = _VerifiedLayout(output)
     index, entries = layout.verify()

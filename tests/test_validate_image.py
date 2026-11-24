@@ -1334,6 +1334,41 @@ def test_unknown_size_threshold_names_are_rejected(tmp_path, value):
         image_validation.validate_image(tmp_path, thresholds={"max_image_szie_mb": value})
 
 
+@pytest.mark.parametrize("thresholds", [False, 0, [], "", True, 1, ["max_image_size_mb"]])
+def test_size_thresholds_require_mapping(tmp_path, thresholds):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Image size thresholds must be a mapping"):
+        image_validation.validate_image(tmp_path, thresholds=thresholds)
+
+
+@pytest.mark.parametrize("key", [None, 1, ("max_image_size_mb",)])
+def test_size_threshold_keys_require_strings(tmp_path, key):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Image size threshold names must be strings"):
+        image_validation.validate_image(tmp_path, thresholds={key: None, "max_layer_size_mb": None})
+
+
+@pytest.mark.parametrize("thresholds", [None, {}])
+def test_empty_size_thresholds_are_unset(tmp_path, thresholds):
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(tmp_path, thresholds=thresholds)
+    assert report["size"]["thresholds"] == {
+        "max_image_size_mb": None, "max_layer_size_mb": None,
+    }
+    assert not report["findings"]
+
+
+def test_size_thresholds_accept_read_only_mapping(tmp_path):
+    from types import MappingProxyType
+
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(
+        tmp_path, thresholds=MappingProxyType({"max_layer_size_mb": "1"}),
+    )
+    assert report["size"]["thresholds"]["max_layer_size_mb"] == "1"
+    assert not report["findings"]
+
+
 @pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
 def test_known_none_size_threshold_is_unset(tmp_path, name):
     _sized_image(tmp_path, 1)
