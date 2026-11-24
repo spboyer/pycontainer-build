@@ -7,10 +7,11 @@ registry, daemon or network, and validates the result with the same resolver
 import json
 import os
 import re
+import stat
 import sys
-import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, TextIO, Tuple
+from uuid import uuid4
 
 from .config_loader import BUILD_TABLE
 from .effective_config import resolve_build_config, resolve_settings
@@ -19,6 +20,7 @@ from .project import detect_python_version
 
 DEFAULT_OUTPUT = "pycontainer.toml"
 MAX_ATTEMPTS = 3
+MAX_STAGING_ATTEMPTS = 10
 EXIT_OK, EXIT_REFUSED, EXIT_INVALID, EXIT_INTERRUPTED = 0, 1, 2, 130
 
 TEMPLATES: Dict[str, Dict[str, Any]] = {
@@ -101,15 +103,17 @@ def build_settings(
     """Return the ordered [build] settings a template produces; no files are touched."""
     if template not in TEMPLATES:
         raise InitError(f"unknown template {template!r}; choose from: {', '.join(TEMPLATES)}")
+    if not context_dir:
+        raise InitError("build context directory must not be empty")
     spec = TEMPLATES[template]
-    app = validate_app(template, app) if app else spec["app"]
+    app = validate_app(template, app) if app is not None else spec["app"]
     port = validate_port(port) if port is not None else spec["port"]
     settings: Dict[str, Any] = {
-        "tag": tag or default_tag(context_dir),
-        "base_image": base_image or default_base_image(context_dir),
+        "tag": default_tag(context_dir) if tag is None else tag,
+        "base_image": default_base_image(context_dir) if base_image is None else base_image,
         "context_dir": context_dir,
     }
-    if platform:
+    if platform is not None:
         settings["platform"] = platform
     deps = spec["include_deps"] if include_deps is None else include_deps
     if deps:
@@ -187,55 +191,56 @@ def _check_target(target: Path) -> None:
         raise InitError(f"output path {target} is a link or directory")
 
 
-def _write_fd(fd: int, content: bytes) -> None:
-    try:
-        handle = os.fdopen(fd, "wb")
-    except BaseException:
-        os.close(fd)
-        raise
-    with handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
+def _write_staged(handle: BinaryIO, content: bytes) -> None:
+    handle.write(content)
+    handle.flush()
+    os.fsync(handle.fileno())
 
 
-def _write_new(target: Path, content: bytes) -> None:
-    """Create target exclusively; remove it again if writing fails."""
-    try:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
-    except FileExistsError:
-        raise OutputExistsError(f"refusing to overwrite existing {target}") from None
-    try:
-        _write_fd(fd, content)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
+def _open_staged(directory: Path) -> Tuple[Path, BinaryIO]:
+    for _ in range(MAX_STAGING_ATTEMPTS):
+        staged = directory / f".pycontainer-init-{uuid4().hex}.tmp"
+        try:
+            handle = open(staged, "xb", opener=lambda path, flags: os.open(path, flags, 0o644))
+        except FileExistsError:
+            continue
+        return staged, handle
+    raise FileExistsError(f"cannot create a unique staging file in {directory}")
 
 
 def publish(content: str, target: Path, force: bool = False) -> None:
     """Validate content with the real loader, then atomically publish it.
 
-    Without force an existing file is never replaced. The staging file is always
-    removed, so cancellation or failure leaves no partial output.
+    Without force an existing file is never replaced. Cancellation or failure
+    before publication leaves no output; after publication it is complete.
     """
     _check_target(target)
-    fd, staged_name = tempfile.mkstemp(prefix=".pycontainer-init-", suffix=".tmp", dir=target.parent)
-    staged = Path(staged_name)
     data = content.encode("utf-8")
+    staged, handle = _open_staged(target.parent)
     try:
-        _write_fd(fd, data)
-        try:
-            resolve_build_config(staged, {})
-        except (OSError, ValueError) as exc:
-            raise InitError(str(exc).replace(str(staged), str(target))) from None
+        with handle:
+            mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
+            _write_staged(handle, data)
+            try:
+                resolve_build_config(staged, {})
+            except (OSError, ValueError) as exc:
+                raise InitError(str(exc).replace(str(staged), str(target))) from None
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o644 if force else mode)
         _check_target(target)
         if force:
-            os.chmod(staged, 0o644)
+            if os.name == "nt":
+                os.chmod(staged, 0o644)
             os.replace(staged, target)
             return
-        if os.path.lexists(target):
-            raise OutputExistsError(f"refusing to overwrite existing {target}")
-        _write_new(target, data)
+        try:
+            os.link(staged, target)
+        except FileExistsError:
+            raise OutputExistsError(f"refusing to overwrite existing {target}") from None
+        except (OSError, NotImplementedError) as exc:
+            raise InitError(f"cannot publish {target} atomically: hard link creation failed: {exc}") from exc
     finally:
         staged.unlink(missing_ok=True)
 
@@ -285,12 +290,20 @@ def run_template(
 ) -> int:
     """Generate a template configuration noninteractively; return an exit code."""
     out, err = out or sys.stdout, err or sys.stderr
+    publishing = False
     try:
         target = resolve_output_path(output)
         if os.path.lexists(target) and not force:
             raise OutputExistsError(f"refusing to overwrite existing {target}; pass --force to replace it")
         settings = build_settings(template, **options)
+        publishing = True
         publish(render_build_toml(settings, template), target, force)
+        _finish(settings, target, template, out)
+    except KeyboardInterrupt:
+        message = ("\nInterrupted during publication; the complete output may already exist."
+                   if publishing else "\nCancelled; no file written.")
+        print(message, file=err)
+        return EXIT_INTERRUPTED
     except OutputExistsError as exc:
         print(f"error: {exc}", file=err)
         return EXIT_REFUSED
@@ -298,7 +311,9 @@ def run_template(
         for line in str(exc).splitlines():
             print(f"error: {line}", file=err)
         return EXIT_INVALID
-    _finish(settings, target, template, out)
+    except OSError as exc:
+        print(f"error: cannot finish publishing configuration: {exc}; output may already exist", file=err)
+        return EXIT_INVALID
     return EXIT_OK
 
 
@@ -402,6 +417,7 @@ def run_wizard(
     w = _Wizard(input_fn, out)
     print("pycontainer init: answer each prompt; press Enter for the default, Ctrl+C to cancel.", file=out)
     print("No credentials are requested; registry login stays with 'build --push'.", file=out)
+    publishing = False
     try:
         template, settings, target = _collect(w)
         content = render_build_toml(settings, template)
@@ -409,12 +425,16 @@ def run_wizard(
         if not w.ask(f"Write {os.path.relpath(target)}? (y/n)", "n", _yes_no):
             print("Cancelled; no file written.", file=out)
             return EXIT_REFUSED
+        publishing = True
         publish(content, target, force=False)
+        _finish(settings, target, template, out)
     except EOFError:
         print("\nCancelled (end of input); no file written.", file=err)
         return EXIT_REFUSED
     except KeyboardInterrupt:
-        print("\nCancelled; no file written.", file=err)
+        message = ("\nInterrupted during publication; the complete output may already exist."
+                   if publishing else "\nCancelled; no file written.")
+        print(message, file=err)
         return EXIT_INTERRUPTED
     except OutputExistsError as exc:
         print(f"error: {exc}", file=err)
@@ -423,5 +443,7 @@ def run_wizard(
         for line in str(exc).splitlines():
             print(f"error: {line}", file=err)
         return EXIT_INVALID
-    _finish(settings, target, template, out)
+    except OSError as exc:
+        print(f"error: cannot finish publishing configuration: {exc}; output may already exist", file=err)
+        return EXIT_INVALID
     return EXIT_OK

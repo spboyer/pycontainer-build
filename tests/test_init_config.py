@@ -1,7 +1,12 @@
+import errno
 import io
 import os
 import socket
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -61,6 +66,8 @@ def test_template_round_trips_through_real_loader(offline, monkeypatch, template
     assert cfg.entrypoint == entry
     assert cfg.exposed_ports == ports
     assert cfg.include_deps is deps
+    assert cfg.context_dir == "." and cfg.platform == "linux/amd64"
+    assert "platform" not in settings
     assert _files(offline) == ["pycontainer.toml", "pyproject.toml"]
 
 
@@ -125,6 +132,31 @@ def test_usage_errors_write_nothing(offline, monkeypatch, argv):
 def test_invalid_template_values_write_nothing(offline, monkeypatch, capsys, extra):
     assert _run(monkeypatch, ["init", "-t", "fastapi", *extra]) == 2
     assert "error:" in capsys.readouterr().err
+    assert _files(offline) == []
+
+
+@pytest.mark.parametrize("template", ["fastapi", "flask", "generic"])
+@pytest.mark.parametrize("option", ["--tag", "--base-image", "--app", "--platform", "--context"])
+def test_explicit_empty_template_values_are_rejected(offline, monkeypatch, capsys, template, option):
+    assert _run(monkeypatch, ["init", "-t", template, option, ""]) == 2
+    assert "error:" in capsys.readouterr().err
+    assert _files(offline) == []
+
+
+@pytest.mark.parametrize("option", ["--tag", "--base-image", "--app", "--platform", "--context"])
+def test_empty_template_values_do_not_replace_existing_file(offline, monkeypatch, option):
+    target = offline / "pycontainer.toml"
+    target.write_text("# existing\n")
+    assert _run(monkeypatch, ["init", "-t", "fastapi", "--force", option, ""]) == 2
+    assert target.read_text() == "# existing\n"
+    assert _files(offline) == ["pycontainer.toml"]
+
+
+def test_empty_platform_reports_shared_resolver_error(offline, monkeypatch, capsys):
+    with pytest.raises(ValueError) as invalid:
+        init_config.resolve_settings({"platform": ""}, {}, "[build]")
+    assert _run(monkeypatch, ["init", "-t", "fastapi", "--platform", ""]) == 2
+    assert str(invalid.value) in capsys.readouterr().err
     assert _files(offline) == []
 
 
@@ -216,6 +248,117 @@ def test_publish_never_clobbers_file_created_after_precheck(offline, monkeypatch
     assert _files(offline) == ["race.toml"]
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_publish_never_exposes_partial_content(offline, monkeypatch, force):
+    target = offline / "cfg.toml"
+    previous = b"# existing content\n"
+    if force:
+        target.write_bytes(previous)
+    content = init_config.render_build_toml(init_config.build_settings("generic"), "generic")
+    observations = []
+
+    with ThreadPoolExecutor(max_workers=1) as observer:
+        def split_write(stream, data):
+            stream.write(data[:8])
+            stream.flush()
+            observations.append(
+                observer.submit(lambda: target.read_bytes() if target.exists() else None).result(timeout=10)
+            )
+            stream.write(data[8:])
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        monkeypatch.setattr(init_config, "_write_staged", split_write)
+        init_config.publish(content, target, force=force)
+
+    assert observations
+    assert all(value == (previous if force else None) for value in observations)
+    assert target.read_bytes() == content.encode("utf-8")
+    assert _files(offline) == ["cfg.toml"]
+
+
+def test_publish_link_collision_preserves_concurrent_file(offline, monkeypatch):
+    target = offline / "cfg.toml"
+    content = init_config.render_build_toml(init_config.build_settings("generic"), "generic")
+    real_link = os.link
+
+    def racing_link(source, destination):
+        target.write_text("# created concurrently\n")
+        real_link(source, destination)
+
+    monkeypatch.setattr(init_config.os, "link", racing_link)
+    with pytest.raises(init_config.OutputExistsError, match="refusing to overwrite"):
+        init_config.publish(content, target)
+    assert target.read_text() == "# created concurrently\n"
+    assert _files(offline) == ["cfg.toml"]
+
+
+def test_staging_name_collision_preserves_existing_file(offline, monkeypatch):
+    taken = UUID("00000000-0000-4000-8000-000000000001")
+    available = UUID("00000000-0000-4000-8000-000000000002")
+    collision = offline / f".pycontainer-init-{taken.hex}.tmp"
+    collision.write_text("# existing\n")
+    candidates = iter((taken, available))
+    monkeypatch.setattr(init_config, "uuid4", lambda: next(candidates))
+
+    init_config.publish("[build]\n", offline / "cfg.toml")
+
+    assert collision.read_text() == "# existing\n"
+    assert (offline / "cfg.toml").read_text() == "[build]\n"
+    assert _files(offline) == sorted([collision.name, "cfg.toml"])
+
+
+def test_concurrent_publishers_create_exactly_one_complete_file(offline, monkeypatch):
+    target = offline / "cfg.toml"
+    contents = [
+        init_config.render_build_toml(init_config.build_settings("generic", tag=tag), "generic")
+        for tag in ("local/first:latest", "local/second:latest")
+    ]
+    barrier = threading.Barrier(2, timeout=10)
+    real_resolve = init_config.resolve_build_config
+
+    def synchronized_resolve(path, overrides):
+        result = real_resolve(path, overrides)
+        barrier.wait()
+        return result
+
+    def create(content):
+        try:
+            init_config.publish(content, target)
+            return "created"
+        except init_config.OutputExistsError:
+            return "exists"
+
+    monkeypatch.setattr(init_config, "resolve_build_config", synchronized_resolve)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(create, contents))
+    assert sorted(outcomes) == ["created", "exists"]
+    assert target.read_text(encoding="utf-8") in contents
+    assert _files(offline) == ["cfg.toml"]
+
+
+@pytest.mark.parametrize("mode", ["template", "wizard"])
+@pytest.mark.parametrize(
+    "error",
+    [OSError(errno.ENOTSUP, "hard links unsupported"), PermissionError(errno.EACCES, "link denied"),
+     NotImplementedError("no hard links")],
+)
+def test_unsupported_atomic_publication_reports_error_without_output(offline, monkeypatch, capsys, error, mode):
+    def reject_link(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(init_config.os, "link", reject_link)
+    if mode == "template":
+        code = _run(monkeypatch, ["init", "-t", "generic"])
+        err = capsys.readouterr().err.lower()
+    else:
+        code, _, _, err = _wizard(FASTAPI_ANSWERS)
+        err = err.lower()
+    assert code == 2
+    assert "error:" in err and "atomic" in err and "link" in err
+    assert _files(offline) == []
+
+
 def test_publish_rejects_invalid_content_without_leftovers(offline):
     with pytest.raises(init_config.InitError, match="platform"):
         init_config.publish('[build]\nplatform = "nope"\n', offline / "bad.toml")
@@ -232,12 +375,101 @@ def test_interrupted_publish_leaves_no_partial_file(offline, monkeypatch):
     assert _files(offline) == []
 
 
-def test_fallback_write_removes_partial_file(offline, monkeypatch):
-    target = offline / "cfg.toml"
+def test_interrupted_staging_removes_partial_file(offline, monkeypatch):
+    def interrupted_write(stream, data):
+        stream.write(data[:8])
+        stream.flush()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(init_config, "_write_staged", interrupted_write)
+    with pytest.raises(KeyboardInterrupt):
+        init_config.publish("[build]\n", offline / "cfg.toml")
+    assert _files(offline) == []
+
+
+def test_interrupted_atomic_publish_before_link_leaves_no_output(offline, monkeypatch):
+    def interrupt_link(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(init_config.os, "link", interrupt_link)
+    with pytest.raises(KeyboardInterrupt):
+        init_config.publish("[build]\n", offline / "cfg.toml")
+    assert _files(offline) == []
+
+
+def test_staging_sync_failure_leaves_no_output(offline, monkeypatch):
     monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk full")))
-    with pytest.raises(OSError):
-        init_config._write_new(target, b"[build]\n")
-    assert not target.exists()
+    with pytest.raises(OSError, match="disk full"):
+        init_config.publish("[build]\n", offline / "cfg.toml")
+    assert _files(offline) == []
+
+
+@pytest.mark.parametrize("mode", ["template", "wizard"])
+def test_init_reports_staging_io_failure(offline, monkeypatch, capsys, mode):
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk full")))
+    if mode == "template":
+        code = _run(monkeypatch, ["init", "-t", "generic"])
+        err = capsys.readouterr().err
+    else:
+        code, _, _, err = _wizard(FASTAPI_ANSWERS)
+    assert code == 2
+    assert "error:" in err and "disk full" in err and "Traceback" not in err
+    assert _files(offline) == []
+
+
+def test_force_replace_failure_preserves_existing_file(offline, monkeypatch, capsys):
+    target = offline / "pycontainer.toml"
+    target.write_text("# existing\n")
+
+    def reject_replace(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "replacement denied")
+
+    monkeypatch.setattr(init_config.os, "replace", reject_replace)
+    assert _run(monkeypatch, ["init", "-t", "generic", "--force"]) == 2
+    assert "replacement denied" in capsys.readouterr().err
+    assert target.read_text() == "# existing\n"
+    assert _files(offline) == ["pycontainer.toml"]
+
+
+def test_cleanup_failure_reports_possible_output(offline, monkeypatch, capsys):
+    real_unlink = Path.unlink
+    stage_paths = []
+
+    def reject_staging_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".pycontainer-init-"):
+            stage_paths.append(path)
+            raise PermissionError(errno.EACCES, "cleanup denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", reject_staging_cleanup)
+        assert _run(patch, ["init", "-t", "generic"]) == 2
+    err = capsys.readouterr().err
+    assert "cleanup denied" in err and "may already exist" in err
+    assert len(stage_paths) == 1 and stage_paths[0].name in err
+    target = offline / "pycontainer.toml"
+    resolve_build_config(target, {})
+    assert stage_paths[0].read_bytes() == target.read_bytes()
+    stage_paths[0].unlink()
+    assert _files(offline) == ["pycontainer.toml"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX umask controls file permissions")
+def test_new_output_respects_umask_and_staging_is_private(offline, monkeypatch):
+    real_resolve = init_config.resolve_build_config
+
+    def inspect_stage(path, overrides):
+        assert path.parent == offline
+        assert path.stat().st_mode & 0o777 == 0o600
+        return real_resolve(path, overrides)
+
+    monkeypatch.setattr(init_config, "resolve_build_config", inspect_stage)
+    original = os.umask(0o027)
+    try:
+        init_config.publish("[build]\n", offline / "cfg.toml")
+    finally:
+        os.umask(original)
+    assert (offline / "cfg.toml").stat().st_mode & 0o777 == 0o640
 
 
 def test_existing_pyproject_settings_are_untouched(offline, monkeypatch, capsys):
@@ -363,6 +595,46 @@ def test_wizard_ctrl_c_writes_nothing(offline):
     code, term, out, err = _wizard(FASTAPI_ANSWERS[:4] + [KeyboardInterrupt()])
     assert code == 130 and "no file written" in err
     assert _files(offline) == []
+
+
+@pytest.mark.parametrize("mode,force", [("template", False), ("template", True), ("wizard", False)])
+def test_interrupt_at_publication_reports_possible_output(offline, monkeypatch, capsys, mode, force):
+    target = offline / "pycontainer.toml"
+    if force:
+        target.write_text("# existing\n")
+    operation = "replace" if force else "link"
+    real_operation = getattr(os, operation)
+
+    def interrupt_after_operation(source, destination):
+        real_operation(source, destination)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(init_config.os, operation, interrupt_after_operation)
+    if mode == "template":
+        args = ["init", "-t", "generic"]
+        code = _run(monkeypatch, [*args, *(["--force"] if force else [])])
+        err = capsys.readouterr().err
+    else:
+        code, _, _, err = _wizard(FASTAPI_ANSWERS)
+    assert code == 130 and "may" in err.lower() and "no file written" not in err.lower()
+    resolve_build_config(target, {})
+    assert _files(offline) == ["pycontainer.toml"]
+
+
+@pytest.mark.parametrize("mode", ["template", "wizard"])
+def test_interrupt_after_publish_reports_possible_output(offline, monkeypatch, capsys, mode):
+    def interrupt_finish(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(init_config, "_finish", interrupt_finish)
+    if mode == "template":
+        code = _run(monkeypatch, ["init", "-t", "generic"])
+        err = capsys.readouterr().err
+    else:
+        code, _, _, err = _wizard(FASTAPI_ANSWERS)
+    assert code == 130 and "may" in err.lower() and "no file written" not in err.lower()
+    resolve_build_config(offline / "pycontainer.toml", {})
+    assert _files(offline) == ["pycontainer.toml"]
 
 
 @pytest.mark.parametrize("answer", ["", "n", "no"])
