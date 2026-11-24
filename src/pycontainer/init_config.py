@@ -238,7 +238,14 @@ def publish(content: str, target: Path, force: bool = False) -> None:
             except (OSError, ValueError) as exc:
                 raise InitError(str(exc).replace(str(staged), str(target))) from None
             if os.name != "nt":
-                mode = 0o644 if force else _output_creation_mode(target.parent)
+                mode = _output_creation_mode(target.parent)
+                if force:
+                    try:
+                        existing_mode = stat.S_IMODE(target.stat(follow_symlinks=False).st_mode)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        mode &= existing_mode
                 os.fchmod(handle.fileno(), mode)
         _check_target(target)
         if force:

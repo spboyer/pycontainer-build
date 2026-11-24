@@ -488,6 +488,44 @@ def test_staging_is_private_from_creation(offline, monkeypatch):
     assert observed_modes and all(mode & 0o077 == 0 for mode in observed_modes)
 
 
+def test_force_creation_uses_posix_umask_mode(offline, monkeypatch):
+    modes = []
+
+    class PosixOS:
+        name = "posix"
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def fchmod(self, fd, mode):
+            modes.append(mode)
+
+    monkeypatch.setattr(init_config, "os", PosixOS())
+    monkeypatch.setattr(init_config, "_output_creation_mode", lambda directory: 0o600)
+    init_config.publish("[build]\n", offline / "cfg.toml", force=True)
+    assert modes[-1] == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX umask controls file permissions")
+@pytest.mark.parametrize(
+    "existing_mode,umask,expected",
+    [(None, 0o077, 0o600), (0o600, 0o022, 0o600), (0o400, 0o022, 0o400), (0o640, 0o077, 0o600)],
+)
+def test_force_respects_umask_and_existing_mode(offline, existing_mode, umask, expected):
+    target = offline / "cfg.toml"
+    if existing_mode is not None:
+        target.write_text("# existing\n")
+        target.chmod(existing_mode)
+    original = os.umask(umask)
+    try:
+        init_config.publish("[build]\n", target, force=True)
+    finally:
+        os.umask(original)
+    assert target.stat().st_mode & 0o777 == expected
+    assert target.read_text(encoding="utf-8") == "[build]\n"
+    assert _files(offline) == ["cfg.toml"]
+
+
 def test_existing_pyproject_settings_are_untouched(offline, monkeypatch, capsys):
     pyproject = offline / "pyproject.toml"
     original = '[project]\nname = "demo"\n\n[tool.pycontainer]\ntag = "mine:1"\n'

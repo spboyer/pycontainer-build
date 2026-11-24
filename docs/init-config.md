@@ -111,6 +111,11 @@ registry credentials, tokens, environment variables or labels.
   unavailable, publication fails explicitly (exit 2) rather than writing
   the output in place. The wizard never replaces files and asks for another
   path instead.
+- On POSIX, new output permissions respect the process umask. With `--force`,
+  existing permission bits are not broadened: the new file's mode is
+  intersected with the existing mode. Ownership and extended ACLs are not
+  preserved; concurrent changes to the target or its permissions are not
+  synchronized. On Windows the staged file inherits the output directory ACL.
 - Path checks do not protect against a directory or staging file being replaced
   concurrently; generate files only in a trusted working directory.
 - End of input or a declined confirmation (exit 1) publishes nothing. Ctrl+C
