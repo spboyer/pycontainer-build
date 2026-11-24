@@ -1,4 +1,4 @@
-"""Content-addressed application layer cache."""
+"""Content-addressed cache for application and dependency layers."""
 import hashlib
 import io
 import json
@@ -325,14 +325,19 @@ class LayerCache:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
-        files_digest = self._compute_files_digest(
+        return self.get_entry(self._compute_files_digest(
             files, workdir, reproducible, namespace=namespace
-        )
+        ))
+
+    def get_entry(self, key: str) -> Optional[Tuple[str, Path]]:
+        """Return a verified ``(digest, blob path)`` for ``key``; discard missing or corrupt blobs."""
+        if not self.enabled:
+            return None
         with self._index_lock():
             entries = self._load_index()
-            entry = entries.get(files_digest)
+            entry = entries.get(key)
             if entry is None:
-                logger.debug("Layer cache miss: no entry for %s", files_digest)
+                logger.debug("Layer cache miss: no entry for %s", key)
                 return None
 
             blob_path = self._blob_path(entry.digest)
@@ -353,6 +358,18 @@ class LayerCache:
             logger.debug("Layer cache hit: %s", entry.digest)
             return entry.digest, blob_path
 
+    def get_bytes(self, key: str, max_bytes: int) -> Optional[bytes]:
+        """Return a small verified blob for ``key``, re-hashing the bytes actually read."""
+        cached = self.get_entry(key)
+        if cached is None:
+            return None
+        digest, blob_path = cached
+        with blob_path.open("rb") as source:
+            content = source.read(max_bytes + 1)
+        if len(content) > max_bytes or f"sha256:{hashlib.sha256(content).hexdigest()}" != digest:
+            return None
+        return content
+
     def store_layer(
         self,
         files: List[Tuple[Path, Path]],
@@ -368,36 +385,61 @@ class LayerCache:
         layer_path = Path(layer_path)
         if not self.enabled:
             return layer_path
+        return self.store_entry(
+            self._compute_files_digest(
+                files, workdir, reproducible, hardlinks, namespace=namespace
+            ),
+            digest,
+            layer_path,
+            [self._relative_path(relative) for _, relative in files] if record_source_files else [],
+        )
+
+    def store_entry(
+        self, key: str, digest: str, blob_source: Path, source_files: List[str]
+    ) -> Path:
+        """Verify ``blob_source`` against ``digest``, publish it atomically and index it under ``key``."""
+        blob_source = Path(blob_source)
+        if not self.enabled:
+            return blob_source
 
         self._digest_hex(digest)
-        actual_digest, size = self._hash_file(layer_path)
+        actual_digest, size = self._hash_file(blob_source)
         if actual_digest != digest:
             raise CacheIntegrityError(
-                f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
+                f"Layer file {blob_source} hashes to {actual_digest}, not {digest}"
             )
-        files_digest = self._compute_files_digest(
-            files, workdir, reproducible, hardlinks, namespace=namespace
-        )
         blob_path = self._blob_path(digest)
 
         with self._index_lock():
             entries = self._load_index()
             if not self._blob_matches(blob_path, digest, size):
-                self._publish_blob(layer_path, blob_path, digest, size)
+                self._publish_blob(blob_source, blob_path, digest, size)
 
-            entries[files_digest] = CacheEntry(
+            entries[key] = CacheEntry(
                 digest=digest,
                 size=size,
                 created=time.time(),
                 last_used=time.time(),
-                source_files=(
-                    [self._relative_path(relative) for _, relative in files]
-                    if record_source_files else []
-                ),
+                source_files=list(source_files),
             )
             self._evict_if_needed(entries)
             self._save_index(entries)
         return blob_path
+
+    def store_bytes(self, key: str, content: bytes, source_files: List[str]) -> Optional[Path]:
+        if not self.enabled:
+            return None
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=".entry-", suffix=".tmp", dir=self.cache_dir
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as target:
+                target.write(content)
+            digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+            return self.store_entry(key, digest, temp_path, source_files)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def copy_verified_blob(self, source: Path, destination: Path, digest: str) -> Path:
         source = Path(source)

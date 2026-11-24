@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -457,6 +458,62 @@ def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path,
             assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
             for other in {"amd", "arm", "armv7"} - {suffix}:
                 assert not any(f"{prefix}_{other}/" in name for name in names)
+
+
+def test_locked_cache_reuses_only_matching_multi_platform_closures(
+    tmp_path, monkeypatch, request, capsys
+):
+    from test_lockfiles import _SimpleIndex, _write_target_marker_uv_project
+
+    for name in list(os.environ):
+        if name.upper().startswith(("PIP_", "PYTHON")):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    ctx = tmp_path / "ctx"
+    index = _SimpleIndex()
+    request.addfinalizer(index.close)
+    _write_target_marker_uv_project(ctx, registry=index.url)
+    for wheel in (ctx / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
+    registry = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"))
+    options = dict(
+        ctx=ctx, include_deps=True, use_cache=True, cache_dir=str(tmp_path / "cache"),
+        base_image="python:3.11-slim", platform="linux/amd64,linux/arm64,linux/arm/v7",
+    )
+    cold = _builder(tmp_path, monkeypatch, registry, **options)
+    cold.build()
+    assert capsys.readouterr().out.count("Dependency layer cache miss: no verified entry") == 3
+    assert index.requests
+    cold_images = [
+        (image.manifest_digest, image.config_digest, image.layers[-2].digest)
+        for image in cold.platform_images
+    ]
+    assert len({image[2] for image in cold_images}) == 3
+    for image, suffix in zip(cold.platform_images, ("amd", "arm", "armv7")):
+        with tarfile.open(image.layers[-2].tar_path) as archive:
+            names = archive.getnames()
+        for prefix in ("marker_root", "marker_trans"):
+            assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
+            for other in {"amd", "arm", "armv7"} - {suffix}:
+                assert not any(f"{prefix}_{other}/" in name for name in names)
+
+    index.requests.clear()
+
+    def forbid_install(*args, **kwargs):
+        pytest.fail("a dependency cache hit must not install packages")
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", forbid_install)
+    hit = _builder(tmp_path, monkeypatch, registry, **options)
+    hit.build()
+
+    assert capsys.readouterr().out.count("Dependency layer cache hit") == 3
+    assert index.requests == []
+    assert [
+        (image.manifest_digest, image.config_digest, image.layers[-2].digest)
+        for image in hit.platform_images
+    ] == cold_images
 
 
 def test_locked_arm_v7_rejects_incompatible_platform_wheel(tmp_path, monkeypatch):

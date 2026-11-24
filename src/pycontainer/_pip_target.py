@@ -10,13 +10,19 @@ unknown fail the install instead of falling back to host values. Host pip
 configuration (environment and config files) is filtered to index and
 authentication keys so it cannot change target selection options.
 """
+import sys
+
+if __name__ == "__main__" and sys.path and sys.path[0] == "":
+    # Keep build-context modules from shadowing the installer's imports.
+    del sys.path[0]
+
 import json
 import os
 import runpy
-import sys
 
 MARKER_ERROR_EXIT = 86
 PATCH_ERROR_EXIT = 87
+SNAPSHOT_ERROR_EXIT = 88
 
 
 class TargetMarkerError(Exception):
@@ -73,10 +79,48 @@ def _pin_pip_configuration(allowed_keys):
         raise TargetMarkerError("pip configuration pinning self-test failed")
 
 
+def _freeze_pip_configuration(snapshot):
+    from pip._internal.cli import parser
+    from pip._internal.commands import create_command
+    from pip._internal.configuration import Configuration
+
+    original_items = parser.ConfigOptionParser._get_ordered_configuration_items
+    shape_probe = Configuration(isolated=False)
+    shape_probe.get_environ_vars = lambda: [("timeout", "123")]
+    shape_probe._load_environment_vars()
+    probe_values = [value for _, value in shape_probe.items()]
+    if probe_values == ["123"]:
+        flattened = {}
+        for values in snapshot["configuration"]:
+            flattened.update(values)
+        frozen_items = tuple(flattened.items())
+    elif probe_values == [{":env:.timeout": "123"}]:
+        frozen_items = tuple(enumerate(snapshot["configuration"]))
+    else:
+        raise TargetMarkerError("unsupported pip configuration shape")
+
+    class FrozenConfiguration:
+        def items(self):
+            return iter(frozen_items)
+
+    def configuration_items(self):
+        configuration = self.config
+        self.config = FrozenConfiguration()
+        try:
+            yield from original_items(self)
+        finally:
+            self.config = configuration
+
+    parser.ConfigOptionParser._get_ordered_configuration_items = configuration_items
+    probe = create_command("install").parser
+    probe.config.load()
+    if list(probe._get_ordered_configuration_items()) != [
+        tuple(item) for item in snapshot["ordered"]
+    ]:
+        raise TargetMarkerError("pip configuration snapshot self-test failed")
+
+
 def main():
-    if sys.path and sys.path[0] == "":
-        # Keep a pip package in the build context from shadowing the builder's pip.
-        del sys.path[0]
     config = json.loads(sys.argv[1])
     pip_args = sys.argv[2:]
     environment = config["environment"]
@@ -128,6 +172,14 @@ def main():
             raise TargetMarkerError("target marker self-test failed")
 
         _pin_pip_configuration(set(config["allowed_config_keys"]))
+        if "configuration_snapshot" in config:
+            try:
+                with open(config["configuration_snapshot"], encoding="utf-8") as source:
+                    _freeze_pip_configuration(json.load(source))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, TargetMarkerError):
+                with open(config["error_file"], "w", encoding="utf-8") as error_file:
+                    error_file.write("pip configuration snapshot could not be verified\n")
+                sys.exit(SNAPSHOT_ERROR_EXIT)
     except Exception as exc:
         with open(config["error_file"], "w", encoding="utf-8") as error_file:
             error_file.write(f"pip could not be pinned to the target: {exc}\n")

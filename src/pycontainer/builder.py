@@ -200,6 +200,14 @@ from .local_image import (
     verify_layer_diff_ids,
 )
 from .cache import LayerCache, app_layer_arcname, emitted_hardlinks, ordered_app_files
+from .dependency_cache import (
+    MAX_INVENTORY_BYTES,
+    DependencyCacheMiss,
+    decode_inventory,
+    dependency_cache_key,
+    encode_inventory,
+    materialize_requirements_snapshot,
+)
 from .history import BuildHistory, BuildTiming
 from .sbom import generate_sbom
 from .squash import SquashError, squash_layers
@@ -208,6 +216,7 @@ from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
     _LOCKFILE_STAGING_PREFIX,
+    PipConfigurationSnapshotError,
     create_console_entrypoints,
     install_locked_requirements,
     install_requirements,
@@ -223,6 +232,8 @@ from .dependencies import (
     validate_target_platform,
 )
 from .lockfiles import (
+    _locked_verification_backend,
+    _locked_verification_roots,
     detect_lockfile, load_lockfile, preflight_lockfile, target_environment,
     verify_locked_installation,
 )
@@ -1379,7 +1390,7 @@ class ImageBuilder:
             target_python_full_version(base_config),
             variant=variant,
         )
-        key = (os_name, arch, variant, environment["python_version"], environment["python_full_version"])
+        key = tuple(sorted(environment.items()))
         cache = getattr(self, "_lock_selection_cache", None)
         if cache is None:
             cache = self._lock_selection_cache = {}
@@ -1492,6 +1503,38 @@ class ImageBuilder:
             variant=variant,
         )
         layers_dir=Path(layers_dir)
+        cache_key = None
+        verification_roots = None
+        if self.cache:
+            try:
+                cache_key, verification_roots = self._dependency_cache_key(
+                    source_kind, source_value, base_config, os_name, arch, version,
+                    base_image_name, base_image_tag_verified, variant=variant,
+                )
+            except DependencyCacheMiss as miss:
+                self._print(f"Dependency layer cache miss: {miss}.")
+            else:
+                cached_layer = self._cached_dependency_layer(layers_dir, cache_key)
+                if cached_layer:
+                    if source_kind == "lock":
+                        selection = self._lock_selection(
+                            base_config, os_name, arch, variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                        )
+                        _locked_verification_roots(
+                            selection,
+                            ctx,
+                            target_environment(
+                                os_name, arch, version, target_python_full_version(base_config),
+                                variant=variant,
+                            ),
+                        )
+                    elif source_kind == "requirements":
+                        self._requirement_files = [
+                            ctx / path for path in cache_key.source_files
+                        ]
+                    return cached_layer
+                self._print("Dependency layer cache miss: no verified entry for these inputs.")
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
@@ -1515,6 +1558,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    environment_snapshot=cache_key.environment if cache_key else None,
                 )
                 verify_locked_installation(
                     selection,
@@ -1524,20 +1568,69 @@ class ImageBuilder:
                         os_name, arch, version, target_python_full_version(base_config),
                         variant=variant,
                     ),
+                    verification_roots=verification_roots,
                 )
             elif source_kind == "requirements":
-                self._requirement_files = install_requirements(
-                    ctx / requirements_relative,
-                    site_packages,
-                    ctx,
-                    os_name,
-                    arch,
-                    version,
-                    base_image_name,
-                    base_config,
-                    variant=variant,
-                    base_image_tag_verified=base_image_tag_verified,
+                snapshot_dir = (
+                    tempfile.TemporaryDirectory(prefix="pycontainer-inputs-")
+                    if cache_key else nullcontext(None)
                 )
+                with snapshot_dir as temporary:
+                    requirement_path = ctx / requirements_relative
+                    snapshot_options = {}
+                    if cache_key:
+                        snapshot = cache_key.requirements_snapshot
+                        if snapshot is None:
+                            raise RuntimeError("Dependency cache key has no requirements snapshot.")
+                        snapshot_root = Path(temporary)
+                        try:
+                            materialize_requirements_snapshot(snapshot, snapshot_root)
+                        except DependencyCacheMiss as miss:
+                            self._print(f"Dependency layer cache miss: {miss}.")
+                            cache_key = None
+                        else:
+                            requirement_path = snapshot_root / requirements_relative
+                            snapshot_options = {
+                                "requirements_context": snapshot_root,
+                                "environment_snapshot": snapshot.ambient.environment,
+                                "pip_configuration": {
+                                    "configuration": snapshot.ambient.configuration,
+                                    "ordered": snapshot.ambient.ordered,
+                                },
+                            }
+                    try:
+                        self._requirement_files = install_requirements(
+                            requirement_path,
+                            site_packages,
+                            ctx,
+                            os_name,
+                            arch,
+                            version,
+                            base_image_name,
+                            base_config,
+                            variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                            **snapshot_options,
+                        )
+                    except PipConfigurationSnapshotError as miss:
+                        if not cache_key:
+                            raise
+                        self._print(f"Dependency layer cache miss: {miss}.")
+                        cache_key = None
+                        self._requirement_files = install_requirements(
+                            ctx / requirements_relative,
+                            site_packages,
+                            ctx,
+                            os_name,
+                            arch,
+                            version,
+                            base_image_name,
+                            base_config,
+                            variant=variant,
+                            base_image_tag_verified=base_image_tag_verified,
+                        )
+                    if cache_key:
+                        self._requirement_files = [ctx / path for path in cache_key.source_files]
             else:
                 stage_virtualenv(
                     deps_paths,
@@ -1606,11 +1699,110 @@ class ImageBuilder:
                 final=layers_dir/digest.split(":",1)[1]
                 _publish_content_addressed(tmp, final, digest, size)
                 self._print(f"✓ Dependency layer created ({digest[:19]}...)")
+                if cache_key:
+                    self._store_dependency_layer(cache_key, digest, final, site_packages)
                 return OCILayer(
                     "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
                 )
             finally:
                 tmp.unlink(missing_ok=True)
+
+    def _dependency_cache_key(
+        self, source_kind, source_value, base_config, os_name, arch, version,
+        base_image_name, base_image_tag_verified, *, variant=None,
+    ):
+        """Return the cache key and the manifest roots it must verify."""
+        ctx = Path(self.config.context_dir)
+        common = dict(
+            source_kind=source_kind,
+            context_dir=ctx,
+            os_name=os_name,
+            arch=arch,
+            python_version=version,
+            python_full_version=target_python_full_version(base_config),
+            base_image=base_image_name,
+            base_config=base_config,
+            base_image_tag_verified=base_image_tag_verified,
+            variant=variant,
+            workdir=self.config.workdir,
+            reproducible=self.config.reproducible,
+            strip_type_stubs=self.config.strip_type_stubs,
+        )
+        if source_kind == "lock":
+            selection = self._lock_selection(
+                base_config, os_name, arch, variant=variant,
+                base_image_tag_verified=base_image_tag_verified,
+            )
+            verification_roots = _locked_verification_roots(
+                selection,
+                ctx,
+                target_environment(
+                    os_name, arch, version, target_python_full_version(base_config),
+                    variant=variant,
+                ),
+            )
+            return dependency_cache_key(
+                requirement_sets=selection.requirement_sets(),
+                lock_name=selection.path.as_posix(),
+                lock_kind=selection.kind,
+                lock_roots=tuple(str(root) for root in verification_roots[0]),
+                lock_verifier=_locked_verification_backend(),
+                **common,
+            ), verification_roots
+        if source_kind == "requirements":
+            return dependency_cache_key(requirements=ctx / source_value, **common), None
+        return dependency_cache_key(**common), None
+
+    def _cached_dependency_layer(self, layers_dir, cache_key):
+        cached = self.cache.get_entry(cache_key.layer)
+        if not cached:
+            return None
+        content = self.cache.get_bytes(cache_key.inventory, MAX_INVENTORY_BYTES)
+        packages = decode_inventory(content, cached[0]) if content is not None else None
+        if packages is None:
+            return None
+        layer = self._publish_cached_layer(layers_dir, *cached, "deps-cache")
+        self._staged_packages = packages
+        self._dependency_site_packages = True
+        self._print(f"✓ Dependency layer cache hit ({layer.digest[:19]}...)")
+        return layer
+
+    def _store_dependency_layer(self, cache_key, digest, layer_path, site_packages):
+        try:
+            packages = staged_packages(site_packages, strict=True)
+        except (UnicodeDecodeError, ValueError):
+            self._print("Dependency layer not cached: staged package metadata is not strictly readable.")
+            return
+        # The layer is indexed first; a hit requires the inventory, so interruption here is a miss.
+        self.cache.store_entry(cache_key.layer, digest, layer_path, list(cache_key.source_files))
+        self.cache.store_bytes(
+            cache_key.inventory,
+            encode_inventory(digest, packages),
+            list(cache_key.source_files),
+        )
+
+    def _publish_cached_layer(self, layers_dir, digest, cache_path, label):
+        final=layers_dir/digest.split(":",1)[1]
+        tmp=_create_temporary_file(layers_dir,label)
+        try:
+            with cache_path.open("rb") as source, tmp.open("wb") as target:
+                shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
+                target.flush()
+                os.fsync(target.fileno())
+            actual_digest, size = _hash_file(tmp)
+            if actual_digest != digest:
+                raise LayerIntegrityError(
+                    f"Cached layer hashes to {actual_digest}, not {digest}."
+                )
+            _publish_content_addressed(tmp, final, digest, size)
+            return OCILayer(
+                "application/vnd.oci.image.layer.v1.tar",
+                digest,
+                size,
+                str(final),
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _create_app_layer(self, layers_dir, include_paths=None):
         ctx=Path(self.config.context_dir)
@@ -1642,28 +1834,7 @@ class ImageBuilder:
                 namespace=self.config.cache_identity(),
             )
             if cached:
-                digest, cache_path=cached
-                final=layers_dir/digest.split(":",1)[1]
-                tmp=_create_temporary_file(layers_dir,"app-cache")
-                try:
-                    with cache_path.open("rb") as source, tmp.open("wb") as target:
-                        shutil.copyfileobj(source, target, _HASH_CHUNK_SIZE)
-                        target.flush()
-                        os.fsync(target.fileno())
-                    actual_digest, size = _hash_file(tmp)
-                    if actual_digest != digest:
-                        raise LayerIntegrityError(
-                            f"Cached layer hashes to {actual_digest}, not {digest}."
-                        )
-                    _publish_content_addressed(tmp, final, digest, size)
-                    return OCILayer(
-                        "application/vnd.oci.image.layer.v1.tar",
-                        digest,
-                        size,
-                        str(final),
-                    )
-                finally:
-                    tmp.unlink(missing_ok=True)
+                return self._publish_cached_layer(layers_dir, *cached, "app-cache")
 
         tmp=_create_temporary_file(layers_dir,"app-layer")
         files_sorted=ordered_app_files(files, self.config.reproducible)
