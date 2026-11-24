@@ -1,0 +1,30 @@
+---
+import Brand from '../components/Brand.astro';
+import '../styles/home.css';
+import { base } from '../../site.config.mjs';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Page not found — pycontainer</title>
+    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container header-inner">
+        <a class="brand" href={base} aria-label="Pycontainer home"><Brand /></a>
+      </div>
+    </header>
+    <main class="closing container">
+      <p class="eyebrow">404 / PAGE NOT FOUND</p>
+      <h1>This page isn't<br /><em>in the image.</em></h1>
+      <p>The link may have moved. Start with the docs or return to the homepage.</p>
+      <a class="button primary" href={`${base}docs/start/quickstart/`}>Open documentation <span aria-hidden="true">↗</span></a>
+      <a class="text-link light" href={base}>Back to home</a>
+    </main>
+  </body>
+</html>
