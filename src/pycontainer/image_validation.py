@@ -624,7 +624,7 @@ def _gunicorn_ports(args):
         if port is None:
             return _UNKNOWN
         ports.add(port)
-    return ports
+    return ports if ports else _UNKNOWN
 
 
 def _listeners(argv):

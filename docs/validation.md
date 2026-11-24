@@ -94,7 +94,8 @@ exit 2 before the base image is pulled or any layout blob is written.
 
 The listener check reads only the image's `Entrypoint` and `Cmd` argv. It
 recognizes `uvicorn` (`--port`), `gunicorn` (every `-b`/`--bind`; `unix:`
-binds are ignored), `flask run` (`--port`/`-p`), Django `runserver
+binds are ignored when mixed with TCP binds; Unix-only binds or file
+descriptors make the TCP listener unknown), `flask run` (`--port`/`-p`), Django `runserver
 [addr:]port`, `streamlit run` (`--server.port`) and Jupyter `lab`, `notebook`
 and `server` (`--port`, `--ServerApp.port`, `--NotebookApp.port`), directly
 or through `python -m` (including `python -m django`). Gradio apps launched as `python app.py`, Celery

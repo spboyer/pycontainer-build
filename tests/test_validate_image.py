@@ -1326,6 +1326,8 @@ UVICORN = ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
           "ExposedPorts": {"8000/tcp": {}}}, set()),
         ({"Entrypoint": ["gunicorn", "-b", "0.0.0.0:8000", "--bind", "unix:/tmp/s", "--bind=[::]:8001", "app:app"],
           "ExposedPorts": {"8000/tcp": {}, "8001/tcp": {}}}, set()),
+        ({"Entrypoint": ["gunicorn", "--bind", "unix:/tmp/s", "--bind", "0.0.0.0:8000", "app:app"],
+          "ExposedPorts": {"8001/tcp": {}}}, {"PCB009"}),
         ({"Entrypoint": ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"],
           "ExposedPorts": {"8501/tcp": {}}}, set()),
         ({"Entrypoint": ["streamlit", "run", "app.py", "--server.port", "8502"],
@@ -1354,7 +1356,11 @@ def test_listener_and_exposed_port_rules(tmp_path, monkeypatch, capsys, config, 
         {"Entrypoint": ["uvicorn", "main:app", "--port"]},
         {"Entrypoint": ["flask", "run"], "ExposedPorts": {"5000/tcp": {}}},
         {"Entrypoint": ["gunicorn", "app:app"], "ExposedPorts": {"8000/tcp": {}}},
-        {"Entrypoint": ["gunicorn", "-b", "fd://3", "app:app"]},
+        {"Entrypoint": ["gunicorn", "--bind", "unix:/tmp/sock", "app:app"],
+         "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["gunicorn", "--bind", "unix:/tmp/a", "--bind", "unix:/tmp/b", "app:app"],
+         "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["gunicorn", "-b", "fd://3", "app:app"], "ExposedPorts": {"8000/tcp": {}}},
         {"Entrypoint": ["gunicorn", "-b", "localhost", "app:app"]},
         {"Entrypoint": ["gunicorn", "-b", "0.0.0.0:8080", "-b0.0.0.0:8081", "app:app"],
          "ExposedPorts": {"8080/tcp": {}, "8081/tcp": {}}},
@@ -1492,6 +1498,18 @@ def test_build_reports_replaced_base_ports(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "info: PCB013:" in out and '"8080/tcp"' in out and '"53/udp"' in out
     assert '"9000/tcp"' not in out.split("PCB013", 1)[1].splitlines()[0]
+    assert len(pushes) == 1
+
+
+@pytest.mark.parametrize("bind", ["unix:/tmp/sock", "fd://3"])
+def test_build_socket_only_listener_does_not_block_push(tmp_path, monkeypatch, capsys, bind):
+    config, pushes = _port_build(
+        tmp_path, monkeypatch, {"8000/tcp": {}},
+        f'entrypoint = ["gunicorn", "--bind", "{bind}", "app:app"]\n',
+    )
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 0
+    output = capsys.readouterr().out
+    assert "info: PCB010:" in output and "PCB009" not in output
     assert len(pushes) == 1
 
 
