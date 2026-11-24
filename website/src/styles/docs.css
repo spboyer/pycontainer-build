@@ -1,0 +1,49 @@
+:root {
+  --sl-font: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --sl-font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --sl-color-accent-low: #441f2c;
+  --sl-color-accent: #ff4f5e;
+  --sl-color-accent-high: #ffb3b9;
+  --sl-color-white: #f4eee3;
+  --sl-color-gray-1: #e5dccd;
+  --sl-color-gray-2: #bfc4ce;
+  --sl-color-gray-3: #939bad;
+  --sl-color-gray-4: #575f70;
+  --sl-color-gray-5: #343c4c;
+  --sl-color-gray-6: #222938;
+  --sl-color-black: #1a1f2b;
+  --sl-color-bg-nav: #1a1f2b;
+  --sl-content-width: 49rem;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #f6d9d8;
+  --sl-color-accent: #972737;
+  --sl-color-accent-high: #721b28;
+  --sl-color-white: #1a1f2b;
+  --sl-color-gray-1: #303848;
+  --sl-color-gray-2: #454e5d;
+  --sl-color-gray-3: #626659;
+  --sl-color-gray-4: #898b80;
+  --sl-color-gray-5: #c8bda9;
+  --sl-color-gray-6: #e7dece;
+  --sl-color-gray-7: #eee6d8;
+  --sl-color-black: #f4eee3;
+  --sl-color-bg-nav: #1a1f2b;
+}
+header.header { border-bottom-color: #383e49; }
+header.header a, header.header select, header.header button { color: #f4eee3; }
+header.header site-search button { border-color: #575f70; background: #242b39; }
+header.header kbd { color: #d6c6a8; background: #1a1f2b; }
+header.header select option { color: #1a1f2b; background: #f4eee3; }
+.content-panel h1 { letter-spacing: -.05em; font-weight: 650; }
+.sl-markdown-content h2 { letter-spacing: -.035em; }
+.sl-markdown-content { line-height: 1.85; }
+.sl-markdown-content a { text-underline-offset: 3px; }
+.sl-markdown-content table { font-size: .85rem; }
+.sl-markdown-content pre { font-size: .85rem; }
+nav.sidebar { font-size: .85rem; }
+:focus-visible { outline: 3px solid #ff4f5e; outline-offset: 3px; }
+::selection { background: #d6c6a8; color: #1a1f2b; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+}

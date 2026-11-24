@@ -1,0 +1,12 @@
+---
+import Brand from './Brand.astro';
+import { base } from '../../site.config.mjs';
+---
+
+<a class="site-title" href={base} aria-label="Pycontainer home">
+  <Brand />
+</a>
+
+<style>
+  .site-title { display: inline-flex; align-items: center; gap: .6rem; color: #f4eee3; text-decoration: none; }
+</style>
