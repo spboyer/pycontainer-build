@@ -1,4 +1,4 @@
-import argparse, json, os, logging, sys
+import argparse, configparser, json, os, logging, sys
 from contextlib import ExitStack
 from pathlib import Path
 from .config import SBOM_FORMATS, SCAN_SEVERITIES
@@ -6,8 +6,11 @@ from .config_loader import _declared_default_values, _validate_config, load_expl
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
-from .build_args import redact_values, resolve_arguments
+from .build_args import known_argument_values, redact_values, resolve_arguments
 from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
+from .dependencies import UnsupportedLibcError
+from .framework import FrameworkDetectionError
+from .project import MissingRequirementsFileError, ProjectMetadataError
 from .fs_utils import output_directory_lock
 from .image_validation import finding_exit_code, validate_ignores, validate_image
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
@@ -30,6 +33,17 @@ class _BuildArgumentLogFilter(logging.Filter):
         record.msg = self.config.redact(record.getMessage())
         record.args = ()
         return True
+
+def _exit_with_message(parser, message, status=None, *, suppress_context):
+    try:
+        if status is None:
+            parser.error(message)
+        else:
+            parser.exit(status, message)
+    except SystemExit as error:
+        if suppress_context:
+            raise error from None
+        raise
 
 def _metadata_argument(value: str) -> tuple[str, str]:
     key, separator, item = value.partition("=")
@@ -472,13 +486,21 @@ def main():
                 raise DevLoopError("--image requires --output-ref so Tilt can read the pushed reference.")
             cli_overrides['tag']=push_target or f"{args.image}:{TILT_PLACEHOLDER_TAG}"
     except DevLoopError as exc:
+        declarations={}
         try:
             file_config=load_config_file(Path(args.config)) if args.config else {}
             declarations=merge_configs(file_config, {}).get("build_args", {})
             resolved_args=resolve_arguments(declarations, args.build_arg)
         except (OSError, ValueError) as config_error:
-            parser.error(str(config_error))
-        parser.error(redact_values(str(exc), resolved_args.values()))
+            known_values = known_argument_values(declarations, args.build_arg)
+            _exit_with_message(
+                parser, redact_values(str(config_error), known_values),
+                suppress_context=any(known_values),
+            )
+        _exit_with_message(
+            parser, redact_values(str(exc), resolved_args.values()),
+            suppress_context=any(resolved_args.values()),
+        )
     if devloop:
         # The tool owns the pushed reference; extra tags and dry runs would break its contract.
         cli_overrides.update(tags=[],semver_tags=False,latest_tag=False,dry_run=False)
@@ -503,7 +525,10 @@ def main():
             if not platform: raise DevLoopError("platform must specify a single target platform.")
             cfg.platform=platform
         except DevLoopError as exc:
-            parser.error(cfg.redact(str(exc)))
+            _exit_with_message(
+                parser, cfg.redact(str(exc)),
+                suppress_context=cfg._needs_build_argument_redaction(),
+            )
 
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
@@ -512,7 +537,7 @@ def main():
 
     from .scanning import ScanError
     log_filter = _BuildArgumentLogFilter(cfg)
-    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    handlers = list(logging.getLogger().handlers)
     for handler in handlers:
         handler.addFilter(log_filter)
     try:
@@ -520,9 +545,25 @@ def main():
             builder=ImageBuilder(cfg)
             out=builder.build()
         except ReleaseNotesError as exc:
-            parser.error(cfg.redact(str(exc)))
+            _exit_with_message(
+                parser, cfg.redact(str(exc)),
+                suppress_context=cfg._needs_build_argument_redaction(),
+            )
         except HistoryStorageError as exc:
-            parser.exit(1,f"Build history error: {cfg.redact(str(exc))}\n")
+            _exit_with_message(
+                parser, f"Build history error: {cfg.redact(str(exc))}\n", 1,
+                suppress_context=cfg._needs_build_argument_redaction(),
+            )
+        except (
+            FrameworkDetectionError, ProjectMetadataError, MissingRequirementsFileError,
+            UnsupportedLibcError,
+        ) as exc:
+            if devloop:
+                raise
+            _exit_with_message(
+                parser, cfg.redact(str(exc)),
+                suppress_context=cfg._needs_build_argument_redaction(),
+            )
         print("Built:", cfg.redact(str(out)))
 
         with ExitStack() as stack:
@@ -565,11 +606,14 @@ def main():
                     write_reference(Path(args.output_ref),pushed)
                     print("Wrote image reference to", cfg.redact(str(args.output_ref)))
     except ScanError as exc:
-        parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
-    except (OSError, ValueError, RuntimeError) as exc:
-        if not cfg.build_args:
+        _exit_with_message(
+            parser, f"{cfg.redact(str(exc))}\n", 3 if exc.category == "findings" else 4,
+            suppress_context=cfg._needs_build_argument_redaction(),
+        )
+    except (OSError, ValueError, RuntimeError, configparser.Error) as exc:
+        if not cfg._needs_build_argument_redaction():
             raise
-        parser.error(cfg.redact(str(exc)))
+        _exit_with_message(parser, cfg.redact(str(exc)), suppress_context=True)
     finally:
         for handler in handlers:
             handler.removeFilter(log_filter)

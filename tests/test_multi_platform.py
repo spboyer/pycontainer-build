@@ -277,7 +277,7 @@ def test_tag_only_base_abi_is_accepted_only_after_verified_tag_pull(
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, variant=None, *, base_image_tag_verified):
+                     base_image, base_config, variant=None, *, base_image_tag_verified, log_redact=str):
         installs.append((arch, variant, version, base_image_tag_verified))
         return []
 
@@ -338,7 +338,7 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
     installs = []
 
     def fake_install(requirements, site_packages, context, os_name, arch, version,
-                     base_image, base_config, *, base_image_tag_verified, variant=None):
+                     base_image, base_config, *, base_image_tag_verified, variant=None, log_redact=str):
         installs.append((arch, base_config["config"]["Env"], base_image_tag_verified))
         return []
 
@@ -519,6 +519,21 @@ def test_enabling_scanning_after_configuration_rejects_index_build(
     assert not (tmp_path / "out" / "index.json").exists()
 
 
+def test_multi_platform_scan_rejection_records_failed_history(tmp_path, monkeypatch):
+    from pycontainer.history import BuildHistory
+
+    registry = FakeBaseRegistry()
+    history_dir = tmp_path / "history"
+    builder = _builder(
+        tmp_path, monkeypatch, registry, record_history=True, history_dir=str(history_dir)
+    )
+    builder.config.scan = True
+    with pytest.raises(ValueError, match="scanning.*multi-platform"):
+        builder.build()
+    assert registry.manifest_calls == []
+    assert [record["status"] for record in BuildHistory(history_dir).list()] == ["failed"]
+
+
 def test_enabling_scanning_after_index_build_rejects_push_before_auth(
     tmp_path, monkeypatch
 ):
@@ -568,6 +583,74 @@ def test_platform_commands_inherit_and_clear_independently(
         assert config.get("Cmd") == (
             runtime[arch]["Cmd"] if expected_cmd == "inherited" else expected_cmd
         )
+
+
+@pytest.mark.parametrize("explicit_label", [None, "custom"])
+@pytest.mark.parametrize("second_platform,second_arch", [("arm64", "arm64"), ("arm/v7", "arm")])
+def test_streamlit_defaults_resolve_per_platform_base(
+    tmp_path, monkeypatch, explicit_label, second_platform, second_arch
+):
+    ctx = _context(tmp_path)
+    (ctx / "app.py").write_text("import streamlit\n")
+    (ctx / "requirements.txt").write_text("streamlit\n")
+    ports = {"amd64": 9101, second_arch: 9102}
+    addresses = {"amd64": "127.0.0.1", second_arch: "0.0.0.0"}
+    env = {
+        arch: [
+            f"STREAMLIT_SERVER_PORT={ports[arch]}",
+            f"STREAMLIT_SERVER_ADDRESS={addresses[arch]}",
+        ]
+        for arch in ports
+    }
+    runtime = {
+        arch: {"Entrypoint": ["base"], "Cmd": ["base-cmd"], "Labels": {"framework": arch}}
+        for arch in ports
+    }
+    labels = {"framework": explicit_label} if explicit_label is not None else None
+    builder = _builder(
+        tmp_path, monkeypatch,
+        FakeBaseRegistry(
+            platforms=("amd64", second_platform), base_env_by_arch=env,
+            base_runtime_by_arch=runtime,
+        ),
+        ctx=ctx, labels=labels, platform=f"linux/amd64,linux/{second_platform}",
+    )
+    builder.build()
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        assert config["Entrypoint"] == [
+            "streamlit", "run", "app.py",
+            f"--server.address={addresses[arch]}", f"--server.port={ports[arch]}",
+        ]
+        assert "Cmd" not in config
+        assert config["ExposedPorts"] == {f"{ports[arch]}/tcp": {}}
+        assert config["Labels"]["framework"] == (explicit_label or "streamlit")
+        if arch == "arm":
+            assert image.platform["variant"] == "v7"
+
+
+def test_jupyter_generated_command_uses_each_base_user(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    (ctx / "requirements.txt").write_text("jupyterlab\n")
+    (ctx / "analysis.ipynb").write_text('{"cells": [], "metadata": {}}')
+    runtime = {
+        "amd64": {"User": "root", "Cmd": ["base-cmd"]},
+        "arm64": {"User": "1000", "Cmd": ["base-cmd"]},
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_runtime_by_arch=runtime), ctx=ctx
+    )
+    builder.build()
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))["config"]
+        assert config["Entrypoint"] == [
+            "jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser",
+            *(["--allow-root"] if arch == "amd64" else []),
+        ]
+        assert "Cmd" not in config
+        assert config["Labels"]["framework"] == "jupyter"
 
 
 @pytest.mark.parametrize(
@@ -1508,6 +1591,42 @@ def test_squash_flattens_builder_layers_and_keeps_base(tmp_path, monkeypatch):
             json.loads(_blob(tmp_path / "out", before.config_digest))["rootfs"]["diff_ids"][0],
             after.layers[1].digest,
         ]
+
+
+def test_squash_preserves_detected_framework_per_platform(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "app.py").write_text("import streamlit\n")
+    (ctx / "requirements.txt").write_text("streamlit\n")
+    ports = {"amd64": 9101, "arm64": 9102}
+    environment = {
+        arch: [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
+            "PYTHON_LIBC=glibc-2.17", f"STREAMLIT_SERVER_PORT={port}",
+        ]
+        for arch, port in ports.items()
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_env_by_arch=environment),
+        ctx=ctx, include_deps=True, squash=True,
+    )
+
+    builder.build()
+
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert config["config"]["Entrypoint"] == [
+            "streamlit", "run", "app.py", "--server.address=0.0.0.0",
+            f"--server.port={ports[arch]}",
+        ]
+        assert config["config"]["ExposedPorts"] == {f"{ports[arch]}/tcp": {}}
+        assert config["config"]["Labels"]["framework"] == "streamlit"
+        assert len(image.layers) == 2
+        assert config["rootfs"]["diff_ids"][-1] == image.layers[-1].digest
+        names = _tar_names(image.layers[-1].tar_path)
+        assert "app/app.py" in names
+        assert f"app/.python/site-packages/native_{arch}/__init__.py" in names
 
 
 def test_squash_and_security_fragments_can_be_combined(tmp_path, monkeypatch):

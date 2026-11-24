@@ -12,6 +12,7 @@ import threading
 import tomllib
 import venv
 import zipfile
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -1199,8 +1200,9 @@ def _layer_names(layer):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("copy_kind", ["original", "replace", "json"])
 def test_build_arguments_preserve_locked_staging_and_redact_paths(
-    tmp_path, monkeypatch, capsys, indexes, dry_run
+    tmp_path, monkeypatch, capsys, indexes, dry_run, copy_kind
 ):
     value = "private-lock-context"
     context = tmp_path / "context"
@@ -1209,11 +1211,21 @@ def test_build_arguments_preserve_locked_staging_and_redact_paths(
     recorded, rogue = indexes(wheel), indexes(wheel)
     _ambient_pip(monkeypatch, tmp_path, rogue.url, project / "wheelhouse")
     _write_uv_project(project, wheel, registry=recorded.url)
+    (context / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True,
-        build_args={"DIRECTORY": value}, workdir="/${DIRECTORY}", dry_run=dry_run,
+        build_args={"DIRECTORY": value, "NESTED": "${UNSET}"},
+        env={"VALUE": "${NESTED}"}, workdir="/${DIRECTORY}", dry_run=dry_run,
         lockfile=f"{value}/uv.lock",
     )
+    if copy_kind == "replace":
+        builder = ImageBuilder(replace(builder.config))
+    elif copy_kind == "json":
+        builder = ImageBuilder(BuildConfig(**json.loads(json.dumps(asdict(builder.config)))))
+
+    assert builder.config.env["VALUE"] == "${UNSET}"
+    assert builder.config.entrypoint[:2] == ["uvicorn", "app:app"]
+    assert builder.config.labels["framework"] == "fastapi"
 
     builder.build()
 
@@ -2267,7 +2279,7 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     ],
 )
 def test_locked_build_selects_target_transitive_markers_across_indexes(
-    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch,
+    tmp_path, monkeypatch, capsys, indexes, arch, selected_arch, excluded_arch,
     missing_transitive, strip_type_stubs,
 ):
     wheelhouse = tmp_path / "wheels"
@@ -2346,7 +2358,10 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True,
         generate_sbom=True, platform=f"linux/{arch}", strip_type_stubs=strip_type_stubs,
+        build_args={"STUB": "types-root"} if strip_type_stubs else None,
     )
+    if strip_type_stubs:
+        builder = ImageBuilder(replace(builder.config, build_args=None))
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
         lambda self, layers_dir, os_name, target_arch: ([], {**BASE_CONFIG, "architecture": target_arch}),
@@ -2382,6 +2397,9 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
         (name, "1.0") for name in expected
     }
     if strip_type_stubs:
+        output = capsys.readouterr().out
+        assert "Removed type stub distributions: <redacted>" in output
+        assert "types-root" not in output
         assert not any(name.endswith(".pyi") or "types_root" in name for name in names)
         bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
         assert len(commands) == 2

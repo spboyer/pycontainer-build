@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sys
+from copy import deepcopy
+from dataclasses import asdict
 
 import pytest
 
@@ -8,6 +10,7 @@ from pycontainer import cli
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
+from pycontainer.framework import apply_framework_defaults
 from pycontainer.release_notes import (
     DEFAULT_RELEASE_NOTES_LABEL,
     MAX_RELEASE_NOTES_BYTES,
@@ -237,6 +240,45 @@ def test_release_notes_framework_key_wins_over_detected_default(tmp_path, monkey
             context_dir=str(context), use_cache=False, release_notes_file="notes.md",
             release_notes_label="framework", labels={"framework": "custom"},
         ))
+
+
+@pytest.mark.parametrize("copy_mode", ["same", "deepcopy", "serialized"])
+def test_release_notes_override_previously_generated_framework_label(tmp_path, monkeypatch, copy_mode):
+    context = _context(tmp_path)
+    (context / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    (context / "notes.md").write_text("notes")
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"), use_cache=False,
+        release_notes_file="notes.md", release_notes_label="framework",
+    )
+    apply_framework_defaults(config, context)
+    if copy_mode == "deepcopy":
+        config = deepcopy(config)
+    elif copy_mode == "serialized":
+        config = BuildConfig(**json.loads(json.dumps(asdict(config))))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+
+    builder = ImageBuilder(config)
+    builder.build()
+    blobs = tmp_path / "output" / "blobs" / "sha256"
+    image = json.loads((blobs / builder.config_digest.split(":", 1)[1]).read_bytes())
+    assert image["config"]["Labels"]["framework"] == "notes"
+    ImageBuilder(config)
+
+
+def test_release_notes_reject_explicit_label_matching_a_generated_default(tmp_path):
+    context = _context(tmp_path)
+    (context / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    (context / "notes.md").write_text("notes")
+    config = BuildConfig(
+        context_dir=str(context), use_cache=False,
+        release_notes_file="notes.md", release_notes_label="framework",
+    )
+    apply_framework_defaults(config, context)
+    config.labels["framework"] = "fastapi"
+
+    with pytest.raises(ReleaseNotesError, match="'framework' conflict"):
+        ImageBuilder(config)
 
 
 def _write_toml(tmp_path, context, extra=""):

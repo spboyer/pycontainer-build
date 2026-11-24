@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .builder import parse_platform
-from .build_args import EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
+from .build_args import (
+    EXPANDABLE_FIELDS, expand_field, known_argument_values, redact_values, resolve_arguments,
+)
 from .config import BuildConfig
 from .config_loader import (
     BUILD_TABLE,
@@ -161,17 +163,7 @@ def resolve_settings(
     try:
         arguments = resolve_arguments(declarations, build_arg_overrides)
     except ValueError as exc:
-        # Resolution can fail before returning otherwise valid defaults/overrides.
-        known_values = []
-        if isinstance(declarations, dict):
-            for declaration in declarations.values():
-                value = declaration.get("default") if isinstance(declaration, dict) else declaration
-                if isinstance(value, str):
-                    known_values.append(value)
-            for item in build_arg_overrides or []:
-                name, separator, value = item.partition("=")
-                if separator and name in declarations:
-                    known_values.append(value)
+        known_values = known_argument_values(declarations, build_arg_overrides)
         field_origin = "CLI option --build-arg" if "--build-arg" in str(exc) or str(exc).startswith("Undeclared build argument ") else origin("build_args")
         raise ConfigValidationError(
             [redact_values(f"{field_origin}: {exc}", known_values)], known_values

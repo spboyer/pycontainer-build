@@ -384,6 +384,22 @@ def test_cli_reports_invalid_tool_pycontainer_config(tmp_path, monkeypatch, caps
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("field", ["_framework_default_env", "_framework_generated_state"])
+def test_cli_rejects_internal_framework_fields_in_config(
+    tmp_path, monkeypatch, capsys, table, field
+):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(f"[{table}]\n{field} = {{}}\n")
+    monkeypatch.setattr(cli, "ImageBuilder", lambda config: pytest.fail("must not build"))
+
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--config", str(config_path)])
+
+    assert error.value.code == 2
+    assert f"Unknown [{table}] setting(s): '{field}'" in capsys.readouterr().err
+
+
 def test_cli_reads_tool_pycontainer_table_and_cli_overrides_it(tmp_path, monkeypatch):
     config_path = tmp_path / "pyproject.toml"
     config_path.write_text(

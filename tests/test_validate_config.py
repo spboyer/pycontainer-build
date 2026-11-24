@@ -1,10 +1,13 @@
+import json
 import os
 import socket
 import sys
+from dataclasses import asdict, replace
 
 import pytest
 
 from pycontainer import builder, cache, cli, effective_config, registry_client
+from pycontainer.config import BuildConfig
 
 
 def _run(monkeypatch, argv):
@@ -155,6 +158,46 @@ def test_build_argument_resolution_matches_build(offline, monkeypatch, table):
     assert [(cfg.tag, cfg.platform) for cfg in configs] == [
         ("app:new", "linux/arm64"), ("app:new", "linux/arm64"),
     ]
+
+
+def test_build_and_validate_configs_keep_one_pass_expansion_after_copy(offline, monkeypatch):
+    path = _write(
+        offline / "config.toml",
+        '[build]\nbase-image = "python:3.11-slim"\ncmd = ["echo", "${A}"]\n'
+        '[build.env]\nVALUE = "${A}"\n'
+        '[build.build-args]\nA = "${B}"\nB = "old-value"\n',
+    )
+    configs = []
+    original = effective_config.resolve_build_config
+
+    def resolve(*args):
+        result = original(*args)
+        configs.append(result[0])
+        return result
+
+    class FakeBuilder:
+        def __init__(self, config):
+            pass
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "resolve_build_config", resolve)
+    monkeypatch.setattr(cli, "ImageBuilder", FakeBuilder)
+    overrides = ["--build-arg", "B=new-value"]
+    assert _run(monkeypatch, ["validate", "config", path, *overrides]) == 0
+    assert _run(monkeypatch, ["build", "--config", path, *overrides]) == 0
+
+    for config in configs:
+        restored = BuildConfig(**json.loads(json.dumps(asdict(config))))
+        for copied in (replace(config), restored):
+            assert copied.cmd == ["echo", "${B}"]
+            assert copied.env == {"VALUE": "${B}"}
+            changed = replace(
+                copied, build_args={"B": "changed-value"},
+                env={"VALUE": "${B}", "NEW": "${B}"},
+            )
+            assert changed.env == {"VALUE": "${B}", "NEW": "changed-value"}
 
 
 @pytest.mark.parametrize("extra", [[], ["--build-arg", "MISSING=value"]])

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import traceback
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from pycontainer.dependencies import (
     target_wheel_platforms,
     validate_requirements,
 )
+from pycontainer.project import declared_dependency_names
 from pycontainer.registry_client import parse_image_reference
 from pycontainer.oci import OCILayer
 
@@ -64,7 +66,7 @@ UNPROVEN_BASE_CONFIG = {
 
 
 def _write_wheel(
-    wheelhouse: Path, tag: str = "py3-none-any", function: str = "main"
+    wheelhouse: Path, tag: str = "py3-none-any", function: str = "main", data_files=None
 ) -> Path:
     wheelhouse.mkdir(parents=True, exist_ok=True)
     wheel_path = wheelhouse / f"fixture_dep-1.0-{tag}.whl"
@@ -84,6 +86,8 @@ def _write_wheel(
             f"[console_scripts]\nfixture-dep = fixture_dep:{function}\n"
         ).encode(),
     }
+    for name, content in (data_files or {}).items():
+        files[f"fixture_dep-1.0.data/data/{name}"] = content
     record = io.StringIO()
     writer = csv.writer(record, lineterminator="\n")
     for name, content in files.items():
@@ -190,7 +194,7 @@ def test_conda_with_selected_pip_requirements_warns_and_never_stages_host_env(
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified, variant=None):
+    def install(path, destination, *args, base_image_tag_verified, variant=None, log_redact=str):
         assert base_image_tag_verified is False
         assert variant is None
         installed.append(path)
@@ -268,14 +272,14 @@ def test_conda_detection_independent_of_app_selection(tmp_path, monkeypatch):
 def test_conda_rejects_invalid_selected_pip_input(tmp_path, monkeypatch, selected):
     (tmp_path / "environment.yml").write_text("invalid YAML")
     (tmp_path / "folder").mkdir()
-    builder = _builder(
-        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
-        requirements_file=selected,
-    )
     monkeypatch.setattr(
         "pycontainer.builder.install_requirements", lambda *args: pytest.fail("pip"),
     )
     with pytest.raises(ValueError):
+        builder = _builder(
+            tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+            requirements_file=selected,
+        )
         builder.build()
 
 
@@ -521,7 +525,7 @@ def test_selected_source_conda_descriptor_prefers_pip_requirements(
     )
     installed = []
 
-    def install(path, destination, *args, base_image_tag_verified, variant=None):
+    def install(path, destination, *args, base_image_tag_verified, variant=None, log_redact=str):
         assert base_image_tag_verified is False
         assert variant is None
         installed.append(path)
@@ -603,13 +607,12 @@ def test_selected_requirements_inside_linked_conda_prefix_is_rejected_before_pul
     context.mkdir()
     (context / "app.py").write_text("print('app')\n")
     _symlink_or_skip(context / "linked", exports, directory=True)
-    builder = _builder(
-        tmp_path / "run", monkeypatch, context=context, include_deps=True,
-        requirements_file="linked/requirements.txt", exclude_paths=exclude_paths,
-        dry_run=True,
-    )
-
     with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder = _builder(
+            tmp_path / "run", monkeypatch, context=context, include_deps=True,
+            requirements_file="linked/requirements.txt", exclude_paths=exclude_paths,
+            dry_run=True,
+        )
         builder.build()
 
 
@@ -661,11 +664,8 @@ def test_conda_rejects_requirements_symlink_outside_context(tmp_path, monkeypatc
     outside = tmp_path / "export.txt"
     outside.write_text("")
     _symlink_or_skip(context / "requirements.txt", outside)
-    builder = _builder(
-        tmp_path, monkeypatch, context=context, include_deps=True,
-        exclude_paths=["requirements.txt"],
-    )
     with pytest.raises(ValueError, match="stay inside the build context"):
+        builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
         builder.build()
 
 
@@ -783,6 +783,265 @@ def test_requirements_install_stages_importable_target_wheel_and_sbom(
     assert [(package["name"], package["versionInfo"]) for package in sbom["packages"]] == [
         ("fixture-dep", "1.0")
     ]
+
+
+def test_staged_jupyter_data_paths_are_added_without_replacing_user_paths(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "analysis.ipynb").write_text("{}")
+    (context / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["jupyterlab"]\n'
+    )
+    _write_wheel(
+        context / "wheelhouse",
+        data_files={
+            "share/jupyter/lab/static/index.html": b"fixture",
+            "etc/jupyter/jupyter_server_config.d/fixture.json": b"{}",
+        },
+    )
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\nfixture-dep==1.0\n"
+    )
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        env={"JUPYTER_PATH": "/custom/data", "JUPYTER_CONFIG_PATH": "/custom/config"},
+    )
+    builder.build()
+    config_path = (
+        Path(builder.config.output_dir)
+        / "blobs"
+        / "sha256"
+        / builder.config_digest.split(":", 1)[1]
+    )
+    image = json.loads(config_path.read_text())["config"]
+    environment = dict(item.split("=", 1) for item in image["Env"])
+    assert environment["JUPYTERLAB_DIR"] == "/app/.python/site-packages/share/jupyter/lab"
+    assert environment["JUPYTER_PATH"] == "/custom/data:/app/.python/site-packages/share/jupyter"
+    assert environment["JUPYTER_CONFIG_PATH"] == "/custom/config:/app/.python/site-packages/etc/jupyter"
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/share/jupyter/lab/static/index.html" in archive.getnames()
+
+
+def test_dependency_staging_expands_environment_requirements_includes(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    _write_wheel(context / "wheelhouse")
+    (context / "requirements.txt").write_text(
+        "--no-index\n--find-links ./wheelhouse\n-r ${NESTED_REQUIREMENTS}\n"
+    )
+    (context / "nested.txt").write_text("fixture-dep==1.0\n")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", "nested.txt")
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    builder.build()
+    with tarfile.open(builder.layers[0].tar_path) as archive:
+        assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()
+
+
+def test_environment_include_preserves_roots_when_also_used_as_constraint(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n-c ${NESTED_REQUIREMENTS}\n")
+    (tmp_path / "nested.txt").write_text('streamlit; sys_platform == "linux"\n')
+    monkeypatch.setenv("NESTED_REQUIREMENTS", "nested.txt")
+
+    assert validate_requirements(requirements, tmp_path) == [
+        'streamlit; sys_platform == "linux"'
+    ]
+    assert declared_dependency_names(tmp_path) == {"streamlit"}
+
+
+def test_utf16_nested_requirements_support_validation_and_framework_discovery(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r nested.txt\n", encoding="utf-16")
+    (tmp_path / "nested.txt").write_text("streamlit\n", encoding="utf-16")
+
+    assert validate_requirements(requirements, tmp_path) == ["streamlit"]
+    assert declared_dependency_names(tmp_path) == {"streamlit"}
+
+
+def test_environment_expansion_cannot_override_pip_target_options(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("${PIP_OVERRIDE}\n")
+    monkeypatch.setenv("PIP_OVERRIDE", "--target outside")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_environment_requirements_path_is_redacted_from_exception_traceback(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", "private-credential-filename.txt")
+    with pytest.raises(OSError) as error:
+        validate_requirements(requirements, tmp_path)
+    assert "private-credential-filename" not in "".join(traceback.format_exception(error.value))
+
+
+def test_cyclic_environment_requirement_link_is_redacted(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n")
+    link = tmp_path / "private-credential-filename.txt"
+    try:
+        link.symlink_to(link)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", link.name)
+    with pytest.raises((OSError, ValueError)) as error:
+        validate_requirements(requirements, tmp_path)
+    assert "private-credential-filename" not in "".join(traceback.format_exception(error.value))
+
+
+def test_symlinked_requirements_validate_nested_files_relative_to_link(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r configs/alias.txt\n")
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "shared").mkdir()
+    target = tmp_path / "shared" / "actual.txt"
+    target.write_text("-r nested.txt\n")
+    (tmp_path / "configs" / "nested.txt").write_text("--target outside\n")
+    link = tmp_path / "configs" / "alias.txt"
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_repeated_symlink_target_does_not_skip_nested_requirement_validation(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r branch/actual.txt\n")
+    nested = tmp_path / "branch" / "sub" / "sub"
+    nested.mkdir(parents=True)
+    target = tmp_path / "branch" / "actual.txt"
+    target.write_text("-r sub/alias.txt\n")
+    (nested / "alias.txt").write_text("--target outside\n")
+    try:
+        (tmp_path / "branch" / "sub" / "alias.txt").symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+    with pytest.raises(ValueError, match="cannot override target install option"):
+        validate_requirements(requirements, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "includes",
+    ["-r shared.txt\n-c shared.txt\n", "-c shared.txt\n-r shared.txt\n"],
+)
+def test_requirements_size_limit_reuses_shared_file_across_roles(tmp_path, monkeypatch, includes):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(includes)
+    shared = tmp_path / "shared.txt"
+    shared.write_text("shared==1.0\n-r nested.txt\n")
+    nested = tmp_path / "nested.txt"
+    nested.write_text("nested==2.0\n")
+    monkeypatch.setattr(
+        dependencies, "MAX_REQUIREMENTS_BYTES",
+        requirements.stat().st_size + shared.stat().st_size + nested.stat().st_size,
+    )
+    original_open = Path.open
+    reads = []
+
+    def track_reads(path, *args, **kwargs):
+        if path in (shared, nested) and args and args[0] == "rb":
+            reads.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", track_reads)
+    constraints = []
+    roots, paths, hash_pinned = dependencies._scan_requirements(
+        requirements, tmp_path, constraints=constraints,
+    )
+
+    assert roots == ["shared==1.0", "nested==2.0"]
+    assert constraints == ["shared==1.0", "nested==2.0"]
+    assert paths == sorted([requirements, shared, nested])
+    assert not hash_pinned
+    assert reads == [shared, nested]
+
+
+def test_requirements_size_limit_counts_each_symlink_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r first.txt\n-r second.txt\n")
+    target = tmp_path / "shared.txt"
+    target.write_text("#" * 60)
+    try:
+        (tmp_path / "first.txt").symlink_to(target.name)
+        (tmp_path / "second.txt").symlink_to(target.name)
+    except OSError as error:
+        pytest.skip(f"File symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="combined"):
+        validate_requirements(requirements, tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["validation", "discovery"])
+def test_requirements_size_limit_uses_bytes_read_when_a_file_grows(
+    tmp_path, monkeypatch, operation
+):
+    monkeypatch.setattr(dependencies, "MAX_REQUIREMENTS_BYTES", 100)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r nested.txt\n")
+    nested = tmp_path / "nested.txt"
+    nested.write_text("#" * 40)
+    original_open = Path.open
+
+    def grow_before_read(path, *args, **kwargs):
+        if path == nested:
+            with open(nested, "ab") as stream:
+                stream.write(b"#" * 50)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", grow_before_read)
+    with pytest.raises(ValueError, match="combined"):
+        if operation == "validation":
+            validate_requirements(requirements, tmp_path)
+        else:
+            declared_dependency_names(tmp_path)
+
+
+def test_requirements_validation_accepts_real_path_in_symlinked_context(tmp_path):
+    real_context = tmp_path / "real"
+    real_context.mkdir()
+    (real_context / "requirements.txt").write_text("-r nested.txt\n")
+    (real_context / "nested.txt").write_text("example==1.0\n")
+    context = tmp_path / "context"
+    try:
+        context.symlink_to(real_context, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Directory symlink unavailable: {error}")
+
+    assert validate_requirements(real_context / "requirements.txt", context) == ["example==1.0"]
+
+
+def test_recursive_requirements_include_is_rejected(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r nested.txt\n")
+    (tmp_path / "nested.txt").write_text("-r requirements.txt\n")
+    with pytest.raises(ValueError, match="include cycle"):
+        validate_requirements(requirements, tmp_path)
+
+
+def test_requirements_nesting_limit_matches_dependency_discovery(tmp_path):
+    for index in range(63):
+        (tmp_path / f"requirements-{index}.txt").write_text(
+            f"-r requirements-{index + 1}.txt\n"
+        )
+    last = tmp_path / "requirements-63.txt"
+    last.write_text("streamlit\n")
+    root = tmp_path / "requirements-0.txt"
+    validate_requirements(root, tmp_path)
+    assert declared_dependency_names(tmp_path, root.name) == {"streamlit"}
+
+    last.write_text("-r requirements-64.txt\n")
+    (tmp_path / "requirements-64.txt").write_text("streamlit\n")
+    with pytest.raises(ValueError, match="nesting depth"):
+        validate_requirements(root, tmp_path)
+    with pytest.raises(ValueError, match="nesting depth"):
+        declared_dependency_names(tmp_path, root.name)
 
 
 def test_excluded_explicit_requirements_still_install_dependencies(
@@ -981,16 +1240,17 @@ def test_dependency_staging_rejects_unsupported_target_and_unbounded_requirement
     requirements = context / "requirements.txt"
     requirements.write_bytes(b"#" * (MAX_REQUIREMENTS_BYTES + 1))
     (context / "app.py").write_text("print('app')\n")
-    builder = ImageBuilder(
-        BuildConfig(
-            context_dir=str(context),
-            include_deps=True,
-            use_cache=False,
-            base_image="python:3.11-slim-bookworm",
-        )
-    )
     with pytest.raises(ValueError, match="Requirements files exceed"):
-        builder._create_deps_layer(tmp_path / "layers", base_config=BASE_CONFIG)
+        ImageBuilder(
+            BuildConfig(
+                context_dir=str(context),
+                include_deps=True,
+                use_cache=False,
+                base_image="python:3.11-slim-bookworm",
+            )
+        )
+    with pytest.raises(ValueError, match="Requirements files exceed"):
+        validate_requirements(requirements, context)
 
 
 def _libc_config(*env):
@@ -1422,7 +1682,7 @@ def test_layer_libc_cannot_establish_digest_custom_or_local_provenance(
     ],
 )
 def test_aspire_and_default_cli_stage_using_verified_base_layer_libc(
-    tmp_path, monkeypatch, base_image, version, arch, record, wheel_platform
+    tmp_path, monkeypatch, capsys, base_image, version, arch, record, wheel_platform
 ):
     from pycontainer import cli
     from pycontainer.registry_client import RegistryClient
@@ -1508,8 +1768,10 @@ def test_aspire_and_default_cli_stage_using_verified_base_layer_libc(
         monkeypatch.setattr(
             subprocess, "Popen", lambda *a, **k: pytest.fail("pip must not run for glibc 2.13")
         )
-        with pytest.raises(ValueError, match="Unsupported PYTHON_LIBC"):
+        with pytest.raises(SystemExit) as error:
             cli.main()
+        assert error.value.code == 2
+        assert "Unsupported PYTHON_LIBC" in capsys.readouterr().err
         assert pushes == []
         return
     cli.main()

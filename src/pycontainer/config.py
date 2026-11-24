@@ -1,10 +1,14 @@
+from copy import deepcopy
 import posixpath
 import re
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
-from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
+from .build_args import (
+    BuildArgument, EXPANDABLE_FIELDS, expand_field, known_argument_values,
+    redact_values, resolve_arguments, unchanged_field_values,
+)
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
@@ -148,6 +152,176 @@ def validate_volume(path: str) -> str:
     return path
 
 
+def _track_list_mutation(method):
+    def tracked(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        self.specified = True
+        return result
+    return tracked
+
+
+class _TrackedList(list):
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.specified = False
+
+    def __deepcopy__(self, memo):
+        copied = type(self)()
+        memo[id(self)] = copied
+        list.extend(copied, (deepcopy(value, memo) for value in self))
+        copied.__dict__.update(deepcopy(self.__dict__, memo))
+        return copied
+
+    append = _track_list_mutation(list.append)
+    clear = _track_list_mutation(list.clear)
+    extend = _track_list_mutation(list.extend)
+    insert = _track_list_mutation(list.insert)
+    pop = _track_list_mutation(list.pop)
+    remove = _track_list_mutation(list.remove)
+    reverse = _track_list_mutation(list.reverse)
+    sort = _track_list_mutation(list.sort)
+    __delitem__ = _track_list_mutation(list.__delitem__)
+    __iadd__ = _track_list_mutation(list.__iadd__)
+    __imul__ = _track_list_mutation(list.__imul__)
+    __setitem__ = _track_list_mutation(list.__setitem__)
+
+
+class _DefaultPorts(_TrackedList):
+    """Keep the mutable list API while distinguishing an untouched default."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.specified = bool(self)
+
+
+class _GeneratedList(_TrackedList):
+    def __init__(self, values=(), *, generated=False):
+        super().__init__(values)
+        self.generated = generated
+        self.snapshot = tuple(self)
+
+    @property
+    def untouched(self):
+        return self.generated and not self.specified and tuple(self) == self.snapshot
+
+
+class _GeneratedLabels(dict):
+    def __init__(self, values=(), *, generated=False):
+        super().__init__(values)
+        self.generated = generated
+        self.snapshot = self.get("framework")
+        self.specified = False
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(deepcopy(dict(self), memo), generated=self.generated)
+        memo[id(self)] = copied
+        copied.snapshot = self.snapshot
+        copied.specified = self.specified
+        return copied
+
+    @property
+    def untouched(self):
+        return (
+            self.generated and not self.specified
+            and self.get("framework") == self.snapshot
+        )
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if key == "framework":
+            self.specified = True
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        if key == "framework":
+            self.specified = True
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        super().update(values)
+        if "framework" in values:
+            self.specified = True
+
+    def clear(self):
+        if "framework" in self:
+            self.specified = True
+        super().clear()
+
+    def pop(self, key, *default):
+        present = key in self
+        result = super().pop(key, *default)
+        if key == "framework" and present:
+            self.specified = True
+        return result
+
+    def popitem(self):
+        key, value = super().popitem()
+        if key == "framework":
+            self.specified = True
+        return key, value
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
+_FRAMEWORK_FIELDS = {
+    "entrypoint": "_framework_generated_entrypoint",
+    "cmd": "_framework_generated_cmd",
+    "exposed_ports": "_framework_generated_ports",
+}
+
+
+def _ports_configured(ports):
+    return ports is not None and (
+        not isinstance(ports, _DefaultPorts) or ports.specified
+    )
+
+
+def _is_generated_field(config, name):
+    value = getattr(config, name)
+    previous = getattr(config, _FRAMEWORK_FIELDS[name], None)
+    return (
+        isinstance(value, _GeneratedList) and value.untouched
+        and (previous is None or value is previous)
+    )
+
+
+def _is_generated_label(config):
+    labels = config.labels
+    previous = getattr(config, "_framework_generated_labels", None)
+    return (
+        isinstance(labels, _GeneratedLabels) and labels.untouched
+        and (previous is None or labels is previous)
+    )
+
+
+class _FrameworkState:
+    """Track generated fields across dataclass copies and serialization."""
+
+    def __init__(self, values, generated, labels, generated_label):
+        self.values = values
+        self.generated = generated
+        self.labels = labels
+        self.generated_label = generated_label
+
+    def __deepcopy__(self, memo):
+        return {
+            "ports_configured": _ports_configured(self.values["exposed_ports"]),
+            "generated": {
+                name: list(value)
+                for name, value in self.values.items()
+                if self.generated[name]
+            },
+            "generated_label": self.labels["framework"] if self.generated_label else None,
+        }
+
+
 @dataclass
 class BuildConfig:
     tag: str = "local/test:latest"
@@ -156,7 +330,7 @@ class BuildConfig:
     workdir: str = "/app"
     entrypoint: Optional[List[str]] = None
     env: Dict[str, str] = field(default_factory=dict)
-    exposed_ports: List[int] = field(default_factory=list)
+    exposed_ports: Optional[List[int]] = None
     include_paths: Optional[List[str]] = None
     exclude_paths: List[str] = field(default_factory=list)
     exclude_defaults: bool = True
@@ -207,21 +381,189 @@ class BuildConfig:
     release_notes_file: Optional[str] = None
     release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
     build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
-    _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _framework_default_env: Dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+    _framework_generated_state: Optional[Union[Dict[str, object], _FrameworkState]] = field(
+        default=None, repr=False, compare=False
+    )
+    _build_args_expansion_state: Optional[Dict[str, object]] = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __setattr__(self, name, value):
+        if (
+            name == "exposed_ports" and isinstance(value, _DefaultPorts)
+            and self.__dict__.get("_framework_initialized", False)
+        ):
+            value = list(value)
+        object.__setattr__(self, name, value)
+
+    def __getstate__(self):
+        self._remember_build_argument_values()
+        return self.__dict__.copy()
+
+    def __getattribute__(self, name):
+        if name == "_framework_generated_state":
+            values = {
+                field_name: object.__getattribute__(self, field_name)
+                for field_name in _FRAMEWORK_FIELDS
+            }
+            generated = {
+                field_name: _is_generated_field(self, field_name)
+                for field_name in _FRAMEWORK_FIELDS
+            }
+            return _FrameworkState(values, generated, self.labels, _is_generated_label(self))
+        if name == "_build_args_expansion_state":
+            instance = object.__getattribute__(self, "__dict__")
+            redactions = object.__getattribute__(self, "_remember_build_argument_values")()
+            expanded = instance.get("_build_args_expanded", False)
+            values = instance["_build_args_values"]
+            if not expanded and not redactions and not any(
+                value is not None for value in values.values()
+            ):
+                return None
+            return {
+                "values": {
+                    field_name: unchanged_field_values(
+                        object.__getattribute__(self, field_name),
+                        values[field_name],
+                    )
+                    for field_name in EXPANDABLE_FIELDS
+                },
+                "redactions": list(redactions),
+            }
+        return object.__getattribute__(self, name)
 
     def __post_init__(self):
+        state = self.__dict__["_build_args_expansion_state"]
+        if state is not None and (
+            not isinstance(state, dict)
+            or set(state) != {"values", "redactions"}
+            or not isinstance(state["values"], dict)
+            or set(state["values"]) != set(EXPANDABLE_FIELDS)
+            or not isinstance(state["redactions"], list)
+            or any(not isinstance(value, str) for value in state["redactions"])
+        ):
+            raise ValueError("Invalid serialized build-argument expansion state.")
+        redactions = ([] if state is None else state["redactions"])
+        self._resolved_build_args: Dict[str, str] = {}
         if self.build_args is not None:
-            self._resolved_build_args = resolve_arguments(self.build_args)
-            for name in EXPANDABLE_FIELDS:
-                setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
+            try:
+                self._resolved_build_args = resolve_arguments(self.build_args)
+            except ValueError as exc:
+                raise ValueError(redact_values(
+                    str(exc), [*redactions, *known_argument_values(self.build_args)]
+                )) from None
+        self._build_args_redactions = tuple(dict.fromkeys(
+            value for value in [*redactions, *self._resolved_build_args.values()] if value
+        ))
+        self._build_args_expanded = state is not None or self.build_args is not None
+        self.__dict__["_build_args_expansion_state"] = None
         try:
+            if self.build_args is not None:
+                for name in EXPANDABLE_FIELDS:
+                    value = getattr(self, name)
+                    if state is None:
+                        expanded = expand_field(value, self._resolved_build_args, name)
+                    else:
+                        expanded = expand_field(value, self._resolved_build_args, name, state["values"][name])
+                    if expanded != value:
+                        setattr(self, name, expanded)
             self._validate()
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
+        if self.build_args is None:
+            values = state["values"] if state is not None else dict.fromkeys(EXPANDABLE_FIELDS)
+        else:
+            values = {name: getattr(self, name) for name in EXPANDABLE_FIELDS}
+        self._build_args_values = deepcopy(values)
+
+    def _remember_generated_expansion(self):
+        for name in ("entrypoint", "cmd"):
+            if _is_generated_field(self, name):
+                self._build_args_values[name] = list(getattr(self, name))
+        if _is_generated_label(self):
+            labels = self._build_args_values["labels"]
+            labels = dict(labels) if isinstance(labels, dict) else {}
+            labels["framework"] = self.labels["framework"]
+            self._build_args_values["labels"] = labels
 
     def _validate(self):
         from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
+
+        generated_state = self.__dict__["_framework_generated_state"]
+        configured = None
+        if isinstance(generated_state, _FrameworkState):
+            if self.exposed_ports is generated_state.values["exposed_ports"]:
+                configured = _ports_configured(self.exposed_ports)
+            else:
+                configured = self.exposed_ports is not None
+            for name, previous in generated_state.values.items():
+                value = getattr(self, name)
+                if isinstance(value, _GeneratedList):
+                    if value is not previous or not generated_state.generated[name]:
+                        object.__setattr__(self, name, list(value))
+                    else:
+                        object.__setattr__(self, _FRAMEWORK_FIELDS[name], value)
+        elif isinstance(generated_state, dict):
+            configured = generated_state.get("ports_configured")
+            snapshots = generated_state.get("generated")
+            if not isinstance(configured, bool) or not isinstance(snapshots, dict):
+                raise ValueError("Invalid serialized framework defaults.")
+            for name in _FRAMEWORK_FIELDS:
+                snapshot = snapshots.get(name)
+                value = getattr(self, name)
+                if isinstance(snapshot, list) and isinstance(value, list) and value == snapshot:
+                    value = _GeneratedList(value, generated=True)
+                    object.__setattr__(self, name, value)
+                    object.__setattr__(self, _FRAMEWORK_FIELDS[name], value)
+        elif generated_state is not None:
+            raise ValueError("Invalid serialized framework defaults.")
+        else:
+            configured = self.exposed_ports is not None
+            for name in _FRAMEWORK_FIELDS:
+                value = getattr(self, name)
+                if isinstance(value, _GeneratedList):
+                    object.__setattr__(self, name, list(value))
+            self._framework_default_env = {}
+
+        if isinstance(generated_state, _FrameworkState):
+            if (
+                isinstance(self.labels, _GeneratedLabels)
+                and self.labels is generated_state.labels
+                and generated_state.generated_label
+            ):
+                object.__setattr__(self, "_framework_generated_labels", self.labels)
+            elif isinstance(self.labels, _GeneratedLabels):
+                self.labels = dict(self.labels)
+        elif isinstance(generated_state, dict):
+            label = generated_state.get("generated_label")
+            if (
+                isinstance(label, str) and isinstance(self.labels, dict)
+                and self.labels.get("framework") == label
+            ):
+                self.labels = _GeneratedLabels(self.labels, generated=True)
+                object.__setattr__(self, "_framework_generated_labels", self.labels)
+            elif isinstance(self.labels, _GeneratedLabels):
+                self.labels = dict(self.labels)
+        elif isinstance(self.labels, _GeneratedLabels):
+            self.labels = dict(self.labels)
+
+        ports = self.exposed_ports
+        if configured is None:
+            configured = _ports_configured(ports)
+        elif not configured and ports:
+            configured = True
+        if ports is None or (
+            not configured and not isinstance(ports, _DefaultPorts)
+        ):
+            ports = _DefaultPorts()
+            object.__setattr__(self, "exposed_ports", ports)
+        elif configured and isinstance(ports, _DefaultPorts):
+            ports = list(ports)
+            object.__setattr__(self, "exposed_ports", ports)
+        if isinstance(ports, _DefaultPorts):
+            ports.specified = configured
 
         self.validate_metadata()
         validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
@@ -288,14 +630,29 @@ class BuildConfig:
                 )
             if self.scan:
                 raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+        object.__setattr__(self, "_framework_initialized", True)
 
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
 
+    def _remember_build_argument_values(self):
+        self._build_args_redactions = tuple(dict.fromkeys(
+            value for value in [
+                *self._build_args_redactions, *known_argument_values(self.build_args)
+            ] if value
+        ))
+        return self._build_args_redactions
+
     def redact(self, message: str) -> str:
         """Keep build input values out of diagnostic output."""
-        return redact_values(message, self._resolved_build_args.values())
+        return redact_values(message, self._remember_build_argument_values())
+
+    def _has_build_argument_values(self) -> bool:
+        return bool(self.build_args or self._build_args_redactions)
+
+    def _needs_build_argument_redaction(self) -> bool:
+        return bool(self._remember_build_argument_values())
 
     def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
         import hashlib
@@ -325,3 +682,7 @@ class BuildConfig:
         from .tags import resolve_tags
 
         return resolve_tags(self.tag, self.tags, self.semver_tags, self.latest_tag)
+
+    def has_exposed_ports(self) -> bool:
+        """Return whether ports were explicitly configured or detected."""
+        return _ports_configured(self.exposed_ports)

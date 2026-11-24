@@ -257,8 +257,9 @@ def test_mirror_serves_pull_without_resolving_or_contacting_upstream(
 
 
 @pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("cleared", [False, True], ids=["configured", "cleared"])
 def test_build_arguments_redact_mirror_logs_and_progress(
-    tmp_path, mirror_auth, caplog, capsys, fallback
+    tmp_path, mirror_auth, caplog, capsys, fallback, cleared
 ):
     value = "private-base-reference"
     with _serve() as (upstream, up), _serve() as (mirror, mir):
@@ -269,6 +270,8 @@ def test_build_arguments_redact_mirror_logs_and_progress(
             tmp_path, upstream, [mirror], base_ref="team/base:${VERSION}",
             build_args={"VERSION": value}, verbose=True,
         )
+        if cleared:
+            builder.config.build_args = None
         with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_mirrors"):
             layers, _ = _pull(builder, tmp_path)
 
@@ -451,7 +454,9 @@ def test_digest_pinned_base_requires_mirror_to_serve_same_digest(tmp_path, mirro
 def test_mirror_token_realm_failure_falls_back(
     tmp_path, mirror_auth, monkeypatch, realm_kind
 ):
-    monkeypatch.setattr(builder_module, "get_mirror_auth", lambda _host: RegistryAuth())
+    monkeypatch.setattr(
+        builder_module, "get_mirror_auth", lambda _host, *, log_redact=None: RegistryAuth()
+    )
     with _serve() as (upstream, up), _serve() as (mirror, mir), _serve() as (
         realm,
         realm_state,

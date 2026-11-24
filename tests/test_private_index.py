@@ -348,6 +348,24 @@ def test_literal_credentials_in_included_constraints_are_rejected(tmp_path):
     assert SECRET not in str(error.value)
 
 
+def test_environment_include_credentials_are_rejected_without_naming_include(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "-r ${PCB_PRIVATE_INCLUDE}\n")
+    (context / "private-name.txt").write_text(
+        f"--index-url https://{USER}:{SECRET}@example.invalid/simple\n"
+    )
+    monkeypatch.setenv("PCB_PRIVATE_INCLUDE", "private-name.txt")
+
+    with pytest.raises(ValueError, match="literal credentials") as error:
+        validate_requirements(context / "requirements.txt", context)
+
+    message = str(error.value)
+    assert "<environment-based requirements file>" in message
+    assert "private-name" not in message
+    assert SECRET not in message and USER not in message
+
+
 @pytest.mark.parametrize("name", ["pip.conf", "constraints-dev.txt"])
 def test_oversized_shipped_pip_input_fails_closed(tmp_path, name):
     context = tmp_path / "context"

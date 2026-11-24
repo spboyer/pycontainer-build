@@ -15,6 +15,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from .project import requirement_name
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,6 @@ DEBIAN = "debian"
 ALPINE = "alpine"
 
 _PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+._-]*$")
-_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
-
 # Runtime libraries (not -dev packages or compilers: no code is compiled in the
 # image) needed by Python packages that dynamically link against system libs.
 # Pure wheels that bundle their libraries (psycopg2-binary, pillow) are absent.
@@ -72,9 +71,9 @@ def _requirement_names(context_dir: Path, requirements_file: Optional[str]) -> S
     if requirements.is_file():
         for line in requirements.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.split("#", 1)[0].strip()
-            match = _REQUIREMENT_NAME.match(line)
-            if match and not line.startswith("-"):
-                names.add(_normalize(match.group(1)))
+            name = requirement_name(line)
+            if name and not line.startswith("-"):
+                names.add(name)
     pyproject = context_dir / "pyproject.toml"
     if pyproject.is_file():
         try:
@@ -83,9 +82,9 @@ def _requirement_names(context_dir: Path, requirements_file: Optional[str]) -> S
             return names
         dependencies = data.get("project", {}).get("dependencies", [])
         for requirement in dependencies if isinstance(dependencies, list) else []:
-            match = _REQUIREMENT_NAME.match(str(requirement).strip())
-            if match:
-                names.add(_normalize(match.group(1)))
+            name = requirement_name(str(requirement))
+            if name:
+                names.add(name)
     return names
 
 

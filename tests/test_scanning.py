@@ -168,6 +168,40 @@ def test_blocked_scan_records_failed_build_history(tmp_path, monkeypatch, scanne
     assert [record["status"] for record in records] == ["failed"]
 
 
+def test_framework_image_scan_blocks_build_and_push(tmp_path, monkeypatch, scanner):
+    from pycontainer.history import BuildHistory
+    from pycontainer.scanning import VulnerabilityFoundError
+
+    scanner[1].write_text(json.dumps({"severities": ["high"]}))
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("import streamlit\n")
+    (context / "requirements.txt").write_text("streamlit\n")
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], BASE_CONFIG))
+    transfers = []
+    monkeypatch.setattr(
+        "pycontainer.builder.get_registry_auth",
+        lambda *args, **kwargs: transfers.append("auth"),
+    )
+    config = BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"),
+        include_paths=["app.py", "requirements.txt"], exposed_ports=[],
+        use_cache=False, record_history=True, history_dir=str(tmp_path / "history"),
+        scan=True, scan_executable=str(scanner[0]), scan_db_dir=str(tmp_path / "db"),
+    )
+    builder = ImageBuilder(config)
+    assert config.entrypoint[:2] == ["streamlit", "run"]
+    assert config.exposed_ports == []
+
+    with pytest.raises(VulnerabilityFoundError):
+        builder.build()
+    with pytest.raises(VulnerabilityFoundError):
+        builder.push(show_progress=False)
+
+    assert transfers == []
+    assert [record["status"] for record in BuildHistory(config.history_dir).list()] == ["failed"]
+
+
 @pytest.mark.parametrize("policy", [
     {"scan_threshold": "critical"}, {"scan_unknown": "ignore"},
     {"scan_threshold": "low"},

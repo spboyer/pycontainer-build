@@ -1,6 +1,7 @@
-import tomllib, re, os
-from pathlib import Path
+import configparser, logging, os, shlex, tomllib, re
+from pathlib import Path, PureWindowsPath
 from typing import List, Optional, Tuple
+from urllib.parse import unquote
 from .fs_utils import (
     DEFAULT_CONTEXT_EXCLUDES,
     VIRTUALENV_EXCLUDES,
@@ -11,6 +12,270 @@ from .fs_utils import (
     conda_prefix,
     _raise_walk_error,
 )
+
+logger = logging.getLogger(__name__)
+_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+_VCS_REQUIREMENT = re.compile(r"^(?:git|hg|svn|bzr)\+")
+
+
+class ProjectMetadataError(ValueError):
+    """Invalid dependency metadata discovered in the build context."""
+
+
+class MissingRequirementsFileError(FileNotFoundError):
+    """A requirements file referenced by project metadata is missing."""
+
+
+def _read_pyproject(path):
+    content = path.read_text(encoding="utf-8")
+    try:
+        return tomllib.loads(content)
+    except tomllib.TOMLDecodeError as error:
+        raise ProjectMetadataError(f"Invalid pyproject.toml: {error}") from error
+
+
+def requirement_name(requirement):
+    requirement = requirement.strip()
+    if _VCS_REQUIREMENT.match(requirement):
+        egg = re.search(r"[#&]egg=([^&\s]+)", requirement)
+        if not egg:
+            return None
+        requirement = unquote(egg.group(1))
+    match = _REQUIREMENT_NAME.match(requirement)
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else None
+
+
+def declared_dependency_names(
+    context_dir,
+    requirements_file="requirements.txt",
+    *,
+    exclude_paths=None,
+    exclude_defaults=True,
+    log_redact=str,
+):
+    """Read declared runtime dependency names without resolving or installing them."""
+    from .dependencies import (
+        MAX_REQUIREMENTS_BYTES,
+        MAX_REQUIREMENTS_NESTING,
+        _REQUIREMENT_VARIABLE,
+        _expand_requirement_variables,
+        _logical_requirement_lines,
+        _redacted_os_error,
+    )
+
+    ctx = Path(context_dir)
+    root = ctx.resolve()
+    logical_root = Path(os.path.abspath(ctx))
+    excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
+    if exclude_paths is not None:
+        excludes.extend(exclude_paths)
+    names = set()
+    visited = set()
+    total_bytes = 0
+
+    def selected_file(relative, *, display=None):
+        relative = relative_context_path(relative)
+        if path_is_excluded(relative, excludes):
+            return None
+        path = ctx / relative
+        try:
+            if not path.is_file():
+                return None
+            contained = path.resolve().is_relative_to(root)
+        except OSError as error:
+            if display is not None and display != relative:
+                raise OSError("Cannot access an environment-based requirements file.") from None
+            redacted_error = _redacted_os_error(error, log_redact)
+            if redacted_error is not error:
+                raise redacted_error from None
+            raise
+        except RuntimeError as error:
+            if display is not None and display != relative:
+                raise OSError("Cannot access an environment-based requirements file.") from None
+            message = log_redact(str(error))
+            if message != str(error):
+                raise RuntimeError(message) from None
+            raise
+        if not contained:
+            if conda_prefix(ctx, relative) is not None:
+                raise ProjectMetadataError(
+                    "Conda staging is unsupported. Export pip-compatible requirements "
+                    "with `python -m pip freeze > requirements.txt` inside the build context."
+                )
+            raise ProjectMetadataError(
+                log_redact(
+                    f"Dependency file is outside the build context: {display or relative}; "
+                    "requirements must stay inside the build context."
+                )
+            )
+        return path
+
+    def read_requirements(relative, *, required=False, environment_path=False, ancestors=frozenset()):
+        nonlocal total_bytes
+        try:
+            relative = relative_context_path(relative)
+        except ValueError as error:
+            message = log_redact(str(error))
+            if message != str(error):
+                raise ValueError(message) from None
+            raise
+        display = "<environment-based requirements file>" if environment_path else relative
+        shown = log_redact(str(display))
+        path = selected_file(relative, display=display)
+        if path is None:
+            if required and not path_is_excluded(relative, excludes):
+                raise MissingRequirementsFileError(f"Requirements file not found: {shown}")
+            return
+        if relative in ancestors:
+            raise ProjectMetadataError(f"Requirements include cycle in {shown}.")
+        if relative in visited:
+            return
+        if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
+            raise ProjectMetadataError(
+                f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
+            )
+        visited.add(relative)
+        size, lines = _logical_requirement_lines(
+            path, display=shown, log_redact=log_redact,
+            max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
+            environment_path=environment_path, size_error=ProjectMetadataError,
+        )
+        total_bytes += size
+        for line_number, line in lines:
+            expanded = _expand_requirement_variables(line)
+            try:
+                parts = shlex.split(expanded, comments=True)
+            except ValueError as error:
+                raise ProjectMetadataError(
+                    f"Invalid requirement syntax in {shown} at line {line_number}"
+                ) from error
+            if not parts:
+                continue
+            first = parts[0]
+            nested = None
+            if first in ("-r", "--requirement"):
+                if len(parts) != 2:
+                    raise ProjectMetadataError(
+                        f"Invalid requirements include in {shown} at line {line_number}"
+                    )
+                nested = parts[1]
+            elif first.startswith("--requirement="):
+                nested = first.partition("=")[2]
+            elif first.startswith("-r") and len(first) > 2:
+                nested = first[2:]
+            if nested is not None:
+                if _REQUIREMENT_VARIABLE.search(nested):
+                    logger.warning(
+                        "%s", log_redact(
+                            f"Cannot inspect an unresolved requirements include in {display} "
+                            f"at line {line_number}"
+                        ),
+                    )
+                    continue
+                if "://" in nested:
+                    logger.warning(
+                        "%s", log_redact(f"Cannot inspect a remote requirements include in {display}")
+                    )
+                else:
+                    nested_path = Path(nested)
+                    windows_path = PureWindowsPath(nested)
+                    if (
+                        not nested
+                        or nested_path.is_absolute()
+                        or windows_path.drive
+                        or windows_path.root
+                    ):
+                        raise ProjectMetadataError(
+                            f"Invalid requirements include in {shown} at line {line_number}"
+                        )
+                    logical_path = Path(os.path.abspath(ctx / relative.parent / nested_path))
+                    environment_include = environment_path or expanded != line
+                    try:
+                        contained = (
+                            logical_path.is_relative_to(logical_root)
+                            and logical_path.resolve().is_relative_to(root)
+                        )
+                    except (OSError, RuntimeError):
+                        if environment_include:
+                            raise ProjectMetadataError(
+                                "Cannot access an environment-based requirements include."
+                            ) from None
+                        raise
+                    if not contained:
+                        raise ProjectMetadataError(
+                            f"Requirements include in {shown} escapes the build context"
+                        )
+                    read_requirements(
+                        logical_path.relative_to(logical_root),
+                        required=True,
+                        environment_path=environment_include,
+                        ancestors=ancestors | {relative},
+                    )
+            elif not first.startswith("-") or first in ("-e", "--editable"):
+                declaration = expanded
+                if first in ("-e", "--editable"):
+                    declaration = expanded.strip()[len(first):].strip()
+                name = requirement_name(declaration)
+                if name:
+                    names.add(name)
+
+    read_requirements(requirements_file or "requirements.txt")
+
+    pyproject = selected_file("pyproject.toml")
+    if pyproject:
+        data = _read_pyproject(pyproject)
+        project = data.get("project", {})
+        if not isinstance(project, dict):
+            raise ProjectMetadataError("[project] must be a TOML table.")
+        dependencies = project.get("dependencies", [])
+        if not isinstance(dependencies, list) or not all(
+            isinstance(item, str) for item in dependencies
+        ):
+            raise ProjectMetadataError("[project].dependencies must be a list of strings")
+        for dependency in dependencies:
+            name = requirement_name(dependency)
+            if name:
+                names.add(name)
+        tool = data.get("tool", {})
+        if not isinstance(tool, dict):
+            raise ProjectMetadataError("[tool] must be a TOML table.")
+        poetry = tool.get("poetry", {})
+        if not isinstance(poetry, dict):
+            raise ProjectMetadataError("[tool.poetry] must be a TOML table.")
+        poetry_dependencies = poetry.get("dependencies", {})
+        if not isinstance(poetry_dependencies, dict):
+            raise ProjectMetadataError("[tool.poetry.dependencies] must be a TOML table.")
+        for name, value in poetry_dependencies.items():
+            if name != "python" and not (
+                isinstance(value, dict) and value.get("optional", False)
+            ):
+                normalized = requirement_name(name)
+                if normalized:
+                    names.add(normalized)
+
+    setup_cfg = selected_file("setup.cfg")
+    if setup_cfg:
+        parser = configparser.ConfigParser(interpolation=None)
+        content = setup_cfg.read_text(encoding="utf-8")
+        try:
+            parser.read_string(content)
+        except configparser.Error as error:
+            message = f"Invalid setup.cfg: {error}"
+            redacted = log_redact(message)
+            if redacted != message:
+                raise ProjectMetadataError(redacted) from None
+            raise ProjectMetadataError(message) from error
+        value = parser.get("options", "install_requires", fallback="")
+        if value.strip().startswith("file:"):
+            for included_file in value.strip()[len("file:"):].split(","):
+                read_requirements(included_file.strip(), required=True)
+        else:
+            dependencies = value.splitlines() if "\n" in value else value.split(";")
+            for dependency in dependencies:
+                name = requirement_name(dependency)
+                if name:
+                    names.add(name)
+    return names
 
 CONDA_FILES = ("environment.yml", "environment.yaml", "conda-lock.yml")
 
@@ -87,7 +352,12 @@ def detect_python_version(context_dir):
     ctx=Path(context_dir); py=context_file_path(ctx, ctx/'pyproject.toml')
     if py.exists():
         data=tomllib.loads(py.read_text())
-        proj=data.get("project",{}); requires_py=proj.get("requires-python")
+        proj=data.get("project",{})
+        if not isinstance(proj, dict):
+            raise ValueError("[project] must be a TOML table.")
+        requires_py=proj.get("requires-python")
+        if requires_py is not None and not isinstance(requires_py, str):
+            raise ValueError("[project].requires-python must be a string.")
         if requires_py:
             match=re.search(r'(\d+\.\d+)', requires_py)
             if match: return match.group(1)
@@ -96,8 +366,13 @@ def detect_python_version(context_dir):
 def detect_entrypoint(context_dir):
     ctx=Path(context_dir); py=context_file_path(ctx, ctx/'pyproject.toml')
     if py.exists():
-        data=tomllib.loads(py.read_text())
-        proj=data.get("project",{}); scripts=proj.get("scripts") or {}
+        data=_read_pyproject(py)
+        proj=data.get("project",{})
+        if not isinstance(proj, dict):
+            raise ProjectMetadataError("[project] must be a TOML table.")
+        scripts=proj.get("scripts", {})
+        if not isinstance(scripts, dict):
+            raise ProjectMetadataError("[project].scripts must be a TOML table.")
         if scripts:
             name,target=next(iter(scripts.items()))
             if isinstance(target,str) and ":" not in target:
@@ -109,6 +384,8 @@ def default_include_paths(
     exclude_paths=None,
     *,
     exclude_defaults=True,
+    requirements_file="requirements.txt",
+    log_redact=str,
 ):
     ctx=Path(context_dir)
     excludes=list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
@@ -127,7 +404,37 @@ def default_include_paths(
     for f in ("pyproject.toml","requirements.txt","setup.cfg"):
         if (ctx/f).exists() and not path_is_excluded(f, excludes):
             c.append(f)
-    if not c: c.append(".")
+    if not c:
+        c.append(".")
+    dependencies = declared_dependency_names(
+        ctx, requirements_file, exclude_paths=excludes, exclude_defaults=False,
+        log_redact=log_redact,
+    )
+    include_notebooks = bool({"jupyterlab", "notebook"} & dependencies)
+    if include_notebooks or logger.isEnabledFor(logging.DEBUG):
+        noted_notebook = False
+
+        def select_notebook(path, relative):
+            nonlocal noted_notebook
+            if path.suffix != ".ipynb":
+                return False
+            if include_notebooks:
+                return True
+            if not noted_notebook:
+                logger.debug(
+                    "%s", log_redact(
+                        "Notebooks found but no jupyterlab or notebook dependency is declared."
+                    )
+                )
+                noted_notebook = True
+            return False
+
+        for path, relative in iter_files(
+            ctx, ["."], exclude_paths=excludes, exclude_defaults=False,
+            file_filter=select_notebook,
+        ):
+            if c != ["."]:
+                c.append(relative.as_posix())
     return c
 
 def find_dependencies(

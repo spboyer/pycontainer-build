@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry
+from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry, _is_generated_label
 from .system_packages import report_system_packages
 from .blob_store import (
     BlobIntegrityError,
@@ -19,6 +19,7 @@ from .fs_utils import (
     VIRTUALENV_EXCLUDES,
     context_exclude_paths,
     ensure_dir,
+    iter_files,
     output_directory_lock,
     relative_context_path,
     select_context_files,
@@ -192,11 +193,11 @@ from .oci import (
     build_oci_layout,
 )
 from .project import (
-    CONDA_FILES, detect_conda_inputs, detect_entrypoint,
+    CONDA_FILES, MissingRequirementsFileError, detect_conda_inputs, detect_entrypoint,
     default_include_paths, find_dependencies,
 )
 from .fs_utils import conda_prefix, relative_context_path
-from .framework import apply_framework_defaults
+from .framework import _configured_command, _environment_port, apply_framework_defaults
 from .release_notes import release_notes_labels
 from .registry_client import (
     RegistryClient,
@@ -243,6 +244,23 @@ from .lockfiles import (
 DEFAULT_REQUIREMENTS_FILE = "requirements.txt"
 
 logger=logging.getLogger(__name__)
+
+def _configured_streamlit_port(arguments):
+    port = None
+    normalized = [str(arg).replace("\\", "/").removeprefix("./") for arg in arguments]
+    executable, command_arguments, _, _ = _configured_command(normalized)
+    if executable != "streamlit":
+        return None
+    for index, argument in enumerate(command_arguments):
+        if argument == "--":
+            break
+        if argument.startswith("--server.port="):
+            port = _environment_port(argument.partition("=")[2], "--server.port")
+        elif argument == "--server.port":
+            value = command_arguments[index + 1] if index + 1 < len(command_arguments) else None
+            port = _environment_port(value, "--server.port")
+    return port
+
 
 UNCOMPRESSED_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar"
 SQUASH_HISTORY_CREATOR = "pycontainer-build --squash"
@@ -430,6 +448,8 @@ class ImageBuilder:
                 context_dir,
                 exclude_paths=self.context_excludes,
                 exclude_defaults=config.exclude_defaults,
+                requirements_file=config.requirements_file,
+                log_redact=config.redact,
             )
         )
         self.dependency_excludes=tuple(
@@ -442,15 +462,23 @@ class ImageBuilder:
             )
         )
         self.release_notes_labels=release_notes_labels(config)
-        framework_label_explicit="framework" in (config.labels or {})
         self.config=apply_framework_defaults(
             config,
             context_dir,
             self.context_include_paths,
             self.context_excludes,
             exclude_defaults=False,
+            files=(
+                path
+                for path, _ in iter_files(
+                    context_dir,
+                    self.context_include_paths,
+                    exclude_paths=self.context_excludes,
+                    exclude_defaults=False,
+                )
+            ),
         )
-        if "framework" in self.release_notes_labels and not framework_label_explicit and self.config.labels:
+        if "framework" in self.release_notes_labels and _is_generated_label(self.config):
             # The configured release-notes key takes precedence over the framework default.
             self.config.labels.pop("framework", None)
         self.verbose=getattr(config, 'verbose', False)
@@ -479,27 +507,26 @@ class ImageBuilder:
         self.config.validate_metadata()
         self._conda_warning_emitted = False
         self._dependency_source_cache = None
-        if self.config.scan and len(self.config.target_platforms()) > 1:
-            raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
-        if conda_prefix(self.config.context_dir, ".") is not None:
-            raise ValueError(
-                "The build context is inside a host Conda environment; use a "
-                "source-only build context to avoid copying host environment files. "
-                "Conda staging is unsupported. Export pip-compatible requirements "
-                "with `python -m pip freeze > requirements.txt` and select that "
-                "file with --requirements and --include-deps."
-            )
-        if self.config.include_deps:
-            self._check_conda_dependencies()
-        if self.dry_run:
-            logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
-            self._show_build_plan()
-            return self.config.tag
-
         timing = BuildTiming() if self._history else None
         token = self._history_timer.set(timing) if timing else None
         try:
             try:
+                if self.config.scan and len(self.config.target_platforms()) > 1:
+                    raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+                if conda_prefix(self.config.context_dir, ".") is not None:
+                    raise ValueError(
+                        "The build context is inside a host Conda environment; use a "
+                        "source-only build context to avoid copying host environment files. "
+                        "Conda staging is unsupported. Export pip-compatible requirements "
+                        "with `python -m pip freeze > requirements.txt` and select that "
+                        "file with --requirements and --include-deps."
+                    )
+                if self.config.include_deps:
+                    self._check_conda_dependencies()
+                if self.dry_run:
+                    logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
+                    self._show_build_plan()
+                    return self.config.tag
                 if self._history:
                     self._history.validate_location(
                         self.config.context_dir, self.config.output_dir
@@ -684,12 +711,8 @@ class ImageBuilder:
             )
         report_system_packages(self.config, base_layers, locked_names, redact=self.config.redact)
         
-        # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
-        if self.config.entrypoint is not None:
-            entry = self.config.entrypoint
-        elif self.config.cmd is not None:
-            entry = None
-        else:
+        entry = self.config.entrypoint
+        if entry is None and self.config.cmd is None:
             entry = detect_entrypoint(self.config.context_dir)
         include = self.context_include_paths
 
@@ -728,30 +751,115 @@ class ImageBuilder:
         all_layers=base_layers+app_layers
 
         image_env = dict(self.config.env)
-        if getattr(self, "_dependency_site_packages", False):
-            base_env = {
-                item.split("=", 1)[0]: item.split("=", 1)[1]
-                for item in base_config.get("config", {}).get("Env", [])
-                if "=" in item
-            }
+        base_env = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in (base_config or {}).get("config", {}).get("Env", [])
+            if "=" in item
+        }
+        detection = getattr(self.config, "_framework_detection", None)
+        if detection and detection.name == "Gradio":
+            for name, value in getattr(self.config, "_framework_default_env", {}).items():
+                if name not in image_env and name not in base_env:
+                    image_env[name] = value
+
+        exposed_ports = (
+            self.config.exposed_ports if self.config.has_exposed_ports() else None
+        )
+        generated_entrypoint = (
+            getattr(self.config, "_framework_entrypoint_generated", False)
+            and entry is getattr(self.config, "_framework_generated_entrypoint", None)
+            and not getattr(entry, "specified", False)
+            and tuple(entry) == getattr(self.config, "_framework_entrypoint_snapshot", ())
+        )
+        generated_ports = (
+            getattr(self.config, "_framework_ports_generated", False)
+            and exposed_ports is getattr(self.config, "_framework_generated_ports", None)
+            and not getattr(exposed_ports, "specified", False)
+            and tuple(exposed_ports) == getattr(self.config, "_framework_ports_snapshot", ())
+        )
+        if (
+            detection and detection.name == "Jupyter" and entry
+            and generated_entrypoint
+        ):
+            image_user = self.config.user or (base_config or {}).get("config", {}).get("User", "")
+            if image_user.partition(":")[0] in ("", "0", "root"):
+                entry = [*entry, "--allow-root"]
+        if detection and detection.name == "Streamlit":
+            command_port = (
+                _configured_streamlit_port([*(entry or []), *(self.config.cmd or [])])
+                if generated_ports and not generated_entrypoint else None
+            )
+            base_port = None
+            if (
+                "STREAMLIT_SERVER_PORT" not in self.config.env
+                and "STREAMLIT_SERVER_PORT" in base_env
+                and (
+                    generated_ports and command_port is None
+                    or generated_entrypoint and exposed_ports == []
+                )
+            ):
+                base_port = _environment_port(base_env["STREAMLIT_SERVER_PORT"], "STREAMLIT_SERVER_PORT")
+            if generated_entrypoint:
+                entry = list(entry)
+                if base_port is not None and (generated_ports or exposed_ports == []):
+                    entry[-1] = f"--server.port={base_port}"
+                if (
+                    "STREAMLIT_SERVER_ADDRESS" not in self.config.env
+                    and "STREAMLIT_SERVER_ADDRESS" in base_env
+                ):
+                    entry[-2] = f"--server.address={base_env['STREAMLIT_SERVER_ADDRESS']}"
+            if generated_ports:
+                if command_port is not None:
+                    exposed_ports = [command_port]
+                elif base_port is not None:
+                    exposed_ports = [base_port]
+        if (
+            detection and detection.name == "Gradio"
+            and not detection.port_from_source
+            and generated_ports
+            and "GRADIO_SERVER_PORT" not in self.config.env
+            and "GRADIO_SERVER_PORT" in base_env
+        ):
+            exposed_ports = [_environment_port(base_env["GRADIO_SERVER_PORT"], "GRADIO_SERVER_PORT")]
+
+        dependency_site = getattr(self, "_dependency_site_packages", False)
+        source_root = detection.source_root if detection and detection.name == "Celery" else None
+        if dependency_site or source_root:
             prefix = self.config.workdir.rstrip("/") + "/.python"
             site_path = f"{prefix}/site-packages"
             bin_path = f"{prefix}/bin"
             current_pythonpath = image_env.get(
                 "PYTHONPATH", base_env.get("PYTHONPATH", "")
             )
-            current_path = image_env.get(
-                "PATH",
-                base_env.get(
-                    "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                ),
-            )
             image_env["PYTHONPATH"] = ":".join(
-                part for part in (site_path, current_pythonpath) if part
+                part for part in (
+                    site_path if dependency_site else None,
+                    f"{self.config.workdir.rstrip('/')}/{source_root}" if source_root else None,
+                    current_pythonpath,
+                ) if part
             )
-            image_env["PATH"] = f"{bin_path}:{current_path}"
+            if dependency_site:
+                current_path = image_env.get(
+                    "PATH",
+                    base_env.get(
+                        "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                    ),
+                )
+                image_env["PATH"] = f"{bin_path}:{current_path}"
+                if detection and detection.name == "Jupyter":
+                    for name, present, relative in (
+                        ("JUPYTER_PATH", self._staged_jupyter_data, "share/jupyter"),
+                        ("JUPYTER_CONFIG_PATH", self._staged_jupyter_config, "etc/jupyter"),
+                    ):
+                        if present:
+                            current = image_env.get(name, base_env.get(name, ""))
+                            image_env[name] = ":".join(
+                                part for part in (current, f"{site_path}/{relative}") if part
+                            )
+                    if self._staged_jupyter_lab and "JUPYTERLAB_DIR" not in base_env:
+                        image_env.setdefault("JUPYTERLAB_DIR", f"{site_path}/share/jupyter/lab")
 
-        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
+        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers],
                                 stop_signal=self.config.stop_signal,volumes=self.config.volumes,
@@ -842,7 +950,6 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
         client=RegistryClient(
             registry,
             repo,
@@ -851,7 +958,7 @@ class ImageBuilder:
             password=auth.password,
             insecure=insecure,
             ca_file=self.config.registry_ca_file,
-            **log_options,
+            log_redact=self.config.redact,
         )
         warned=self.__dict__.setdefault('_warned_insecure_registries', set())
         if insecure and registry.lower() not in warned:
@@ -864,7 +971,7 @@ class ImageBuilder:
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = {"log_redact": self.config.redact}
 
         def upstream_client():
             auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
@@ -1131,7 +1238,7 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
-        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+        log_options = {"log_redact": self.config.redact}
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
@@ -1216,17 +1323,18 @@ class ImageBuilder:
             self._print(f"  Platform: {platforms[0]}")
         self._print(f"  Context: {self.config.context_dir}")
         self._print(f"  Working Dir: {self.config.workdir}")
-        if self.config.entrypoint is not None:
-            entrypoint = ' '.join(self.config.entrypoint) or '<none>'
-        elif self.config.cmd is not None:
-            entrypoint = '<inherited from base image>'
+        if self.config.entrypoint is None:
+            entrypoint = (
+                "<inherited from base>" if self.config.cmd is not None else "<auto-detect>"
+            )
         else:
-            entrypoint = '<auto-detect>'
+            entrypoint = " ".join(self.config.entrypoint) or "<cleared>"
         self._print(f"  Entrypoint: {entrypoint}")
         if self.config.cmd is not None:
-            self._print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
-        if self.config.exposed_ports:
-            self._print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
+            self._print(f"  Command: {' '.join(self.config.cmd) or '<cleared>'}")
+        if self.config.has_exposed_ports():
+            ports = ", ".join(map(str, self.config.exposed_ports)) or "<cleared>"
+            self._print(f"  Exposed Ports: {ports}")
         if self.config.env:
             self._print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
@@ -1409,8 +1517,10 @@ class ImageBuilder:
             if requirements_relative.is_absolute() or ".." in requirements_relative.parts:
                 raise ValueError("Requirements path must be relative and stay inside the build context.")
             if not (ctx / requirements_relative).is_file():
-                raise FileNotFoundError(
-                    f"Requirements file not found: {requirements_relative.as_posix()}"
+                raise MissingRequirementsFileError(
+                    self.config.redact(
+                        f"Requirements file not found: {requirements_relative.as_posix()}"
+                    )
                 )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
@@ -1445,6 +1555,7 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
+            log_options = {"log_redact": self.config.redact}
             if source_kind == "lock":
                 selection = self._lock_selection(
                     base_config, os_name, arch, variant=variant,
@@ -1465,6 +1576,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    **log_options,
                 )
                 verify_locked_installation(
                     selection,
@@ -1487,6 +1599,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    **log_options,
                 )
             else:
                 stage_virtualenv(
@@ -1503,9 +1616,9 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                removed = strip_type_stubs(site_packages)
+                removed = strip_type_stubs(site_packages, log_redact=self.config.redact)
                 if removed:
-                    print(f"Removed type stub distributions: {', '.join(removed)}")
+                    self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
@@ -1522,6 +1635,11 @@ class ImageBuilder:
                 key=lambda path: path.relative_to(stage_root).as_posix(),
             )
             self._dependency_site_packages = bool(files)
+            self._staged_jupyter_data = (site_packages / "share" / "jupyter").is_dir()
+            self._staged_jupyter_config = (site_packages / "etc" / "jupyter").is_dir()
+            self._staged_jupyter_lab = (
+                site_packages / "share" / "jupyter" / "lab" / "static" / "index.html"
+            ).is_file()
             if not files:
                 return None
 
@@ -1639,7 +1757,7 @@ class ImageBuilder:
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
                     namespace=self.config.cache_identity(),
-                    record_source_files=not bool(self.config.build_args),
+                    record_source_files=not self.config._has_build_argument_values(),
                     hardlinks=hardlinks,
                 )
 

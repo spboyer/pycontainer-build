@@ -215,7 +215,7 @@ offline preparation, error behavior and the opt-in acceptance test.
 - ✅ **Distroless detection** — Auto-handles shell-less base images
 
 **Production Features** (Phase 4):
-- ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
+- ✅ **Framework auto-detection** — FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, and Celery
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
 - ✅ **Configuration templates and wizard** — `pycontainer init` for FastAPI, Flask and generic apps
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
@@ -386,13 +386,19 @@ available in the [integration examples](examples/editor-task-runners/).
 By default, `pycontainer` auto-detects:
 
 - **Base image**: Python version from `requires-python` in `pyproject.toml` (e.g., `>=3.11` → `python:3.11-slim`)
-- **Entry point**: First `[project.scripts]` entry in `pyproject.toml`
-  (skipped when `cmd` is configured without `entrypoint`: the image then keeps
-  the base image's `Entrypoint` and runs `cmd`, as Docker does; an explicit
-  `entrypoint = []` / `cmd = []` clear the base image's value)
-- **Include paths**: `src/`, `app/`, or `<package>/` dirs + `pyproject.toml`, `requirements.txt`
+- **Entry point**: A detected framework, then a supported project script module or `python -m app`.
+  A configured `cmd` without an `entrypoint` keeps the base image's `Entrypoint`;
+  explicit `entrypoint = []` and `cmd = []` clear the corresponding base values.
+- **Include paths**: `src/`, `app/`, `package/`, root Python files, and project metadata; notebook files are included when Jupyter is declared
 - **Working directory**: `/app/`
 - **Architecture**: `amd64/linux`
+
+[Framework detection](docs/framework-detection.md) documents commands,
+precedence, ambiguous projects, explicit overrides, and Jupyter authentication.
+Detection priority is FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, then
+Celery; Celery defaults to a worker with no exposed ports.
+Detection does not install dependencies or execute application code. For a root
+image user, the generated Jupyter command permits root; prefer a non-root user.
 
 ### Explicit Configuration
 
@@ -1068,14 +1074,27 @@ SBOM formats, system-package declarations and other settings do not expand.
 are not rescanned, defaults do not reference other arguments, and no host
 environment lookup, expression evaluation or shell execution occurs.
 Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
-without it, existing literal dollar expressions are preserved.
+without it, existing literal dollar expressions are preserved. Copying or
+serializing a config does not re-interpolate already expanded or
+framework-generated values, even if its arguments change. Unexpanded user
+fields and changed values, including edits made after construction, expand once
+on a copy with arguments; copies without arguments defer their expansion. List
+entries are matched by value and count, preserving earlier matching entries.
+An override identical to an existing value is indistinguishable from an
+unchanged copy and remains literal. Construct a fresh config from unexpanded
+values to re-interpolate it. The config remembers nonempty argument values when
+it resolves them, redacts output, or is copied or serialized. An in-place value
+inserted and removed before any of these observations cannot be recovered.
+Serialized configs, including `dataclasses.asdict` and JSON snapshots, retain
+observed values for diagnostic redaction even after arguments are cleared;
+treat these snapshots as sensitive.
 
 Arguments are **not secrets** and are not automatically runtime environment
 variables. Only explicit interpolation into persisted image fields (including
 labels, environment, command or workdir) stores a value in image metadata.
 Configuration/source files selected for the app layer are still copied normally;
 exclude files containing defaults if they should not be shipped.
-Diagnostic output redacts nonempty argument values. Cache metadata contains
+Diagnostic output redacts known nonempty argument values. Cache metadata contains
 hashed resolved configuration/target/backend identity, not argument values;
 argument builds omit source-path metadata. Unused argument changes do not
 invalidate the app-layer cache. The cache stores actual layer contents, not
@@ -1120,7 +1139,7 @@ meaning when loaded. Build arguments do not introduce stages or conditions.
 
 ### ✅ **Phase 4: Polish & Production Readiness** (COMPLETE)
 
-- [x] Framework auto-detection (FastAPI, Flask, Django)
+- [x] Framework auto-detection (FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, Celery)
 - [x] `pycontainer.toml` configuration schema
 - [x] SBOM (Software Bill of Materials) generation
 - [x] Reproducible builds (deterministic layer creation)
@@ -1172,7 +1191,7 @@ Works in GitHub Codespaces, Dev Box, locked-down environments — anywhere Pytho
 
 Known limitations and future enhancements:
 
-- **Framework detection** — Supports FastAPI, Flask, Django only (easy to extend)
+- **Framework detection** — Static heuristics cannot infer every dynamic factory or entrypoint; configure ambiguous projects explicitly
 - **SBOM scope** — Python distributions staged by pycontainer; does not scan host or base-image packages
 - **System packages** — Verification is advisory; installing apt/apk packages
   is not available. See [system packages](docs/system-packages.md).

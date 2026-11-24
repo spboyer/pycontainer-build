@@ -87,7 +87,7 @@ def build_config_json(architecture, os_name, env, working_dir, entrypoint, expos
     rootfs=cfg.setdefault("rootfs", {})
     rootfs["type"]=rootfs.get("type", "layers")
     rootfs["diff_ids"]=[*rootfs.get("diff_ids", []), *(layer_diff_ids or [])]
-    if exposed_ports:
+    if exposed_ports is not None:
         cfg["config"]["ExposedPorts"]={f"{p}/tcp":{} for p in exposed_ports}
     if stop_signal:
         cfg["config"]["StopSignal"]=stop_signal

@@ -401,6 +401,7 @@ def test_base_image_pull_passes_resolved_basic_credentials(tmp_path, monkeypatch
                 "password": "docker-password",
                 "insecure": False,
                 "ca_file": None,
+                "log_redact": builder.config.redact,
             },
         )
     ]
@@ -456,6 +457,7 @@ def test_image_push_passes_resolved_basic_credentials(tmp_path, monkeypatch):
                 "password": "docker-password",
                 "insecure": False,
                 "ca_file": None,
+                "log_redact": builder.config.redact,
             },
         )
     ]

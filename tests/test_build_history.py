@@ -328,6 +328,62 @@ def test_rejected_package_index_credentials_are_not_recorded(tmp_path, monkeypat
     assert secret not in history.history_file.read_text()
 
 
+@pytest.mark.parametrize("signal", ["environment.yml", "conda-meta"])
+def test_conda_preflight_failure_is_recorded(tmp_path, monkeypatch, signal):
+    config = _history_config(tmp_path, include_deps=True)
+    path = Path(config.context_dir) / signal
+    if signal == "conda-meta":
+        path.mkdir()
+    else:
+        path.write_text("name: example\n")
+    builder = ImageBuilder(config)
+    monkeypatch.setattr(builder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
+
+    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+        builder.build()
+
+    record = BuildHistory(config.history_dir).list()[0]
+    assert record["status"] == "failed"
+    assert record["phases_ns"] == {}
+
+
+@pytest.mark.parametrize("exclude_credentials", [False, True])
+def test_framework_history_respects_selected_file_credential_scan(
+    tmp_path, monkeypatch, exclude_credentials
+):
+    secret = "synthetic-selected-index-secret"
+    _offline_base(monkeypatch)
+    config = _history_config(
+        tmp_path,
+        include_deps=False,
+        include_paths=["app.py", "pyproject.toml", "pip.conf"],
+        exclude_paths=["pip.conf"] if exclude_credentials else [],
+    )
+    context = Path(config.context_dir)
+    (context / "app.py").write_text("import streamlit\n")
+    (context / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\nversion = "1"\ndependencies = ["streamlit"]\n'
+    )
+    (context / "pip.conf").write_text(
+        f"[global]\nindex-url = https://synthetic-user:{secret}@example.invalid/simple\n"
+    )
+    builder = ImageBuilder(config)
+    assert "streamlit" in builder.config.entrypoint
+
+    if exclude_credentials:
+        builder.build()
+    else:
+        with pytest.raises(ValueError, match="literal credentials") as error:
+            builder.build()
+        assert secret not in str(error.value)
+
+    history = BuildHistory(config.history_dir)
+    record = history.list()[0]
+    assert record["status"] == ("success" if exclude_credentials else "failed")
+    assert "application" in record["phases_ns"]
+    assert secret not in history.history_file.read_text()
+
+
 def test_constructor_failure_is_recorded(tmp_path, monkeypatch):
     import pycontainer.builder as builder_module
 

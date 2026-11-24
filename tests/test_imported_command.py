@@ -143,6 +143,30 @@ def test_imported_empty_entrypoint_and_cmd_clear_base_values(tmp_path, monkeypat
     assert "Cmd" not in image
 
 
+@pytest.mark.parametrize("clear_entrypoint", [False, True])
+def test_imported_command_is_not_replaced_by_detected_streamlit(
+    tmp_path, monkeypatch, clear_entrypoint
+):
+    dockerfile = 'CMD ["python", "main.py"]'
+    if clear_entrypoint:
+        dockerfile = "ENTRYPOINT []\n" + dockerfile
+    result, config = _imported_config(tmp_path, dockerfile, framework=True)
+    context = tmp_path / "context"
+    (context / "main.py").write_text("import streamlit\n")
+    (context / "requirements.txt").write_text("streamlit\n")
+
+    image = _built_config(tmp_path, monkeypatch, ENTRYPOINT_BASE, config)["config"]
+
+    if clear_entrypoint:
+        assert "Entrypoint" not in image
+        assert "framework" not in image.get("Labels", {})
+        assert "ExposedPorts" not in image
+    else:
+        assert image["Entrypoint"] == ENTRYPOINT_BASE["config"]["Entrypoint"]
+        assert image["Labels"]["framework"] == "streamlit"
+    assert image["Cmd"] == result.config["cmd"] == ["python", "main.py"]
+
+
 @pytest.mark.parametrize(
     ("entrypoint", "cmd", "expected_entrypoint", "expected_cmd"),
     [
@@ -240,8 +264,8 @@ def test_dry_run_plan_reports_inherited_entrypoint(tmp_path, capsys):
         BuildConfig(context_dir=str(context), cmd=["python", "app.py"], dry_run=True)
     ).build()
     out = capsys.readouterr().out
-    assert "Entrypoint: <inherited from base image>" in out
-    assert "Cmd: python app.py" in out
+    assert "Entrypoint: <inherited from base>" in out
+    assert "Command: python app.py" in out
 
 
 def test_cmd_build_argument_preserves_base_entrypoint_and_redacts_plan(tmp_path, monkeypatch, capsys):
@@ -259,6 +283,6 @@ def test_cmd_build_argument_preserves_base_entrypoint_and_redacts_plan(tmp_path,
 
     ImageBuilder(BuildConfig(**options, dry_run=True)).build()
     out = capsys.readouterr().out
-    assert "Entrypoint: <inherited from base image>" in out
-    assert "Cmd: python <redacted>" in out
+    assert "Entrypoint: <inherited from base>" in out
+    assert "Command: python <redacted>" in out
     assert "private-command" not in out

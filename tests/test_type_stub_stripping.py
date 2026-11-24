@@ -1,6 +1,8 @@
 import json
+import logging
 import sys
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -249,6 +251,24 @@ def test_builder_strip_type_stubs_is_opt_in_reproducible_and_updates_sbom(
 
     assert "types-requests" in sbom_names(default)
     assert sbom_names(first) == ["Django_Stubs", "runtime-dep"]
+
+
+def test_builder_redacts_kept_stub_warning_after_arguments_are_cleared(
+    tmp_path, monkeypatch, caplog
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path, monkeypatch, context, strip_type_stubs=True,
+        build_args={"STUB": "Django_Stubs"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(replace(builder.config, build_args=None)).build()
+
+    assert "Keeping <redacted>-1.0.dist-info" in caplog.text
+    assert "Django_Stubs" not in caplog.text
 
 
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):

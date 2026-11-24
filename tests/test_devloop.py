@@ -569,6 +569,29 @@ def test_skaffold_request_errors_redact_build_arguments(tmp_path, monkeypatch, r
 
 
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+@pytest.mark.parametrize("override", [False, True])
+def test_devloop_argument_resolution_errors_redact_known_values(
+    tmp_path, monkeypatch, recording, capsys, command, override,
+):
+    value = "private_value"
+    default = "fallback" if override else value
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(f'[build.build-args]\nVALUE = "{default}"\n{value} = {{}}\n')
+    monkeypatch.delenv("IMAGE", raising=False)
+    monkeypatch.delenv("EXPECTED_REF", raising=False)
+    extra = ["--build-arg", f"VALUE={value}"] if override else []
+
+    with pytest.raises(SystemExit) as error:
+        run_cli(monkeypatch, command, "--config", str(config), *extra)
+
+    assert error.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert value not in diagnostic
+    assert "Missing required build argument(s): <redacted>." in diagnostic
+    assert recording == []
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
 def test_devloop_cli_runtime_metadata_overrides(tmp_path, monkeypatch, recording, command):
     config = tmp_path / "pycontainer.toml"
     ca_file = tmp_path / "ca.pem"
@@ -687,6 +710,26 @@ def test_devloop_build_failure_stops_before_push(tmp_path, monkeypatch, recordin
     with pytest.raises(RuntimeError, match="synthetic build failure"):
         run_cli(monkeypatch, *argv)
     assert recording[0].pushes == []
+    assert not (tmp_path / "ref").exists()
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_builder_initialization_error_propagates(tmp_path, monkeypatch, recording, command):
+    def fail_init(_config):
+        raise ValueError("synthetic initialization failure")
+
+    monkeypatch.setattr(cli, "ImageBuilder", fail_init)
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        argv = [command]
+    else:
+        argv = [command, "--image", "localhost:5000/a", "--output-ref", str(tmp_path / "ref")]
+
+    with pytest.raises(ValueError, match="synthetic initialization failure"):
+        run_cli(monkeypatch, *argv)
+    assert recording == []
     assert not (tmp_path / "ref").exists()
 
 

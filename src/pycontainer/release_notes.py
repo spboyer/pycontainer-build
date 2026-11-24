@@ -68,13 +68,18 @@ def release_notes_path(context_dir: str, release_notes_file: str) -> Path:
 
 def release_notes_labels(config) -> Dict[str, str]:
     """Return the generated release-notes label, rejecting explicit label collisions."""
+    from .config import _is_generated_label
+
     validate_release_notes_settings(config.release_notes_file, config.release_notes_label)
     if config.release_notes_file is None:
         return {}
     path = release_notes_path(config.context_dir, config.release_notes_file)
     generated = {config.release_notes_label: read_release_notes(path)}
+    labels = config.labels
+    if _is_generated_label(config):
+        labels = {key: value for key, value in labels.items() if key != "framework"}
     try:
-        merge_image_labels(labels=config.labels, generated_labels=generated)
+        merge_image_labels(labels=labels, generated_labels=generated)
     except ValueError as error:
         raise ReleaseNotesError(str(error)) from None
     return generated

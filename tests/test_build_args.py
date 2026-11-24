@@ -1,8 +1,14 @@
 """Build argument grammar, one-pass expansion and image/cache boundaries."""
+import configparser
+import errno
 import json
 import logging
 import sys
 import tarfile
+import tomllib
+import traceback
+from copy import copy, deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,13 +17,15 @@ import pytest
 from pycontainer import cli
 from pycontainer import auth as auth_module
 from pycontainer import builder as builder_module
+from pycontainer import dependencies as dependencies_module
 from pycontainer.auth import RegistryAuth
 from pycontainer.build_args import resolve_arguments
 from pycontainer.builder import ImageBuilder
 from pycontainer.cache import LayerCache
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
-from pycontainer.registry_client import RegistryClient
+from pycontainer.project import declared_dependency_names
+from pycontainer.registry_client import RegistryClient, RegistryConnectionError
 from pycontainer.system_packages import report_system_packages
 
 
@@ -91,6 +99,407 @@ def test_interpolation_is_one_pass_and_does_not_read_environment(monkeypatch, te
     )
     assert config.labels == {"result": expected, "${A}": "unchanged-key"}
     assert config.env == {}
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_keeps_expanded_dollars_literal_and_expands_new_values(copy_kind):
+    original = BuildConfig(
+        build_args={"A": "${B}", "B": "expanded"},
+        cmd=["echo", "${A}", "$${B}"],
+        env={"VALUE": "${A}"},
+        labels={"literal": "$${B}"},
+    )
+    if copy_kind == "replace":
+        copied = replace(original, env={**original.env, "NEW": "${B}"})
+    else:
+        data = json.loads(json.dumps(asdict(original)))
+        data["env"]["NEW"] = "${B}"
+        copied = BuildConfig(**data)
+
+    assert copied.cmd == ["echo", "${B}", "${B}"]
+    assert copied.env == {"VALUE": "${B}", "NEW": "expanded"}
+    assert copied.labels == {"literal": "${B}"}
+    assert original.env == {"VALUE": "${B}"}
+    moved = replace(copied, cmd=["env", *copied.cmd])
+    assert moved.cmd == ["env", "echo", "${B}", "${B}"]
+
+
+def test_config_copy_with_new_arguments_keeps_existing_values_and_redaction():
+    original = BuildConfig(build_args={"A": "old-value"}, env={"VALUE": "${A}"})
+    copied = replace(original, build_args={"A": "new-value"}, cmd=["${A}"])
+
+    assert copied.env == {"VALUE": "old-value"}
+    assert copied.cmd == ["new-value"]
+    assert copied.redact("old-value and new-value") == "<redacted> and <redacted>"
+    cleared = replace(copied, build_args=None)
+    assert cleared.redact("old-value and new-value") == "<redacted> and <redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_retains_redaction_after_in_place_argument_clear(copy_kind):
+    original = BuildConfig(build_args={"VALUE": "synthetic-copy-marker"})
+    original.build_args.clear()
+
+    if copy_kind == "replace":
+        copied = replace(original)
+    else:
+        copied = BuildConfig(**json.loads(json.dumps(asdict(original))))
+
+    assert copied.redact("synthetic-copy-marker") == "<redacted>"
+
+
+@pytest.mark.parametrize("copier", [copy, deepcopy], ids=["shallow", "deep"])
+def test_copy_observes_updated_build_arguments_before_they_are_cleared(copier):
+    config = BuildConfig(build_args={"VALUE": "original-copy-marker"})
+    config.build_args["VALUE"] = "updated-copy-marker"
+    copied = copier(config)
+    copied.build_args.clear()
+
+    assert copied.redact("original-copy-marker updated-copy-marker") == "<redacted> <redacted>"
+
+
+@pytest.mark.parametrize("mutation", ["assignment", "update", "nested-default"])
+def test_current_in_place_argument_updates_are_redacted_at_builder_boundary(
+    tmp_path, capsys, mutation
+):
+    previous, current = "previous-marker-205", "updated-marker-205"
+    declaration = {"default": previous} if mutation == "nested-default" else previous
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": declaration}
+    )
+    if mutation == "assignment":
+        config.build_args["VALUE"] = current
+    elif mutation == "update":
+        config.build_args.update({"VALUE": current})
+    else:
+        config.build_args["VALUE"]["default"] = current
+
+    builder = ImageBuilder(config)
+    builder._print(f"diagnostic {previous} {current}")
+    output = capsys.readouterr().out
+    assert previous not in output and current not in output
+    assert output.count("<redacted>") == 2
+    assert config.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+    config.build_args.clear()
+    assert config.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+
+@pytest.mark.parametrize("arguments", [None, {}, {"EMPTY": ""}])
+@pytest.mark.parametrize("phase", ["initialize", "build"])
+@pytest.mark.parametrize("kind", ["os", "ini", "toml"])
+def test_cli_preserves_unrelated_exception_causes_without_redactable_values(
+    tmp_path, monkeypatch, arguments, phase, kind
+):
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args=arguments)
+    cause = RuntimeError("original cause")
+    if kind == "toml":
+        with pytest.raises(tomllib.TOMLDecodeError) as parsed:
+            tomllib.loads("invalid = [")
+        failure = parsed.value
+    else:
+        failure = (
+            OSError("unrelated build failure") if kind == "os"
+            else configparser.Error("unrelated build failure")
+        )
+    failure.__cause__ = cause
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "__init__" if phase == "initialize" else "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(type(failure)) as error:
+        cli.main()
+    assert error.value is failure
+    assert error.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("phase", ["initialize", "build"])
+@pytest.mark.parametrize(
+    ("kind", "exit_code"),
+    [
+        ("operational", 2), ("configparser", 2), ("release-notes", 2),
+        ("history", 1), ("scanner", 3),
+    ],
+)
+def test_cli_redacts_unrelated_exception_after_build_arguments_are_cleared(
+    tmp_path, monkeypatch, capsys, phase, kind, exit_code
+):
+    from pycontainer.history import HistoryStorageError
+    from pycontainer.release_notes import ReleaseNotesError
+    from pycontainer.scanning import ScanError
+
+    marker = "retained-marker-205"
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": marker})
+    config.build_args.clear()
+
+    def fail(*args, **kwargs):
+        errors = {
+            "operational": OSError(f"failure {marker}"),
+            "configparser": configparser.Error(f"failure {marker}"),
+            "release-notes": ReleaseNotesError(f"failure {marker}"),
+            "history": HistoryStorageError(f"failure {marker}"),
+            "scanner": ScanError("findings", f"failure {marker}"),
+        }
+        raise errors[kind] from ValueError(f"cause {marker}")
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "__init__" if phase == "initialize" else "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == exit_code
+    stderr = capsys.readouterr().err
+    assert marker not in stderr
+    assert "<redacted>" in stderr
+    assert "Traceback" not in stderr
+    assert marker not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize("kind", ["release-notes", "history", "scanner"])
+def test_cli_known_error_exit_keeps_context_without_redactable_values(
+    tmp_path, monkeypatch, kind
+):
+    from pycontainer.history import HistoryStorageError
+    from pycontainer.release_notes import ReleaseNotesError
+    from pycontainer.scanning import ScanError
+
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""})
+    errors = {
+        "release-notes": ReleaseNotesError("failure"),
+        "history": HistoryStorageError("failure"),
+        "scanner": ScanError("findings", "failure"),
+    }
+    failure = errors[kind]
+    cause = RuntimeError("original cause")
+    failure.__cause__ = cause
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli.ImageBuilder, "build", fail)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.__context__ is failure
+    assert error.value.__context__.__cause__ is cause
+    assert not error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_copy_with_cleared_arguments_retains_unobserved_in_place_update(copy_kind):
+    previous, current = "previous-marker-205", "updated-marker-205"
+    config = BuildConfig(build_args={"VALUE": previous})
+    config.build_args.update({"VALUE": current})
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = None
+        copied = BuildConfig(**data)
+
+    assert copied.redact(f"{previous} {current}") == "<redacted> <redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_argument_added_after_unexpanded_config_survives_copy_redaction(copy_kind):
+    config = BuildConfig(cmd=["${VALUE}"])
+    config.build_args = {"VALUE": "current-marker-205"}
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = None
+        copied = BuildConfig(**data)
+
+    assert copied.redact("current-marker-205") == "<redacted>"
+    assert copied.cmd == ["${VALUE}"]
+    assert replace(copied, build_args={"VALUE": "expanded"}).cmd == ["expanded"]
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_snapshot_equal_overrides_remain_literal_when_arguments_change(copy_kind):
+    original = BuildConfig(
+        build_args={"A": "${B}", "B": "old-value"},
+        workdir="/${A}", cmd=["${A}"], env={"VALUE": "${A}"},
+    )
+    overrides = {
+        "build_args": {"B": "new-value"},
+        "workdir": "/${B}",
+        "cmd": ["${B}"],
+        "env": {"VALUE": "${B}"},
+    }
+    if copy_kind == "replace":
+        copied = replace(original, **overrides)
+    else:
+        data = json.loads(json.dumps(asdict(original)))
+        data.update(overrides)
+        copied = BuildConfig(**data)
+
+    assert copied.workdir == "/${B}"
+    assert copied.cmd == ["${B}"]
+    assert copied.env == {"VALUE": "${B}"}
+    assert copied.redact("old-value new-value ${B}") == "<redacted> <redacted> <redacted>"
+    cleared = replace(copied, build_args=None)
+    assert {"old-value", "new-value"} <= set(asdict(cleared)["_build_args_expansion_state"]["redactions"])
+
+    fresh = BuildConfig(**overrides)
+    assert (fresh.workdir, fresh.cmd, fresh.env) == (
+        "/new-value", ["new-value"], {"VALUE": "new-value"}
+    )
+
+
+def test_config_copy_expands_new_duplicate_list_entries():
+    original = BuildConfig(build_args={"A": "${B}", "B": "expanded"}, cmd=["${A}"])
+
+    copied = replace(original, cmd=[*original.cmd, "${B}"])
+
+    assert copied.cmd == ["${B}", "expanded"]
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_expands_values_mutated_after_construction(copy_kind):
+    removed = "removed-explicit-environment-value"
+    original = BuildConfig(
+        build_args={"A": "old-value", "B": "${A}"},
+        cmd=["echo", "${B}"], env={"KEEP": "${B}", "REMOVE": removed},
+        labels={"keep": "${B}"},
+    )
+    original.cmd.append("${A}")
+    original.env["NEW"] = "${A}"
+    del original.env["REMOVE"]
+    original.labels["new"] = "${A}"
+    original.workdir = "/${A}"
+
+    if copy_kind == "replace":
+        copied = replace(original, build_args={"A": "new-value", "B": "${A}"})
+    else:
+        serialized = json.dumps(asdict(original))
+        assert removed not in serialized
+        data = json.loads(serialized)
+        data["build_args"]["A"] = "new-value"
+        copied = BuildConfig(**data)
+
+    assert copied.cmd == ["echo", "${A}", "new-value"]
+    assert copied.env == {"KEEP": "${A}", "NEW": "new-value"}
+    assert copied.labels == {"keep": "${A}", "new": "new-value"}
+    assert copied.workdir == "/new-value"
+
+    cleared = replace(original, build_args=None)
+    if copy_kind == "replace":
+        resumed = replace(cleared, build_args={"A": "new-value", "B": "${A}"})
+    else:
+        data = json.loads(json.dumps(asdict(cleared)))
+        data["build_args"] = {"A": "new-value", "B": "${A}"}
+        resumed = BuildConfig(**data)
+    assert resumed.cmd == copied.cmd
+    assert resumed.env == copied.env
+    assert resumed.labels == copied.labels
+    assert resumed.workdir == copied.workdir
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_config_copy_preserves_generated_literal_paths_when_commands_change(
+    tmp_path, copy_kind,
+):
+    script = "demo_${UNDECLARED}.py"
+    (tmp_path / script).write_text("import streamlit as st\nst.write('hello')\n")
+    (tmp_path / "requirements.txt").write_text("streamlit\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["demo_$${UNDECLARED}.py", "requirements.txt"],
+        use_cache=False, build_args={"PORT": "old-value"},
+    )
+    ImageBuilder(config)
+    config.entrypoint.append("${PORT}")
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args={"PORT": "new-value"})
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"]["PORT"] = "new-value"
+        copied = BuildConfig(**data)
+
+    assert copied.entrypoint[2] == script
+    assert copied.entrypoint[-1] == "new-value"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+@pytest.mark.parametrize("assign_arguments", [False, True])
+def test_new_arguments_do_not_reexpand_framework_defaults_generated_without_arguments(
+    tmp_path, copy_kind, assign_arguments
+):
+    script = "demo_${UNDECLARED}.py"
+    (tmp_path / script).write_text("import streamlit as st\nst.write('hello')\n")
+    (tmp_path / "requirements.txt").write_text("streamlit\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, env={"USER": "${VALUE}"},
+        labels={"user": "${VALUE}"},
+    )
+    ImageBuilder(config)
+    if assign_arguments:
+        config.build_args = {"VALUE": "current"}
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args={"VALUE": "current"})
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = {"VALUE": "current"}
+        copied = BuildConfig(**data)
+
+    assert copied.entrypoint[2] == script
+    assert copied.env["USER"] == "current"
+    assert copied.labels["user"] == "current"
+    assert copied.redact("current") == "<redacted>"
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+def test_new_arguments_expand_mutated_generated_command_entries(tmp_path, copy_kind):
+    script = "demo_${UNDECLARED}.py"
+    (tmp_path / script).write_text("import streamlit as st\nst.write('hello')\n")
+    (tmp_path / "requirements.txt").write_text("streamlit\n")
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False)
+    ImageBuilder(config)
+    config.entrypoint.append("${VALUE}")
+
+    if copy_kind == "replace":
+        copied = replace(config, build_args={"VALUE": "current"})
+    else:
+        data = json.loads(json.dumps(asdict(config)))
+        data["build_args"] = {"VALUE": "current"}
+        copied = BuildConfig(**data)
+
+    assert copied.entrypoint[2] == script
+    assert copied.entrypoint[-1] == "current"
+
+
+@pytest.mark.parametrize("failure", ["retained-resolution", "current-resolution", "interpolation"])
+def test_config_copy_redacts_previous_arguments_from_construction_errors(failure):
+    original = BuildConfig(build_args={"SECRET": "private_input"})
+    value = "current_input" if failure == "current-resolution" else "private_input"
+
+    with pytest.raises(ValueError) as error:
+        if failure == "retained-resolution":
+            replace(original, build_args={"private_input": {}})
+        elif failure == "current-resolution":
+            replace(original, build_args={"current_input": {}, "OTHER": "current_input"})
+        else:
+            replace(original, build_args={}, cmd=["${private_input}"])
+
+    assert value not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_invalid_serialized_expansion_state_is_rejected():
+    with pytest.raises(ValueError, match="Invalid serialized build-argument expansion state"):
+        BuildConfig(build_args={}, _build_args_expansion_state={"values": {}})
 
 
 @pytest.mark.parametrize(
@@ -317,8 +726,380 @@ def test_security_fragment_output_path_redacts_build_arguments(tmp_path, monkeyp
     assert "<redacted>" in caplog.text
 
 
+def test_direct_build_redacts_framework_source_warnings_after_arguments_are_cleared(
+    tmp_path, caplog
+):
+    value = "private_module"
+    (tmp_path / f"{value}.py").write_text("from fastapi import FastAPI\napp = FastAPI(\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        cmd=["python"], use_cache=False, build_args={"SOURCE": value},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(replace(config, build_args=None))
+
+    assert "Cannot inspect" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+@pytest.mark.parametrize("include_paths", [None, ["app.py"]], ids=["default", "explicit"])
+def test_direct_build_redacts_requirements_discovery_warnings_after_arguments_are_cleared(
+    tmp_path, monkeypatch, caplog, include_paths
+):
+    value = "private_requirements"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    (tmp_path / f"{value}.txt").write_text("-r ${UNSET_REQUIREMENTS_FILE}\n")
+    monkeypatch.delenv("UNSET_REQUIREMENTS_FILE", raising=False)
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=include_paths,
+        requirements_file="${SOURCE}.txt", use_cache=False,
+        build_args={"SOURCE": value},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ImageBuilder(replace(config, build_args=None))
+
+    assert "unresolved requirements include" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+def test_direct_build_redacts_framework_errors_after_arguments_are_cleared(tmp_path):
+    value = "private_module"
+    (tmp_path / f"{value}.py").write_text(
+        "from fastapi import FastAPI\ndef create():\n    return FastAPI()\n"
+    )
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        use_cache=False, build_args={"SOURCE": value},
+    )
+
+    with pytest.raises(ValueError, match="Cannot determine an importable FastAPI") as error:
+        ImageBuilder(replace(config, build_args=None))
+
+    assert value not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_direct_build_redacts_requirements_install_warning_after_arguments_are_cleared(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    value = "private_requirements"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    (tmp_path / f"{value}.txt").write_text("fixture-dep\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"],
+        requirements_file="${SOURCE}.txt", use_cache=False, include_deps=True,
+        build_args={"SOURCE": value, "PIP_SETTING": "PIP_TARGET"},
+    )
+    builder = ImageBuilder(replace(config, build_args=None))
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8",
+            "PYTHON_LIBC=glibc-2.17",
+        ]},
+    }
+
+    def fail_before_pip(*args, **kwargs):
+        raise OSError("pip start blocked by test")
+
+    monkeypatch.setenv("PIP_TARGET", str(tmp_path / "ignored"))
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", fail_before_pip)
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="Unable to start pip"):
+        builder._create_deps_layer(tmp_path, base_config=base_config)
+
+    assert "not fully pinned" in caplog.text
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    output = capsys.readouterr().out
+    assert "Ignoring host pip settings" in output
+    assert "PIP_TARGET" not in output
+    assert "<redacted>" in output
+
+
+def test_direct_build_redacts_missing_requirements_after_arguments_are_cleared(tmp_path):
+    value = "private_requirements"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"], use_cache=False,
+        requirements_file="${SOURCE}.txt", include_deps=True,
+        build_args={"SOURCE": value},
+    )
+    builder = ImageBuilder(replace(config, build_args=None))
+
+    with pytest.raises(FileNotFoundError) as error:
+        builder._create_deps_layer(tmp_path)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+@pytest.mark.parametrize("include_paths", [None, ["app.py"]], ids=["default", "explicit"])
+def test_invalid_requirements_path_redacts_retained_arguments_in_traceback(
+    tmp_path, include_paths
+):
+    value = "private_requirements_path"
+    (tmp_path / "app.py").write_text("print('hello')\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=include_paths, use_cache=False,
+        requirements_file="${SOURCE}/../requirements.txt",
+        build_args={"SOURCE": value},
+    )
+    config.build_args.clear()
+
+    with pytest.raises(ValueError, match="Context paths must be relative") as error:
+        ImageBuilder(config)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_source_read_error_redacts_retained_arguments_in_traceback(tmp_path, monkeypatch):
+    value = "private_source_error_marker"
+    source = tmp_path / "app.py"
+    source.write_text("print('hello')\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["app.py"], use_cache=False,
+        build_args={"VALUE": value},
+    )
+    config.build_args.clear()
+    original_open = Path.open
+
+    def deny_source(path, *args, **kwargs):
+        if path == source:
+            raise PermissionError(errno.EACCES, f"Permission denied: {value}", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_source)
+    with pytest.raises(PermissionError) as error:
+        ImageBuilder(config)
+
+    assert error.value.errno == errno.EACCES
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_setup_cfg_parse_error_redacts_retained_arguments_in_traceback(tmp_path):
+    value = "private_setup_cfg_marker"
+    (tmp_path / "setup.cfg").write_text(f"[options]\n{value}\n")
+    config = BuildConfig(build_args={"VALUE": value})
+    config.build_args.clear()
+
+    with pytest.raises(ValueError, match="Invalid setup.cfg") as error:
+        declared_dependency_names(tmp_path, log_redact=config.redact)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_discovery_preserves_unredacted_requirement_read_error(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n")
+    failure = PermissionError(errno.EACCES, "Permission denied", str(requirements))
+    original_open = Path.open
+
+    def deny_requirements(path, *args, **kwargs):
+        if path == requirements:
+            raise failure
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_requirements)
+    with pytest.raises(PermissionError) as error:
+        declared_dependency_names(tmp_path)
+
+    assert error.value is failure
+
+
+@pytest.mark.parametrize("add_value", [False, True])
+def test_dependency_staging_redactor_observes_arguments_added_after_staging_begins(
+    tmp_path, monkeypatch, add_value
+):
+    value = "private_late_dependency_marker"
+    (tmp_path / "requirements.txt").write_text("example==1.0\n")
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, include_deps=True,
+        build_args={"VALUE": ""},
+    )
+    builder = ImageBuilder(config)
+    base_config = {
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Env": [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.8",
+            "PYTHON_LIBC=glibc-2.17",
+        ]},
+    }
+
+    failure = OSError(f"Cannot start pip: {value}" if add_value else "Unrelated spawn failure")
+
+    def fail_pip(*args, **kwargs):
+        if add_value:
+            config.build_args["VALUE"] = value
+        raise failure
+
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", fail_pip)
+    with pytest.raises(RuntimeError, match="Unable to start pip") as error:
+        builder._create_deps_layer(tmp_path, base_config=base_config)
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is (None if add_value else failure)
+
+
+def test_requirements_install_redacts_missing_include_after_arguments_are_cleared(tmp_path):
+    value = "private_requirements"
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(f"-r {value}.txt\n")
+    config = replace(BuildConfig(build_args={"SOURCE": value}), build_args=None)
+    base_config = {"config": {"Env": ["PYTHON_LIBC=glibc-2.17"]}}
+
+    with pytest.raises(FileNotFoundError) as error:
+        dependencies_module.install_requirements(
+            requirements, tmp_path / "site-packages", tmp_path, "linux", "amd64",
+            "3.11", "python:3.11-slim", base_config,
+            base_image_tag_verified=True, log_redact=config.redact,
+        )
+
+    assert error.value.errno == errno.ENOENT
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+@pytest.mark.parametrize("operation", ["install", "discovery"])
+def test_requirements_read_failure_preserves_errno_and_redacts_retained_arguments(
+    tmp_path, monkeypatch, operation
+):
+    value = "private_requirements"
+    requirements = tmp_path / f"{value}.txt"
+    requirements.write_text("example==1.0\n")
+    config = replace(BuildConfig(build_args={"SOURCE": value}), build_args=None)
+    original_open = Path.open
+
+    def deny_requirements(path, *args, **kwargs):
+        if path == requirements:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_requirements)
+    with pytest.raises(PermissionError) as error:
+        if operation == "install":
+            dependencies_module._scan_requirements(
+                requirements, tmp_path, log_redact=config.redact
+            )
+        else:
+            declared_dependency_names(
+                tmp_path, requirements.name, log_redact=config.redact
+            )
+
+    assert error.value.errno == errno.EACCES
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+def test_requirements_read_failure_redacts_error_details_not_present_in_path(
+    tmp_path, monkeypatch
+):
+    value = "private_failure"
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n")
+    config = replace(BuildConfig(build_args={"VALUE": value}), build_args=None)
+    original_open = Path.open
+
+    def deny_requirements(path, *args, **kwargs):
+        if path == requirements:
+            raise PermissionError(errno.EACCES, f"Permission denied: {value}", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_requirements)
+    with pytest.raises(PermissionError) as error:
+        dependencies_module._scan_requirements(
+            requirements, tmp_path, log_redact=config.redact
+        )
+
+    assert error.value.errno == errno.EACCES
+    assert value not in "".join(traceback.format_exception(error.value))
+    assert "<redacted>" in str(error.value)
+
+
+@pytest.mark.parametrize("operation", ["install", "discovery"])
+def test_environment_requirements_read_failure_hides_the_entire_path(
+    tmp_path, monkeypatch, operation
+):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("-r ${NESTED_REQUIREMENTS}\n")
+    nested = tmp_path / "private-environment-path.txt"
+    nested.write_text("example==1.0\n")
+    monkeypatch.setenv("NESTED_REQUIREMENTS", nested.name)
+    original_open = Path.open
+
+    def deny_nested(path, *args, **kwargs):
+        if path == nested:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_nested)
+    with pytest.raises(PermissionError) as error:
+        if operation == "install":
+            dependencies_module._scan_requirements(requirements, tmp_path)
+        else:
+            declared_dependency_names(tmp_path)
+
+    assert error.value.errno == errno.EACCES
+    assert nested.name not in "".join(traceback.format_exception(error.value))
+    assert "<environment-based requirements file>" in str(error.value)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("failure", ["exit", "spawn"])
+def test_pip_failure_redacts_retained_build_arguments(tmp_path, monkeypatch, locked, failure):
+    value = "private_failure"
+    config = replace(BuildConfig(build_args={"VALUE": value}), build_args=None)
+    base_config = {"config": {"Env": ["PYTHON_LIBC=glibc-2.17"]}}
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n")
+
+    class FailedPip:
+        def wait(self, timeout):
+            return 1
+
+    def fake_pip(*args, stderr, **kwargs):
+        if failure == "spawn":
+            raise OSError(f"Cannot start {value}")
+        stderr.write(f"ERROR: Cannot install {value}\n".encode())
+        stderr.flush()
+        return FailedPip()
+
+    monkeypatch.setattr(dependencies_module.subprocess, "Popen", fake_pip)
+    with pytest.raises(RuntimeError) as error:
+        if locked:
+            dependencies_module.install_locked_requirements(
+                [("https://example.test/simple", "example==1.0\n")],
+                tmp_path / "stage" / "site-packages", tmp_path, "linux", "amd64",
+                "3.11", "python:3.11-slim", base_config,
+                base_image_tag_verified=True, log_redact=config.redact,
+            )
+        else:
+            dependencies_module.install_requirements(
+                requirements, tmp_path / "stage" / "site-packages", tmp_path,
+                "linux", "amd64", "3.11", "python:3.11-slim", base_config,
+                base_image_tag_verified=True, log_redact=config.redact,
+            )
+
+    assert value not in "".join(traceback.format_exception(error.value))
+    if failure == "exit":
+        assert "<redacted>" in str(error.value)
+    else:
+        assert "Unable to start pip" in str(error.value)
+
+
 @pytest.mark.parametrize("operation", ["pull", "push"])
-def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, caplog, operation):
+@pytest.mark.parametrize("copy_args", ["original", "empty", "none", "cleared", "json"])
+def test_direct_build_redacts_registry_rate_limit_logs(
+    tmp_path, monkeypatch, caplog, capsys, operation, copy_args
+):
     value = "private-registry"
     config = BuildConfig(
         base_image="${REGISTRY}.example/team/base:v1",
@@ -328,6 +1109,12 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
         output_dir=str(tmp_path / "out"),
         use_cache=False,
     )
+    if copy_args in {"empty", "none"}:
+        config = replace(config, build_args={} if copy_args == "empty" else None)
+    elif copy_args in {"cleared", "json"}:
+        config.build_args = None
+        if copy_args == "json":
+            config = BuildConfig(**json.loads(json.dumps(asdict(config))))
     builder = ImageBuilder(config)
     monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
 
@@ -354,16 +1141,141 @@ def test_direct_build_redacts_registry_rate_limit_logs(tmp_path, monkeypatch, ca
 
     assert "rate limit" in caplog.text
     assert value not in caplog.text
+    assert value not in capsys.readouterr().out
 
 
-def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
-    value = "privatehost"
+def test_registry_redactor_observes_current_arguments_before_they_are_cleared(
+    tmp_path, caplog
+):
+    previous, current = "previous-registry-205", "current-registry-205"
     config = BuildConfig(
-        base_image="${REGISTRY}.azurecr.io/team/base:v1",
+        context_dir=str(tmp_path), use_cache=False, build_args={"VALUE": previous}
+    )
+    config.build_args["VALUE"] = current
+    builder = ImageBuilder(config)
+
+    client = builder._registry_client("registry.example", "app", RegistryAuth())
+    config.build_args.clear()
+    with caplog.at_level(logging.WARNING):
+        client._observe_rate_limit(
+            {"ratelimit-limit": "100", "ratelimit-remaining": "0"},
+            f"https://{previous}-{current}.example",
+        )
+
+    assert previous not in caplog.text and current not in caplog.text
+    assert caplog.text.count("<redacted>") == 2
+
+
+@pytest.mark.parametrize("arguments", [None, {"EMPTY": ""}])
+def test_registry_redactor_observes_arguments_added_after_client_creation(
+    tmp_path, caplog, arguments
+):
+    value = "late-registry-value-205"
+    config = BuildConfig(context_dir=str(tmp_path), use_cache=False, build_args=arguments)
+    client = ImageBuilder(config)._registry_client("registry.example", "app", RegistryAuth())
+    if config.build_args is None:
+        config.build_args = {}
+    config.build_args["VALUE"] = value
+
+    with caplog.at_level(logging.WARNING):
+        client._observe_rate_limit(
+            {"ratelimit-limit": "100", "ratelimit-remaining": "0"},
+            f"https://{value}.example",
+        )
+
+    config.build_args.clear()
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert config.redact(value) == "<redacted>"
+
+
+def test_mirror_redactors_observe_arguments_added_after_client_creation(
+    tmp_path, monkeypatch, caplog
+):
+    value = "late-mirror-value-205"
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""},
+        registry_mirrors={"base.example": ["mirror.azurecr.io"]},
+    )
+    client = ImageBuilder(config)._base_image_client("base.example", "app")
+    config.build_args["VALUE"] = value
+    monkeypatch.setattr(
+        auth_module.DockerConfigAuthProvider, "get_credentials", lambda *args: None
+    )
+
+    def fail_auth(*args, **kwargs):
+        raise OSError(value)
+
+    def pull_manifest(registry, *args, **kwargs):
+        if registry.registry == "mirror.azurecr.io":
+            raise RegistryConnectionError("mirror unavailable")
+        return {}, None
+
+    monkeypatch.setattr(auth_module.subprocess, "run", fail_auth)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *args, **kwargs: RegistryAuth())
+    monkeypatch.setattr(RegistryClient, "pull_manifest", pull_manifest)
+
+    with caplog.at_level(logging.WARNING):
+        client.pull_manifest(value)
+
+    config.build_args.clear()
+    assert "Azure CLI authentication failed" in caplog.text
+    assert "Registry mirror" in caplog.text
+    assert value not in caplog.text
+    assert caplog.text.count("<redacted>") >= 2
+    assert config.redact(value) == "<redacted>"
+
+
+def test_cli_logging_observes_arguments_added_after_filter_setup(
+    tmp_path, monkeypatch, caplog
+):
+    value = "late-cli-value-205"
+    config = BuildConfig(
+        context_dir=str(tmp_path), use_cache=False, build_args={"EMPTY": ""}
+    )
+
+    class LoggingBuilder:
+        def __init__(self, config):
+            config.build_args["VALUE"] = value
+
+        def build(self):
+            logging.getLogger(__name__).warning("diagnostic %s", value)
+            return "app:latest"
+
+    monkeypatch.setattr(cli, "resolve_build_config", lambda *args: (config, None))
+    monkeypatch.setattr(cli, "ImageBuilder", LoggingBuilder)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--context", str(tmp_path)])
+
+    with caplog.at_level(logging.WARNING):
+        cli.main()
+
+    config.build_args.clear()
+    assert value not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert config.redact(value) == "<redacted>"
+
+
+@pytest.mark.parametrize("operation", ["pull", "mirror", "push"])
+@pytest.mark.parametrize("cleared", [False, True], ids=["configured", "cleared"])
+def test_direct_build_redacts_azure_auth_logs(
+    tmp_path, monkeypatch, caplog, operation, cleared
+):
+    value = "privatehost"
+    registry = f"{value}.azurecr.io"
+    config = BuildConfig(
+        base_image=(
+            "base.example/team/base:v1" if operation == "mirror"
+            else "${REGISTRY}.azurecr.io/team/base:v1"
+        ),
+        tag="${REGISTRY}.azurecr.io/team/app:v1",
+        registry_mirrors={"base.example": [registry]} if operation == "mirror" else {},
         build_args={"REGISTRY": value},
         context_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
         use_cache=False,
     )
+    if cleared:
+        config.build_args = None
     for provider in (auth_module.EnvironmentAuthProvider, auth_module.DockerConfigAuthProvider):
         monkeypatch.setattr(provider, "get_token", lambda self, registry: None)
         monkeypatch.setattr(provider, "get_credentials", lambda self, registry: None)
@@ -374,12 +1286,27 @@ def test_direct_build_redacts_azure_auth_logs(tmp_path, monkeypatch, caplog):
         RegistryClient, "pull_manifest",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
     )
+    monkeypatch.setattr(
+        RegistryClient, "push_blob",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stopped after auth")),
+    )
+    builder = ImageBuilder(config)
+    builder.manifest_digest = "sha256:" + "a" * 64
+    builder.config_digest = "sha256:" + "b" * 64
+    builder.layers = []
+    manifest = tmp_path / "out" / "blobs" / "sha256" / ("a" * 64)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"{}")
 
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="stopped"):
-        ImageBuilder(config)._pull_base_image(tmp_path / "layers", "linux", "amd64")
+        if operation == "push":
+            builder.push(show_progress=False)
+        else:
+            builder._pull_base_image(tmp_path / "layers", "linux", "amd64")
 
     assert "Azure CLI authentication failed" in caplog.text
     assert value not in caplog.text
+    assert "<redacted>" in caplog.text
 
 
 def test_direct_build_redacts_system_package_logs(tmp_path, monkeypatch, caplog):
@@ -475,6 +1402,88 @@ def test_build_cache_identity_and_no_implicit_runtime_leakage(tmp_path, monkeypa
         [(tmp_path / "app.py", Path("app.py"))],
         workdir=first.workdir, namespace=first.cache_identity("other-backend"),
     ) is None
+
+
+def test_empty_build_argument_still_hides_cache_source_paths(tmp_path, monkeypatch):
+    source = "private-source.py"
+    (tmp_path / source).write_text("print('hello')")
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    cache_dir = tmp_path / "cache"
+    config = BuildConfig(
+        context_dir=str(tmp_path), include_paths=[source], use_cache=True,
+        output_dir=str(tmp_path / "image"), cache_dir=str(cache_dir),
+        build_args={"EMPTY": ""},
+    )
+
+    ImageBuilder(config).build()
+
+    entries = json.loads((cache_dir / "index.json").read_text())
+    assert entries
+    assert all(entry["source_files"] == [] for entry in entries.values())
+    assert source not in json.dumps(entries)
+
+
+@pytest.mark.parametrize("arguments", [{}, None])
+def test_cache_hides_source_paths_after_arguments_are_cleared(tmp_path, monkeypatch, arguments):
+    value = "private-source"
+    (tmp_path / f"{value}.py").write_text("print('hello')")
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    cache_dir = tmp_path / "cache"
+    original = BuildConfig(
+        context_dir=str(tmp_path), include_paths=["${SOURCE}.py"],
+        output_dir=str(tmp_path / "image"), cache_dir=str(cache_dir),
+        build_args={"SOURCE": value},
+    )
+
+    ImageBuilder(replace(original, build_args=arguments)).build()
+
+    entries = json.loads((cache_dir / "index.json").read_text())
+    assert entries
+    assert all(entry["source_files"] == [] for entry in entries.values())
+    assert value not in json.dumps(entries)
+
+
+@pytest.mark.parametrize("copy_kind", ["replace", "json"])
+@pytest.mark.parametrize("persist_explicit", [False, True])
+def test_retained_arguments_do_not_implicitly_persist_in_build_outputs(
+    tmp_path, monkeypatch, copy_kind, persist_explicit
+):
+    previous, current = "private-previous-value", "private-current-value"
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    output, cache, history = (tmp_path / name for name in ("image", "cache", "history"))
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: ([], None))
+    original = BuildConfig(
+        context_dir=str(context), include_paths=["app.py"], output_dir=str(output),
+        cache_dir=str(cache), record_history=True, history_dir=str(history),
+        env={"EXPLICIT": "${VALUE}"} if persist_explicit else {},
+        build_args={"VALUE": previous},
+    )
+    changed = replace(original, build_args={"VALUE": current})
+    if copy_kind == "replace":
+        cleared = replace(changed, build_args=None)
+    else:
+        data = json.loads(json.dumps(asdict(changed)))
+        data["build_args"] = None
+        cleared = BuildConfig(**data)
+
+    builder = ImageBuilder(cleared)
+    builder.build()
+
+    metadata = json.loads(
+        (output / "blobs" / "sha256" / builder.config_digest.split(":")[1]).read_bytes()
+    )
+    assert (f"EXPLICIT={previous}" in metadata["config"].get("Env", [])) is persist_explicit
+    for directory in (output, cache, history):
+        files = [path for path in directory.rglob("*") if path.is_file()]
+        assert files
+        contents = b"".join(path.read_bytes() for path in files)
+        assert current.encode() not in contents
+        assert (previous.encode() in contents) is (persist_explicit and directory == output)
+    assert json.loads((history / "history.json").read_text())["records"][-1]["status"] == "success"
+    entries = json.loads((cache / "index.json").read_text())
+    assert entries and all(entry["source_files"] == [] for entry in entries.values())
 
 
 def test_storage_locations_do_not_invalidate_equal_source_layer(tmp_path):

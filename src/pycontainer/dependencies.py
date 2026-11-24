@@ -29,6 +29,7 @@ from .venv_markers import declared_roots, host_facts, venv_layout_os
 
 
 MAX_REQUIREMENTS_BYTES = 1024 * 1024
+MAX_REQUIREMENTS_NESTING = 64
 logger = logging.getLogger(__name__)
 MAX_ENTRY_POINTS_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
@@ -77,6 +78,7 @@ _DEBIAN_GLIBC_MINOR = {
 }
 _ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
+_REQUIREMENT_VARIABLE = re.compile(r"\$\{([A-Z0-9_]+)\}")
 _LAUNCHER_RECORD_PATH = re.compile(
     r"(?:\.\./\.\./Scripts|\.\./\.\./\.\./bin)/([^/:]+)", re.IGNORECASE
 )
@@ -232,12 +234,16 @@ def _base_environment(base_config: Optional[dict]) -> dict:
     return environment
 
 
+class UnsupportedLibcError(ValueError):
+    """The target base image's libc cannot be used for wheel staging."""
+
+
 def _parse_libc(libc: str) -> Tuple[str, int]:
     match = _LIBC_PATTERN.fullmatch(libc)
     family = match and (match.group(1) or match.group(3))
     minor = match and int(match.group(2) or match.group(4))
     if not match or (family == "glibc" and minor < _MIN_GLIBC_MINOR):
-        raise ValueError(
+        raise UnsupportedLibcError(
             f"Unsupported PYTHON_LIBC value {libc!r} in the base image config; "
             f"supported values are {_SUPPORTED_LIBC_TEXT}."
         )
@@ -471,20 +477,30 @@ def install_requirements(
     *,
     locked: bool = False,
     base_image_tag_verified: bool = False,
+    log_redact=str,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
-    target_options = _target_options(
-        os_name, arch, python_version, base_image, base_config,
-        base_image_tag_verified=base_image_tag_verified,
-        variant=variant,
+    try:
+        target_options = _target_options(
+            os_name, arch, python_version, base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+            variant=variant,
+        )
+    except ValueError as exc:
+        message = log_redact(str(exc))
+        if message != str(exc):
+            raise ValueError(message) from None
+        raise
+    _, requirement_files, hash_pinned = _scan_requirements(
+        requirements, context_dir, log_redact=log_redact
     )
-    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
         logger.warning(
-            "%s is not fully pinned with ==versions and --hash values, so the "
-            "dependency layer is not reproducible. Use a lockfile or "
-            "`pip-compile --generate-hashes`.",
-            requirements.name,
+            "%s", log_redact(
+                f"{requirements.name} is not fully pinned with ==versions and --hash values, "
+                "so the dependency layer is not reproducible. Use a lockfile or "
+                "`pip-compile --generate-hashes`."
+            ),
         )
     target = _target_text(os_name, arch, variant)
 
@@ -524,7 +540,7 @@ def install_requirements(
     environment = (
         _locked_pip_environment(destination.parent)
         if locked
-        else _pip_environment(destination.parent)
+        else _pip_environment(destination.parent, log_redact=log_redact)
     )
     # pip logs index HTTP failures only at debug level, so keep its debug log in
     # host temp space (never the tarred stage) to classify authentication errors.
@@ -540,6 +556,10 @@ def install_requirements(
                     stderr=pip_errors,
                 )
             except OSError as exc:
+                if log_redact(str(exc)) != str(exc):
+                    raise RuntimeError(
+                        "Unable to start pip for target dependency installation."
+                    ) from None
                 raise RuntimeError(
                     "Unable to start pip for target dependency installation."
                 ) from exc
@@ -565,7 +585,7 @@ def install_requirements(
 
     secrets = known_secrets(environment, _placeholder_names(requirement_files))
     if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
-        details = redact(_read_marker_error(error_file), secrets)
+        details = log_redact(redact(_read_marker_error(error_file), secrets))
         if returncode == _MARKER_ERROR_EXIT:
             raise ValueError(
                 "Cannot evaluate dependency environment markers for target "
@@ -583,7 +603,7 @@ def install_requirements(
             else ""
         )
         raise RuntimeError(
-            _pip_failure_message(
+            log_redact(_pip_failure_message(
                 redact(pip_output, secrets),
                 os_name,
                 arch,
@@ -591,7 +611,7 @@ def install_requirements(
                 redact(pip_debug, secrets),
                 _LOCKED_AUTH_HINT if locked else _AUTH_HINT,
                 variant,
-            ) + hint
+            ) + hint)
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -604,7 +624,7 @@ def install_requirements(
     return requirement_files
 
 
-def _pip_environment(temporary_dir: Path) -> dict:
+def _pip_environment(temporary_dir: Path, *, log_redact=str) -> dict:
     environment = {}
     ignored = []
     for name, value in os.environ.items():
@@ -614,10 +634,10 @@ def _pip_environment(temporary_dir: Path) -> dict:
             continue
         environment[name] = value
     if ignored:
-        print(
+        print(log_redact(
             "Ignoring host pip settings that could change target dependency "
             f"selection: {', '.join(sorted(ignored))}"
-        )
+        ))
     environment.update(
         {
             "TMP": str(temporary_dir),
@@ -764,6 +784,7 @@ def install_locked_requirements(
     *,
     variant: Optional[str] = None,
     base_image_tag_verified: bool = False,
+    log_redact=str,
 ) -> None:
     """Install each recorded index's packages from that index alone, then merge them."""
     requirement_sets = list(requirement_sets)
@@ -773,10 +794,12 @@ def install_locked_requirements(
             requirements = Path(temp) / f"locked-requirements-{number}.txt"
             target = destination if len(requirement_sets) == 1 else stage_root / f"locked-site-{number}"
             requirements.write_text(text, encoding="utf-8")
+            log_options = {"log_redact": log_redact} if log_redact is not str else {}
             install_requirements(
                 requirements, target, context_dir, os_name, arch, python_version,
                 base_image, base_config, variant=variant, locked=True,
                 base_image_tag_verified=base_image_tag_verified,
+                **log_options,
             )
             if target != destination:
                 _merge_site_packages(target, destination)
@@ -832,8 +855,60 @@ def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     return data.decode("utf-8-sig", errors)
 
 
-def _read_requirements_text(path: Path) -> str:
-    return _decode_requirements(path.read_bytes())
+def _logical_requirement_lines(
+    path, *, display=None, context_root=None, log_redact=str,
+    max_bytes=None, environment_path=False, size_error=ValueError,
+):
+    limit = MAX_REQUIREMENTS_BYTES if max_bytes is None else max_bytes
+    try:
+        with path.open("rb") as source:
+            data = source.read(limit + 1)
+    except OSError as error:
+        if environment_path:
+            if error.errno is not None:
+                arguments = [error.errno, "Cannot read requirements file", str(display)]
+                if getattr(error, "winerror", None) is not None:
+                    arguments.append(error.winerror)
+                raise type(error)(*arguments) from None
+            raise type(error)(f"Cannot read requirements file: {display}") from None
+        redacted_error = _redacted_os_error(error, log_redact)
+        if redacted_error is not error:
+            raise redacted_error from None
+        raise
+    if len(data) > limit:
+        raise size_error(
+            "Requirements files exceed the combined "
+            f"{MAX_REQUIREMENTS_BYTES}-byte limit."
+        )
+    text = _decode_requirements(data)
+    if context_root is not None:
+        shown = None if display is None or display == path else str(display)
+        reject_literal_credentials(path, text, context_root, shown=shown)
+
+    def lines():
+        continuation = ""
+        start_line = 1
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            if not continuation:
+                start_line = line_number
+            if raw_line.rstrip().endswith("\\"):
+                continuation += raw_line.rstrip()[:-1] + " "
+            else:
+                yield start_line, continuation + raw_line
+                continuation = ""
+        if continuation:
+            raise ValueError(
+                f"Requirements file has an incomplete line continuation: {display or path}"
+            )
+
+    return len(data), lines()
+
+
+def _expand_requirement_variables(line):
+    def expand(match):
+        return os.environ.get(match.group(1)) or match.group(0)
+
+    return _REQUIREMENT_VARIABLE.sub(expand, line)
 
 
 def validate_requirements(
@@ -849,59 +924,96 @@ def validate_requirements(
     return _scan_requirements(requirements, context_dir, check_overrides, constraints)[0]
 
 
+def _redacted_os_error(error: OSError, log_redact):
+    message = log_redact(str(error))
+    if message == str(error):
+        return error
+    if error.errno is None or error.strerror is None:
+        return type(error)(message)
+    arguments = [error.errno, log_redact(error.strerror)]
+    if error.filename is not None:
+        arguments.append(log_redact(os.fsdecode(error.filename)))
+        winerror = getattr(error, "winerror", None)
+        if winerror is not None or error.filename2 is not None:
+            arguments.extend((
+                winerror,
+                log_redact(os.fsdecode(error.filename2)) if error.filename2 is not None else None,
+            ))
+    return type(error)(*arguments)
+
+
 def _scan_requirements(
     requirements: Path,
     context_dir: Path,
     check_overrides: bool = True,
     constraints: Optional[List[str]] = None,
+    *,
+    log_redact=str,
 ) -> Tuple[List[str], List[Path], bool]:
     """Validate a local requirements graph and report roots, files and hash pinning."""
     context_root = context_dir.resolve()
-    pending = [(requirements.resolve(strict=True), False)]
+    logical_root = Path(os.path.abspath(context_dir))
+    initial_path = Path(os.path.abspath(requirements))
+    if not initial_path.is_relative_to(logical_root) and initial_path.is_relative_to(context_root):
+        initial_path = logical_root / initial_path.relative_to(context_root)
+    pending = [(initial_path, False, frozenset(), False)]
     visited = set()
-    counted_files = set()
+    parsed_files = {}
     total_bytes = 0
     hash_pinned = True
     roots = []
     while pending:
-        path, constraint = pending.pop()
-        visit = (path, constraint)
-        if visit in visited:
-            continue
+        path, environment_path, ancestors, constraint = pending.pop()
+        shown = log_redact(str(path))
+        display = (
+            "<environment-based requirements file>" if environment_path
+            else path if shown == str(path) else shown
+        )
         try:
-            path.relative_to(context_root)
-        except ValueError as exc:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements include.") from None
+            redacted_error = _redacted_os_error(error, log_redact)
+            if redacted_error is not error:
+                raise redacted_error from None
+            raise
+        except RuntimeError as error:
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements include.") from None
+            message = log_redact(str(error))
+            if message != str(error):
+                raise RuntimeError(message) from None
+            raise
+        if not path.is_relative_to(logical_root) or not resolved.is_relative_to(context_root):
             raise ValueError(
-                f"Requirements include must stay inside the build context: {path}"
-            ) from exc
-        visited.add(visit)
-        if path not in counted_files:
-            counted_files.add(path)
-            total_bytes += path.stat().st_size
-            if total_bytes > MAX_REQUIREMENTS_BYTES:
-                raise ValueError(
-                    "Requirements files exceed the combined "
-                    f"{MAX_REQUIREMENTS_BYTES}-byte limit."
-                )
-
-        text = _read_requirements_text(path)
-        reject_literal_credentials(path, text, context_root)
-        logical_lines = []
-        continuation = ""
-        for raw_line in text.splitlines():
-            if raw_line.rstrip().endswith("\\"):
-                continuation += raw_line.rstrip()[:-1] + " "
-                continue
-            logical_lines.append(continuation + raw_line)
-            continuation = ""
-        if continuation:
-            raise ValueError(f"Requirements file has an incomplete line continuation: {path}")
-
-        for line in logical_lines:
+                f"Requirements include must stay inside the build context: {display}"
+            )
+        if path in ancestors:
+            raise ValueError(f"Requirements include cycle in {display}.")
+        if (path, constraint) in visited:
+            continue
+        if len(ancestors) >= MAX_REQUIREMENTS_NESTING:
+            raise ValueError(
+                f"Requirements includes exceed the maximum nesting depth of {MAX_REQUIREMENTS_NESTING}."
+            )
+        visited.add((path, constraint))
+        # Interpret each role separately without re-reading the same logical file.
+        if path not in parsed_files:
+            size, lines = _logical_requirement_lines(
+                path, display=display, context_root=context_root, log_redact=log_redact,
+                max_bytes=MAX_REQUIREMENTS_BYTES - total_bytes,
+                environment_path=environment_path,
+            )
+            total_bytes += size
+            parsed_files[path] = tuple(lines)
+        lines = parsed_files[path]
+        for _, line in lines:
+            expanded = _expand_requirement_variables(line)
             try:
-                options = shlex.split(line, comments=True)
+                options = shlex.split(expanded, comments=True)
             except ValueError as exc:
-                raise ValueError(f"Invalid requirements syntax in {path}.") from exc
+                raise ValueError(f"Invalid requirements syntax in {display}.") from exc
             if not options:
                 continue
             if not options[0].startswith("-"):
@@ -921,7 +1033,7 @@ def _scan_requirements(
             option = options[0]
             if option in {"-r", "--requirement", "-c", "--constraint"}:
                 if len(options) != 2:
-                    raise ValueError(f"Invalid requirements include in {path}.")
+                    raise ValueError(f"Invalid requirements include in {display}.")
                 include = options[1]
                 include_constraint |= option in {"-c", "--constraint"}
             elif option.startswith("--requirement="):
@@ -943,14 +1055,22 @@ def _scan_requirements(
                     constraints.append(requirement)
 
             if include is not None:
+                if _REQUIREMENT_VARIABLE.search(include):
+                    raise ValueError("Requirements include contains an unset environment variable.")
                 if include.startswith(("http://", "https://", "file://")):
                     raise ValueError(
                         "Remote and file-URL requirements includes are unsupported; "
                         "use a local file inside the build context."
                     )
-                included_path = (path.parent / include).resolve(strict=True)
-                pending.append((included_path, include_constraint))
-    return roots, sorted(counted_files), hash_pinned
+                environment_include = environment_path or expanded != line
+                windows_path = PureWindowsPath(include)
+                if Path(include).is_absolute() or windows_path.drive or windows_path.root:
+                    raise ValueError("Requirements includes must use context-relative paths.")
+                included_path = Path(os.path.abspath(path.parent / include))
+                pending.append(
+                    (included_path, environment_include, ancestors | {path}, include_constraint)
+                )
+    return roots, sorted({path for path, _ in visited}), hash_pinned
 
 
 def _is_hash_pinned(options: List[str]) -> bool:
@@ -969,14 +1089,19 @@ def _is_hash_pinned(options: List[str]) -> bool:
     specifier = " ".join(words).split(";", 1)[0].strip()
     exact = re.fullmatch(r"[^=<>!~@,]+===?\s*[^\s,*]+", specifier) is not None
     return exact and has_hash
-def reject_literal_credentials(path: Path, text: str, context_root: Path) -> None:
+
+
+def reject_literal_credentials(
+    path: Path, text: str, context_root: Path, *, shown: Optional[str] = None
+) -> None:
     findings = find_credentials(text)
     if not findings:
         return
-    try:
-        shown = path.resolve().relative_to(context_root.resolve()).as_posix()
-    except ValueError:
-        shown = path.name
+    if shown is None:
+        try:
+            shown = path.resolve().relative_to(context_root.resolve()).as_posix()
+        except ValueError:
+            shown = path.name
     locations = ", ".join(f"line {line} ({url})" for line, url in findings[:5])
     raise ValueError(
         f"{shown} contains a URL with literal credentials at {locations}; "
@@ -1334,7 +1459,7 @@ def staged_packages(
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
 
 
-def strip_type_stubs(site_packages: Path) -> List[str]:
+def strip_type_stubs(site_packages: Path, *, log_redact=str) -> List[str]:
     """Remove stub-only distributions and ``.pyi`` files; return removed names.
 
     Every RECORD is validated and every deletion is resolved before anything
@@ -1375,8 +1500,9 @@ def strip_type_stubs(site_packages: Path) -> List[str]:
             stub_dirs.append(info_dir)
         else:
             logger.warning(
-                "Keeping %s: it ships runtime files; only its .pyi files are removed.",
-                info_dir.name,
+                "%s", log_redact(
+                    f"Keeping {info_dir.name}: it ships runtime files; only its .pyi files are removed."
+                ),
             )
 
     retained_keys = set()
