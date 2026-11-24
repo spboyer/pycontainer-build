@@ -51,7 +51,9 @@ ignore = ["PCB001", "PCB004"]
 Repeat `--ignore RULE` to add CLI suppressions to the TOML list. Unknown IDs,
 invalid types and unknown validation settings are errors. PCB002 is a known,
 reserved ID, so ignoring it is currently a no-op. Suppressions apply only to
-findings, never to layout or integrity errors.
+findings, never to layout or integrity errors. Configuration, ignore and layout
+diagnostics redact declared build-argument values, as `validate config` does;
+`validate image` redacts declared defaults because it accepts no `--build-arg`.
 
 `--fail-on warning` is the default; `--fail-on error` still reports warnings,
 but does not fail solely because of them. `build --validate` always fails on
