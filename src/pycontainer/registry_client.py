@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
+from typing import BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from .blob_store import (
     BlobIntegrityError,
@@ -594,6 +594,8 @@ class RegistryClient:
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         insecure: bool = False,
         ca_file: Optional[str] = None,
+        *,
+        log_redact: Optional[Callable[[str], str]] = None,
     ):
         if timeout <= 0:
             raise ValueError("Registry request timeout must be greater than zero.")
@@ -605,6 +607,7 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
+        self._log_redact = log_redact
         self.insecure = insecure
         scheme = "http" if insecure else "https"
         self.base_url = f"{scheme}://{self.registry}/v2"
@@ -689,12 +692,12 @@ class RegistryClient:
             MAX_ERROR_TEXT_CHARS,
             username=self.username,
         )
-        logger.debug(
-            "Registry %s rate limit: limit=%s remaining=%s",
-            host,
-            "unknown" if limit is None else limit,
-            "unknown" if remaining is None else remaining,
+        message = (
+            f"Registry {host} rate limit: "
+            f"limit={'unknown' if limit is None else limit} "
+            f"remaining={'unknown' if remaining is None else remaining}"
         )
+        logger.debug("%s", self._redact_log(message))
         if remaining is None or self._rate_limit_warned:
             return
         threshold = LOW_RATE_LIMIT_REMAINING
@@ -702,13 +705,15 @@ class RegistryClient:
             threshold = max(1, min(LOW_RATE_LIMIT_REMAINING, limit // 10))
         if remaining <= threshold:
             self._rate_limit_warned = True
-            logger.warning(
-                "Registry %s rate limit is nearly exhausted: %s of %s requests "
-                "remaining. Authenticate or reduce pulls to avoid HTTP 429 errors.",
-                host,
-                remaining,
-                "unknown" if limit is None else limit,
+            message = (
+                f"Registry {host} rate limit is nearly exhausted: {remaining} of "
+                f"{'unknown' if limit is None else limit} requests remaining. "
+                "Authenticate or reduce pulls to avoid HTTP 429 errors."
             )
+            logger.warning("%s", self._redact_log(message))
+
+    def _redact_log(self, message: str) -> str:
+        return self._log_redact(message) if self._log_redact is not None else message
 
     def _parse_www_authenticate(self, header: str) -> Optional[Dict[str, str]]:
         """Parse Www-Authenticate header for OAuth2 challenge."""

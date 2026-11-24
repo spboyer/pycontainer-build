@@ -945,6 +945,68 @@ how to apply them.
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
 
+### Build arguments
+
+Declare inputs in either configuration table, then pass repeatable overrides:
+
+```toml
+[build]
+tag = "myapp:${VERSION}"
+workdir = "/app"
+entrypoint = ["python", "-m", "app"]
+
+[build.build-args]
+VERSION = "1.0.0"                 # string default
+ENVIRONMENT = {}                   # required, including an explicitly empty value
+OPTION = { default = "" }          # optional default table
+
+[build.labels]
+version = "${VERSION}"
+literal = "$${VERSION}"            # persists the literal ${VERSION}
+
+[build.env]
+APP_ENV = "${ENVIRONMENT}"         # explicit runtime persistence
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg ENVIRONMENT=production --build-arg VERSION=1.2.3
+```
+
+For `pyproject.toml`, use `[tool.pycontainer.build-args]` instead.
+The `skaffold-build` and `tilt-build` commands accept the same overrides
+when using a configuration file.
+Names match `[A-Za-z_][A-Za-z0-9_]*`; values are strings. Overrides split on
+the first `=` (so `OPTION=a=b` is valid), and the last occurrence wins.
+Ordinary explicit CLI settings override file settings before interpolation.
+Malformed or undeclared arguments, missing required values, invalid/unclosed
+references, and C0/C1/DEL control characters fail before building, including
+in dry-run mode. Defaults are checked even when overridden.
+
+`${NAME}` expands **once**, only in `tag`, `tags`, `base_image`, `context_dir`,
+`workdir`, `entrypoint`, `cmd`, `user`, `include_paths`, `exclude_paths`,
+`output_dir`, `cache_dir`, `requirements_file`, `platform`, `stop_signal`,
+`volumes`, and the **values**
+of `env` and `labels`. Hyphenated setting aliases work too. Dictionary keys,
+SBOM formats, system-package declarations and other settings do not expand.
+`$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
+are not rescanned, defaults do not reference other arguments, and no host
+environment lookup, expression evaluation or shell execution occurs.
+Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
+without it, existing literal dollar expressions are preserved.
+
+Arguments are **not secrets** and are not automatically runtime environment
+variables. Only explicit interpolation into persisted image fields (including
+labels, environment, command or workdir) stores a value in image metadata.
+Configuration/source files selected for the app layer are still copied normally;
+exclude files containing defaults if they should not be shipped.
+Diagnostic output redacts nonempty argument values. Cache metadata contains
+hashed resolved configuration/target/backend identity, not argument values;
+argument builds omit source-path metadata. Unused argument changes do not
+invalidate the app-layer cache. The cache stores actual layer contents, not
+encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
+scoped interface; imported values escape dollars to preserve their runtime
+meaning when loaded. Build arguments do not introduce stages or conditions.
+
 ---
 
 ## 🗺️ Roadmap

@@ -2,9 +2,10 @@ import argparse, json, os, logging, sys
 from pathlib import Path
 from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES, SIGNING_PROVIDERS, NOTATION_SIGNATURE_FORMATS
 from .builder import ImageBuilder
-from .config_loader import config_from_file
+from .config_loader import config_from_file, load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .build_args import redact_values, resolve_arguments
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -15,6 +16,16 @@ from .devloop import (
     tilt_expected_reference,
     write_reference,
 )
+
+class _BuildArgumentLogFilter(logging.Filter):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def filter(self, record):
+        record.msg = self.config.redact(record.getMessage())
+        record.args = ()
+        return True
 
 def _metadata_argument(value: str) -> tuple[str, str]:
     key, separator, item = value.partition("=")
@@ -53,6 +64,7 @@ def _run_registry(parser, args):
 
 def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
+    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
     if tagging:
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
         b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
@@ -317,27 +329,28 @@ def main():
             push_target=tilt_expected_reference(os.environ,args.image)
             if push_target is None and not args.output_ref:
                 raise DevLoopError("--image requires --output-ref so Tilt can read the pushed reference.")
-            platform=single_platform(args.platform,"--platform")
-            if platform: cli_overrides['platform']=platform
             cli_overrides['tag']=push_target or f"{args.image}:{TILT_PLACEHOLDER_TAG}"
     except DevLoopError as exc:
-        parser.error(str(exc))
+        try:
+            file_config=load_config_file(Path(args.config)) if args.config else {}
+            declarations=merge_configs(file_config, {}).get("build_args", {})
+            resolved_args=resolve_arguments(declarations, args.build_arg)
+        except (OSError, ValueError) as config_error:
+            parser.error(str(config_error))
+        parser.error(redact_values(str(exc), resolved_args.values()))
     if devloop:
         # The tool owns the pushed reference; extra tags and dry runs would break its contract.
         cli_overrides.update(tags=[],semver_tags=False,latest_tag=False,dry_run=False)
 
     try:
         if args.config:
-            cfg=config_from_file(Path(args.config), cli_overrides)
+            cfg=config_from_file(Path(args.config), cli_overrides, args.build_arg)
         else:
-            cfg=BuildConfig(**cli_overrides)
+            resolve_arguments({}, args.build_arg)
+            cfg=BuildConfig(**cli_overrides, build_args={})
             if 'base_image' not in cli_overrides:
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"
-        if devloop:
-            platform=single_platform(cfg.platform,"platform")
-            if not platform: raise DevLoopError("platform must specify a single target platform.")
-            cfg.platform=platform
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 
@@ -346,40 +359,58 @@ def main():
     if cfg.sign and cfg.dry_run:
         parser.error("--sign cannot be used with --dry-run.")
 
+    if devloop:
+        try:
+            source="--platform" if args.cmd=="tilt-build" and args.platform is not None else "platform"
+            platform=single_platform(cfg.platform,source)
+            if not platform: raise DevLoopError("platform must specify a single target platform.")
+            cfg.platform=platform
+        except DevLoopError as exc:
+            parser.error(cfg.redact(str(exc)))
+
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     from .scanning import ScanError
+    log_filter = _BuildArgumentLogFilter(cfg)
+    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    for handler in handlers:
+        handler.addFilter(log_filter)
     try:
-        builder=ImageBuilder(cfg)
-        out=builder.build()
-    except ReleaseNotesError as exc:
-        parser.error(str(exc))
-    except HistoryStorageError as exc:
-        parser.exit(1,f"Build history error: {exc}\n")
-    except ScanError as exc:
-        parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
-    print("Built:", out)
-    
-    if push:
-        if username and not password:
-            password=os.getenv('REGISTRY_PASSWORD')
-        if args.cmd=="tilt-build" and push_target is None:
-            push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
         try:
+            builder=ImageBuilder(cfg)
+            out=builder.build()
+        except ReleaseNotesError as exc:
+            parser.error(cfg.redact(str(exc)))
+        except HistoryStorageError as exc:
+            parser.exit(1,f"Build history error: {cfg.redact(str(exc))}\n")
+        print("Built:", cfg.redact(str(out)))
+
+        if push:
+            if username and not password:
+                password=os.getenv('REGISTRY_PASSWORD')
+            if args.cmd=="tilt-build" and push_target is None:
+                push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
             pushed=builder.push(
                 registry_url=push_target,
                 username=username,
                 password=password,
                 show_progress=not args.no_progress,
             )
-        except ScanError as exc:
-            parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
-        if getattr(args,"output_ref",None):
-            write_reference(Path(args.output_ref),pushed)
-            print("Wrote image reference to", args.output_ref)
+            if getattr(args,"output_ref",None):
+                write_reference(Path(args.output_ref),pushed)
+                print("Wrote image reference to", cfg.redact(str(args.output_ref)))
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
+    except (OSError, ValueError, RuntimeError) as exc:
+        if not cfg.build_args:
+            raise
+        parser.error(cfg.redact(str(exc)))
+    finally:
+        for handler in handlers:
+            handler.removeFilter(log_filter)
 
 if __name__=="__main__":
     main()

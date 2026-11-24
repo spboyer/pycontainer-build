@@ -451,13 +451,16 @@ class ImageBuilder:
         else:
             self.cache=None
 
+    def _print(self, message: str):
+        print(self.config.redact(message))
+
     def _record_failed_history(self, timing, config):
         try:
             self._history.validate_location(config.context_dir, config.output_dir)
             self._history.append(timing.record("failed"))
         except BaseException as error:
             # Recording must never replace the original build failure.
-            logger.error("Build history could not be saved or confirmed: %s", error)
+            logger.error("Build history could not be saved or confirmed: %s", config.redact(str(error)))
 
     def _time_history_phase(self, name):
         timing = self._history_timer.get() if self._history_timer else None
@@ -480,7 +483,7 @@ class ImageBuilder:
         if self.config.include_deps:
             self._check_conda_dependencies()
         if self.dry_run:
-            logger.info("DRY RUN: Would build image %s", self.config.tag)
+            logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
             self._show_build_plan()
             return self.config.tag
 
@@ -503,11 +506,13 @@ class ImageBuilder:
                         with scanned_image(
                             Path(self.config.output_dir), self.manifest_digest, self.config
                         ):
-                            logger.info("Vulnerability gate passed for %s", self.manifest_digest)
+                            logger.info(self.config.redact(
+                                f"Vulnerability gate passed for {self.manifest_digest}"
+                            ))
                     for fragment_path in write_security_fragments(
                         Path(self.config.output_dir), security_fragments
                     ):
-                        logger.info(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)")
+                        logger.info(self.config.redact(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)"))
             except BaseException:
                 if timing:
                     self._record_failed_history(timing, self.config)
@@ -588,15 +593,14 @@ class ImageBuilder:
                     ),
                     package_inventory=getattr(self, "_staged_packages", []),
                 )
-            logger.info(f"✓ SBOM saved to {sbom_path}")
-
+            logger.info(self.config.redact(f"✓ SBOM saved to {sbom_path}"))
         return self.config.tag
 
     def _build_multi_platform(self, output: Path, layers_dir: Path, refs_dir: Path, platforms: List[str]):
         """Build every platform in isolation, then publish one index only if all succeed."""
         images=[]
         for platform in platforms:
-            print(f"Building platform {platform}...")
+            self._print(f"Building platform {platform}...")
             images.append(self._build_platform_image(layers_dir, platform))
 
         index_digest, index_size=self._write_image_index(layers_dir, images)
@@ -625,7 +629,7 @@ class ImageBuilder:
         self.config_digest=None
         self.platform_images=images
         self.layers=list({layer.digest: layer for image in images for layer in image.layers}.values())
-        print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
+        self._print(f"✓ Image index created for {', '.join(platforms)} ({index_digest[:19]}...)")
         return self.config.tag
 
     def _write_image_index(self, layers_dir: Path, images: List["PlatformImage"]) -> Tuple[str, int]:
@@ -664,7 +668,7 @@ class ImageBuilder:
                     base_image_tag_verified=self._has_verified_base_image_tag(),
                 ).packages
             )
-        report_system_packages(self.config, base_layers, locked_names)
+        report_system_packages(self.config, base_layers, locked_names, redact=self.config.redact)
         
         # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
         if self.config.entrypoint is not None:
@@ -761,6 +765,7 @@ class ImageBuilder:
     def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
+        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
         client=RegistryClient(
             registry,
             repo,
@@ -769,20 +774,23 @@ class ImageBuilder:
             password=auth.password,
             insecure=insecure,
             ca_file=self.config.registry_ca_file,
+            **log_options,
         )
         warned=self.__dict__.setdefault('_warned_insecure_registries', set())
         if insecure and registry.lower() not in warned:
             warned.add(registry.lower())
-            logger.warning(
+            logger.warning(self.config.redact(
                 f"WARNING: using plain HTTP for insecure registry {registry}; "
                 "traffic is unencrypted and unauthenticated by TLS."
-            )
+            ))
         return client
 
     def _base_image_client(self, registry: str, repo: str):
         """Return a pull client that tries configured mirrors before upstream."""
+        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+
         def upstream_client():
-            auth=get_registry_auth(registry, include_generic_environment=False)
+            auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
             return self._registry_client(registry, repo, auth)
 
         mirrors=self.config.registry_mirrors.get(canonical_registry(registry), [])
@@ -790,11 +798,11 @@ class ImageBuilder:
             return upstream_client()
 
         def mirror_client(host):
-            return lambda: self._registry_client(host, repo, get_mirror_auth(host))
+            return lambda: self._registry_client(host, repo, get_mirror_auth(host, **log_options))
 
         endpoints=[(host, mirror_client(host)) for host in mirrors]
         endpoints.append((registry, upstream_client))
-        return MirroredPullClient(registry, endpoints)
+        return MirroredPullClient(registry, endpoints, **log_options)
 
     def _pull_base_image(self, layers_dir: Path, os_name: str, arch: str) -> Tuple[List[OCILayer], Optional[Dict]]:
         """Pull or load the base image, return (base_layers, base_config)."""
@@ -809,9 +817,10 @@ class ImageBuilder:
         target = f"{os_name}/{arch}" + (
             f"/{requested_variant}" if requested_variant else ""
         )
-        print(f"Loading local base image {self.config.base_image} for {target}...")
+        self._print(f"Loading local base image {self.config.base_image} for {target}...")
         with open_local_image_source(
-            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant
+            local, layers_dir, Path(self.config.output_dir), os_name, arch, requested_variant,
+            progress=self._print,
         ) as source:
             self._pin_local_base_snapshot(getattr(source, "snapshot_digest", None))
             base_layers, base_config = self._read_base_image(
@@ -857,7 +866,7 @@ class ImageBuilder:
         # mutable tag is never requested again, so a moved tag cannot mix bases.
         snapshot = None if local else getattr(self, "_registry_base_snapshot", None)
         if not local:
-            print(f"Pulling base image {self.config.base_image} for {target}...")
+            self._print(f"Pulling base image {self.config.base_image} for {target}...")
         if snapshot is None:
             manifest, resolved_digest = client.pull_manifest(
                 reference,
@@ -994,16 +1003,16 @@ class ImageBuilder:
         ):
             layer_path=layers_dir/_digest_filename(layer_digest)
             if not layer_path.exists() or layer_path.is_symlink():
-                print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
+                self._print(f"  {'Copying' if local else 'Pulling'} layer {i}/{len(layer_descriptors)} ({layer_digest[:19]}...)")
             client.pull_blob(layer_digest, layer_path, layer_size)
             base_layers.append(
                 OCILayer(media_type, layer_digest, layer_size, str(layer_path))
             )
         
-        print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
+        self._print(f"✓ Base image {'loaded' if local else 'pulled'} ({len(base_layers)} layers)")
         if self.verbose and isinstance(client, MirroredPullClient):
             served=", ".join(client.serving_hosts) or "local blob store"
-            print(f"  Served by: {served}")
+            self._print(f"  Served by: {served}")
         return base_layers, base_config
     
     def push(self, registry_url: Optional[str]=None, auth_token: Optional[str]=None, username: Optional[str]=None, password: Optional[str]=None, show_progress: bool=True):
@@ -1047,15 +1056,17 @@ class ImageBuilder:
         if getattr(self, "index_digest", None):
             self.pushed_refs=[]
         
+        log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
         auth=get_registry_auth(
             registry,
             bearer_token=auth_token,
             username=username,
             password=password,
+            **log_options,
         )
         client=self._registry_client(registry, repo, auth)
         
-        if show_progress: print(f"Pushing to {registry}/{repo}:{tag}")
+        if show_progress: self._print(f"Pushing to {registry}/{repo}:{tag}")
 
         if signer:
             self._push_signed_image(
@@ -1080,19 +1091,19 @@ class ImageBuilder:
 
         for i, layer in enumerate(layers, 1):
             digest=layer["digest"]
-            if show_progress: print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
+            if show_progress: self._print(f"  Pushing layer {i}/{len(layers)} ({digest[:19]}...)")
             blob_path=layers_dir/digest.split(":",1)[1]
             skipped=not client.push_blob(digest, blob_path, check_exists=True)
-            if show_progress and skipped: print(f"    Layer exists, skipped")
+            if show_progress and skipped: self._print("    Layer exists, skipped")
         
-        if show_progress: print(f"  Pushing config ({config_digest[:19]}...)")
+        if show_progress: self._print(f"  Pushing config ({config_digest[:19]}...)")
         cfg_path=layers_dir/config_digest.split(":",1)[1]
         client.push_blob(config_digest, cfg_path, check_exists=True)
         
-        if show_progress: print(f"  Pushing manifest ({manifest_digest[:19]}...)")
+        if show_progress: self._print(f"  Pushing manifest ({manifest_digest[:19]}...)")
         for push_tag in push_tags:
             client.push_manifest(push_tag, manifest_data)
-            if show_progress: print(f"✓ Pushed {registry}/{repo}:{push_tag}")
+            if show_progress: self._print(f"✓ Pushed {registry}/{repo}:{push_tag}")
         self.pushed_refs=[f"{registry}/{repo}:{t}" for t in push_tags]
 
         return f"{registry}/{repo}:{tag}"
@@ -1253,16 +1264,16 @@ class ImageBuilder:
             for layer in image.layers: blobs.setdefault(layer.digest, None)
             blobs.setdefault(image.config_digest, None)
         for i, digest in enumerate(blobs, 1):
-            if show_progress: print(f"  Pushing blob {i}/{len(blobs)} ({digest[:19]}...)")
+            if show_progress: self._print(f"  Pushing blob {i}/{len(blobs)} ({digest[:19]}...)")
             skipped=not client.push_blob(digest, layers_dir/_digest_filename(digest), check_exists=True)
-            if show_progress and skipped: print(f"    Blob exists, skipped")
+            if show_progress and skipped: self._print(f"    Blob exists, skipped")
         for image in self.platform_images:
             target="/".join(image.platform[k] for k in ("os","architecture","variant") if k in image.platform)
-            if show_progress: print(f"  Pushing {target} manifest ({image.manifest_digest[:19]}...)")
+            if show_progress: self._print(f"  Pushing {target} manifest ({image.manifest_digest[:19]}...)")
             manifest_data=(layers_dir/_digest_filename(image.manifest_digest)).read_bytes()
             client.push_manifest(image.manifest_digest, manifest_data)
         index_data=(layers_dir/_digest_filename(self.index_digest)).read_bytes()
-        if show_progress: print(f"  Pushing image index ({self.index_digest[:19]}...)")
+        if show_progress: self._print(f"  Pushing image index ({self.index_digest[:19]}...)")
         client.push_index(self.index_digest, index_data)
         for i, push_tag in enumerate(push_tags):
             ref=f"{repository}:{push_tag}"
@@ -1277,69 +1288,69 @@ class ImageBuilder:
                     f"Previously pushed tags were not rolled back. Cause: {error}"
                 ) from error
             self.pushed_refs.append(ref)
-            if show_progress: print(f"✓ Pushed index tag {push_tag}")
+            if show_progress: self._print(f"✓ Pushed index tag {push_tag}")
     
     def _show_build_plan(self):
         """Display build plan for dry-run mode."""
-        print(f"Build Plan for {self.config.tag}:")
+        self._print(f"Build Plan for {self.config.tag}:")
         if len(self.config.all_tags())>1:
-            print(f"  Tags: {', '.join(self.config.all_tags())}")
-        print(f"  Base Image: {self.config.base_image}")
+            self._print(f"  Tags: {', '.join(self.config.all_tags())}")
+        self._print(f"  Base Image: {self.config.base_image}")
         if self.config.registry_mirrors:
             mirrors="; ".join(f"{k} -> {', '.join(v)}" for k,v in self.config.registry_mirrors.items())
-            print(f"  Base Image Mirrors: {mirrors}")
+            self._print(f"  Base Image Mirrors: {mirrors}")
         platforms=self.config.target_platforms()
         if len(platforms)>1:
-            print(f"  Platforms (image index): {', '.join(platforms)}")
+            self._print(f"  Platforms (image index): {', '.join(platforms)}")
         else:
-            print(f"  Platform: {platforms[0]}")
-        print(f"  Context: {self.config.context_dir}")
-        print(f"  Working Dir: {self.config.workdir}")
+            self._print(f"  Platform: {platforms[0]}")
+        self._print(f"  Context: {self.config.context_dir}")
+        self._print(f"  Working Dir: {self.config.workdir}")
         if self.config.entrypoint is not None:
             entrypoint = ' '.join(self.config.entrypoint) or '<none>'
         elif self.config.cmd is not None:
             entrypoint = '<inherited from base image>'
         else:
             entrypoint = '<auto-detect>'
-        print(f"  Entrypoint: {entrypoint}")
+        self._print(f"  Entrypoint: {entrypoint}")
         if self.config.cmd is not None:
-            print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
+            self._print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
         if self.config.exposed_ports:
-            print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
+            self._print(f"  Exposed Ports: {', '.join(map(str, self.config.exposed_ports))}")
         if self.config.env:
-            print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
+            self._print(f"  Environment: {', '.join(f'{k}={v}' for k,v in self.config.env.items())}")
         if self.config.labels:
-            print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
+            self._print(f"  Labels: {len(self.config.labels)} configured (values hidden)")
         for key, notes in self.release_notes_labels.items():
-            print(f"  Release Notes: label {key}, {len(notes.encode('utf-8'))} bytes (contents hidden)")
+            self._print(f"  Release Notes: label {key}, {len(notes.encode('utf-8'))} bytes (contents hidden)")
         if self.config.manifest_annotations:
-            print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
+            self._print(f"  Manifest Annotations: {len(self.config.manifest_annotations)} configured (values hidden)")
         if self.config.index_annotations:
-            print(f"  Index Annotations: {len(self.config.index_annotations)} configured (values hidden)")
+            self._print(f"  Index Annotations: {len(self.config.index_annotations)} configured (values hidden)")
         if self.config.stop_signal:
-            print(f"  Stop Signal: {self.config.stop_signal}")
+            self._print(f"  Stop Signal: {self.config.stop_signal}")
         if self.config.volumes:
-            print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
-        print(f"  Include Dependencies: {self.config.include_deps}")
+            self._print(f"  Volumes (metadata, merged with base): {', '.join(self.config.volumes)}")
+        self._print(f"  Include Dependencies: {self.config.include_deps}")
         if self.config.include_deps:
             try:
                 kind, value = self._dependency_source()
             except FileNotFoundError as error:
-                print(f"  Dependency Source: unresolved ({error})")
+                self._print(f"  Dependency Source: unresolved ({error})")
             else:
                 if kind == "lock":
                     preflight_lockfile(Path(self.config.context_dir), value)
                 described = "virtualenv site-packages" if kind == "venv" else value.as_posix()
-                print(f"  Dependency Source: {kind} ({described})")
+                self._print(f"  Dependency Source: {kind} ({described})")
                 if kind == "lock":
-                    print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
+                    self._print("  Lockfile target markers (including uv marker freshness) and wheels: checked during build.")
             if self.config.strip_type_stubs:
-                print("  Strip Type Stubs: True")
+                self._print("  Strip Type Stubs: True")
         if self.config.system_packages:
-            print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
+            self._print(f"  System Packages (verified, not installed): {', '.join(self.config.system_packages)}")
         for name in render_security_fragments(self.config.security, self.config.context_dir):
-            print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
-        print(f"  Use Cache: {self.config.use_cache}")
+            self._print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
+        self._print(f"  Use Cache: {self.config.use_cache}")
 
     def _uses_lockfile(self) -> bool:
         if self.config.lockfile:
@@ -1369,7 +1380,7 @@ class ImageBuilder:
         else:
             detected = detect_lockfile(ctx) if self.config.use_lockfile else None
             if detected:
-                print(f"Using lockfile {detected} for dependencies (disable with --no-lockfile).")
+                self._print(f"Using lockfile {detected} for dependencies (disable with --no-lockfile).")
                 source = ("lock", Path(detected))
             else:
                 deps_paths = find_dependencies(
@@ -1457,9 +1468,9 @@ class ImageBuilder:
             logger.warning(
                 "Conda inputs ignored (%s); installing only %s from %s. "
                 "Conda-only packages are not staged.",
-                ", ".join(path.as_posix() for path in signals),
+                self.config.redact(", ".join(path.as_posix() for path in signals)),
                 "locked dependencies" if selected_lock else "pip requirements",
-                relative.as_posix(),
+                self.config.redact(relative.as_posix()),
             )
             self._conda_warning_emitted = True
         return True
@@ -1525,7 +1536,7 @@ class ImageBuilder:
                     base_config, os_name, arch, variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
                 )
-                print(
+                self._print(
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
                 )
@@ -1606,7 +1617,7 @@ class ImageBuilder:
             if not files:
                 return None
 
-            print(f"Creating dependency layer ({len(files)} staged files)...")
+            self._print(f"Creating dependency layer ({len(files)} staged files)...")
             tmp=_create_temporary_file(layers_dir,"deps-layer")
             try:
                 with tarfile.open(tmp, "w") as tar:
@@ -1636,7 +1647,7 @@ class ImageBuilder:
                 digest, size = _hash_file(tmp)
                 final=layers_dir/digest.split(":",1)[1]
                 _publish_content_addressed(tmp, final, digest, size)
-                print(f"✓ Dependency layer created ({digest[:19]}...)")
+                self._print(f"✓ Dependency layer created ({digest[:19]}...)")
                 return OCILayer(
                     "application/vnd.oci.image.layer.v1.tar", digest, size, str(final)
                 )
@@ -1661,6 +1672,7 @@ class ImageBuilder:
                 files,
                 workdir=self.config.workdir,
                 reproducible=self.config.reproducible,
+                namespace=self.config.cache_identity(),
             )
             if cached:
                 digest, cache_path=cached
@@ -1718,6 +1730,8 @@ class ImageBuilder:
                     final,
                     workdir=self.config.workdir,
                     reproducible=self.config.reproducible,
+                    namespace=self.config.cache_identity(),
+                    record_source_files=not bool(self.config.build_args),
                     hardlinks=hardlinks,
                 )
 

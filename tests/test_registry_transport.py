@@ -854,9 +854,27 @@ def test_builder_warns_once_per_insecure_host(tmp_path, caplog):
     assert len(warnings) == 1
 
 
+def test_insecure_registry_warning_redacts_build_argument(tmp_path, caplog):
+    registry = "private-registry.example:5000"
+    config = BuildConfig(
+        context_dir=str(tmp_path), insecure_registries=[registry],
+        build_args={"REGISTRY": "private-registry"},
+    )
+    builder = ImageBuilder(config)
+    auth = RegistryAuth()
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.builder"):
+        client = builder._registry_client(registry, "app", auth)
+
+    assert client.base_url == f"http://{registry}/v2"
+    assert "private-registry" not in caplog.text
+    assert "<redacted>.example:5000" in caplog.text
+
+
+@pytest.mark.parametrize("with_build_args", [False, True])
 @pytest.mark.parametrize("transport", ["http", "custom-ca-https"])
 def test_builder_pull_and_push_honor_registry_transport(
-    tmp_path, monkeypatch, certificate_authority, transport
+    tmp_path, monkeypatch, certificate_authority, transport, with_build_args
 ):
     server_context, ca_file = certificate_authority
     tls_context = server_context if transport == "custom-ca-https" else None
@@ -886,12 +904,13 @@ def test_builder_pull_and_push_honor_registry_transport(
         state.blobs[config_digest] = config_bytes
         output = tmp_path / "image"
         builder = ImageBuilder(BuildConfig(
-            base_image=f"{registry}/team/base:latest",
-            tag=f"{registry}/team/app:v1",
+            base_image="${REGISTRY}/team/base:latest" if with_build_args else f"{registry}/team/base:latest",
+            tag="${REGISTRY}/team/app:v1" if with_build_args else f"{registry}/team/app:v1",
             context_dir=str(tmp_path),
             output_dir=str(output),
             insecure_registries=[registry] if transport == "http" else [],
             registry_ca_file=ca_file if tls_context else None,
+            build_args={"REGISTRY": registry} if with_build_args else None,
         ))
 
         layers, pulled_config = builder._pull_base_image(

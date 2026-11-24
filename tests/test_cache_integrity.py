@@ -450,6 +450,55 @@ def test_cache_invalidates_when_hardlink_topology_changes(tmp_path, reproducible
     assert (repeated_digest, repeated_entries) == (fresh_digest, fresh_entries)
 
 
+def test_cache_combines_build_arguments_and_hardlink_topology(tmp_path):
+    import json
+
+    context = tmp_path / "context"
+    context.mkdir()
+    cache_dir = tmp_path / "cache"
+    hits = []
+
+    def build(version, name):
+        output = tmp_path / name
+        config = BuildConfig(
+            context_dir=str(context), output_dir=str(output),
+            include_paths=["a.txt", "b.txt"], cache_dir=str(cache_dir),
+            build_args={"VERSION": version}, workdir="/srv/${VERSION}",
+        )
+        builder = ImageBuilder(config)
+        get_layer = builder.cache.get_layer
+
+        def record_lookup(*args, **kwargs):
+            cached = get_layer(*args, **kwargs)
+            hits.append(cached is not None)
+            return cached
+
+        builder.cache.get_layer = record_lookup
+        layers_dir = output / "layers"
+        layers_dir.mkdir(parents=True)
+        layer = builder._create_app_layer(layers_dir, builder.context_include_paths)
+        with tarfile.open(layer.tar_path) as archive:
+            types = [member.type for member in archive.getmembers()]
+        return layer.digest, types
+
+    _write_topology(context, True)
+    linked = build("release-one", "linked")
+    assert build("release-one", "repeat") == linked
+    _write_topology(context, False)
+    independent = build("release-one", "independent")
+    build("release-two", "other-version")
+
+    assert hits == [False, True, False, False]
+    assert linked[1] == [tarfile.REGTYPE, tarfile.LNKTYPE]
+    assert independent[1] == [tarfile.REGTYPE, tarfile.REGTYPE]
+    assert independent[0] != linked[0]
+    metadata = json.loads((cache_dir / "index.json").read_text())
+    assert len(metadata) == 3
+    assert all(entry["source_files"] == [] for entry in metadata.values())
+    assert "release-one" not in json.dumps(metadata)
+    assert "release-two" not in json.dumps(metadata)
+
+
 def test_cache_identity_for_equivalent_hardlink_topology_is_portable(tmp_path):
     cache = LayerCache(tmp_path / "cache")
     keys = []
