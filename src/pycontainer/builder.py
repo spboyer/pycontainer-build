@@ -1228,7 +1228,7 @@ class ImageBuilder:
 
         self.signed_ref=subject
         if show_progress:
-            print(f"✓ Signed {subject}")
+            self._print(f"✓ Signed {subject}")
         push_method=client.push_index if is_index else client.push_manifest
         for index, tag in enumerate(push_tags):
             ref=tag_refs[index]
@@ -1254,7 +1254,7 @@ class ImageBuilder:
                     "No rollback was attempted."
                 ) from None
             if show_progress:
-                print(f"✓ Pushed signed image tag {ref}")
+                self._print(f"✓ Pushed signed image tag {ref}")
 
     def _push_image_index(self, client, layers_dir: Path, push_tags: List[str], repository: str, show_progress: bool) -> None:
         """Push blobs, then platform manifests by digest, then the index; tags go last."""

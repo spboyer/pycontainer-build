@@ -188,6 +188,20 @@ def test_signed_push_verifies_and_signs_immutable_top_level_before_tags(
             assert registry.events.index(("head", image.manifest_digest)) < sign_index
 
 
+def test_signed_push_progress_redacts_build_argument_values(tmp_path, monkeypatch, capsys):
+    builder = _builder(tmp_path, monkeypatch, "linux/amd64")
+    registry = FakeRegistry()
+    _use_registry(monkeypatch, registry)
+    monkeypatch.setattr(builder.config, "_resolved_build_args", {"REL": "private-v2"})
+
+    builder.push(registry_url="registry.example/team/app:private-v2", show_progress=True)
+
+    output = capsys.readouterr().out
+    assert "✓ Signed registry.example/team/app@sha256:" in output
+    assert "✓ Pushed signed image tag registry.example/team/app:<redacted>" in output
+    assert "private-v2" not in output
+
+
 @pytest.mark.parametrize("platform", ["linux/amd64", "linux/amd64,linux/arm64"])
 def test_unsigned_push_does_not_invoke_signer_or_signed_readback(
     tmp_path, monkeypatch, platform
