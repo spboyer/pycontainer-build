@@ -878,6 +878,29 @@ def pdm_content_hash(pyproject: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _reject_pdm_recorded_urls(lock: dict, strategy: list) -> None:
+    """Recorded artifact URLs are not honored yet (#59), so they must not be replaced by an index."""
+    unsupported = (
+        "pdm.lock records artifact URLs ({}), which are not honored yet (#59); "
+        "relock without `static_urls` so packages resolve from the project index."
+    )
+    if "static_urls" in strategy:
+        raise LockfileError(unsupported.format("static_urls strategy"))
+    packages = lock.get("package", [])
+    if not isinstance(packages, list) or any(not isinstance(entry, dict) for entry in packages):
+        raise LockfileError("pdm.lock package entries are invalid; relock with PDM.")
+    for entry in packages:
+        name = entry.get("name")
+        source = f"package {name}" if isinstance(name, str) and name else "a package"
+        if "url" in entry:
+            raise LockfileError(unsupported.format(source))
+        files = entry.get("files", [])
+        if not isinstance(files, list) or any(not isinstance(item, dict) for item in files):
+            raise LockfileError(f"pdm.lock {source} has invalid files entries; relock with PDM.")
+        if any("url" in item for item in files):
+            raise LockfileError(unsupported.format(f"{source} files"))
+
+
 def _load_pdm(path: Path, environment, context_dir: Path, manifest=None):
     lock = _read_toml(path)
     pyproject = manifest if manifest is not None else _read_toml(
@@ -886,11 +909,15 @@ def _load_pdm(path: Path, environment, context_dir: Path, manifest=None):
     metadata = lock.get("metadata", {})
     if not str(metadata.get("lock_version", "")).startswith("4."):
         raise LockfileError("pdm.lock lock_version is unsupported; relock with PDM 2.11 or newer.")
-    if "inherit_metadata" not in metadata.get("strategy", []):
+    strategy = metadata.get("strategy", [])
+    if not isinstance(strategy, list) or any(not isinstance(item, str) for item in strategy):
+        raise LockfileError("pdm.lock metadata strategy is invalid; relock with PDM.")
+    if "inherit_metadata" not in strategy:
         raise LockfileError(
             "pdm.lock was created without the inherit_metadata strategy, so target "
             "markers are not recorded; relock with `pdm lock --strategy inherit_metadata`."
         )
+    _reject_pdm_recorded_urls(lock, strategy)
     algorithm, _, expected = str(metadata.get("content_hash", "")).partition(":")
     if algorithm != "sha256" or expected != pdm_content_hash(pyproject):
         raise _stale("pdm.lock", "pdm lock")

@@ -608,6 +608,10 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+PDM locks with the `static_urls` strategy or recorded package/file artifact
+URLs are rejected, including for inactive groups, until those origins can be
+installed faithfully (#59); relock without `static_urls`. The error never
+echoes the URL.
 PDM and uv projects with dynamic dependencies are unsupported. Poetry dynamic
 dependencies must be declared in `tool.poetry.dependencies`.
 Poetry's Python and dependency ranges support PEP 440 constraints, exact

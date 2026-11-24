@@ -382,6 +382,8 @@ markers for the target (never the host) and installs the selection through
 index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
 ignored), merged only when files are byte-identical. A format that cannot
 establish a package's index fails closed (PDM allows one effective index).
+PDM `static_urls` locks and any package/file `url` rows (active or inactive)
+fail with `LockfileError` before selection, cache lookup or staging (#59, open).
 For `linux/arm/v7`, lock selection and staged-wheel closure use the
 `platform_machine=armv7l` marker and the same variant-specific wheel tags as
 ordinary requirements.
