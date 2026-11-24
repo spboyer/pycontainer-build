@@ -27,11 +27,16 @@ from pycontainer.auth import (
     EnvironmentAuthProvider,
     RegistryAuth,
 )
+from pycontainer.blob_store import BlobIntegrityError
 from pycontainer.builder import ImageBuilder
 from pycontainer.config import BuildConfig
 from pycontainer.history import BuildHistory
 from pycontainer.registry_client import (
+    RegistryAuthenticationError,
     RegistryClient,
+    RegistryConnectionError,
+    RegistryQuotaError,
+    RegistryRateLimitError,
     RegistryRequestError,
     SafeRedirect,
 )
@@ -349,8 +354,6 @@ def test_remote_cache_redacts_build_arguments_in_diagnostics(
     tmp_path, registry, monkeypatch, caplog, option
 ):
     registry.fail[("GET", "manifests/")] = 403
-    if option == "cache_to":
-        registry.fail[("POST", "blobs/uploads/")] = 403
     builder = _builder(
         tmp_path, "redaction", build_args={"REGISTRY": CACHE_HOST},
         **{option: CACHE_SPEC},
@@ -363,11 +366,14 @@ def test_remote_cache_redacts_build_arguments_in_diagnostics(
             _app_layer(builder, tmp_path, "redaction")
 
     assert CACHE_HOST not in caplog.text
-    assert "<redacted>" in caplog.text
     if option == "cache_to":
+        assert "<redacted>" in str(error.value)
         assert CACHE_HOST not in str(error.value)
         assert CACHE_HOST not in "".join(traceback.format_exception(error.value))
         assert error.value.__context__ is None
+        assert not [request for request in registry.requests if request[1] in ("POST", "PUT", "PATCH", "DELETE")]
+    else:
+        assert "<redacted>" in caplog.text
 
 
 def test_remote_cache_success_redacts_build_arguments(tmp_path, registry, monkeypatch, caplog):
@@ -1005,11 +1011,210 @@ def test_export_restores_missing_blob_for_current_record(tmp_path, registry, mis
     assert RegistryLayerCache(writer.remote_cache_to.ref).fetch(key, tmp_path / "reader")
 
 
+@pytest.fixture
+def unpublished_cache_layer(tmp_path):
+    data = b"synthetic application layer"
+    path = tmp_path / "application.tar"
+    path.write_bytes(data)
+    return "a" * 64, _digest(data), path, len(data)
+
+
+def _assert_export_fails_without_writes(
+    tmp_path, registry, cache, layer, error_type, caplog
+):
+    manifests = registry.manifests.copy()
+    blobs = registry.blobs.copy()
+    with pytest.raises(RemoteCacheError, match="Failed to export") as error:
+        cache.store(*layer)
+    assert isinstance(error.value.__cause__, error_type)
+    assert registry.manifests == manifests
+    assert registry.blobs == blobs
+    assert not [request for request in registry.requests if request[1] in ("POST", "PUT", "PATCH", "DELETE")]
+
+    with caplog.at_level(logging.WARNING, logger="pycontainer.remote_cache"):
+        assert cache.fetch(layer[0], tmp_path / "reader") is None
+    assert "could not import" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (429, RegistryRateLimitError),
+        (413, RegistryQuotaError),
+        (403, RegistryRequestError),
+        (500, RegistryRequestError),
+    ],
+)
+def test_export_stops_on_manifest_http_failure(
+    tmp_path, registry, monkeypatch, caplog, unpublished_cache_layer, status, error_type
+):
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _: None)
+    registry.fail[("GET", "manifests/")] = status
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+
+    _assert_export_fails_without_writes(
+        tmp_path, registry, cache, unpublished_cache_layer, error_type, caplog
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [("network", RegistryConnectionError), ("recursion", RecursionError)],
+)
+def test_export_stops_on_manifest_connection_failure(
+    tmp_path, registry, monkeypatch, caplog, unpublished_cache_layer, failure, error_type
+):
+    original = registry.open
+
+    def offline_manifest(request, timeout=None):
+        if request.get_method() == "GET" and "/manifests/" in request.full_url:
+            registry.requests.append((CACHE_HOST, "GET", urllib.parse.urlsplit(request.full_url).path, None))
+            if failure == "network":
+                raise urllib.error.URLError("synthetic connection failure")
+            raise RecursionError("synthetic transport recursion")
+        return original(request, timeout)
+
+    monkeypatch.setattr(registry, "open", offline_manifest)
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _: None)
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+
+    _assert_export_fails_without_writes(
+        tmp_path, registry, cache, unpublished_cache_layer, error_type, caplog
+    )
+
+
+def test_export_stops_on_manifest_token_exchange_failure(
+    tmp_path, registry, monkeypatch, caplog, unpublished_cache_layer
+):
+    original = registry.open
+
+    def reject_token_exchange(request, timeout=None):
+        url = request.full_url
+        parsed = urllib.parse.urlsplit(url)
+        if request.get_method() == "GET" and "/manifests/" in parsed.path:
+            registry.requests.append((parsed.netloc, "GET", parsed.path, None))
+            challenge = 'Bearer realm="https://auth.example/token",service="cache.example"'
+            raise _http_error(url, 401, {"WWW-Authenticate": challenge})
+        if parsed.netloc == "auth.example":
+            registry.requests.append((parsed.netloc, "GET", parsed.path, None))
+            raise _http_error(url, 403)
+        return original(request, timeout)
+
+    monkeypatch.setattr(registry, "open", reject_token_exchange)
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+
+    _assert_export_fails_without_writes(
+        tmp_path, registry, cache, unpublished_cache_layer, RegistryAuthenticationError, caplog
+    )
+
+
+@pytest.mark.parametrize("body", [b'{}', b'\xff', b''])
+@pytest.mark.parametrize(("algorithm", "hex_length"), [("sha256", 64), ("sha512", 128)])
+def test_export_stops_on_manifest_digest_mismatch(
+    tmp_path, registry, monkeypatch, caplog, unpublished_cache_layer, body,
+    algorithm, hex_length,
+):
+    registry.manifests[cache_tag(unpublished_cache_layer[0])] = body
+    original = registry._manifest
+
+    def mismatched_manifest(url, method, reference, request):
+        response = original(url, method, reference, request)
+        if method == "GET":
+            response.headers["Docker-Content-Digest"] = f"{algorithm}:" + "0" * hex_length
+        return response
+
+    monkeypatch.setattr(registry, "_manifest", mismatched_manifest)
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+
+    _assert_export_fails_without_writes(
+        tmp_path, registry, cache, unpublished_cache_layer, BlobIntegrityError, caplog
+    )
+
+
+def test_export_stops_on_oversized_manifest(
+    tmp_path, registry, caplog, unpublished_cache_layer
+):
+    registry.manifests[cache_tag(unpublished_cache_layer[0])] = (
+        b" " * (remote_cache.MAX_RECORD_MANIFEST_BYTES + 1)
+    )
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+
+    _assert_export_fails_without_writes(
+        tmp_path, registry, cache, unpublished_cache_layer, RegistryRequestError, caplog
+    )
+
+
+def test_export_manifest_failure_redacts_traceback(
+    registry, monkeypatch, caplog, unpublished_cache_layer
+):
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _: None)
+    registry.fail[("GET", "manifests/")] = 429
+    cache = RegistryLayerCache(
+        parse_cache_spec(CACHE_SPEC),
+        log_redact=lambda value: value.replace(CACHE_HOST, "<redacted>"),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RemoteCacheError, match="Failed to export") as error:
+            cache.store(*unpublished_cache_layer)
+    assert "<redacted>" in str(error.value)
+    assert CACHE_HOST not in str(error.value)
+    assert CACHE_HOST not in "".join(traceback.format_exception(error.value))
+    assert CACHE_HOST not in caplog.text
+    assert error.value.__context__ is None
+    assert registry.blobs == {} and registry.manifests == {}
+    assert not registry.manifest_puts()
+
+
+def test_export_creates_missing_record_without_warning(
+    registry, caplog, unpublished_cache_layer
+):
+    cache = RegistryLayerCache(parse_cache_spec(CACHE_SPEC))
+    with caplog.at_level(logging.WARNING, logger="pycontainer.remote_cache"):
+        assert cache.store(*unpublished_cache_layer) is True
+    assert caplog.text == ""
+    assert cache_tag(unpublished_cache_layer[0]) in registry.manifests
+
+
+def test_manifest_error_fails_build_without_registry_writes(tmp_path, registry, monkeypatch):
+    history_dir = tmp_path / "history"
+    writer = _builder(
+        tmp_path, "writer", cache_to=CACHE_SPEC,
+        record_history=True, history_dir=str(history_dir),
+    )
+    registry.fail[("GET", "manifests/")] = 429
+    monkeypatch.setattr("pycontainer.registry_client.time.sleep", lambda _: None)
+
+    with pytest.raises(RemoteCacheError, match="Failed to export"):
+        writer.build()
+
+    assert BuildHistory(history_dir).list()[0]["status"] == "failed"
+    assert registry.blobs == {} and registry.manifests == {}
+    assert not [request for request in registry.requests if request[1] in ("POST", "PUT", "PATCH", "DELETE")]
+
+
 def test_export_replaces_manifest_with_invalid_utf8(tmp_path, registry):
     writer, layer = _export(tmp_path, registry)
     key = _key_for(writer)
     tag = cache_tag(key)
     registry.manifests[tag] = b"\xff"
+
+    assert writer.remote_cache_to.store(
+        key, layer.digest, Path(layer.tar_path), layer.size
+    ) is True
+    assert json.loads(registry.manifests[tag])["layers"][0]["digest"] == layer.digest
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"", b"not-json", b"[]", b"[" * 20000 + b"]" * 20000, b'{"n":' + b"9" * 5000 + b"}"],
+    ids=["empty", "invalid-json", "non-object", "deeply-nested", "oversized-integer"],
+)
+def test_export_replaces_unparseable_existing_manifest(tmp_path, registry, body):
+    writer, layer = _export(tmp_path, registry)
+    key = _key_for(writer)
+    tag = cache_tag(key)
+    registry.manifests[tag] = body
 
     assert writer.remote_cache_to.store(
         key, layer.digest, Path(layer.tar_path), layer.size

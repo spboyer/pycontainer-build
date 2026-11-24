@@ -774,7 +774,9 @@ the latter warns and permits HTTP credentials only for loopback hosts.
 
 Import is best-effort: a missing record is a quiet miss, and an invalid record,
 integrity failure, auth or network error logs a warning and rebuilds the layer
-locally. Export errors fail the build. Manifests and configs are size-bounded,
+locally. Export errors fail the build: missing or malformed records may be
+replaced, but registry-read, size-limit and digest failures abort before any
+registry writes. Manifests and configs are size-bounded,
 layers are limited to 4 GiB and verified by digest and size, credentials come
 from the cache registry's own provider, and control-plane redirects strip
 `Authorization` across origins. Redirected blob storage receives no registry

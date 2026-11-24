@@ -21,6 +21,7 @@ from .auth import RegistryAuth, get_registry_auth
 from .blob_store import BlobIntegrityError, digest_filename
 from .registry_client import (
     RegistryClient,
+    RegistryManifestFormatError,
     RegistryNotFoundError,
     RegistryRequestError,
     parse_image_reference,
@@ -327,7 +328,7 @@ class RegistryLayerCache:
                 return False
             # The record is published last so readers never see missing blobs.
             self.client.push_manifest(tag, manifest_bytes)
-        except (RegistryRequestError, BlobIntegrityError, OSError) as error:
+        except (RegistryRequestError, BlobIntegrityError, OSError, RecursionError) as error:
             message = self._redact(
                 f"Failed to export remote cache record {tag} to {self.ref}: {error}"
             )
@@ -344,8 +345,7 @@ class RegistryLayerCache:
             _, digest = self.client.pull_manifest(tag, max_size=MAX_RECORD_MANIFEST_BYTES)
         except RegistryNotFoundError:
             return None
-        except (RegistryRequestError, BlobIntegrityError, RecursionError) as error:
-            # An unreadable record is replaced; push failures still surface below.
+        except RegistryManifestFormatError as error:
             logger.debug("%s", self._redact(f"Replacing unreadable remote cache record {tag}: {error}"))
             return None
         return digest

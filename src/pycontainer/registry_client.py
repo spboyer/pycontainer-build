@@ -94,6 +94,10 @@ class RegistryNotFoundError(RegistryRequestError):
         super().__init__(f"{message} (manifest not found).")
 
 
+class RegistryManifestFormatError(RegistryRequestError):
+    """Raised when a registry manifest cannot be decoded as a JSON object."""
+
+
 class RegistryRateLimitError(RegistryRequestError):
     """Raised when a registry rejects requests because of a rate limit."""
 
@@ -1141,10 +1145,6 @@ class RegistryClient:
             )
         if status != 200:
             raise self._error("Manifest pull", url, status, body, response_headers)
-        if not body:
-            raise RegistryRequestError(
-                f"Registry returned an empty manifest response for {reference}."
-            )
         if expected_size is not None and len(body) != expected_size:
             raise BlobIntegrityError(
                 f"Downloaded manifest has size {len(body)}, expected {expected_size}."
@@ -1155,39 +1155,45 @@ class RegistryClient:
                 f"Downloaded manifest hashes to {body_digest}, expected "
                 f"{expected_digest}."
             )
+        digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
+            "docker-content-digest"
+        )
+        if digest:
+            if digest.startswith("sha512:"):
+                expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
+            elif digest.startswith("sha256:"):
+                expected_header = body_digest
+            else:
+                # Unsupported algorithms remain opaque and are not treated as verified.
+                expected_header = None
+            if expected_header is not None and digest != expected_header:
+                raise BlobIntegrityError(
+                    f"Registry-reported manifest digest does not match its body "
+                    f"digest {body_digest}."
+                )
+        else:
+            digest = body_digest
+        if not body:
+            raise RegistryManifestFormatError(
+                f"Registry returned an empty manifest response for {reference}."
+            )
         try:
             manifest = json.loads(body)
         except json.JSONDecodeError as error:
             parse_error = f" at line {error.lineno}, column {error.colno}"
         except UnicodeDecodeError:
             parse_error = ": expected UTF-8"
+        except (RecursionError, ValueError):
+            parse_error = ": exceeded supported JSON limits"
         else:
             parse_error = None
         if parse_error:
-            raise RegistryRequestError(
+            raise RegistryManifestFormatError(
                 f"Registry returned invalid manifest JSON{parse_error}."
             )
         if not isinstance(manifest, dict):
-            raise RegistryRequestError(
+            raise RegistryManifestFormatError(
                 f"Registry returned a non-object manifest for {reference}."
-            )
-        digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
-            "docker-content-digest"
-        )
-        if not digest:
-            return manifest, body_digest
-        if digest.startswith("sha512:"):
-            expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
-        elif digest.startswith("sha256:"):
-            expected_header = body_digest
-        else:
-            # Unsupported algorithms cannot be verified; return the header opaquely so
-            # callers never treat it, or a sha256 alias, as a verified digest.
-            return manifest, digest
-        if digest != expected_header:
-            raise BlobIntegrityError(
-                f"Registry-reported manifest digest does not match its body "
-                f"digest {body_digest}."
             )
         return manifest, digest
 

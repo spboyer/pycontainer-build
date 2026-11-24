@@ -73,7 +73,9 @@ identity, layer format and builder Python version. Push access to the cache
 repository defines the trusted writers; digests prove integrity, not
 provenance. Import failures warn and rebuild; remote caching validates the tar
 against its source identity and rechecks sources. Mismatched cached layers are
-rebuilt; export publishes blobs before the tag and fails explicitly.
+rebuilt; export publishes blobs before the tag and fails explicitly. Missing
+or malformed manifests can be replaced, but registry-read, size-limit and
+digest failures abort before any registry writes.
 Control-plane redirects drop `Authorization`
 across origins. Blob redirects carry no credentials, and every hop must be HTTPS
 unless it stays on an explicitly insecure registry's own origin.
