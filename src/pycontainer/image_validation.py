@@ -890,13 +890,13 @@ def validate_image(
     if base_layer_count is not None and expected_digest is None:
         raise ValueError("Base layer attribution requires the expected manifest digest.")
     validate_ignores(ignores)
+    unknown = sorted(set(thresholds or {}) - set(SIZE_THRESHOLDS))
+    if unknown:
+        raise ValueError(f"Unknown image size threshold(s): {', '.join(unknown)}.")
     thresholds = {
         name: parse_size_threshold(value, name)
         for name, value in (thresholds or {}).items() if value is not None
     }
-    unknown = sorted(set(thresholds) - set(SIZE_THRESHOLDS))
-    if unknown:
-        raise ValueError(f"Unknown image size threshold(s): {', '.join(unknown)}.")
     layout = _VerifiedLayout(output)
     index, entries = layout.verify()
     digest, selected_platform, runtime = layout.select(index, entries, tag, platform)

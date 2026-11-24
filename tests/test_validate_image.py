@@ -1327,6 +1327,23 @@ def _sized_image(layout, layer_bytes, **kwargs):
     return descriptor, config, layer
 
 
+@pytest.mark.parametrize("value", [None, "1"])
+def test_unknown_size_threshold_names_are_rejected(tmp_path, value):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Unknown image size threshold"):
+        image_validation.validate_image(tmp_path, thresholds={"max_image_szie_mb": value})
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+def test_known_none_size_threshold_is_unset(tmp_path, name):
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(tmp_path, thresholds={name: None})
+    assert report["size"]["thresholds"] == {
+        "max_image_size_mb": None, "max_layer_size_mb": None,
+    }
+    assert not report["findings"]
+
+
 @pytest.mark.parametrize(("delta", "expected"), [(-1, 0), (0, 0), (1, 1)])
 def test_image_size_threshold_boundaries(tmp_path, monkeypatch, capsys, delta, expected):
     layout = tmp_path / "layout"
