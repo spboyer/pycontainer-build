@@ -4,6 +4,7 @@ import json
 import hashlib
 import tarfile
 import subprocess
+import traceback
 import zipfile
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -1012,6 +1013,42 @@ def test_matrix_build_args_redact_dry_run_and_publication(tmp_path, monkeypatch,
         build.push()
     assert "sensitive-release" not in str(error.value)
     assert "<redacted>" in str(error.value)
+
+
+@pytest.mark.parametrize("phase", ["authentication", "publication"])
+@pytest.mark.parametrize("status", [None, 403])
+def test_matrix_build_arg_failure_traceback_is_redacted(tmp_path, monkeypatch, phase, status):
+    build, _, _ = matrix(
+        tmp_path, monkeypatch, tag="registry.example/team/app:${VERSION}",
+        build_args={"VERSION": "synthetic-sensitive"}, semver_tags=False,
+    )
+    build.build()
+    attempts = []
+
+    def fail(*args, **kwargs):
+        attempts.append(phase)
+        if status is not None:
+            raise RegistryHTTPError(status, "synthetic-sensitive rejection")
+        raise RuntimeError("synthetic-sensitive unknown outcome")
+
+    if phase == "authentication":
+        monkeypatch.setattr(matrix_module, "get_registry_auth", fail)
+    else:
+        push = FakePushClient()
+        monkeypatch.setattr(push, "push_blob", fail)
+        monkeypatch.setattr(builder_module, "RegistryClient", push)
+    with pytest.raises(MatrixPublicationError) as caught:
+        build.push(show_progress=False)
+    error = caught.value
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert "synthetic-sensitive" not in formatted
+    assert "<redacted>" in formatted
+    assert error.status == status
+    assert attempts == [phase]
+    assert error.operations[0].outcome == (
+        "failed" if phase == "authentication" or status is not None else "unknown"
+    )
+    assert all(op.outcome == "unattempted" for op in error.operations[1:])
 
 
 def test_locked_matrix_checks_base_minor_before_resolving_lock(tmp_path, monkeypatch):

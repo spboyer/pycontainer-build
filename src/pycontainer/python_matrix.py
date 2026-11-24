@@ -120,6 +120,7 @@ class MatrixPublicationError(RuntimeError):
         redact: Optional[Callable[[str], str]] = None,
     ):
         self.operations = operations
+        self.status = cause.status if isinstance(cause, RegistryRequestError) else None
         groups = [
             f"{status}: " + (", ".join(
                 f"{op.kind} {op.reference}" for op in operations if op.outcome == status
@@ -285,7 +286,7 @@ class PythonMatrixBuilder:
                 self.operations.insert(0, PublicationOperation(
                     "authentication", repository, Path(self.config.output_dir), "failed"
                 ))
-                raise MatrixPublicationError(self.operations, error, self.config.redact) from error
+                raise MatrixPublicationError(self.operations, error, self.config.redact) from None
             for operation in self.operations:
                 reference = (
                     operation.reference.split("@", 1)[1] if "@" in operation.reference
@@ -305,7 +306,7 @@ class PythonMatrixBuilder:
                         and 400 <= error.status < 500 and error.status != 408
                         else "unknown"
                     )
-                    raise MatrixPublicationError(self.operations, error, self.config.redact) from error
+                    raise MatrixPublicationError(self.operations, error, self.config.redact) from None
                 operation.outcome = "confirmed"
                 if show_progress:
                     print(self.config.redact(f"Confirmed {operation.kind}: {operation.reference}"))
