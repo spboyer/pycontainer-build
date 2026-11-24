@@ -87,6 +87,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over auto-detected lockfiles and venvs)")
     b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
     b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
+    b.add_argument("--strip-type-stubs",action="store_true",default=None,help="Remove .pyi files and stub-only distributions (types-*, *-stubs) from the dependency layer")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
@@ -253,6 +254,7 @@ def main():
         'requirements_file': args.requirements_file,
         'lockfile': args.lockfile,
         'use_lockfile': args.use_lockfile,
+        'strip_type_stubs': args.strip_type_stubs,
         'verbose': args.verbose,
         'dry_run': getattr(args,"dry_run",None),
         'platform': getattr(args,"platform",None),
