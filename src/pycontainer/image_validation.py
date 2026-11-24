@@ -878,8 +878,8 @@ def _size_findings(size, thresholds, ignores):
 
 
 def validate_image(
-    output, tag=None, platform=None, ignores=(), thresholds=None,
-    expected_digest=None, base_layer_count=None, base_exposed_ports=None, redact=str,
+    output, tag=None, platform=None, ignores=(), base_exposed_ports=None, redact=str, *,
+    thresholds=None, expected_digest=None, base_layer_count=None,
 ):
     """Verify every reachable blob, then lint one unambiguously selected image.
 

@@ -1978,6 +1978,19 @@ def test_port_findings_redact_configured_values_before_encoding(
     assert json.dumps("bad-<redacted>-port") in message
 
 
+def test_validate_image_keeps_prior_positional_parameters(tmp_path):
+    key = "bad-secret-port"
+    descriptor, _, _ = _image(tmp_path, config={"ExposedPorts": {}})
+    _layout(tmp_path, [descriptor])
+    report = image_validation.validate_image(
+        tmp_path, None, None, (), [key], lambda text: text.replace("secret", "<redacted>")
+    )
+    findings = {item["rule_id"]: item["message"] for item in report["findings"]}
+    assert "PCB013" in findings
+    assert "bad-<redacted>-port" in findings["PCB013"]
+    assert report["size"]["thresholds"] == {"max_image_size_mb": None, "max_layer_size_mb": None}
+
+
 def test_non_object_exposed_ports_is_a_config_error(tmp_path, monkeypatch, capsys):
     descriptor, _, _ = _image(tmp_path, config={"ExposedPorts": ["8000/tcp"]})
     _layout(tmp_path, [descriptor])
