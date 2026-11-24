@@ -2,7 +2,7 @@ import argparse, json, os, logging, sys
 from contextlib import ExitStack
 from pathlib import Path
 from .config import SBOM_FORMATS, SCAN_SEVERITIES
-from .config_loader import _validate_config, load_explicit_file_config
+from .config_loader import _declared_default_values, _validate_config, load_explicit_file_config
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
@@ -59,12 +59,7 @@ def _image_validation(output, tag, platform, ignores, format_, fail_on, expected
 
 def _declared_argument_redactor(declarations):
     """Redact declared build-argument values, even when the declarations are invalid."""
-    values=[]
-    if isinstance(declarations, dict):
-        for declaration in declarations.values():
-            value=declaration.get("default") if isinstance(declaration, dict) else declaration
-            if isinstance(value, str):
-                values.append(value)
+    values=_declared_default_values({"build_args": declarations})
     return lambda message: redact_values(message, values)
 
 def _validate_image_command(parser, args):

@@ -284,6 +284,29 @@ def test_invalid_validation_configuration_redacts_build_arguments(tmp_path, monk
     _assert_redacted(capsys)
 
 
+@pytest.mark.parametrize("command", ["config", "image"])
+def test_config_key_collisions_redact_declared_build_arguments(tmp_path, monkeypatch, capsys, command):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    secret = "redaction-fixture-2159"
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build]\n{secret} = true\n{secret.replace("-", "_")} = true\n'
+        f'[build.build-args]\nTOKEN = "{secret}"\n'
+    )
+
+    if command == "image":
+        code = _validate(monkeypatch, tmp_path, "--config", str(config))
+    else:
+        code = _run(monkeypatch, ["validate", "config", str(config)])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert secret not in captured.out + captured.err
+    assert "normalize to the same setting 'redaction_fixture_2159'" in captured.err
+    assert "<redacted>" in captured.err
+
+
 def test_unknown_cli_ignore_redacts_configured_build_arguments(tmp_path, monkeypatch, capsys):
     descriptor, _, _ = _image(tmp_path)
     _layout(tmp_path, [descriptor])
