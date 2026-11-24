@@ -1,0 +1,8 @@
+- id: pycontainer-validate-config
+  name: Validate pycontainer configuration
+  description: Check selected build configurations offline without building images.
+  entry: pycontainer validate config --
+  language: python
+  files: '(^|/)pycontainer\.toml$'
+  types: [file]
+  require_serial: true

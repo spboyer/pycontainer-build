@@ -59,6 +59,8 @@ reserved ID, so ignoring it is currently a no-op. Suppressions apply only to
 findings, never to layout or integrity errors. Configuration, ignore and layout
 diagnostics redact declared build-argument values, as `validate config` does;
 `validate image` redacts declared defaults because it accepts no `--build-arg`.
+Both commands also redact declared defaults from key-normalization collisions
+(for example `my-key` and `my_key`), which are reported before other checks.
 
 `--max-image-size-mb` and `--max-layer-size-mb` (on `validate image`, and on
 `build` together with `--validate`) override the matching TOML key only when

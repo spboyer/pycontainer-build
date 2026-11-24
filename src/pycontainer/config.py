@@ -183,6 +183,8 @@ class BuildConfig:
     semver_tags: bool = False
     latest_tag: bool = False
     validate: Dict[str, Any] = field(default_factory=dict)
+    squash: bool = False
+    analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
     index_annotations: Optional[Dict[str, str]] = None
     scan: bool = False
