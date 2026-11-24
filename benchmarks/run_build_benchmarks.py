@@ -22,6 +22,7 @@ import urllib.request
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -206,6 +207,8 @@ def _measure_transfer_worker(spec):
         "dependency_layer_bytes": 0,
         "cache_lookups": 0,
         "cache_hits": 0,
+        "dependency_cache_lookups": 0,
+        "dependency_cache_hits": 0,
         "uploaded_bytes": spec["size_bytes"],
         "downloaded_bytes": spec["size_bytes"],
     }
@@ -660,8 +663,9 @@ def _measure_worker(spec):
     output.mkdir(parents=True, exist_ok=True)
     layers_dir = output / "blobs" / "sha256"
     layers_dir.mkdir(parents=True, exist_ok=True)
-    cache_hits = {"lookups": 0, "hits": 0}
+    cache_hits = {"lookups": 0, "hits": 0, "dependency_lookups": 0, "dependency_hits": 0}
     original_get_layer = LayerCache.get_layer
+    original_get_entry = LayerCache.get_entry
 
     def tracked_get_layer(cache, files, **kwargs):
         cache_hits["lookups"] += 1
@@ -669,7 +673,15 @@ def _measure_worker(spec):
         cache_hits["hits"] += layer is not None
         return layer
 
+    def tracked_get_entry(cache, key):
+        entry = original_get_entry(cache, key)
+        if key.startswith("deps-v"):
+            cache_hits["dependency_lookups"] += 1
+            cache_hits["dependency_hits"] += entry is not None
+        return entry
+
     LayerCache.get_layer = tracked_get_layer
+    LayerCache.get_entry = tracked_get_entry
     config = BuildConfig(
         tag="benchmark:local",
         context_dir=str(context),
@@ -727,18 +739,31 @@ def _measure_worker(spec):
             "dependency_layer_bytes": dependency_layer_bytes,
             "cache_lookups": cache_hits["lookups"],
             "cache_hits": cache_hits["hits"],
+            "dependency_cache_lookups": cache_hits["dependency_lookups"],
+            "dependency_cache_hits": cache_hits["dependency_hits"],
+            "pip_version": metadata.version("pip"),
         }
     finally:
         tracemalloc.stop()
         LayerCache.get_layer = original_get_layer
+        LayerCache.get_entry = original_get_entry
 
 
 def _invoke_worker(spec):
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.upper().startswith(("PIP_", "PYTHON"))
+    }
+    environment["PIP_CONFIG_FILE"] = os.devnull
+    environment["NETRC"] = os.devnull
+    environment["NO_PROXY"] = "*"
+    environment["no_proxy"] = "*"
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker", json.dumps(spec)],
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
     return json.loads(result.stdout)
 
@@ -754,6 +779,9 @@ def _measured_case(name, description, specs):
         ),
         "median_output_bytes": statistics.median(sample["output_bytes"] for sample in samples),
         "total_cache_hits": sum(sample["cache_hits"] for sample in samples),
+        "total_dependency_cache_hits": sum(
+            sample["dependency_cache_hits"] for sample in samples
+        ),
     }
     if "uploaded_bytes" in samples[0]:
         summary["median_uploaded_bytes"] = statistics.median(
@@ -1089,6 +1117,49 @@ def run_benchmarks(args):
             )
         )
 
+        pinned_context = root / "pinned-context"
+        _create_fixture(pinned_context, args.files, args.file_bytes)
+        wheel = pinned_context / "wheelhouse" / "benchmark_dependency-1.0-py3-none-any.whl"
+        (pinned_context / "requirements.txt").write_text(
+            "--no-index\n--find-links ./wheelhouse\nbenchmark-dependency==1.0 "
+            f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n",
+            encoding="utf-8",
+        )
+        cases.append(
+            _measured_case(
+                "dependency-layer-cold",
+                "Full local build of a hash-pinned requirements fixture with an empty cache per sample; pip stages the dependency layer.",
+                [
+                    _spec(
+                        pinned_context,
+                        root / f"pinned-cold-output-{sample}",
+                        root / f"pinned-cold-cache-{sample}",
+                        include_deps=True,
+                    )
+                    for sample in range(args.repetitions)
+                ],
+            )
+        )
+        pinned_cache = root / "pinned-warm-cache"
+        _invoke_worker(
+            _spec(pinned_context, root / "pinned-warmup-output", pinned_cache, include_deps=True)
+        )
+        cases.append(
+            _measured_case(
+                "dependency-layer-hit",
+                "Same hash-pinned fixture with a populated cache and fresh output per sample; the dependency layer is reused without running pip install.",
+                [
+                    _spec(
+                        pinned_context,
+                        root / f"pinned-hit-output-{sample}",
+                        pinned_cache,
+                        include_deps=True,
+                    )
+                    for sample in range(args.repetitions)
+                ],
+            )
+        )
+
         server, server_thread, registry_url = _start_benchmark_registry(
             root / "synthetic-registry"
         )
@@ -1135,6 +1206,10 @@ def run_benchmarks(args):
             "environment": {
                 "python": sys.version,
                 "implementation": platform.python_implementation(),
+                "pip": next(
+                    case["samples"][0]["pip_version"]
+                    for case in cases if case["name"] == "dependency-layer-cold"
+                ),
                 "system": platform.system(),
                 "release": platform.release(),
                 "machine": platform.machine(),
@@ -1167,6 +1242,7 @@ def run_benchmarks(args):
                 "python_tracemalloc_peak_bytes": "Python-tracked peak allocations during builder construction and measured work.",
                 "output_bytes": "App-layer tar bytes for app-only; total local OCI output file bytes for full builds.",
                 "cache_hits": "App-layer cache hits observed during the measured build.",
+                "dependency_cache_hits": "Verified dependency-layer cache entries found during the measured build; worker PIP_* and PYTHON* settings are cleared, pip config and netrc disabled and proxies bypassed. Plain requirements still read pip configuration once per build.",
                 "registry_transfer": "Per-sample loopback synthetic registry upload/download; server storage and fixture generation are excluded from the measured worker process. These are not external registry throughput results.",
                 "registry_network": "The registry runs in a separate process and sleeps request_delay_ms before every response, approximating one round trip per HTTP request. The client opens a new connection per request; real HTTPS adds TCP and TLS handshakes per request, so a delay of about three RTTs approximates one HTTPS request. Bandwidth is paced in 64 KiB chunks either across all connections (shared, one bottleneck link) or per connection (per-connection, models per-flow TCP limits). Probe workers transfer the same blobs through RegistryClient with a thread pool and are an estimate of concurrency headroom, not a product path; probe_1_worker calibrates the probe against the real sequential path. projected_saving_* are paired per-sample medians of the 1-worker minus N-worker probe transfer time; projected_saving_share divides that by the sequential product pull + local build + push total. No tracemalloc runs during network cases.",
                 "timing_gates": "None; compare trends only across matching environments and fixture parameters.",

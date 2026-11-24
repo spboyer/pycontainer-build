@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,14 @@ def test_network_savings_come_from_matched_probes_with_identical_bases(
     assert len({repository for repository, _ in seeds}) == 6
 
 
-def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
+def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path, monkeypatch):
+    pip_config = tmp_path / "pip.conf"
+    pip_config.write_text("[install]\nno-deps = true\n", encoding="utf-8")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(pip_config))
+    monkeypatch.setenv("PIP_NO_DEPS", "1")
+    monkeypatch.setenv("NETRC", str(tmp_path / "netrc"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "python-user-base"))
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
     output = tmp_path / "benchmark.json"
     subprocess.run(
         [
@@ -129,6 +137,7 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
     )
 
     results = json.loads(output.read_text(encoding="utf-8"))
+    assert results["environment"]["pip"] == metadata.version("pip")
     cases = {case["name"]: case for case in results["cases"]}
     assert set(cases) == {
         "app-only",
@@ -137,6 +146,8 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
         "local-full-build-no-op",
         "local-full-build-app-change",
         "local-full-build-dependency-change",
+        "dependency-layer-cold",
+        "dependency-layer-hit",
         "registry-blob-transfer-1MiB",
         "registry-blob-transfer-2MiB",
         "registry-network-2x0.25-5ms-1000Mbit",
@@ -168,6 +179,10 @@ def test_benchmark_harness_records_isolated_build_and_transfer_cases(tmp_path):
     assert cases["local-full-build-no-op"]["samples"][0]["cache_hits"] == 1
     assert cases["local-full-build-app-change"]["samples"][0]["cache_hits"] == 0
     assert cases["local-full-build-dependency-change"]["samples"][0]["cache_hits"] == 1
+    assert cases["local-full-build-dependency-change"]["samples"][0]["dependency_cache_hits"] == 0
+    assert cases["dependency-layer-cold"]["samples"][0]["dependency_cache_hits"] == 0
+    assert cases["dependency-layer-cold"]["samples"][0]["dependency_cache_lookups"] == 1
+    assert cases["dependency-layer-hit"]["samples"][0]["dependency_cache_hits"] == 1
     for size_mib in (1, 2):
         sample = cases[f"registry-blob-transfer-{size_mib}MiB"]["samples"][0]
         assert sample["uploaded_bytes"] == size_mib * 1024 * 1024

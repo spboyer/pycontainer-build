@@ -612,6 +612,10 @@ PDM lock_version 4 with `inherit_metadata` (Python-only targets), and uv lock
 version 1 for a single project. Git, path, URL, and editable packages, uv
 workspaces, sources, overrides and constraints, and PDM `find_links` fail with
 an explicit error rather than falling back to an unconstrained install.
+PDM locks with the `static_urls` strategy or recorded package/file artifact
+URLs are rejected, including for inactive groups, until those origins can be
+installed faithfully (#59); relock without `static_urls`. The error never
+echoes the URL.
 PDM and uv projects with dynamic dependencies are unsupported. Poetry dynamic
 dependencies must be declared in `tool.poetry.dependencies`.
 Poetry's Python and dependency ranges support PEP 440 constraints, exact
@@ -828,6 +832,55 @@ The cache automatically:
 - Invalidates when hardlinks between selected files are added or removed;
   the key records context-relative link targets, not inode numbers
 - Evicts old entries using LRU when size limit reached (default: 5GB)
+
+**Dependency layer reuse.** A whole staged dependency layer is reused only when
+its complete target closure is provably hash-pinned: a lockfile selection, or
+requirements (including nested `-r`/`-c` files) where every requirement is
+`==`-pinned with `--hash`. A hit runs no pip install and makes no index requests,
+and yields the same layer digest, DiffID and SBOM inventory as a fresh build.
+The key covers requirement/constraint/find-links content, target platform,
+pip target/ABI/libc tags, the installer's target marker environment, locked
+manifest roots and extras from the same snapshot used for package selection,
+the backend used for closure verification, Python version and implementation,
+workdir, type-stub stripping, pip version, the installer backend and sanitized index and find-links
+identities, including their exact paths. Plain
+requirements also key allowlisted ambient pip settings, read locally through
+pip's configuration parser even on a hit; snapshots preserve file/environment
+precedence with both pip 25's flat settings and pip 26's per-file settings.
+Shadowed settings are still checked for unsafe sources. Locked installs are `--isolated`.
+Index credentials and userinfo placeholders never enter cache metadata.
+Anything that cannot be proven is
+an explicit miss printed as
+`Dependency layer cache miss: <reason>.`, including unpinned or unhashed
+requirements, `-e`, `--no-deps`, direct-URL constraints, `file:` find-links,
+virtualenv staging, `--no-reproducible`, unknown ambient pip settings, and any
+index or find-links URL with userinfo, a credential-bearing path, query string
+or fragment. Configured netrc credentials, client certificates and explicit
+keyring providers also cause misses: authentication can route the same URL to
+different feeds. Index URLs must use HTTP or HTTPS.
+HTTP, HTTPS, all-protocol or system proxies also cause a miss unless
+`NO_PROXY=*` bypasses them; a pip-configured proxy always causes a miss for
+plain requirements. Proxies can route the same index to different feeds.
+Plain requirements also miss for absolute includes, symlinked requirement
+files, or local find-links paths that are absolute, symlinked, outside the
+context, or contain directories or HTML. Local find-links from ambient pip
+configuration, unsupported requirement encodings and ambiguous comments also
+miss. Nonempty `PYTHON*` environment
+variables such as `PYTHONPATH`, `PYTHONHOME` and `PYTHONUSERBASE` also cause
+a miss for both lockfiles and plain requirements, except informational
+Python-image version/bootstrap metadata; their values are never stored. Plain
+requirements also miss when `PIP_CONFIG_FILE` is relative because pip runs in
+the build context. On an eligible plain-requirements miss, the installer uses
+private temporary copies of the keyed requirements, local find-links files,
+pip settings and environment; the files are verified against the key before
+use. Eligible locked installs also use the captured no-proxy environment.
+Eligible installs disable netrc so credentials added after keying cannot change
+their source.
+Copies are limited to 512 MiB and 100,000 files, and failure to make or
+verify them falls back to an uncached install. Temporary configuration can
+contain credentials and is removed after staging. A hit reuses the artifacts
+selected when the entry was stored. Avoid editing the build context while a
+build runs: the snapshot protects cache identity, not all other image layers.
 
 **Saving and restoring the cache (offline export/import):** the `--cache-dir`
 directory (`index.json` plus `blobs/sha256/`) is self-contained and stores only

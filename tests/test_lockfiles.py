@@ -80,6 +80,52 @@ def _selected(selection):
 
 
 @pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_selection_keeps_its_manifest_roots(tmp_path, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    selection = load_lockfile(context, Path(lock_name), PY311)
+    roots, source = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+    replacement = "[packages]\n" if kind == "pipenv" else '[project]\nname = "replacement"\n'
+    (context / manifest_name).write_text(replacement, encoding="utf-8")
+    retained, retained_source = lockfile_module._locked_verification_roots(selection, context, PY311)
+
+    assert tuple(map(str, retained)) == tuple(map(str, roots))
+    assert retained_source == source
+    with pytest.raises(LockfileError, match="roots changed after dependency selection"):
+        verify_locked_installation(
+            selection, context, tmp_path / "site", PY311, verification_roots=([], source)
+        )
+    incomplete = LockSelection(selection.kind, selection.path, selection.packages)
+    with pytest.raises(LockfileError, match="missing its manifest-root snapshot"):
+        verify_locked_installation(incomplete, context, tmp_path / "site", PY311)
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
+def test_lock_reader_uses_the_manifest_captured_for_roots(tmp_path, monkeypatch, kind):
+    context = _copy(tmp_path, kind)
+    lock_name, manifest_name = FORMATS[kind]
+    manifest_path = context / manifest_name
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    reader = getattr(lockfile_module, f"_load_{kind}")
+
+    def read_after_manifest_change(path, environment, context_dir, manifest=None):
+        manifest_path.write_text("[packages]\n", encoding="utf-8")
+        try:
+            return reader(path, environment, context_dir, manifest)
+        finally:
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    monkeypatch.setattr(lockfile_module, f"_load_{kind}", read_after_manifest_change)
+    selection = load_lockfile(context, Path(lock_name), PY311)
+
+    assert _selected(selection) == EXPECTED_311
+    roots, _ = lockfile_module._locked_verification_roots(selection, context, PY311)
+    assert roots
+
+
+@pytest.mark.parametrize("kind", sorted(FORMATS))
 @pytest.mark.parametrize("target_kind", ["outside", "dangling"])
 @pytest.mark.parametrize("operation", ["preflight", "load", "verify"])
 def test_lock_manifest_link_cannot_leave_context_or_dangle(tmp_path, kind, target_kind, operation):
@@ -742,6 +788,152 @@ def test_pdm_multiple_indexes_fail_closed_including_preflight(tmp_path, prefligh
             preflight_lockfile(context, Path("pdm.lock"))
         else:
             load_lockfile(context, Path("pdm.lock"), PY311)
+
+
+PDM_ARTIFACT_URL = "https://one.example.invalid/secret-tenant/packages"
+
+
+def _pdm_with_recorded_urls(tmp_path, *, static_urls=True, package="anyio", package_url=False):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8")
+    if static_urls:
+        text = text.replace('strategy = ["inherit_metadata"]', 'strategy = ["inherit_metadata", "static_urls"]')
+    if package_url:
+        text = text.replace(
+            f'name = "{package}"\n', f'name = "{package}"\nurl = "{PDM_ARTIFACT_URL}/{package}.whl"\n', 1
+        )
+    else:
+        block = text.index(f'name = "{package}"\n')
+        start = text.index("{file = ", block)
+        end = text.index('", hash', start)
+        filename = text[start + len('{file = "'):end]
+        text = text[:start] + f'{{url = "{PDM_ARTIFACT_URL}/{filename}' + text[end:]
+    lock_path.write_text(text, encoding="utf-8")
+    return context
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"static_urls": False},
+        {"static_urls": False, "package": "pluggy"},
+        {"static_urls": False, "package": "pluggy", "package_url": True},
+    ],
+    ids=["generated", "url-without-strategy", "inactive-file-url", "inactive-package-url"],
+)
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_recorded_artifact_urls_fail_closed_without_echoing_them(tmp_path, options, preflight):
+    context = _pdm_with_recorded_urls(tmp_path, **options)
+
+    with pytest.raises(LockfileError, match="artifact URLs") as error:
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+    assert "example.invalid" not in str(error.value)
+    assert "secret-tenant" not in str(error.value)
+
+
+def test_pdm_static_urls_strategy_alone_fails_closed(tmp_path):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    lock_path.write_text(
+        lock_path.read_text(encoding="utf-8").replace(
+            'strategy = ["inherit_metadata"]', 'strategy = ["inherit_metadata", "static_urls"]'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockfileError, match="static_urls strategy"):
+        preflight_lockfile(context, Path("pdm.lock"))
+
+
+@pytest.mark.parametrize("name", [
+    "https://user:synthetic-secret@example.invalid/private",
+    "injected\nlog-line",
+    "injected\tlog-field",
+])
+@pytest.mark.parametrize("diagnostic", ["package-url", "file-url", "invalid-files"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_pdm_url_guard_diagnostics_do_not_echo_package_names(tmp_path, name, diagnostic, preflight):
+    context = _pdm_with_recorded_urls(
+        tmp_path, static_urls=False, package="pluggy", package_url=diagnostic == "package-url",
+    )
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8").replace('name = "pluggy"', f"name = {json.dumps(name)}")
+    if diagnostic == "invalid-files":
+        start = text.index("files = [\n", text.index(f"name = {json.dumps(name)}"))
+        text = text[:start] + 'files = [\n    "invalid",\n' + text[start + len("files = [\n"):]
+    lock_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError) as error:
+        if preflight:
+            preflight_lockfile(context, Path("pdm.lock"))
+        else:
+            load_lockfile(context, Path("pdm.lock"), PY311)
+    message = str(error.value)
+    assert name not in message
+    assert "synthetic-secret" not in message
+    assert "\n" not in message
+    assert "\t" not in message
+
+
+@pytest.mark.parametrize("malformed", ["strategy", "packages", "files"])
+def test_pdm_malformed_strategy_or_files_fail_closed(tmp_path, malformed):
+    context = _copy(tmp_path, "pdm")
+    lock_path = context / "pdm.lock"
+    text = lock_path.read_text(encoding="utf-8")
+    if malformed == "strategy":
+        text = text.replace('strategy = ["inherit_metadata"]', 'strategy = "inherit_metadata"', 1)
+    elif malformed == "packages":
+        text = 'package = ["invalid"]\n' + text[:text.index("[[package]]")]
+    else:
+        files = text.index("files = [\n", text.index('name = "pluggy"'))
+        text = text[:files] + 'files = [\n    "invalid",\n' + text[files + len("files = [\n"):]
+    lock_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(LockfileError, match="invalid"):
+        preflight_lockfile(context, Path("pdm.lock"))
+
+
+def test_pdm_filename_only_locks_are_unaffected(tmp_path):
+    context = _copy(tmp_path, "pdm")
+
+    preflight_lockfile(context, Path("pdm.lock"))
+    assert _selected(load_lockfile(context, Path("pdm.lock"), PY311)) == EXPECTED_311
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_pdm_recorded_artifact_urls_block_build_install_and_cache(tmp_path, monkeypatch, dry_run):
+    context = _pdm_with_recorded_urls(tmp_path)
+    (context / "app.py").write_text("print('ok')\n")
+    monkeypatch.setattr(
+        "pycontainer.builder.install_locked_requirements",
+        lambda *args, **kwargs: pytest.fail("wrong-origin dependency install ran"),
+    )
+    monkeypatch.setattr(
+        "pycontainer.builder.install_requirements",
+        lambda *args, **kwargs: pytest.fail("dependency install ran"),
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_cached_dependency_layer",
+        lambda *args, **kwargs: pytest.fail("dependency cache was consulted"),
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda self, layers_dir, os_name, arch: ([], BASE_CONFIG),
+    )
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(tmp_path / "output"),
+        cache_dir=str(tmp_path / "cache"), base_image="python:3.11-slim-bookworm",
+        include_deps=True, dry_run=dry_run, include_paths=["app.py"], cmd=["python", "app.py"],
+    ))
+    assert (builder.cache is None) is dry_run
+
+    with pytest.raises(LockfileError, match="artifact URLs"):
+        builder.build()
 
 
 def test_pdm_toml_index_settings_are_rejected(tmp_path):
@@ -2231,10 +2423,12 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     site_packages = tmp_path / "stage" / "site-packages"
     site_packages.parent.mkdir()
     commands = []
+    environments = []
     popen = subprocess.Popen
 
     def record_pip(command, *args, **kwargs):
         commands.append(command)
+        environments.append(kwargs["env"])
         return popen(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", record_pip)
@@ -2248,6 +2442,15 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
     bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
     assert len(commands) == 2
     assert all(command[1:5] == ["-E", "-P", "-c", bootstrap] for command in commands)
+    assert all(
+        {"--isolated", "--no-deps", "--require-hashes"} <= set(command)
+        for command in commands
+    )
+    assert all(
+        {key.upper(): value for key, value in env.items() if key.upper().startswith("PIP_")}
+        == {"PIP_CONFIG_FILE": os.devnull}
+        for env in environments
+    )
     assert {path.name for path in site_packages.iterdir()} >= {"marker_first", "marker_second"}
     assert any("marker-first" in path for path in index_a.requests)
     assert any("marker-second" in path for path in index_b.requests)
@@ -2464,7 +2667,7 @@ def _bypass_locked_pip_isolation(monkeypatch, key):
     monkeypatch.setattr(
         dependencies,
         "_locked_pip_environment",
-        lambda temporary_dir: {
+        lambda temporary_dir, _source_environment=None: {
             **os.environ,
             **{name: str(temporary_dir) for name in ("TMP", "TEMP", "TMPDIR")},
         },
