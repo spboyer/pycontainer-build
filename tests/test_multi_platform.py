@@ -1593,6 +1593,42 @@ def test_squash_flattens_builder_layers_and_keeps_base(tmp_path, monkeypatch):
         ]
 
 
+def test_squash_preserves_detected_framework_per_platform(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "app.py").write_text("import streamlit\n")
+    (ctx / "requirements.txt").write_text("streamlit\n")
+    ports = {"amd64": 9101, "arm64": 9102}
+    environment = {
+        arch: [
+            "PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9",
+            "PYTHON_LIBC=glibc-2.17", f"STREAMLIT_SERVER_PORT={port}",
+        ]
+        for arch, port in ports.items()
+    }
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(base_env_by_arch=environment),
+        ctx=ctx, include_deps=True, squash=True,
+    )
+
+    builder.build()
+
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert config["config"]["Entrypoint"] == [
+            "streamlit", "run", "app.py", "--server.address=0.0.0.0",
+            f"--server.port={ports[arch]}",
+        ]
+        assert config["config"]["ExposedPorts"] == {f"{ports[arch]}/tcp": {}}
+        assert config["config"]["Labels"]["framework"] == "streamlit"
+        assert len(image.layers) == 2
+        assert config["rootfs"]["diff_ids"][-1] == image.layers[-1].digest
+        names = _tar_names(image.layers[-1].tar_path)
+        assert "app/app.py" in names
+        assert f"app/.python/site-packages/native_{arch}/__init__.py" in names
+
+
 def test_squash_and_security_fragments_can_be_combined(tmp_path, monkeypatch):
     _install_fake_deps(monkeypatch)
     ctx = _context(tmp_path, requirements=True)
