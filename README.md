@@ -936,7 +936,8 @@ volumes = ["/data", "/var/cache/app"]
 `[tool.pycontainer.labels]`), which is what `pycontainer import` generates.
 The same keys, validation and CLI precedence apply. A file that defines both
 `[build]` and `[tool.pycontainer]` is rejected rather than merged; keep exactly
-one. Poetry-only keys such as `push` are reported as unknown by
+one. A file passed explicitly that defines neither table (for example a
+misspelled `[biuld]`) is an error, not a silent fall-back to defaults. Poetry-only keys such as `push` are reported as unknown by
 `pycontainer build`; use `--push` instead. See
 [Dockerfile import](docs/dockerfile-import.md).
 
@@ -949,6 +950,26 @@ how to apply them.
 
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
+
+### Validating configuration offline
+
+`pycontainer validate config` resolves the effective build configuration the
+same way `build` does (defaults, local Python detection, `[build]` or
+`[tool.pycontainer]`, and CLI-over-file precedence) without building, pulling,
+pushing, touching the cache or writing files:
+
+```bash
+pycontainer validate config                    # build defaults for the current directory
+pycontainer validate config pycontainer.toml pyproject.toml --platform linux/arm64
+pycontainer validate config -c pyproject.toml
+```
+
+It exits 0 when every configuration is valid and 2 for invalid settings,
+missing files, files without a `[build]` or `[tool.pycontainer]` table,
+conflicting tables or usage errors, and lists the registry,
+dependency-resolution and runtime checks it did not perform. A passing
+validation does not prove a build will succeed. See
+[configuration validation](docs/validate-config.md).
 
 ### Build arguments
 
