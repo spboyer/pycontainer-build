@@ -5,7 +5,7 @@ from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
 from .build_args import redact_values, resolve_arguments
-from .effective_config import NOT_PERFORMED, resolve_build_config
+from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -358,13 +358,15 @@ def main():
         for path in sources:
             label=path if path is not None else "defaults (no configuration file)"
             try:
-                _,table=resolve_build_config(Path(path) if path is not None else None,cli_overrides,args.build_arg)
+                cfg,table=resolve_build_config(Path(path) if path is not None else None,cli_overrides,args.build_arg)
             except (OSError,ValueError) as exc:
                 invalid+=1
+                if isinstance(exc,ConfigValidationError):
+                    label=exc.redact(label)
                 for line in str(exc).splitlines():
                     print(f"error: {label}: {line}",file=sys.stderr)
             else:
-                print(f"ok: {label}"+(f" {table}" if table else ""))
+                print(f"ok: {cfg.redact(label)}"+(f" {table}" if table else ""))
         print("Not performed (offline validation does not prove a successful build):")
         for check in NOT_PERFORMED:
             print(f"  - {check}")

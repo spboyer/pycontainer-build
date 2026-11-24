@@ -53,9 +53,13 @@ NOT_PERFORMED = (
 class ConfigValidationError(ValueError):
     """One or more source-qualified configuration diagnostics."""
 
-    def __init__(self, diagnostics: List[str]):
+    def __init__(self, diagnostics: List[str], redaction_values=()):
         self.diagnostics = list(diagnostics)
+        self._redaction_values = tuple(redaction_values)
         super().__init__("\n".join(self.diagnostics))
+
+    def redact(self, message: str) -> str:
+        return redact_values(message, self._redaction_values)
 
 
 def _origin(field: str, overrides: Dict[str, Any], table: Optional[str], file_keys) -> str:
@@ -158,20 +162,27 @@ def resolve_settings(
 ) -> BuildConfig:
     """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
-    _validate_config(merged, table or BUILD_TABLE)
     origin = lambda field: _origin(field, overrides, table, file_config)
     try:
         arguments = resolve_arguments(merged.get("build_args") or {}, build_arg_overrides)
     except ValueError as exc:
         field_origin = "CLI option --build-arg" if "--build-arg" in str(exc) or str(exc).startswith("Undeclared build argument ") else origin("build_args")
         raise ConfigValidationError([f"{field_origin}: {exc}"]) from None
+    try:
+        _validate_config(merged, table or BUILD_TABLE)
+    except ValueError as exc:
+        raise ConfigValidationError(
+            [redact_values(str(exc), arguments.values())], arguments.values()
+        ) from None
     expanded = dict(merged)
     for field in EXPANDABLE_FIELDS:
         if field in merged:
             try:
                 expanded[field] = expand_field(merged[field], arguments, field)
             except ValueError as exc:
-                raise ConfigValidationError([f"{origin(field)}: {redact_values(str(exc), arguments.values())}"]) from None
+                raise ConfigValidationError(
+                    [f"{origin(field)}: {redact_values(str(exc), arguments.values())}"], arguments.values()
+                ) from None
     merged["build_args"] = arguments
     try:
         cfg = BuildConfig(**merged)
@@ -184,18 +195,21 @@ def resolve_settings(
                 except ValueError as path_error:
                     errors.append(f"{origin(field)}: {path_error}")
                     break
-        raise ConfigValidationError([redact_values(error, arguments.values()) for error in errors]) from None
+        raise ConfigValidationError(
+            [redact_values(error, arguments.values()) for error in errors], arguments.values()
+        ) from None
     if detect_base_image and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
-        except (AttributeError, TypeError, ValueError) as exc:
+        except (AttributeError, OSError, TypeError, ValueError) as exc:
             pyproject = Path(cfg.context_dir) / "pyproject.toml"
             raise ConfigValidationError(
-                [cfg.redact(f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}")]
+                [cfg.redact(f"{pyproject} [project].requires-python: cannot detect the Python version: {exc}")],
+                arguments.values(),
             ) from None
         cfg.base_image = f"python:{version}-slim"
 
     errors = semantic_errors(cfg, origin)
     if errors:
-        raise ConfigValidationError([cfg.redact(error) for error in errors])
+        raise ConfigValidationError([cfg.redact(error) for error in errors], arguments.values())
     return cfg

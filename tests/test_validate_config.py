@@ -178,6 +178,27 @@ def test_interpolated_diagnostics_are_redacted(offline, monkeypatch, capsys):
         assert "<redacted>" in err
 
 
+@pytest.mark.parametrize("valid", [True, False])
+@pytest.mark.parametrize("override", [False, True])
+def test_source_labels_redact_resolved_arguments(offline, monkeypatch, capsys, valid, override):
+    value = "supplied-value" if override else "declared-value"
+    source = offline / value
+    source.mkdir()
+    path = _write(
+        source / "config.toml",
+        '[build]\n' + ('' if valid else 'context-dir = "missing"\n') +
+        '[build.build-args]\nVALUE = "declared-value"\n',
+    )
+    extra = ["--build-arg", f"VALUE={value}"] if override else []
+    assert _run(monkeypatch, ["validate", "config", path, *extra]) == (0 if valid else 2)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert value not in output
+    assert "<redacted>" in output
+    assert "config.toml" in output
+    assert ("ok:" if valid else "error:") in output
+
+
 def test_validation_applies_security_after_platform_override_and_expansion(offline, monkeypatch, capsys):
     path = _write(
         offline / "config.toml",
