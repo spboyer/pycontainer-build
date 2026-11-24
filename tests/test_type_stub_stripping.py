@@ -396,6 +396,46 @@ def test_builder_keeps_characters_written_when_redacting_stub_os_errors(
     assert "types_requests" not in "".join(traceback.format_exception(error.value))
 
 
+@pytest.mark.parametrize("regenerated_field", ["message", "attributes"])
+def test_builder_rejects_stub_error_constructors_that_regenerate_build_values(
+    tmp_path, monkeypatch, regenerated_field
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _stub_builder(tmp_path, monkeypatch, context, "synthetic-secret", False)
+    real_rmtree = shutil.rmtree
+
+    class RegeneratingError(OSError):
+        def __init__(self, *args):
+            if regenerated_field == "message":
+                super().__init__("synthetic-secret")
+            else:
+                super().__init__(13, "synthetic-secret", "synthetic-secret")
+                self.filename2 = "synthetic-secret"
+                self.detail = "synthetic-secret"
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise RegeneratingError()
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(OSError) as caught:
+        builder.build()
+
+    error = caught.value
+    assert not isinstance(error, RegeneratingError)
+    assert "synthetic-secret" not in "".join(traceback.format_exception(error))
+    assert "synthetic-secret" not in repr(error.args)
+    assert "synthetic-secret" not in repr(vars(error))
+    assert not hasattr(error, "detail")
+    assert error.__cause__ is None and error.__context__ is None
+    if regenerated_field == "attributes":
+        assert error.errno == 13
+        assert error.strerror == error.filename == error.filename2 == "<redacted>"
+
+
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
     configs = []
 

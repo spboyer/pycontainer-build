@@ -116,19 +116,23 @@ def _redacted_os_error(error: OSError, redact) -> OSError:
             args += (winerror, filename2)
     else:
         args = (redact(str(error)),)
-    try:
-        replacement = type(error)(*args)
-    except TypeError:
-        # Subclasses with a custom constructor still get the standard attributes.
-        replacement = OSError(*args)
+    standard_types = (
+        OSError, BlockingIOError, ChildProcessError, ConnectionError,
+        BrokenPipeError, ConnectionAbortedError, ConnectionRefusedError,
+        ConnectionResetError, FileExistsError, FileNotFoundError,
+        InterruptedError, IsADirectoryError, NotADirectoryError,
+        PermissionError, ProcessLookupError, TimeoutError,
+    )
+    # Custom constructors may regenerate the very text being redacted.
+    error_type = type(error) if type(error) in standard_types else OSError
+    replacement = error_type(*args)
     if filename is not None and replacement.filename is None:
         replacement.filename = filename
     if filename2 is not None:
         replacement.filename2 = filename2
-    try:
-        replacement.characters_written = error.characters_written
-    except AttributeError:
-        pass
+    characters_written = getattr(error, "characters_written", None)
+    if isinstance(characters_written, int):
+        replacement.characters_written = characters_written
     return replacement
 
 
