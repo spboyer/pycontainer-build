@@ -46,7 +46,6 @@ IMAGE_CONFIG_MEDIA_TYPES = {
     "application/vnd.oci.image.config.v1+json",
     "application/vnd.docker.container.image.v1+json",
 }
-_LOCKFILE_STAGING_PREFIX = ".pycontainer-lockfile-"
 
 
 def _write_content_addressed_bytes(
@@ -206,7 +205,9 @@ from .sbom import generate_sbom
 from .tags import local_reference_names
 from .security import SECURITY_DIR, render_security_fragments, write_security_fragments
 from .dependencies import (
+    _LOCKFILE_STAGING_PREFIX,
     create_console_entrypoints,
+    install_locked_requirements,
     install_requirements,
     reject_credentialed_direct_urls,
     reject_shipped_credentials,
@@ -1409,24 +1410,18 @@ class ImageBuilder:
                     f"Staging {len(selection.packages)} locked packages from "
                     f"{selection.path.as_posix()}..."
                 )
-                with tempfile.TemporaryDirectory(
-                    prefix=_LOCKFILE_STAGING_PREFIX, dir=ctx.resolve()
-                ) as requirements_dir:
-                    locked_requirements = Path(requirements_dir) / "locked-requirements.txt"
-                    locked_requirements.write_text(selection.render_requirements(), encoding="utf-8")
-                    install_requirements(
-                        locked_requirements,
-                        site_packages,
-                        ctx,
-                        os_name,
-                        arch,
-                        version,
-                        base_image_name,
-                        base_config,
-                        variant=variant,
-                        locked=True,
-                        base_image_tag_verified=base_image_tag_verified,
-                    )
+                install_locked_requirements(
+                    selection.requirement_sets(),
+                    site_packages,
+                    ctx,
+                    os_name,
+                    arch,
+                    version,
+                    base_image_name,
+                    base_config,
+                    variant=variant,
+                    base_image_tag_verified=base_image_tag_verified,
+                )
                 verify_locked_installation(
                     selection,
                     ctx,

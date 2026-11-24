@@ -786,7 +786,7 @@ def test_cli_history_options_and_push_outcome(tmp_path, monkeypatch):
         raise RuntimeError("synthetic push failure")
 
     monkeypatch.setattr(ImageBuilder, "push", fail_push)
-    monkeypatch.setattr(cli, "detect_python_version", lambda context: "3.11")
+    monkeypatch.setattr("pycontainer.effective_config.detect_python_version", lambda context: "3.11")
     config_path = tmp_path / "pycontainer.toml"
     config_path.write_text(
         "[build]\n"

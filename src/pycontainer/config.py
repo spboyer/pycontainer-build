@@ -5,7 +5,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
-from .file_rules import evaluate_file_rules
+from .file_rules import FileRuleError, evaluate_file_rules
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
@@ -221,6 +221,8 @@ class BuildConfig:
                 self._conditional_includes, self._conditional_excludes = evaluate_file_rules(
                     self.file_rules, self._resolved_build_args, self.platform
                 )
+        except FileRuleError as exc:
+            raise FileRuleError(self.redact(str(exc))) from None
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
 

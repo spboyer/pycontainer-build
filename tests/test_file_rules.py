@@ -184,7 +184,6 @@ def test_rules_reject_invalid_target_platform(platform):
                     build_args={"BUILD_MODE": "production"})
 
 
-CLI_OVERRIDES = ["--platform", "linux/arm64", "--build-arg", "BUILD_MODE=dev"]
 CLI_ENTRY_POINTS = {
     "build": ["build"],
     "dry-run": ["build", "--dry-run"],
@@ -192,62 +191,102 @@ CLI_ENTRY_POINTS = {
 }
 
 
-@pytest.mark.parametrize("entry_point", list(CLI_ENTRY_POINTS))
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize(
+    ("file_platform", "platform_override", "expected_platform"),
+    [
+        ('"${TARGET}"', [], "linux/arm64"),
+        ('"${TARGET}"', ["--platform", "linux/arm64/v8"], "linux/arm64/v8"),
+        ("123", ["--platform", "linux/arm64"], "linux/arm64"),
+    ],
+)
 def test_cli_overrides_resolve_before_rules_in_every_entry_point(
-    tmp_path, monkeypatch, entry_point
+    tmp_path, monkeypatch, capsys, table, file_platform, platform_override, expected_platform
 ):
-    if entry_point == "validate" and not hasattr(cli, "_validate_config_command"):
-        pytest.skip("pycontainer validate config arrives with #186; runs after integration")
-    import pycontainer.config as config_module
-
     context = _context(tmp_path)
+    conda = context / "debug_tools" / "environment"
+    (conda / "conda-meta").mkdir(parents=True)
+    (conda / "fastapi.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
     path = tmp_path / "pycontainer.toml"
     path.write_text(
-        f'[build]\ncontext-dir = {str(context)!r}\n'
-        f'output-dir = {str(tmp_path / "out")!r}\n'
-        'include-paths = ["app.py"]\nplatform = "linux/amd64"\n'
-        '[build.build-args]\nBUILD_MODE = "production"\n'
-        '[[build.file-rules]]\n'
+        f'[{table}]\ncontext-dir = {json.dumps(str(context))}\n'
+        f'output-dir = {json.dumps(str(tmp_path / "out"))}\n'
+        f'include-paths = ["app.py"]\nplatform = {file_platform}\n'
+        'use-cache = false\nverbose = true\n'
+        f'[{table}.build-args]\nBUILD_MODE = "production"\nTARGET = "linux/amd64"\n'
+        f'[[{table}.file-rules]]\n'
         'when = \'BUILD_MODE == "dev" and target.arch == "arm64"\'\n'
         'include = "debug_tools/**"\n'
+        f'[[{table}.file-rules]]\n'
+        'when = \'BUILD_MODE == "dev" and target.arch == "arm64"\'\n'
+        'exclude = "debug_tools/nested/**"\n'
     )
-    evaluations, selections = [], []
-    real_evaluate = config_module.evaluate_file_rules
+    configs, builders, pulls = [], [], []
+    real_resolve = cli.resolve_build_config
 
-    def recording_evaluate(rules, arguments, platform):
-        result = real_evaluate(rules, arguments, platform)
-        evaluations.append((dict(arguments), platform, result))
+    def recording_resolve(*args):
+        result = real_resolve(*args)
+        configs.append(result[0])
         return result
 
-    class CapturingBuilder:
+    class CapturingBuilder(ImageBuilder):
         def __init__(self, config):
-            selections.append(_selected(config))
+            super().__init__(config)
+            builders.append(self)
 
-        def build(self):
-            return tmp_path / "out"
+    def pull_base(builder, layers_dir, os_name, arch):
+        assert not builder.config.dry_run
+        pulls.append((os_name, arch))
+        return [], {"config": {}, "rootfs": {"type": "layers", "diff_ids": []}}
 
-    monkeypatch.setattr(config_module, "evaluate_file_rules", recording_evaluate)
+    monkeypatch.setattr(cli, "resolve_build_config", recording_resolve)
     monkeypatch.setattr(cli, "ImageBuilder", CapturingBuilder)
-    command = CLI_ENTRY_POINTS[entry_point]
-    config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
-    monkeypatch.setattr(
-        sys, "argv", ["pycontainer", *command, *config_args, *CLI_OVERRIDES]
+    monkeypatch.setattr(ImageBuilder, "_pull_base_image", pull_base)
+    overrides = [
+        "--build-arg", "BUILD_MODE=production", "--build-arg", "BUILD_MODE=dev",
+        "--build-arg", "TARGET=linux/arm64", *platform_override,
+    ]
+    expected = ["app.py", "debug_tools/inspect.py"]
+    for entry_point in ("validate", "dry-run", "build"):
+        command = CLI_ENTRY_POINTS[entry_point]
+        config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
+        monkeypatch.setattr(
+            sys, "argv", ["pycontainer", *command, *config_args, *overrides]
+        )
+        cli.main()
+        output = capsys.readouterr().out
+        cfg = configs[-1]
+        assert cfg.platform == expected_platform
+        assert cfg._resolved_build_args == {"BUILD_MODE": "dev", "TARGET": "linux/arm64"}
+        assert cfg._conditional_includes == ("debug_tools/**",)
+        assert cfg._conditional_excludes == ("debug_tools/nested/**",)
+        if entry_point == "validate":
+            assert not builders and not (tmp_path / "out").exists()
+            assert "build context: file selection" in output
+        else:
+            assert [relative.as_posix() for _, relative in builders[-1].context_files] == expected
+            assert cfg.entrypoint is None
+            if entry_point == "dry-run":
+                assert "debug_tools/inspect.py" in output
+                assert "debug_tools/nested/trace.py" not in output
+                assert not (tmp_path / "out").exists()
+            else:
+                with tarfile.open(builders[-1].layers[-1].tar_path) as archive:
+                    assert sorted(archive.getnames()) == [f"app/{name}" for name in expected]
+
+    assert len({cfg.cache_identity() for cfg in configs}) == 1
+    production, _ = real_resolve(
+        path, {"platform": expected_platform},
+        ["BUILD_MODE=production", "TARGET=linux/arm64"],
     )
-    cli.main()
-
-    # File defaults never reach evaluation; only the resolved overrides do.
-    assert evaluations and set(map(repr, evaluations)) == {repr((
-        {"BUILD_MODE": "dev"}, "linux/arm64", (("debug_tools/**",), ()),
-    ))}
-    if entry_point != "validate":
-        assert selections == [
-            ["app.py", "debug_tools/inspect.py", "debug_tools/nested/trace.py"]
-        ]
+    assert not production._conditional_includes
+    assert production.cache_identity() != configs[0].cache_identity()
+    assert pulls == [("linux", "arm64")]
 
 
-@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("entry_point", list(CLI_ENTRY_POINTS))
 def test_cli_multi_platform_with_per_target_rules_fails_before_building(
-    tmp_path, monkeypatch, capsys, dry_run
+    tmp_path, monkeypatch, capsys, entry_point
 ):
     context = _context(tmp_path)
     path = tmp_path / "pycontainer.toml"
@@ -262,16 +301,128 @@ def test_cli_multi_platform_with_per_target_rules_fails_before_building(
     )
     constructed = []
     monkeypatch.setattr(cli, "ImageBuilder", lambda config: constructed.append(config))
+    config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
     monkeypatch.setattr(sys, "argv", [
-        "pycontainer", "build", "--config", str(path),
-        "--platform", "linux/amd64,linux/arm64", *(["--dry-run"] if dry_run else []),
+        "pycontainer", *CLI_ENTRY_POINTS[entry_point], *config_args,
+        "--platform", "linux/amd64,linux/arm64",
     ])
-    with pytest.raises((SystemExit, ValueError)) as raised:
+    with pytest.raises(SystemExit) as raised:
         cli.main()
     captured = capsys.readouterr()
+    assert raised.value.code == 2
     assert "single target platform" in str(raised.value) + captured.out + captured.err
+    assert "[build].file_rules" in captured.err
     assert constructed == []
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("entry_point", list(CLI_ENTRY_POINTS))
+@pytest.mark.parametrize(
+    ("condition", "pattern", "message"),
+    [
+        ('MODE == "other" and UNKNOWN == "value"', "debug_tools/**", "unknown name UNKNOWN"),
+        ('MODE === "private-value"', "debug_tools/**", "invalid token"),
+        ('MODE == "private-value"', "../private-value/secret", "must be relative"),
+    ],
+)
+def test_invalid_rules_report_source_without_exposing_arguments(
+    tmp_path, monkeypatch, capsys, table, entry_point, condition, pattern, message
+):
+    context = _context(tmp_path)
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        f'[{table}]\ncontext-dir = {json.dumps(str(context))}\n'
+        f'output-dir = {json.dumps(str(tmp_path / "out"))}\n'
+        f'[{table}.build-args]\nMODE = "default"\n'
+        f'[[{table}.file-rules]]\nwhen = {json.dumps(condition)}\n'
+        f'include = {json.dumps(pattern)}\n'
+    )
+    monkeypatch.setattr(
+        cli, "ImageBuilder", lambda config: pytest.fail("invalid rules reached the builder")
+    )
+    config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", *CLI_ENTRY_POINTS[entry_point], *config_args,
+        "--build-arg", "MODE=private-value",
+    ])
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert f"[{table}].file_rules" in captured.err
+    assert "file_rules[1]" in captured.err
+    assert message in captured.err
+    assert "private-value" not in captured.err + captured.out
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("entry_point", list(CLI_ENTRY_POINTS))
+def test_invalid_cli_platform_with_rules_reports_platform_source(
+    tmp_path, monkeypatch, capsys, entry_point
+):
+    context = _context(tmp_path)
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        f'[build]\ncontext-dir = {json.dumps(str(context))}\n'
+        '[[build.file-rules]]\nwhen = \'target.arch == "arm64"\'\n'
+        'include = "native/arm64.so"\n'
+    )
+    monkeypatch.setattr(
+        cli, "ImageBuilder", lambda config: pytest.fail("invalid platform reached the builder")
+    )
+    config_args = [str(path)] if entry_point == "validate" else ["--config", str(path)]
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", *CLI_ENTRY_POINTS[entry_point], *config_args, "--platform", "bad",
+    ])
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    assert raised.value.code == 2
+    assert "CLI option --platform: Invalid platform format: bad" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_validation_remains_offline_while_build_rejects_an_unselected_link_target(
+    tmp_path, monkeypatch, capsys, table
+):
+    context = _context(tmp_path)
+    _symlink(context / "debug_tools" / "alias.py", Path("..") / "app.py")
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        f'[{table}]\ncontext-dir = {json.dumps(str(context))}\n'
+        f'output-dir = {json.dumps(str(tmp_path / "out"))}\n'
+        'include-paths = ["app.py"]\nuse-cache = false\n'
+        f'[{table}.build-args]\nMODE = "production"\n'
+        f'[[{table}.file-rules]]\nwhen = \'MODE == "dev"\'\n'
+        'include = "debug_tools/**"\n'
+        f'[[{table}.file-rules]]\nwhen = \'MODE == "dev"\'\n'
+        'exclude = "app.py"\n'
+    )
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image",
+        lambda *args: pytest.fail("an unsafe selected link reached the base-image pull"),
+    )
+    override = ["--build-arg", "MODE=dev"]
+    monkeypatch.setattr(sys, "argv", [
+        "pycontainer", "validate", "config", str(path), *override,
+    ])
+    cli.main()
+    assert "build context: file selection" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists()
+
+    for entry_point in ("build", "dry-run"):
+        monkeypatch.setattr(sys, "argv", [
+            "pycontainer", *CLI_ENTRY_POINTS[entry_point], "--config", str(path), *override,
+        ])
+        with pytest.raises(SystemExit) as raised:
+            cli.main()
+        assert raised.value.code == 2
+        assert "another selected file" in capsys.readouterr().err
+        assert not (tmp_path / "out").exists()
 
 
 def test_excludes_win_over_overlapping_includes(tmp_path):

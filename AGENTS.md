@@ -12,6 +12,8 @@ daemon without discussing the trade-off first.
   environment contracts; registry push only, single platform, see
   `docs/skaffold-tilt.md` and `examples/skaffold`, `examples/tilt`.
 - `config.py`, `config_loader.py`: `BuildConfig` and `[build]` TOML settings.
+- `effective_config.py`: pure resolver and semantic checks shared by `build`
+  and the offline `validate config` command.
 - `project.py`, `framework.py`, `fs_utils.py`: discovery and file selection.
 - `builder.py`: base pull, dependency/app tar layers, layout assembly, push.
 - `oci.py`: image configuration, descriptors, manifest and index serialization.
@@ -337,7 +339,10 @@ secrets only.
 Lockfile staging (`lockfiles.py`) reads Poetry, Pipenv, PDM and uv locks
 without their tools, rejects stale locks against the manifest, evaluates
 markers for the target (never the host) and installs the selection through
-`install_requirements(..., locked=True)` (`--no-deps --require-hashes`).
+`install_locked_requirements`: one isolated pip run per recorded package
+index (`--isolated --no-deps --require-hashes`, `PIP_*` and pip config
+ignored), merged only when files are byte-identical. A format that cannot
+establish a package's index fails closed (PDM allows one effective index).
 For `linux/arm/v7`, lock selection and staged-wheel closure use the
 `platform_machine=armv7l` marker and the same variant-specific wheel tags as
 ordinary requirements.
@@ -354,7 +359,7 @@ roots and recorded edges must match the selection. After installation, all
 four formats' wheel metadata is checked for target-compatible transitive
 versions, markers and requested extras. Metadata must match its `.dist-info`
 directory and is limited to 1 MiB; this cannot recover dependencies missing
-from the wheels' own metadata.
+from the wheels' own metadata. Plain requirements keep ambient pip configuration.
 Precedence: `lockfile`, `requirements_file`, one auto-detected root lock,
 venv, `requirements.txt`; explicit `lockfile` and `requirements_file` are
 mutually exclusive. Non-registry sources fail; never add an
