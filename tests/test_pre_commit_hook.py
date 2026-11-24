@@ -150,7 +150,7 @@ def test_real_hook_multiple_paths_and_no_side_effects(installed_hook, invalid):
     output = result.stdout + result.stderr
     assert result.returncode == (1 if invalid else 0), output
     for path in paths:
-        assert path in output
+        assert path.replace("\\", "/") in output.replace("\\", "/"), output
     if invalid:
         assert "exit code: 2" in output
         assert "[tool.pycontainer].platform: Invalid platform format" in output
