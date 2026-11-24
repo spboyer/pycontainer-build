@@ -476,12 +476,20 @@ def install_requirements(
     log_redact=str,
 ) -> List[Path]:
     """Install target wheels and return the validated requirements files."""
-    target_options = _target_options(
-        os_name, arch, python_version, base_image, base_config,
-        base_image_tag_verified=base_image_tag_verified,
-        variant=variant,
+    try:
+        target_options = _target_options(
+            os_name, arch, python_version, base_image, base_config,
+            base_image_tag_verified=base_image_tag_verified,
+            variant=variant,
+        )
+    except ValueError as exc:
+        message = log_redact(str(exc))
+        if message != str(exc):
+            raise ValueError(message) from None
+        raise
+    _, requirement_files, hash_pinned = _scan_requirements(
+        requirements, context_dir, log_redact=log_redact
     )
-    _, requirement_files, hash_pinned = _scan_requirements(requirements, context_dir)
     if not locked and not hash_pinned:
         logger.warning(
             "%s", log_redact(
@@ -544,6 +552,10 @@ def install_requirements(
                     stderr=pip_errors,
                 )
             except OSError as exc:
+                if log_redact(str(exc)) != str(exc):
+                    raise RuntimeError(
+                        "Unable to start pip for target dependency installation."
+                    ) from None
                 raise RuntimeError(
                     "Unable to start pip for target dependency installation."
                 ) from exc
@@ -569,7 +581,7 @@ def install_requirements(
 
     secrets = known_secrets(environment, _placeholder_names(requirement_files))
     if returncode in {_MARKER_ERROR_EXIT, _PATCH_ERROR_EXIT}:
-        details = redact(_read_marker_error(error_file), secrets)
+        details = log_redact(redact(_read_marker_error(error_file), secrets))
         if returncode == _MARKER_ERROR_EXIT:
             raise ValueError(
                 "Cannot evaluate dependency environment markers for target "
@@ -587,7 +599,7 @@ def install_requirements(
             else ""
         )
         raise RuntimeError(
-            _pip_failure_message(
+            log_redact(_pip_failure_message(
                 redact(pip_output, secrets),
                 os_name,
                 arch,
@@ -595,7 +607,7 @@ def install_requirements(
                 redact(pip_debug, secrets),
                 _LOCKED_AUTH_HINT if locked else _AUTH_HINT,
                 variant,
-            ) + hint
+            ) + hint)
         )
 
     for scripts_dir in (destination / "bin", destination / "Scripts"):
@@ -768,6 +780,7 @@ def install_locked_requirements(
     *,
     variant: Optional[str] = None,
     base_image_tag_verified: bool = False,
+    log_redact=str,
 ) -> None:
     """Install each recorded index's packages from that index alone, then merge them."""
     requirement_sets = list(requirement_sets)
@@ -777,10 +790,12 @@ def install_locked_requirements(
             requirements = Path(temp) / f"locked-requirements-{number}.txt"
             target = destination if len(requirement_sets) == 1 else stage_root / f"locked-site-{number}"
             requirements.write_text(text, encoding="utf-8")
+            log_options = {"log_redact": log_redact} if log_redact is not str else {}
             install_requirements(
                 requirements, target, context_dir, os_name, arch, python_version,
                 base_image, base_config, variant=variant, locked=True,
                 base_image_tag_verified=base_image_tag_verified,
+                **log_options,
             )
             if target != destination:
                 _merge_site_packages(target, destination)
@@ -836,13 +851,21 @@ def _decode_requirements(data: bytes, errors: str = "strict") -> str:
     return data.decode("utf-8-sig", errors)
 
 
-def _logical_requirement_lines(path, *, display=None, context_root=None):
+def _logical_requirement_lines(path, *, display=None, context_root=None, log_redact=str):
     try:
         with path.open("rb") as source:
             data = source.read(MAX_REQUIREMENTS_BYTES + 1)
-    except OSError:
+    except OSError as error:
         if display is not None and display != path:
-            raise OSError(f"Cannot read requirements file: {display}") from None
+            if error.errno is not None:
+                arguments = [error.errno, "Cannot read requirements file", str(display)]
+                if getattr(error, "winerror", None) is not None:
+                    arguments.append(error.winerror)
+                raise type(error)(*arguments) from None
+            raise type(error)(f"Cannot read requirements file: {display}") from None
+        redacted_error = _redacted_os_error(error, log_redact)
+        if redacted_error is not error:
+            raise redacted_error from None
         raise
     if len(data) > MAX_REQUIREMENTS_BYTES:
         raise ValueError(
@@ -889,11 +912,31 @@ def validate_requirements(
     return _scan_requirements(requirements, context_dir, check_overrides, constraints)[0]
 
 
+def _redacted_os_error(error: OSError, log_redact):
+    message = log_redact(str(error))
+    if message == str(error):
+        return error
+    if error.errno is None or error.strerror is None:
+        return type(error)(message)
+    arguments = [error.errno, log_redact(error.strerror)]
+    if error.filename is not None:
+        arguments.append(log_redact(os.fsdecode(error.filename)))
+        winerror = getattr(error, "winerror", None)
+        if winerror is not None or error.filename2 is not None:
+            arguments.extend((
+                winerror,
+                log_redact(os.fsdecode(error.filename2)) if error.filename2 is not None else None,
+            ))
+    return type(error)(*arguments)
+
+
 def _scan_requirements(
     requirements: Path,
     context_dir: Path,
     check_overrides: bool = True,
     constraints: Optional[List[str]] = None,
+    *,
+    log_redact=str,
 ) -> Tuple[List[str], List[Path], bool]:
     """Validate a local requirements graph and report roots, files and hash pinning."""
     context_root = context_dir.resolve()
@@ -906,12 +949,26 @@ def _scan_requirements(
     roots = []
     while pending:
         path, environment_path, ancestors, constraint = pending.pop()
-        display = "<environment-based requirements file>" if environment_path else path
+        shown = log_redact(str(path))
+        display = (
+            "<environment-based requirements file>" if environment_path
+            else path if shown == str(path) else shown
+        )
         try:
             resolved = path.resolve(strict=True)
-        except (OSError, RuntimeError):
+        except OSError as error:
             if environment_path:
                 raise OSError("Cannot access an environment-based requirements include.") from None
+            redacted_error = _redacted_os_error(error, log_redact)
+            if redacted_error is not error:
+                raise redacted_error from None
+            raise
+        except RuntimeError as error:
+            if environment_path:
+                raise OSError("Cannot access an environment-based requirements include.") from None
+            message = log_redact(str(error))
+            if message != str(error):
+                raise RuntimeError(message) from None
             raise
         if not path.is_relative_to(logical_root) or not resolved.is_relative_to(context_root):
             raise ValueError(
@@ -928,9 +985,12 @@ def _scan_requirements(
         visited.add((path, constraint))
         try:
             size = path.stat().st_size
-        except OSError:
+        except OSError as error:
             if environment_path:
                 raise OSError("Cannot access an environment-based requirements file.") from None
+            redacted_error = _redacted_os_error(error, log_redact)
+            if redacted_error is not error:
+                raise redacted_error from None
             raise
         if resolved not in counted_files:
             counted_files.add(resolved)
@@ -942,7 +1002,7 @@ def _scan_requirements(
                 )
 
         for _, line in _logical_requirement_lines(
-            path, display=display, context_root=context_root
+            path, display=display, context_root=context_root, log_redact=log_redact
         ):
             expanded = _expand_requirement_variables(line)
             try:

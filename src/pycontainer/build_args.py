@@ -29,13 +29,17 @@ def redact_values(message: str, values: Iterable[str]) -> str:
     return message
 
 
-def known_argument_values(declarations) -> List[str]:
+def known_argument_values(declarations, overrides: Optional[List[str]] = None) -> List[str]:
     if not isinstance(declarations, dict):
         return []
     values = []
     for declaration in declarations.values():
         value = declaration.get("default") if isinstance(declaration, dict) else declaration
         if isinstance(value, str):
+            values.append(value)
+    for item in overrides or []:
+        name, separator, value = item.partition("=")
+        if separator and name in declarations:
             values.append(value)
     return values
 
@@ -111,23 +115,42 @@ def expand(value: str, arguments: Dict[str, str], field: str) -> str:
 _NO_PREVIOUS_VALUE = object()
 
 
+def _match_previous_list_entries(value, previous):
+    existing = Counter(
+        item for item in previous if isinstance(item, str)
+    ) if isinstance(previous, list) else Counter()
+    for item in value:
+        unchanged = isinstance(item, str) and existing[item] > 0
+        if unchanged:
+            existing[item] -= 1
+        yield item, unchanged
+
+
+def unchanged_field_values(value, previous):
+    if isinstance(value, dict):
+        existing = previous if isinstance(previous, dict) else {}
+        return {
+            key: item for key, item in value.items()
+            if key in existing and item == existing[key]
+        }
+    if isinstance(value, list):
+        return [
+            item for item, unchanged in _match_previous_list_entries(value, previous)
+            if unchanged
+        ]
+    return value if value == previous else None
+
+
 def expand_field(value, arguments: Dict[str, str], field: str, previous=_NO_PREVIOUS_VALUE):
     if previous is not _NO_PREVIOUS_VALUE and value == previous:
         return value
     if isinstance(value, str):
         return expand(value, arguments, field)
     if isinstance(value, list):
-        existing = Counter(
-            item for item in previous if isinstance(item, str)
-        ) if isinstance(previous, list) else Counter()
-        result = []
-        for item in value:
-            if isinstance(item, str) and existing[item]:
-                existing[item] -= 1
-                result.append(item)
-            else:
-                result.append(expand(item, arguments, field))
-        return result
+        return [
+            item if unchanged else expand(item, arguments, field)
+            for item, unchanged in _match_previous_list_entries(value, previous)
+        ]
     if isinstance(value, dict):
         existing = previous if isinstance(previous, dict) else {}
         return {

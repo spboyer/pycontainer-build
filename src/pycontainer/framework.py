@@ -1054,6 +1054,7 @@ def apply_framework_defaults(
         config._framework_generated_labels = config.labels
     else:
         config._framework_generated_labels = None
+    config._remember_generated_expansion()
     logger.info("%s", config.redact(f"Detected framework: {framework.lower()}"))
     
     return config

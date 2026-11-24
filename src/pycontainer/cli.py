@@ -4,7 +4,7 @@ from .config import SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
-from .build_args import redact_values, resolve_arguments
+from .build_args import known_argument_values, redact_values, resolve_arguments
 from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
@@ -345,12 +345,13 @@ def main():
                 raise DevLoopError("--image requires --output-ref so Tilt can read the pushed reference.")
             cli_overrides['tag']=push_target or f"{args.image}:{TILT_PLACEHOLDER_TAG}"
     except DevLoopError as exc:
+        declarations={}
         try:
             file_config=load_config_file(Path(args.config)) if args.config else {}
             declarations=merge_configs(file_config, {}).get("build_args", {})
             resolved_args=resolve_arguments(declarations, args.build_arg)
         except (OSError, ValueError) as config_error:
-            parser.error(str(config_error))
+            parser.error(redact_values(str(config_error), known_argument_values(declarations, args.build_arg)))
         parser.error(redact_values(str(exc), resolved_args.values()))
     if devloop:
         # The tool owns the pushed reference; extra tags and dry runs would break its contract.

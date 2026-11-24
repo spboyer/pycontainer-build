@@ -1430,7 +1430,9 @@ class ImageBuilder:
                 raise ValueError("Requirements path must be relative and stay inside the build context.")
             if not (ctx / requirements_relative).is_file():
                 raise FileNotFoundError(
-                    f"Requirements file not found: {requirements_relative.as_posix()}"
+                    self.config.redact(
+                        f"Requirements file not found: {requirements_relative.as_posix()}"
+                    )
                 )
         if os_name is None or arch is None:
             os_name, arch = parse_platform(self.config.platform)
@@ -1465,6 +1467,7 @@ class ImageBuilder:
         with tempfile.TemporaryDirectory(prefix="pycontainer-deps-") as stage:
             stage_root = Path(stage)
             site_packages = stage_root / "site-packages"
+            log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
             if source_kind == "lock":
                 selection = self._lock_selection(
                     base_config, os_name, arch, variant=variant,
@@ -1485,6 +1488,7 @@ class ImageBuilder:
                     base_config,
                     variant=variant,
                     base_image_tag_verified=base_image_tag_verified,
+                    **log_options,
                 )
                 verify_locked_installation(
                     selection,
@@ -1496,7 +1500,6 @@ class ImageBuilder:
                     ),
                 )
             elif source_kind == "requirements":
-                log_options = {"log_redact": self.config.redact} if self.config._has_build_argument_values() else {}
                 self._requirement_files = install_requirements(
                     ctx / requirements_relative,
                     site_packages,

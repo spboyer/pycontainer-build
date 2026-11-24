@@ -39,7 +39,9 @@ redact nonempty argument values, including values within success/error source
 path labels. Only matching value substrings are replaced.
 This does not change the direct Python API:
 omitted `BuildConfig.build_args` preserves literal dollars; an explicitly
-provided table, including an empty one, enables interpolation.
+provided table, including an empty one, enables interpolation. See
+[build arguments](../README.md#build-arguments) for copy and serialization
+behavior.
 
 `pycontainer validate` is a namespace: a bare `validate` is a usage error.
 `validate image` is reserved for image linting and is not yet available.

@@ -1020,8 +1020,10 @@ environment lookup, expression evaluation or shell execution occurs.
 Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
 without it, existing literal dollar expressions are preserved. Copying or
 serializing a config does not re-interpolate existing values, even if its
-arguments change. Changed values supplied during copying expand once; list
-entries are matched by value and count, preserving earlier matching entries.
+arguments change. Changed values, including edits made after construction,
+expand once on a copy with arguments; copies without arguments defer their
+expansion. List entries are matched by value and count, preserving earlier
+matching entries.
 An override identical to an existing value is indistinguishable from an
 unchanged copy and remains literal. Construct a fresh config from unexpanded
 values to re-interpolate it. Serialized configs retain earlier and current

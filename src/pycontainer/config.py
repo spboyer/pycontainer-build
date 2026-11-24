@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 from .build_args import (
     BuildArgument, EXPANDABLE_FIELDS, expand_field, known_argument_values,
-    redact_values, resolve_arguments,
+    redact_values, resolve_arguments, unchanged_field_values,
 )
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
@@ -411,7 +411,10 @@ class BuildConfig:
                 return None
             return {
                 "values": {
-                    field_name: deepcopy(object.__getattribute__(self, field_name))
+                    field_name: unchanged_field_values(
+                        object.__getattribute__(self, field_name),
+                        instance["_build_args_values"][field_name],
+                    )
                     for field_name in EXPANDABLE_FIELDS
                 },
                 "redactions": list(instance["_build_args_redactions"]),
@@ -456,6 +459,22 @@ class BuildConfig:
             self._validate()
         except ValueError as exc:
             raise ValueError(self.redact(str(exc))) from None
+        self._build_args_values = deepcopy(
+            state["values"] if self.build_args is None and state is not None
+            else {name: getattr(self, name) for name in EXPANDABLE_FIELDS}
+        )
+
+    def _remember_generated_expansion(self):
+        if not self._build_args_expanded:
+            return
+        for name in ("entrypoint", "cmd"):
+            if _is_generated_field(self, name):
+                self._build_args_values[name] = list(getattr(self, name))
+        if _is_generated_label(self):
+            labels = self._build_args_values["labels"]
+            labels = dict(labels) if isinstance(labels, dict) else {}
+            labels["framework"] = self.labels["framework"]
+            self._build_args_values["labels"] = labels
 
     def _validate(self):
         from .release_notes import validate_release_notes_settings
