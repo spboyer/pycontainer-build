@@ -217,6 +217,7 @@ offline preparation, error behavior and the opt-in acceptance test.
 **Production Features** (Phase 4):
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django, Streamlit, Gradio, Jupyter, and Celery
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
+- ✅ **Configuration templates and wizard** — `pycontainer init` for FastAPI, Flask and generic apps
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
 - ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
   OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
@@ -986,6 +987,28 @@ conflicting tables or usage errors, and lists the registry,
 dependency-resolution and runtime checks it did not perform. A passing
 validation does not prove a build will succeed. See
 [configuration validation](docs/validate-config.md).
+
+### Generating a configuration file
+
+`pycontainer init` writes a `[build]` file offline from a template, or from an
+explicitly invoked terminal wizard. It never prompts for credentials, never
+contacts a registry or daemon, and never edits `pyproject.toml`:
+
+```bash
+pycontainer init --list-templates                       # fastapi, flask, generic
+pycontainer init --template fastapi                     # writes pycontainer.toml
+pycontainer init -t flask --app web:app --port 8080 -o deploy/flask.toml
+pycontainer init --interactive                          # TTY only; never overwrites
+pycontainer build --config pycontainer.toml
+```
+
+The result is validated with the same loader and resolver `build --config`
+uses before it is published. An existing regular file is refused unless
+`--force` is passed (templates only); links, directories and special files are
+rejected. Cancellation never exposes a partial output file.
+Creating without `--force` requires hard-link support for atomic no-clobber publication.
+Templates write configuration only; they do not add application code or new
+framework detection. See [configuration templates and wizard](docs/init-config.md).
 
 ### Build arguments
 
