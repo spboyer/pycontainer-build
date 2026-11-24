@@ -2235,6 +2235,7 @@ def test_locked_pip_ignores_pythonpath_shadowing(tmp_path, monkeypatch):
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     requirements = context / "requirements.txt"
     requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
         f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
     )
     poison = tmp_path / "pythonpath"
@@ -2264,7 +2265,10 @@ def test_locked_pip_cannot_ignore_target_requires_python(tmp_path, monkeypatch, 
     wheel = wheelhouse / "marker_root-1.0-py3-none-any.whl"
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     requirements = context / "requirements.txt"
-    requirements.write_text(f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8")
+    requirements.write_text(
+        "--no-index\n--find-links ./wheelhouse\n"
+        f"marker-root==1.0 --hash=sha256:{digest}\n", encoding="utf-8"
+    )
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
     if source == "environment":
