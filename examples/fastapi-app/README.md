@@ -4,6 +4,10 @@ This is a sample FastAPI application demonstrating all pycontainer-build integra
 
 ## Quick Start
 
+Automatic and codename-less official Python bases remain supported through
+verified base-layer libc package metadata. Missing or unsupported evidence
+fails closed; pin a mapped release or provide supported base `PYTHON_LIBC`.
+
 ### Build with pycontainer-build (CLI)
 
 ```bash

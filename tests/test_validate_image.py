@@ -1,4 +1,5 @@
 import copy
+import gzip
 import hashlib
 import json
 import socket
@@ -1004,6 +1005,118 @@ def test_validation_holds_output_lock_until_push(tmp_path, monkeypatch):
     assert called == [True]
 
 
+@pytest.mark.parametrize(("arm_user", "expected"), [("1000", 0), ("root", 1)])
+def test_build_validation_gates_every_platform(tmp_path, monkeypatch, capsys, arm_user, expected):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+
+    def base(self, layers_dir, os_name, arch):
+        return [], {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": arm_user if arch == "arm64" else "1000",
+                "Entrypoint": ["python", "app.py"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+         "--validate", "--push"],
+    ) == expected
+    assert len(pushes) == (1 if expected == 0 else 0)
+    if expected:
+        assert "PCB001" in capsys.readouterr().out
+
+
+def test_validation_and_scan_hold_output_lock_through_push(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from pycontainer import scanning
+
+    real_push = builder.ImageBuilder.push
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(builder.ImageBuilder, "push", real_push)
+    scans, pushes = [], []
+
+    @contextmanager
+    def scan(output, digest, config):
+        with pytest.raises(RuntimeError, match="concurrent writes"):
+            with output_directory_lock(output):
+                pytest.fail("the output lock must remain held during scanning")
+        scans.append(digest)
+        yield Path(output), {"digest": digest}
+
+    def push(self, *args):
+        with pytest.raises(RuntimeError, match="concurrent writes"):
+            with output_directory_lock(self.config.output_dir):
+                pytest.fail("the output lock must remain held during push")
+        pushes.append(True)
+        return self.config.tag
+
+    monkeypatch.setattr(scanning, "scanned_image", scan)
+    monkeypatch.setattr(builder.ImageBuilder, "_push_image", push)
+    assert _run(monkeypatch, ["build", "--config", str(config), "--scan", "--validate", "--push"]) == 0
+    assert len(scans) == 2
+    assert scans[0] == scans[1]
+    assert pushes == [True]
+
+
+def test_build_validation_redacts_arguments_in_layout_errors(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    config.write_text(
+        config.read_text().replace('output-dir = "output"', 'output-dir = "output-${NAME}"')
+        + '\n[build.build-args]\nNAME = "private-build-value"\n'
+    )
+
+    def fail(output, **kwargs):
+        raise ValueError(f"Cannot read {output}")
+
+    monkeypatch.setattr(cli, "validate_image", fail)
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 2
+    captured = capsys.readouterr()
+    assert "private-build-value" not in captured.out + captured.err
+    assert "<redacted>" in captured.err
+    assert not pushes
+
+
+def test_multi_platform_validation_rejects_replaced_index(tmp_path, monkeypatch):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+
+    def base(self, layers_dir, os_name, arch):
+        return [], {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+
+    original = builder.ImageBuilder.build
+
+    def replace_index(self):
+        result = original(self)
+        output = Path(self.config.output_dir)
+        index_path = output / "blobs" / "sha256" / self.manifest_digest.split(":", 1)[1]
+        index = json.loads(index_path.read_text())
+        index["annotations"] = {"changed": "true"}
+        replacement = _blob(output, index, INDEX)
+        replacement["annotations"] = {REF: self.config.tag}
+        _layout(output, [replacement])
+        return result
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    monkeypatch.setattr(builder.ImageBuilder, "build", replace_index)
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+         "--validate", "--push"],
+    ) == 2
+    assert not pushes
+
+
 def test_build_does_not_push_when_the_layout_was_replaced(tmp_path, monkeypatch, capsys):
     config, pushes = _build_fixture(tmp_path, monkeypatch)
     original = builder.ImageBuilder.build
@@ -1262,10 +1375,11 @@ def test_build_reports_attributed_contributions_in_engine(tmp_path, monkeypatch)
     cfg, _ = effective_config.resolve_build_config(config, {})
     built = builder.ImageBuilder(cfg)
     built.build()
+    image = built.platform_images[0]
 
     size = image_validation.validate_image(
         Path(cfg.output_dir), tag=cfg.tag, expected_digest=built.manifest_digest,
-        base_layer_count=built.base_layer_count,
+        base_layer_count=len(image.layers) - image.app_layer_count,
     )["size"]
 
     roles = [layer["role"] for layer in size["layers"]]
@@ -1276,6 +1390,50 @@ def test_build_reports_attributed_contributions_in_engine(tmp_path, monkeypatch)
         "application_bytes": size["layers"][1]["bytes"],
     }
     assert size["image_bytes"] == size["config_bytes"] + base_bytes + size["layers"][1]["bytes"]
+
+
+def test_multi_platform_size_validation_uses_each_platforms_base_layers(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    base_sizes = {}
+
+    def base(self, layers_dir, os_name, arch):
+        contents = [b"a" * 50] if arch == "amd64" else [b"b" * 50, b"c" * 20000]
+        layers, diff_ids = [], []
+        for content in contents:
+            data = gzip.compress(content, compresslevel=0, mtime=0)
+            digest = "sha256:" + hashlib.sha256(data).hexdigest()
+            path = layers_dir / digest.split(":", 1)[1]
+            path.write_bytes(data)
+            layers.append(builder.OCILayer(GZIP_LAYER, digest, len(data), str(path)))
+            diff_ids.append("sha256:" + hashlib.sha256(content).hexdigest())
+        base_sizes[arch] = sum(layer.size for layer in layers)
+        return layers, {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": diff_ids},
+        }
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    args = [
+        "build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+        "--validate", "--push",
+    ]
+    assert _run(monkeypatch, args) == 0
+    out = capsys.readouterr().out
+    assert f"Contributions: base {base_sizes['amd64']} bytes" in out
+    assert f"Contributions: base {base_sizes['arm64']} bytes" in out
+    assert len(pushes) == 1
+
+    pushes.clear()
+    assert _run(monkeypatch, [*args, "--max-layer-size-mb", "0.015"]) == 1
+    out = capsys.readouterr().out
+    assert f"Contributions: base {base_sizes['amd64']} bytes" in out
+    assert f"Contributions: base {base_sizes['arm64']} bytes" in out
+    assert "PCB007" in out
+    assert not pushes
 
 
 def test_build_toml_threshold_blocks_push(tmp_path, monkeypatch, capsys):
