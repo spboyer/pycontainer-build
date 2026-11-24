@@ -155,6 +155,8 @@ class LayerCache:
         workdir: str = "/app",
         reproducible: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
+        *,
+        namespace: Optional[str] = None,
     ) -> str:
         file_records = []
         ordered_files = ordered_app_files(files, reproducible)
@@ -197,6 +199,8 @@ class LayerCache:
             "reproducible": bool(reproducible),
             "files": file_records,
         }
+        if namespace is not None:
+            identity["namespace"] = namespace
         serialized = json.dumps(
             identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -315,12 +319,15 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
     ) -> Optional[Tuple[str, Path]]:
         if not self.enabled:
             logger.debug("Layer cache miss: caching is disabled")
             return None
 
-        files_digest = self._compute_files_digest(files, workdir, reproducible)
+        files_digest = self._compute_files_digest(
+            files, workdir, reproducible, namespace=namespace
+        )
         with self._index_lock():
             entries = self._load_index()
             entry = entries.get(files_digest)
@@ -354,6 +361,8 @@ class LayerCache:
         *,
         workdir: str = "/app",
         reproducible: bool = True,
+        namespace: Optional[str] = None,
+        record_source_files: bool = True,
         hardlinks: Optional[Dict[str, str]] = None,
     ) -> Path:
         layer_path = Path(layer_path)
@@ -366,7 +375,9 @@ class LayerCache:
             raise CacheIntegrityError(
                 f"Layer file {layer_path} hashes to {actual_digest}, not {digest}"
             )
-        files_digest = self._compute_files_digest(files, workdir, reproducible, hardlinks)
+        files_digest = self._compute_files_digest(
+            files, workdir, reproducible, hardlinks, namespace=namespace
+        )
         blob_path = self._blob_path(digest)
 
         with self._index_lock():
@@ -379,7 +390,10 @@ class LayerCache:
                 size=size,
                 created=time.time(),
                 last_used=time.time(),
-                source_files=[self._relative_path(relative) for _, relative in files],
+                source_files=(
+                    [self._relative_path(relative) for _, relative in files]
+                    if record_source_files else []
+                ),
             )
             self._evict_if_needed(entries)
             self._save_index(entries)

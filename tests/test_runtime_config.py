@@ -95,6 +95,38 @@ def test_toml_and_cli_overrides(tmp_path):
         config_from_file(path)
 
 
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+def test_runtime_metadata_build_arguments_resolve_and_redact(tmp_path, capsys, table):
+    path = tmp_path / "pycontainer.toml"
+    path.write_text(
+        f'[{table}]\nstop_signal = "${{SIGNAL}}"\n'
+        'volumes = ["/data/${NAME}", "/price$$5"]\n'
+        f'[{table}.build-args]\nSIGNAL = "SIGINT"\nNAME = "private-volume"\n'
+    )
+    config = config_from_file(path, {"dry_run": True}, ["SIGNAL=SIGTERM"])
+
+    assert config.stop_signal == "SIGTERM"
+    assert config.volumes == ["/data/private-volume", "/price$5"]
+    ImageBuilder(config).build()
+    output = capsys.readouterr().out
+    assert "private-volume" not in output
+    assert "/data/<redacted>" in output
+
+    other = config_from_file(path, {}, ["NAME=another-volume"])
+    assert config.cache_identity() != other.cache_identity()
+    with pytest.raises(ValueError) as error:
+        config_from_file(path, {}, ["SIGNAL=private-invalid"])
+    assert "private-invalid" not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_volume_literal_dollars_require_explicit_interpolation():
+    assert BuildConfig(volumes=["/data/$$cash"]).volumes == ["/data/$$cash"]
+    assert BuildConfig(volumes=["/data/$$cash"], build_args={}).volumes == ["/data/$cash"]
+    with pytest.raises(ValueError, match="Undeclared build argument"):
+        BuildConfig(volumes=["/data/${NAME}"], build_args={})
+
+
 def test_cli_flags_reach_build_config(monkeypatch):
     configs = []
 
@@ -165,6 +197,28 @@ def test_built_layout_serializes_fields_with_consistent_descriptors(tmp_path, mo
     config = image["config"]
     assert config["StopSignal"] == "SIGTERM"
     assert config["Volumes"] == {"/data": {}, "/srv/uploads": {}, "/var/lib/base": {}}
+
+
+def test_interpolated_runtime_metadata_is_written_to_image(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hi')\n")
+    monkeypatch.setattr(
+        ImageBuilder, "_pull_base_image", lambda self, layers_dir, os_name, arch: ([], BASE)
+    )
+    output = tmp_path / "out"
+    builder = ImageBuilder(BuildConfig(
+        context_dir=str(context), output_dir=str(output), include_paths=["app.py"],
+        use_cache=False, stop_signal="${SIGNAL}", volumes=["/data/${NAME}"],
+        build_args={"SIGNAL": "SIGTERM", "NAME": "uploads"},
+    ))
+
+    builder.build()
+
+    config_blob = output / "blobs" / "sha256" / builder.config_digest.split(":", 1)[1]
+    image = json.loads(config_blob.read_bytes())["config"]
+    assert image["StopSignal"] == "SIGTERM"
+    assert image["Volumes"] == {"/data": {}, "/data/uploads": {}, "/var/lib/base": {}}
 
 
 def test_security_fragment_coexists_with_runtime_metadata(tmp_path, monkeypatch):

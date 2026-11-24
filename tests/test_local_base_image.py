@@ -312,6 +312,45 @@ def test_oci_layout_build_preserves_base_offline(tmp_path, offline):
     assert builder._base_image_name == "3.11-slim"
 
 
+@pytest.mark.parametrize("transport", ["oci", "docker-archive"])
+def test_local_base_image_progress_redacts_build_arguments(tmp_path, offline, capsys, transport):
+    value = "private-base"
+    suffix = "" if transport == "oci" else ".tar"
+    source = tmp_path / f"{value}{suffix}"
+    if transport == "oci":
+        layout = Layout(source)
+        descriptor, platform, _ = layout.image(b"base")
+        layout.add(descriptor, platform=platform)
+    else:
+        docker_archive(source, [(["base:v1"], "amd64", [layer_tar({"base": b"base"})])])
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('hello')\n")
+    template = tmp_path / f"${{SOURCE}}{suffix}"
+    config = BuildConfig(
+        base_image=f"{transport}:{template}",
+        build_args={"SOURCE": value},
+        context_dir=str(context),
+        output_dir=str(tmp_path / "out"),
+        use_cache=False,
+    )
+
+    ImageBuilder(config).build()
+
+    output = capsys.readouterr().out
+    assert value not in output
+    assert "Loading local base image" in output and "<redacted>" in output
+    assert ("Copying layer" if transport == "oci" else "Loading layer") in output
+    assert "Base image loaded" in output
+
+
+def test_docker_archive_progress_preserves_filename_without_arguments(tmp_path, offline, capsys):
+    archive = tmp_path / "base.tar"
+    docker_archive(archive, [(["base:v1"], "amd64", [layer_tar({"base": b"base"})])])
+    build(tmp_path, f"docker-archive:{archive}")
+    assert "Loading layer 1/1 from base.tar" in capsys.readouterr().out
+
+
 def test_oci_layout_selects_reference_among_many(tmp_path, offline):
     layout = Layout(tmp_path / "base")
     first, platform, _ = layout.image(b"first")

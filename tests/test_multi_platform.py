@@ -1329,6 +1329,38 @@ def test_push_order_is_blobs_manifests_index_then_tags(tmp_path, monkeypatch):
     assert builder.pushed_refs == ["registry.example/team/app:v1", "registry.example/team/app:latest"]
 
 
+def test_build_arguments_select_platforms_label_each_image_and_redact_index_output(
+    tmp_path, monkeypatch, capsys,
+):
+    value = "private-team"
+    platforms = "linux/amd64,linux/arm64,linux/arm/v7"
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7")),
+        tag="registry.example/${TEAM}/app:v1", platform="${PLATFORMS}",
+        labels={"team": "${TEAM}"}, build_args={"TEAM": value, "PLATFORMS": platforms},
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+    assert index["manifests"][2]["platform"] == {
+        "architecture": "arm", "os": "linux", "variant": "v7",
+    }
+    _verify_index = builder_module._verify_image_index
+    _verify_index(
+        out / "blobs" / "sha256", builder.index_digest, builder.index_size,
+        builder.platform_images, check_diff_ids=True,
+    )
+    for descriptor in index["manifests"]:
+        manifest = json.loads(_blob(out, descriptor["digest"]))
+        config = json.loads(_blob(out, manifest["config"]["digest"]))
+        assert config["config"]["Labels"]["team"] == value
+    monkeypatch.setattr(builder_module, "RegistryClient", FakePushClient())
+    builder.push(show_progress=True)
+    output = capsys.readouterr()
+    assert "Pushing image index" in output.out
+    assert value not in output.out + output.err
+
+
 def test_failed_index_push_publishes_no_tags(tmp_path, monkeypatch):
     builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry())
     builder.build()

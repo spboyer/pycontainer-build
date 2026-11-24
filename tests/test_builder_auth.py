@@ -184,6 +184,24 @@ def test_base_pull_does_not_send_generic_destination_credentials(
     _assert_no_destination_secret(fake.headers_for(host, realm_host))
 
 
+@pytest.mark.parametrize("kind", ["basic", "bearer"])
+def test_base_pull_with_build_args_does_not_send_destination_credentials(
+    tmp_path, monkeypatch, registries, kind
+):
+    fake, _ = registries
+    _set_destination_credentials(monkeypatch, kind)
+    builder = ImageBuilder(BuildConfig(
+        base_image="${HOST}/team/image:latest",
+        build_args={"HOST": "base.example"},
+        context_dir=str(tmp_path),
+    ))
+
+    builder._pull_base_image(tmp_path / "blobs", "linux", "amd64")
+
+    assert fake.headers_for("auth.base.example") == [None]
+    _assert_no_destination_secret(fake.headers_for("base.example", "auth.base.example"))
+
+
 def test_base_pull_uses_registry_scoped_docker_config(
     tmp_path, monkeypatch, registries
 ):

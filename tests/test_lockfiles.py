@@ -1198,6 +1198,42 @@ def _layer_names(layer):
         return archive.getnames()
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_build_arguments_preserve_locked_staging_and_redact_paths(
+    tmp_path, monkeypatch, capsys, indexes, dry_run
+):
+    value = "private-lock-context"
+    context = tmp_path / "context"
+    project = context / value
+    wheel = _write_wheel(project / "wheelhouse")
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, project / "wheelhouse")
+    _write_uv_project(project, wheel, registry=recorded.url)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        build_args={"DIRECTORY": value}, workdir="/${DIRECTORY}", dry_run=dry_run,
+        lockfile=f"{value}/uv.lock",
+    )
+
+    builder.build()
+
+    output = capsys.readouterr().out
+    assert value not in output
+    assert "<redacted>" in output
+    if dry_run:
+        assert "Dependency Source: lock" in output
+        assert not recorded.requests
+    else:
+        assert "Staging 1 locked packages" in output
+        assert "fixture-dep" in {name for name, _ in builder._staged_packages}
+        assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+        assert any(
+            f"{value}/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+            for layer in builder.layers
+        )
+    assert not rogue.requests
+
+
 def _write_pipenv_project(context, *, requires=(), extras=(), registry="https://pypi.org/simple"):
     wheelhouse = context / "wheelhouse"
     _write_named_wheel(wheelhouse, "marker-root", requires=requires, extras=extras)
