@@ -4,11 +4,12 @@ import hashlib
 import json
 import socket
 import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
 
-from pycontainer import builder, cache, cli, effective_config, image_validation, registry_client
+from pycontainer import builder, cache, cli, config_loader, effective_config, image_validation, registry_client
 from pycontainer.fs_utils import output_directory_lock
 
 
@@ -1356,6 +1357,110 @@ def test_decimal_thresholds_compare_exactly(tmp_path, monkeypatch, capsys, layer
     assert len(_report(capsys)["findings"]) == expected
 
 
+def _precise_threshold(actual, delta):
+    with localcontext() as context:
+        context.prec = 80
+        return Decimal(actual) / Decimal(MIB) + Decimal(delta) * Decimal("1e-50")
+
+
+@pytest.mark.parametrize(("name", "rule"), [
+    ("max_image_size_mb", "PCB006"), ("max_layer_size_mb", "PCB007"),
+])
+@pytest.mark.parametrize("source", ["cli", "build", "tool.pycontainer"])
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_threshold_precision_survives_loading_and_reporting(
+    tmp_path, monkeypatch, capsys, name, rule, source, format_, delta
+):
+    _, config, _ = _sized_image(tmp_path, 1)
+    actual = config["size"] + 1 if name == "max_image_size_mb" else 1
+    threshold = _precise_threshold(actual, delta)
+    options = ["--format", format_]
+    if source == "cli":
+        options += ["--" + name.replace("_", "-"), format(threshold, "f")]
+    else:
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[{source}.validate]\n{name} = {threshold:f}\n")
+        options += ["--config", str(settings)]
+
+    assert _validate(monkeypatch, tmp_path, *options) == (1 if delta < 0 else 0)
+    if format_ == "json":
+        report = _report(capsys)
+        assert report["size"]["thresholds"][name] == str(threshold)
+        findings = report["findings"]
+        assert [item["rule_id"] for item in findings] == ([rule] if delta < 0 else [])
+        output = " ".join(item["message"] for item in findings)
+    else:
+        output = capsys.readouterr().out
+    if delta < 0:
+        assert f"above {name} = {threshold}" in output
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("source", ["cli", "build", "tool.pycontainer"])
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize(("value", "expected"), [
+    ("1e-400", 1), ("1e5000", 2), ("1e-5000", 2), ("1e9999999999999999999999", 2),
+])
+def test_threshold_magnitudes_are_exact_or_explicit_errors(
+    tmp_path, monkeypatch, capsys, name, source, format_, value, expected
+):
+    _sized_image(tmp_path, 1)
+    options = ["--format", format_]
+    if source == "cli":
+        options += ["--" + name.replace("_", "-"), value]
+    else:
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[{source}.validate]\n{name} = {value}\n")
+        options += ["--config", str(settings)]
+    assert _validate(monkeypatch, tmp_path, *options) == expected
+    if expected == 2:
+        captured = capsys.readouterr()
+        assert not captured.out and "exponent" in captured.err
+        diagnostic_name = name.replace("_", "-") if source == "cli" else name
+        assert diagnostic_name in captured.err
+    elif format_ == "json":
+        assert _report(capsys)["size"]["thresholds"][name] == "1E-400"
+    else:
+        assert f"above {name} = 1E-400" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("source", ["cli", "build"])
+def test_excessive_threshold_precision_is_a_usage_error(tmp_path, monkeypatch, capsys, name, source):
+    value = "1." + "1" * 1000
+    options = ["--" + name.replace("_", "-"), value]
+    if source == "build":
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[build.validate]\n{name} = {value}\n")
+        options = ["--config", str(settings)]
+    assert _validate(monkeypatch, tmp_path, *options) == 2
+    captured = capsys.readouterr()
+    assert not captured.out and "1000" in captured.err and "digits" in captured.err
+
+
+@pytest.mark.parametrize(("exponent", "valid"), [(1000, True), (-1000, True), (1001, False), (-1001, False)])
+def test_size_threshold_exponent_limits(exponent, valid):
+    value = f"1e{exponent}"
+    if valid:
+        assert image_validation.parse_size_threshold(value, "threshold") == Decimal(value)
+    else:
+        with pytest.raises(ValueError, match="exponent"):
+            image_validation.parse_size_threshold(value, "threshold")
+
+
+def test_exact_toml_thresholds_preserve_unrelated_float_types(tmp_path):
+    settings = tmp_path / "settings.toml"
+    settings.write_text(
+        "[build]\nother = { numbers = [0.1, 1e-400, 1e9999999999999999999999] }\n"
+        "[build.validate]\nmax_image_size_mb = 0.00000095367431640624999999999999999999\n"
+    )
+    config = config_loader.load_config_file(settings)
+    assert config["validate"]["max_image_size_mb"] == Decimal("0.00000095367431640624999999999999999999")
+    assert config["other"]["numbers"] == [0.1, 0.0, float("inf")]
+    assert all(type(value) is float for value in config["other"]["numbers"])
+
+
 @pytest.mark.parametrize("format_", ["text", "json"])
 def test_no_thresholds_report_stored_size_without_warnings(tmp_path, monkeypatch, capsys, format_):
     _, config, layer = _sized_image(tmp_path, 10, layer_type=GZIP_LAYER)
@@ -1421,7 +1526,7 @@ def test_threshold_cli_overrides_toml_only_when_supplied(
     report = _report(capsys)
     assert [item["rule_id"] for item in report["findings"]] == (["PCB007"] if expected else [])
     effective = cli_value or toml_value
-    assert report["size"]["thresholds"]["max_layer_size_mb"] == int(effective)
+    assert report["size"]["thresholds"]["max_layer_size_mb"] == effective
 
 
 @pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
@@ -1586,6 +1691,25 @@ def test_build_toml_threshold_blocks_push(tmp_path, monkeypatch, capsys):
         "build", "--config", str(config), "--validate", "--push", "--max-image-size-mb", "100",
     ]) == 0
     assert len(pushes) == 1
+
+
+@pytest.mark.parametrize(("name", "rule"), [
+    ("max_image_size_mb", "PCB006"), ("max_layer_size_mb", "PCB007"),
+])
+def test_build_preserves_exact_toml_thresholds(tmp_path, monkeypatch, capsys, name, rule):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    args = ["build", "--config", str(config), "--validate", "--push"]
+    assert _run(monkeypatch, args) == 0
+    size = image_validation.validate_image(tmp_path / "output")["size"]
+    actual = size["image_bytes"] if name == "max_image_size_mb" else size["largest_layer"]["bytes"]
+    threshold = _precise_threshold(actual, -1)
+    with config.open("a") as stream:
+        stream.write(f"\n[build.validate]\n{name} = {threshold:f}\n")
+    pushes.clear()
+    capsys.readouterr()
+    assert _run(monkeypatch, ["validate", "config", str(config)]) == 0
+    assert _run(monkeypatch, args) == 1
+    assert not pushes and rule in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

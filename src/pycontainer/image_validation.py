@@ -34,6 +34,8 @@ VERSION_LABEL = "org.opencontainers.image.version"
 
 MIB = 1024 * 1024
 SIZE_THRESHOLDS = ("max_image_size_mb", "max_layer_size_mb")
+MAX_SIZE_THRESHOLD_DIGITS = 1000
+MAX_SIZE_THRESHOLD_EXPONENT = 1000
 STORED_SIZE_NOTE = (
     "Sizes are stored blob sizes recorded in the layout: compressed layers count compressed "
     "bytes and uncompressed tar layers count their full size. Network transfer and "
@@ -94,15 +96,25 @@ def parse_size_threshold(value, name):
     """Return a positive, finite MiB threshold as an exact Decimal."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
         raise ValueError(f"{name} must be a positive number of MiB.")
-    text = repr(value) if isinstance(value, float) else str(value).strip()
-    if isinstance(value, str) and not _DECIMAL_LITERAL.fullmatch(text):
-        raise ValueError(f"{name} must be a positive number of MiB.")
+    if isinstance(value, str):
+        value = value.strip()
+        if not _DECIMAL_LITERAL.fullmatch(value):
+            raise ValueError(f"{name} must be a positive number of MiB.")
     try:
-        number = Decimal(text)
+        number = Decimal(repr(value) if isinstance(value, float) else value)
     except InvalidOperation:
-        raise ValueError(f"{name} must be a positive number of MiB.") from None
+        raise ValueError(f"{name} has an unsupported decimal exponent.") from None
     if not number.is_finite() or number <= 0:
         raise ValueError(f"{name} must be a positive number of MiB.")
+    if (
+        len(number.as_tuple().digits) > MAX_SIZE_THRESHOLD_DIGITS
+        or abs(number.adjusted()) > MAX_SIZE_THRESHOLD_EXPONENT
+    ):
+        raise ValueError(
+            f"{name} must have at most {MAX_SIZE_THRESHOLD_DIGITS} coefficient digits "
+            f"and an adjusted decimal exponent between -{MAX_SIZE_THRESHOLD_EXPONENT} "
+            f"and {MAX_SIZE_THRESHOLD_EXPONENT}."
+        )
     return number
 
 
@@ -514,10 +526,6 @@ def _compression(media_type):
     return "unknown"
 
 
-def _json_number(value):
-    return int(value) if value == value.to_integral_value() else float(value)
-
-
 def _size_report(config_size, layers, base_layer_count, thresholds):
     if base_layer_count is not None and not 0 <= base_layer_count <= len(layers):
         raise ImageValidationError("Base layer count does not match the selected image.")
@@ -553,7 +561,7 @@ def _size_report(config_size, layers, base_layer_count, thresholds):
         "contributions": contributions,
         "layers": entries,
         "thresholds": {
-            name: None if thresholds.get(name) is None else _json_number(thresholds[name])
+            name: None if thresholds.get(name) is None else str(thresholds[name])
             for name in SIZE_THRESHOLDS
         },
         "note": STORED_SIZE_NOTE,

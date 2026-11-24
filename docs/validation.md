@@ -65,12 +65,17 @@ Both commands also redact declared defaults from key-normalization collisions
 `--max-image-size-mb` and `--max-layer-size-mb` (on `validate image`, and on
 `build` together with `--validate`) override the matching TOML key only when
 supplied; otherwise the TOML value, if any, applies. Thresholds are positive,
-finite decimal numbers of MiB (1 MiB = 1,048,576 bytes), compared exactly
-without binary rounding, so `0.1` means 104,857.6 bytes. A size equal to the
-threshold passes; only a larger size warns. Zero, negative, non-finite,
-boolean or non-numeric values (including TOML strings) are configuration
-errors with exit 2. Without a threshold, no size finding is produced. The TOML
-keys use underscores only.
+finite decimal numbers of MiB (1 MiB = 1,048,576 bytes). CLI literals and TOML
+numbers retain their decimal precision and are compared exactly without
+binary rounding, so `0.1` means 104,857.6 bytes. A size equal to the threshold
+passes; only a larger size warns. Values may have at most 1,000 coefficient
+digits (including trailing zeros) and an adjusted decimal exponent from
+-1,000 through 1,000 (the exponent of the leading significant digit).
+For example, `1e-400` is supported, while `1e5000` is rejected.
+Zero, negative, non-finite, boolean or non-numeric values (including TOML
+strings), and values outside these precision/magnitude limits, are
+configuration or usage errors with exit 2. Without a threshold, no size
+finding is produced. The TOML keys use underscores only.
 
 `--fail-on warning` is the default; `--fail-on error` still reports warnings,
 but does not fail solely because of them. `build --validate` always fails on
@@ -109,7 +114,12 @@ ignoring PCB006 or PCB007 does not suppress it.
   type) and `role`.
 - `contributions`: base versus application/dependency bytes, plus
   `config_bytes` separately.
-- `thresholds` and `note`.
+- `thresholds`: each configured value is an **exact decimal string**, using
+  Python's `str(Decimal)` notation (for example `"1"`, `"1.0"` or `"1E-400"`),
+  or `null` when unset. JSON numeric floats are not used for thresholds:
+  consumers should parse these strings as decimals, not binary floats.
+  Text finding messages use the same exact decimal notation.
+- `note`: the stored-size accounting caveat.
 
 These are **stored blob sizes**. Base layers pulled from a registry usually
 keep their compressed media types, so they count compressed bytes, while
