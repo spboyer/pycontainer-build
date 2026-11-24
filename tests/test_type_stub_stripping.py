@@ -1,3 +1,4 @@
+import errno
 import json
 import logging
 import shutil
@@ -349,6 +350,50 @@ def test_builder_redacts_build_argument_values_in_stub_os_errors(
     assert error.value.filename.endswith("<redacted>-1.0.dist-info")
     assert "types_requests" not in "".join(traceback.format_exception(error.value))
     assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+@pytest.mark.parametrize("build_args", [None, {"STUB": "unrelated-value"}])
+def test_builder_keeps_stub_error_cause_without_values_to_redact(
+    tmp_path, monkeypatch, build_args
+):
+    context = tmp_path / "context"
+    site = context / ".venv" / "Lib" / "site-packages"
+    _site_packages(site)
+    (site / "types_requests-1.0.dist-info" / "RECORD").write_bytes(b"\xff\xfe")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _builder(
+        tmp_path / "build", monkeypatch, context,
+        strip_type_stubs=True, build_args=build_args,
+    )
+
+    with pytest.raises(ValueError) as error:
+        builder.build()
+
+    assert isinstance(error.value.__cause__, UnicodeDecodeError)
+
+
+def test_builder_keeps_characters_written_when_redacting_stub_os_errors(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    builder = _stub_builder(tmp_path, monkeypatch, context, "types_requests", False)
+    real_rmtree = shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise BlockingIOError(errno.EAGAIN, f"partial write {path}", 7)
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(BlockingIOError) as error:
+        builder.build()
+
+    assert error.value.errno == errno.EAGAIN
+    assert error.value.characters_written == 7
+    assert error.value.strerror.endswith("<redacted>-1.0.dist-info")
+    assert "types_requests" not in "".join(traceback.format_exception(error.value))
 
 
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):

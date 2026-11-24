@@ -1,4 +1,4 @@
-import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
+import copy, hashlib, json, os, shutil, tarfile, tempfile, logging, traceback
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -118,12 +118,17 @@ def _redacted_os_error(error: OSError, redact) -> OSError:
         args = (redact(str(error)),)
     try:
         replacement = type(error)(*args)
-    except Exception:
+    except TypeError:
+        # Subclasses with a custom constructor still get the standard attributes.
         replacement = OSError(*args)
     if filename is not None and replacement.filename is None:
         replacement.filename = filename
     if filename2 is not None:
         replacement.filename2 = filename2
+    try:
+        replacement.characters_written = error.characters_written
+    except AttributeError:
+        pass
     return replacement
 
 
@@ -503,10 +508,14 @@ class ImageBuilder:
         redact = self.config.redact
         try:
             return strip_type_stubs(site_packages, redact=redact)
-        except OSError as error:
-            replacement = _redacted_os_error(error, redact)
-        except ValueError as error:
-            replacement = ValueError(redact(str(error)))
+        except (OSError, ValueError) as error:
+            formatted = "".join(traceback.format_exception(error))
+            if redact(formatted) == formatted:
+                raise
+            if isinstance(error, OSError):
+                replacement = _redacted_os_error(error, redact)
+            else:
+                replacement = ValueError(redact(str(error)))
         # Raised outside the handler so no chained exception keeps the unredacted text.
         raise replacement
 
