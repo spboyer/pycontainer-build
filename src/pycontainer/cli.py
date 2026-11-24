@@ -33,6 +33,24 @@ def _metadata_argument(value: str) -> tuple[str, str]:
         raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
     return key, item
 
+INIT_TEMPLATE_OPTIONS = ("tag", "base_image", "context_dir", "app", "port", "platform", "include_deps")
+
+def _init_command(parser, args):
+    from .init_config import DEFAULT_OUTPUT, TEMPLATES, run_template, run_wizard
+    given=[name for name in (*INIT_TEMPLATE_OPTIONS, "output") if getattr(args, name) is not None]
+    if args.list_templates:
+        if given or args.force:
+            parser.error("--list-templates takes no other options.")
+        for name, spec in TEMPLATES.items():
+            print(f"{name}: {spec['description']}")
+        return
+    if args.interactive:
+        if given or args.force:
+            parser.error("--interactive asks for every setting; do not combine it with other options.")
+        raise SystemExit(run_wizard())
+    options={name: getattr(args, name) for name in INIT_TEMPLATE_OPTIONS if getattr(args, name) is not None}
+    raise SystemExit(run_template(args.template, args.output if args.output is not None else DEFAULT_OUTPUT, args.force, options))
+
 def _tolerate_unencodable_output():
     # Redirected output on Windows defaults to a legacy code page that cannot encode status symbols.
     for stream in (sys.stdout, sys.stderr):
@@ -167,6 +185,28 @@ def main():
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    # --- init subcommand (templates and interactive wizard) ---
+    from .init_config import DEFAULT_OUTPUT, TEMPLATES
+    ini=sub.add_parser(
+        "init",
+        help="Create a build configuration file from a template or an interactive wizard",
+        description="Write a [build] configuration file offline. Existing files are never replaced "
+        "without --force; the wizard never replaces files.",
+    )
+    mode=ini.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--template","-t",choices=tuple(TEMPLATES),help="Generate a configuration from a template")
+    mode.add_argument("--interactive","-i",action="store_true",help="Answer prompts in a terminal (requires a TTY)")
+    mode.add_argument("--list-templates",action="store_true",help="List the available templates")
+    ini.add_argument("--output","-o",help=f"Relative output path (default: {DEFAULT_OUTPUT})")
+    ini.add_argument("--force",action="store_true",help="Replace an existing output file (templates only)")
+    ini.add_argument("--tag",help="Image tag (default: local/<context directory name>:latest)")
+    ini.add_argument("--base-image",help="Base image (default: python:<requires-python>-slim)")
+    ini.add_argument("--context",dest="context_dir",help="Build context directory (default: .)")
+    ini.add_argument("--app",help="Application target: module:app for fastapi/flask, module for generic")
+    ini.add_argument("--port",type=int,help="Exposed port (default: 8000 fastapi, 5000 flask, none generic)")
+    ini.add_argument("--platform",help="Target platform, e.g. linux/amd64 or linux/arm64")
+    ini.add_argument("--include-deps",action=argparse.BooleanOptionalAction,default=None,help="Stage dependencies (default: on for fastapi/flask)")
+    # --- end init subcommand ---
     reg=sub.add_parser("registry",help="Delete or prune images in a registry")
     reg_sub=reg.add_subparsers(dest="registry_cmd",required=True)
     rd=reg_sub.add_parser("delete",help="Delete one manifest digest (removes every tag pointing to it)")
@@ -203,6 +243,9 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="init":
+        _init_command(ini, args)
+        return
     if args.cmd=="registry":
         raise SystemExit(_run_registry(parser,args))
     if args.cmd=="history":
