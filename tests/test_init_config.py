@@ -293,10 +293,11 @@ def test_publish_link_collision_preserves_concurrent_file(offline, monkeypatch):
     assert _files(offline) == ["cfg.toml"]
 
 
-def test_staging_name_collision_preserves_existing_file(offline, monkeypatch):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX output-mode probe is not used on Windows")
+def test_mode_probe_collision_preserves_existing_file(offline, monkeypatch):
     taken = UUID("00000000-0000-4000-8000-000000000001")
     available = UUID("00000000-0000-4000-8000-000000000002")
-    collision = offline / f".pycontainer-init-{taken.hex}.tmp"
+    collision = offline / f".pycontainer-init-mode-{taken.hex}.tmp"
     collision.write_text("# existing\n")
     candidates = iter((taken, available))
     monkeypatch.setattr(init_config, "uuid4", lambda: next(candidates))
@@ -436,7 +437,7 @@ def test_cleanup_failure_reports_possible_output(offline, monkeypatch, capsys):
     stage_paths = []
 
     def reject_staging_cleanup(path, *args, **kwargs):
-        if path.name.startswith(".pycontainer-init-"):
+        if path.name.startswith(".pycontainer-init-stage-"):
             stage_paths.append(path)
             raise PermissionError(errno.EACCES, "cleanup denied", str(path))
         return real_unlink(path, *args, **kwargs)
@@ -470,6 +471,21 @@ def test_new_output_respects_umask_and_staging_is_private(offline, monkeypatch):
     finally:
         os.umask(original)
     assert (offline / "cfg.toml").stat().st_mode & 0o777 == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes control staging visibility")
+def test_staging_is_private_from_creation(offline, monkeypatch):
+    real_mkstemp = init_config.tempfile.mkstemp
+    observed_modes = []
+
+    def inspect_creation(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        observed_modes.append(os.fstat(fd).st_mode & 0o777)
+        return fd, name
+
+    monkeypatch.setattr(init_config.tempfile, "mkstemp", inspect_creation)
+    init_config.publish("[build]\n", offline / "cfg.toml")
+    assert observed_modes and all(mode & 0o077 == 0 for mode in observed_modes)
 
 
 def test_existing_pyproject_settings_are_untouched(offline, monkeypatch, capsys):

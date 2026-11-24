@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, TextIO, Tuple
 from uuid import uuid4
@@ -20,7 +21,7 @@ from .project import detect_python_version
 
 DEFAULT_OUTPUT = "pycontainer.toml"
 MAX_ATTEMPTS = 3
-MAX_STAGING_ATTEMPTS = 10
+MAX_MODE_PROBE_ATTEMPTS = 10
 EXIT_OK, EXIT_REFUSED, EXIT_INVALID, EXIT_INTERRUPTED = 0, 1, 2, 130
 
 TEMPLATES: Dict[str, Dict[str, Any]] = {
@@ -197,15 +198,19 @@ def _write_staged(handle: BinaryIO, content: bytes) -> None:
     os.fsync(handle.fileno())
 
 
-def _open_staged(directory: Path) -> Tuple[Path, BinaryIO]:
-    for _ in range(MAX_STAGING_ATTEMPTS):
-        staged = directory / f".pycontainer-init-{uuid4().hex}.tmp"
+def _output_creation_mode(directory: Path) -> int:
+    for _ in range(MAX_MODE_PROBE_ATTEMPTS):
+        probe = directory / f".pycontainer-init-mode-{uuid4().hex}.tmp"
         try:
-            handle = open(staged, "xb", opener=lambda path, flags: os.open(path, flags, 0o644))
+            handle = open(probe, "xb", opener=lambda path, flags: os.open(path, flags, 0o644))
         except FileExistsError:
             continue
-        return staged, handle
-    raise FileExistsError(f"cannot create a unique staging file in {directory}")
+        try:
+            with handle:
+                return stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+        finally:
+            probe.unlink(missing_ok=True)
+    raise FileExistsError(f"cannot create a unique permission probe in {directory}")
 
 
 def publish(content: str, target: Path, force: bool = False) -> None:
@@ -216,10 +221,15 @@ def publish(content: str, target: Path, force: bool = False) -> None:
     """
     _check_target(target)
     data = content.encode("utf-8")
-    staged, handle = _open_staged(target.parent)
+    fd, staged_name = tempfile.mkstemp(prefix=".pycontainer-init-stage-", suffix=".tmp", dir=target.parent)
+    staged = Path(staged_name)
     try:
+        try:
+            handle = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
         with handle:
-            mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
             if os.name != "nt":
                 os.fchmod(handle.fileno(), 0o600)
             _write_staged(handle, data)
@@ -228,7 +238,8 @@ def publish(content: str, target: Path, force: bool = False) -> None:
             except (OSError, ValueError) as exc:
                 raise InitError(str(exc).replace(str(staged), str(target))) from None
             if os.name != "nt":
-                os.fchmod(handle.fileno(), 0o644 if force else mode)
+                mode = 0o644 if force else _output_creation_mode(target.parent)
+                os.fchmod(handle.fileno(), mode)
         _check_target(target)
         if force:
             if os.name == "nt":
