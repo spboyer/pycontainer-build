@@ -527,6 +527,61 @@ def test_builder_redacts_raw_stub_error_values_with_mixed_quotes(
         assert error.filename == '/tmp/prefix"<redacted>-suffix\udcff'
 
 
+@pytest.mark.parametrize("numeric_field", ["strerror", "filename", "filename2"])
+def test_builder_keeps_non_pathlike_stub_error_metadata_when_redacting(
+    tmp_path, monkeypatch, numeric_field
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    value = "synthetic-error-value"
+    builder = _stub_builder(tmp_path, monkeypatch, context, value, False)
+    original = PermissionError(13, value, value)
+    setattr(original, numeric_field, 42)
+    real_rmtree = shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise original
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(PermissionError) as caught:
+        builder.build()
+
+    error = caught.value
+    assert error.errno == 13
+    assert getattr(error, numeric_field) == 42
+    assert value not in "".join(traceback.format_exception(error))
+    assert value not in repr(error.args)
+    assert error.__cause__ is None and error.__context__ is None
+
+
+def test_builder_does_not_chain_unredacted_stub_error_if_reconstruction_fails(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    value = "synthetic-error-value"
+    builder = _stub_builder(tmp_path, monkeypatch, context, value, False)
+    original = PermissionError(13, "permission denied", value)
+
+    def fail_strip(*args, **kwargs):
+        raise original
+
+    def fail_reconstruction(*args, **kwargs):
+        raise RuntimeError("cannot reconstruct")
+
+    monkeypatch.setattr("pycontainer.builder.strip_type_stubs", fail_strip)
+    monkeypatch.setattr("pycontainer.builder._redacted_os_error", fail_reconstruction)
+    with pytest.raises(RuntimeError, match="cannot reconstruct") as caught:
+        builder.build()
+
+    assert value not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
     configs = []
 

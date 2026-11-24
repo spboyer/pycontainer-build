@@ -135,6 +135,8 @@ def _redacted_os_error(error: OSError, redact) -> OSError:
     def text(value):
         if value is None:
             return None
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            return "<redacted>" if _diagnostic_needs_redaction(value, redact) else value
         value = os.fspath(value)
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="surrogateescape")
@@ -570,11 +572,12 @@ class ImageBuilder:
                 pending.extend((current.__cause__, current.__context__))
             if not _diagnostic_needs_redaction(diagnostics, redact):
                 raise
-            if isinstance(error, OSError):
-                replacement = _redacted_os_error(error, redact)
-            else:
-                replacement = ValueError(redact(str(error)))
-        # Raised outside the handler so no chained exception keeps the unredacted text.
+            failure = error
+        # Reconstruct outside the handler so reconstruction failures cannot chain it.
+        if isinstance(failure, OSError):
+            replacement = _redacted_os_error(failure, redact)
+        else:
+            replacement = ValueError(redact(str(failure)))
         raise replacement
 
     def _record_failed_history(self, timing, config):
