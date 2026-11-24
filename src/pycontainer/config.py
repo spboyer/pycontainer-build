@@ -4,6 +4,7 @@ import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
@@ -170,6 +171,7 @@ class BuildConfig:
     requirements_file: Optional[str] = None
     lockfile: Optional[str] = None
     use_lockfile: bool = True
+    strip_type_stubs: bool = False
     verbose: bool = False
     dry_run: bool = False
     platform: str = "linux/amd64"
@@ -203,8 +205,20 @@ class BuildConfig:
     volumes: List[str] = field(default_factory=list)
     release_notes_file: Optional[str] = None
     release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
+    build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
+    _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
+        if self.build_args is not None:
+            self._resolved_build_args = resolve_arguments(self.build_args)
+            for name in EXPANDABLE_FIELDS:
+                setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
+        try:
+            self._validate()
+        except ValueError as exc:
+            raise ValueError(self.redact(str(exc))) from None
+
+    def _validate(self):
         from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
@@ -277,6 +291,23 @@ class BuildConfig:
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
+
+    def redact(self, message: str) -> str:
+        """Keep build input values out of diagnostic output."""
+        return redact_values(message, self._resolved_build_args.values())
+
+    def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
+        import hashlib
+        import json
+
+        storage_fields = {"context_dir", "output_dir", "cache_dir"}
+        identity = {
+            name: getattr(self, name)
+            for name in EXPANDABLE_FIELDS if name not in storage_fields
+        }
+        identity["backend"] = backend
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def validate_metadata(self) -> None:
         from .metadata import validate_metadata
