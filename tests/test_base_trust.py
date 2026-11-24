@@ -19,6 +19,7 @@ from pycontainer.blob_store import BlobIntegrityError
 from pycontainer.builder import ImageBuilder, UnsupportedPlatformError
 from pycontainer.config import BuildConfig
 from pycontainer.config_loader import config_from_file
+from pycontainer.effective_config import resolve_build_config
 from pycontainer.registry_client import RegistryClient
 
 
@@ -378,6 +379,20 @@ def test_nested_trust_config_is_loaded_without_cli_override(tmp_path):
         'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
     )
     assert config_from_file(config).base_image_trust == _policy()
+
+
+def test_trust_and_image_validation_config_coexist(tmp_path):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(
+        '[build]\nbase_image = "registry.example/team/base:latest"\n'
+        '[build.base_image_trust]\nprovider = "cosign"\n'
+        'repository = "registry.example/team/base"\n'
+        'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
+        '[build.validate]\nignore = ["PCB001"]\n'
+    )
+    effective, _ = resolve_build_config(config, {})
+    assert effective.base_image_trust == _policy()
+    assert effective.validate == {"ignore": ["PCB001"]}
 
 
 @pytest.mark.parametrize(

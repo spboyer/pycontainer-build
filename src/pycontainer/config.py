@@ -183,6 +183,7 @@ class BuildConfig:
     semver_tags: bool = False
     latest_tag: bool = False
     base_image_trust: Optional[Dict[str, str]] = None
+    validate: Dict[str, List[str]] = field(default_factory=dict)
     squash: bool = False
     analyze_layers: bool = False
     manifest_annotations: Optional[Dict[str, str]] = None
