@@ -374,7 +374,8 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
 
 
 @pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
-def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path, monkeypatch, request, source):
+@pytest.mark.parametrize("squash", [False, True])
+def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path, monkeypatch, request, source, squash):
     from test_lockfiles import _SimpleIndex, _write_target_marker_uv_project
 
     ctx = tmp_path / "ctx"
@@ -421,7 +422,7 @@ def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path,
     )
     builder = _builder(
         tmp_path, monkeypatch, registry, ctx=ctx, include_deps=True, base_image=base_image,
-        platform=platforms,
+        platform=platforms, squash=squash,
         labels={"example.label": "explicit"}, manifest_annotations={"example.manifest": "value"},
         index_annotations={"example.index": "value"},
     )
@@ -445,10 +446,12 @@ def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path,
         assert manifest["annotations"]["example.manifest"] == "value"
         assert config["config"]["Labels"]["example.label"] == "explicit"
         assert len(config["rootfs"]["diff_ids"]) == len(manifest["layers"])
-        assert config["rootfs"]["diff_ids"][-2:] == [
-            layer.digest for layer in image.layers[-2:]
+        builder_layers = image.layers[1:]
+        assert len(builder_layers) == (1 if squash else 2)
+        assert config["rootfs"]["diff_ids"][1:] == [
+            layer.digest for layer in builder_layers
         ]
-        with tarfile.open(image.layers[-2].tar_path) as archive:
+        with tarfile.open(builder_layers[0].tar_path) as archive:
             names = archive.getnames()
         for prefix in ("marker_root", "marker_trans"):
             assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
@@ -1002,12 +1005,13 @@ def test_multi_platform_conda_with_requirements_stages_each_target(tmp_path, mon
 
 
 @pytest.mark.parametrize("include_target_dependency", [False, True])
+@pytest.mark.parametrize("squash", [False, True])
 @pytest.mark.parametrize(
     ("target", "machine"),
     [("arm64", "aarch64"), ("arm/v7", "armv7l")],
 )
 def test_multi_platform_virtualenv_validates_each_target_base(
-    tmp_path, monkeypatch, include_target_dependency, target, machine
+    tmp_path, monkeypatch, include_target_dependency, target, machine, squash
 ):
     ctx = _context(tmp_path)
     site = ctx / ".venv" / "lib" / "python3.11" / "site-packages"
@@ -1045,7 +1049,7 @@ def test_multi_platform_virtualenv_validates_each_target_base(
     builder = _builder(
         tmp_path, monkeypatch,
         FakeBaseRegistry(platforms=("amd64", target), base_env_by_arch=envs),
-        include_deps=True, ctx=ctx, platform=f"linux/amd64,linux/{target}",
+        include_deps=True, ctx=ctx, platform=f"linux/amd64,linux/{target}", squash=squash,
     )
 
     if include_target_dependency:
@@ -1053,6 +1057,13 @@ def test_multi_platform_virtualenv_validates_each_target_base(
         assert [image.platform["architecture"] for image in builder.platform_images] == [
             "amd64", target.split("/")[0]
         ]
+        for image in builder.platform_images:
+            assert len(image.layers) == (2 if squash else 3)
+            with tarfile.open(image.layers[1].tar_path) as tar:
+                names = tar.getnames()
+            assert any(name.endswith("/app_lib.py") for name in names)
+            if squash:
+                assert any(name.endswith("/app.py") for name in names)
         if target == "arm/v7":
             assert builder.platform_images[1].platform["variant"] == "v7"
     else:
@@ -1446,6 +1457,263 @@ def test_push_rejects_layout_mutated_after_build(tmp_path, monkeypatch):
     with pytest.raises(LayerIntegrityError):
         builder.push(show_progress=False)
     assert client.calls == []
+
+
+def _install_fake_deps(monkeypatch):
+    def fake_install(requirements, site_packages, ctx, os_name, arch, version, base_image, base_config, **kwargs):
+        package = site_packages / f"native_{arch}"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(f"ARCH = {arch!r}\n")
+        return [requirements]
+
+    monkeypatch.setattr(builder_module, "install_requirements", fake_install)
+
+
+def _tar_names(path):
+    with tarfile.open(path) as tar:
+        return sorted(tar.getnames())
+
+
+def test_squash_flattens_builder_layers_and_keeps_base(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    plain = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx, tags=["_dev"]
+    )
+    plain.build()
+    squashed = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx,
+        output_dir=str(tmp_path / "squashed"), squash=True, tags=["_dev"],
+    )
+    squashed.build()
+    out = tmp_path / "squashed"
+
+    assert not (out / "layer-analysis.json").exists()
+    layout = json.loads((out / "index.json").read_text())
+    encoded = "pycontainer-" + "registry.example/team/app:_dev".encode().hex()
+    for reference in ("registry.example/team/app:v1", encoded):
+        assert _select_layout_reference(layout, reference)["digest"] == squashed.index_digest
+    for before, after in zip(plain.platform_images, squashed.platform_images):
+        assert len(before.layers) == 3 and len(after.layers) == 2
+        assert after.layers[0].digest == before.layers[0].digest
+        assert after.app_layer_count == 1
+        expected = sorted(
+            name.lstrip("/") for layer in before.layers[1:] for name in _tar_names(layer.tar_path)
+        )
+        assert _tar_names(after.layers[1].tar_path) == expected
+        manifest = json.loads(_blob(out, after.manifest_digest))
+        config = json.loads(_blob(out, manifest["config"]["digest"]))
+        assert [layer["digest"] for layer in manifest["layers"]] == [layer.digest for layer in after.layers]
+        assert config["rootfs"]["diff_ids"] == [
+            json.loads(_blob(tmp_path / "out", before.config_digest))["rootfs"]["diff_ids"][0],
+            after.layers[1].digest,
+        ]
+
+
+def test_squash_and_security_fragments_can_be_combined(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    plain = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx,
+        squash=True,
+    )
+    plain.build()
+    secured = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, ctx=ctx,
+        output_dir=str(tmp_path / "secured"), squash=True, analyze_layers=True,
+        security={"kubernetes": {"capabilities": {"drop": ["ALL"]}}},
+    )
+    secured.build()
+
+    assert secured.index_digest == plain.index_digest
+    assert all(len(image.layers) == 2 for image in secured.platform_images)
+    assert (tmp_path / "secured" / "layer-analysis.json").is_file()
+    fragment = tmp_path / "secured" / "security" / "kubernetes-security-context.json"
+    assert json.loads(fragment.read_text()) == {"capabilities": {"drop": ["ALL"]}}
+
+
+@pytest.mark.parametrize("platform", [MULTI, "linux/amd64"])
+def test_squash_preserves_runtime_metadata_and_local_history(tmp_path, monkeypatch, platform):
+    from pycontainer.history import BuildHistory
+
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    (ctx / "notes.md").write_bytes(b"Release notes\r\n")
+    registry = FakeBaseRegistry(base_runtime_by_arch={
+        arch: {"Labels": {"base-label": arch}, "Volumes": {"/data": {}}}
+        for arch in ("amd64", "arm64")
+    })
+    builder = _builder(
+        tmp_path, monkeypatch, registry, ctx=ctx, platform=platform,
+        include_deps=True, squash=True, analyze_layers=True,
+        labels={"app-label": "value"},
+        manifest_annotations={"example.manifest": "value"},
+        index_annotations={"example.index": "value"},
+        stop_signal="SIGTERM", volumes=["/cache"],
+        release_notes_file="notes.md", release_notes_label="example.notes",
+        record_history=True, history_dir=str(tmp_path / "history"),
+    )
+    builder.build()
+    original_digest = builder.manifest_digest
+    builder.build()
+
+    assert builder.manifest_digest == original_digest
+    output = tmp_path / "out"
+    layout = json.loads((output / "index.json").read_bytes())
+    assert layout["annotations"]["example.index"] == "value"
+    if platform == MULTI:
+        image_index = json.loads(_blob(output, builder.index_digest))
+        assert image_index["annotations"] == {"example.index": "value"}
+    for image in builder.platform_images:
+        manifest = json.loads(_blob(output, image.manifest_digest))
+        config = json.loads(_blob(output, image.config_digest))
+        assert manifest["annotations"] == {"example.manifest": "value"}
+        assert len(image.layers) == 2
+        assert config["config"]["Labels"] == {
+            "base-label": image.platform["architecture"],
+            "app-label": "value", "example.notes": "Release notes\n",
+        }
+        assert config["config"]["StopSignal"] == "SIGTERM"
+        assert config["config"]["Volumes"] == {"/cache": {}, "/data": {}}
+        assert config["rootfs"]["diff_ids"][-1] == image.layers[-1].digest
+        builder_module._verify_platform_image(output / "blobs" / "sha256", image, True)
+    reports = json.loads((output / "layer-analysis.json").read_bytes())["platforms"]
+    assert len(reports) == len(builder.platform_images)
+    records = BuildHistory(tmp_path / "history").list()
+    assert len(records) == 2
+    for record in records:
+        assert record["status"] == "success"
+        assert {"base_image", "dependencies", "application"} <= record["phases_ns"].keys()
+
+
+def test_repeated_squashed_builds_are_reproducible(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    first = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, squash=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+    first.build()
+    second = ImageBuilder(first.config)
+    second.build()
+    assert second.index_digest == first.index_digest
+
+
+def test_squash_with_single_builder_layer_is_a_no_op(tmp_path, monkeypatch):
+    ctx = _context(tmp_path)
+    plain = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), ctx=ctx, platform="linux/amd64")
+    plain.build()
+    squashed = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), ctx=ctx, platform="linux/amd64",
+        output_dir=str(tmp_path / "squashed"), squash=True,
+    )
+    squashed.build()
+    assert squashed.manifest_digest == plain.manifest_digest
+
+
+def test_squash_failure_keeps_existing_tags(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+    (out / "refs" / "tags" / "v1").write_text("previous")
+
+    def unsquashable(paths, destination):
+        raise builder_module.SquashError("unrepresentable")
+
+    monkeypatch.setattr(builder_module, "squash_layers", unsquashable)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, squash=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+    with pytest.raises(builder_module.SquashError, match="unrepresentable"):
+        builder.build()
+    assert (out / "index.json").read_text() == "previous"
+    assert (out / "refs" / "tags" / "v1").read_text() == "previous"
+    assert not list((out / "blobs" / "sha256").glob(".squash-layer-*"))
+
+
+@pytest.mark.parametrize("platform", [MULTI, "linux/amd64"])
+def test_layer_analysis_failure_keeps_existing_tags(tmp_path, monkeypatch, platform):
+    out = tmp_path / "out"
+    (out / "refs" / "tags").mkdir(parents=True)
+    (out / "index.json").write_text("previous")
+    (out / "refs" / "tags" / "v1").write_text("previous")
+
+    def failing_write(self, output, images):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(builder_module.ImageBuilder, "_write_layer_analysis", failing_write)
+    builder = _builder(tmp_path, monkeypatch, FakeBaseRegistry(), analyze_layers=True, platform=platform)
+    with pytest.raises(OSError, match="disk full"):
+        builder.build()
+    assert (out / "index.json").read_text() == "previous"
+    assert (out / "refs" / "tags" / "v1").read_text() == "previous"
+
+
+def test_layer_analysis_reports_prediction_and_shared_blobs(tmp_path, monkeypatch):
+    _install_fake_deps(monkeypatch)
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(), include_deps=True, analyze_layers=True,
+        ctx=_context(tmp_path, requirements=True),
+    )
+    builder.build()
+    report = json.loads((tmp_path / "out" / "layer-analysis.json").read_text())
+
+    assert report["squash_requested"] is False
+    assert [platform["platform"] for platform in report["platforms"]] == ["linux/amd64", "linux/arm64"]
+    app_digest = builder.platform_images[0].layers[-1].digest
+    assert {"digest": app_digest, "platforms": ["linux/amd64", "linux/arm64"]} in report["shared_blobs"]
+    for platform, image in zip(report["platforms"], builder.platform_images):
+        assert [layer["origin"] for layer in platform["layers"]] == ["base", "builder", "builder"]
+        assert platform["uncompressed_bytes"] == sum(
+            layer["uncompressed_bytes"] for layer in platform["layers"]
+        )
+        squash = platform["squash"]
+        assert squash["applied"] is False and squash["source_layers"] == 2
+        assert squash["dropped_entries"] == 0
+        assert squash["predicted_bytes"] == squash["measured_bytes"]
+        assert squash["measured_bytes"] < squash["source_bytes"]
+
+
+def test_squash_history_only_when_base_history_is_aligned():
+    aligned = {"history": [{"created_by": "base"}, {"empty_layer": True}]}
+    builder_module._append_squash_history(aligned, 1, 2)
+    assert aligned["history"][-1]["created_by"] == "pycontainer-build --squash"
+    misaligned = {"history": [{"created_by": "base"}]}
+    builder_module._append_squash_history(misaligned, 2, 2)
+    assert misaligned["history"] == [{"created_by": "base"}]
+    missing = {}
+    builder_module._append_squash_history(missing, 1, 2)
+    assert "history" not in missing
+
+
+def test_squash_options_parse_from_cli_and_toml(tmp_path, monkeypatch):
+    import sys
+    from pycontainer import cli
+    from pycontainer.config_loader import config_from_file
+
+    configs = []
+
+    class Fake:
+        def __init__(self, config):
+            configs.append(config)
+
+        def build(self):
+            return "layout"
+
+    monkeypatch.setattr(cli, "ImageBuilder", Fake)
+    monkeypatch.setattr(sys, "argv", ["pycontainer", "build", "--tag", "app:v1", "--squash", "--analyze-layers"])
+    cli.main()
+    assert configs[0].squash and configs[0].analyze_layers
+    assert not BuildConfig(tag="app:v1").squash
+
+    path = tmp_path / "pycontainer.toml"
+    path.write_text('[build]\ntag = "app:v1"\nsquash = true\nanalyze-layers = true\n')
+    cfg = config_from_file(path)
+    assert cfg.squash and cfg.analyze_layers
+    path.write_text('[build]\ntag = "app:v1"\nsquash = "yes"\n')
+    with pytest.raises(ValueError, match="squash"):
+        config_from_file(path)
 
 
 ARM_SET = ("amd64", "arm64", "arm/v5", "arm/v6", "arm/v7")

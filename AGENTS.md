@@ -25,6 +25,8 @@ daemon without discussing the trade-off first.
   digest shared with a retained tag, and never retry `DELETE`. Tests use the
   in-process fake registry in `tests/test_registry_cleanup.py`, never a real one.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
+- `squash.py`, `layer_analysis.py`: opt-in builder-layer squashing with OCI
+  whiteout/opaque semantics, and the `layer-analysis.json` report.
 - `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
   Multi-platform index scanning is rejected; build and scan each target separately.
 - `system_packages.py`: system package declaration, inference and base-image
@@ -195,6 +197,25 @@ evidence of enforcement.
 prerequisites (user namespaces, subuids, cgroup delegation, binfmt, OCI
 runtimes) on GitHub-hosted x64 and arm64 runners. It is observational, not a
 gate; see `docs/plans/2026-11-22-execution-backend-host-probe.md`.
+
+`--squash` (opt-in) merges only builder-created layers; base layers are never
+squashed. Unrepresentable overlay cases raise `SquashError` rather than being
+approximated. `scripts/check_squash_equivalence.py` is the opt-in Docker
+equivalence check for plain versus squashed images (`--skopeo-image` runs
+Skopeo from a container). The historical Linux-builder workaround for Windows
+CRLF console-script shebangs is tracked in
+[#225](https://github.com/spboyer/pycontainer-build/issues/225); its fix is
+included via [#228](https://github.com/spboyer/pycontainer-build/pull/228).
+The workaround is no longer required for the fixed Windows-generated entrypoints.
+Before final main integration, Windows-built plain-versus-squashed fixture equivalence passed on commit
+`a4fc1d5a41ff80b2b85f7441ab9c5a62c85294f0` in
+[hosted run 45203932420](https://github.com/spboyer/pycontainer-build/actions/runs/45203932420).
+The opt-in `windows-squash-equivalence` dispatch of `runtime-check.yml`
+builds layouts on a hosted Windows runner and compares their imported Linux
+runtime behavior, recording commit, run, attempt and artifact identity.
+Current integration evidence is recorded in
+[#195's testing section](https://github.com/spboyer/pycontainer-build/pull/195).
+See `docs/layer-squashing.md` for semantics, size and cache-reuse trade-offs.
 
 `tests/test_devloop.py` runs the Skaffold and Tilt example commands through
 fake tool launchers against a loopback registry. Real interoperability is
