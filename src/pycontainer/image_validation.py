@@ -486,7 +486,10 @@ def _references(descriptor):
 
 
 def _port_number(text):
-    if not text or len(text) > MAX_PORT_DIGITS or not text.isascii() or not text.isdigit():
+    if not text or not text.isascii() or not text.isdigit():
+        return None
+    text = text.lstrip("0")
+    if not text or len(text) > MAX_PORT_DIGITS:
         return None
     value = int(text)
     return value if 1 <= value <= 65535 else None
@@ -543,6 +546,10 @@ def _option_values(args, names):
                 values.append(arg[len(prefix) + 1:])
             elif _ambiguous_option(arg, names):
                 return _UNKNOWN
+            elif (arg.startswith("-") and "=" not in arg and index + 1 < len(args)
+                  and args[index + 1].startswith("-")):
+                # An unmodeled option may consume the following option-looking value.
+                return _UNKNOWN
         index += 1
     return values
 
@@ -597,9 +604,12 @@ def _server(argv):
 def _runserver_port(args):
     """Parse Django `runserver [addrport]`; any unrecognized option makes the listener unknown."""
     index = 0
+    ports = _UNKNOWN
     while index < len(args):
         arg = args[index]
         if arg in RUNSERVER_VALUE_OPTIONS:
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                return _UNKNOWN
             index += 2
             continue
         if arg.startswith("-"):
@@ -608,8 +618,11 @@ def _runserver_port(args):
             index += 1
             continue
         port = _address_port(arg)
-        return _UNKNOWN if port is None else {port}
-    return _UNKNOWN
+        if port is None or ports is not _UNKNOWN:
+            return _UNKNOWN
+        ports = {port}
+        index += 1
+    return ports
 
 
 def _gunicorn_ports(args):

@@ -1317,9 +1317,15 @@ UVICORN = ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
         ({"Entrypoint": ["uvicorn", "main:app", "--port", "8000", "--port", "9000"],
           "ExposedPorts": {"8000/tcp": {}}}, {"PCB009"}),
         ({"Entrypoint": ["flask", "run", "--host=0.0.0.0", "--port=5000"], "ExposedPorts": {"5000/tcp": {}}}, set()),
+        ({"Entrypoint": ["flask", "run", "--port", "000080"],
+          "ExposedPorts": {"000080/tcp": {}}}, {"PCB011"}),
+        ({"Entrypoint": ["uvicorn", "main:app", "--port", "0" * 5000 + "8000"],
+          "ExposedPorts": {"0" * 5000 + "8000/tcp": {}}}, set()),
         ({"Entrypoint": ["python", "-m", "flask", "--app", "app", "run", "-p", "5001"],
           "ExposedPorts": {"5000/tcp": {}}}, {"PCB009"}),
         ({"Entrypoint": ["python", "manage.py", "runserver", "0.0.0.0:8000"], "ExposedPorts": {"8000/tcp": {}}}, set()),
+        ({"Entrypoint": ["python", "manage.py", "runserver", "8000", "--noreload", "--verbosity", "2"],
+          "ExposedPorts": {"8000/tcp": {}}}, set()),
         ({"Entrypoint": ["python3", "manage.py", "runserver", "--noreload", "[::]:8001"],
           "ExposedPorts": {"8000/tcp": {}}}, {"PCB009"}),
         ({"Entrypoint": ["python", "-m", "django", "runserver", "--verbosity", "2", "-v=3", "0.0.0.0:8000"],
@@ -1368,9 +1374,17 @@ def test_listener_and_exposed_port_rules(tmp_path, monkeypatch, capsys, config, 
         {"Entrypoint": ["gunicorn", "--bind", "0.0.0.0:8080", "--bin", "0.0.0.0:8081", "app:app"],
          "ExposedPorts": {"8080/tcp": {}, "8081/tcp": {}}},
         {"Entrypoint": ["flask", "run", "--port", "5000", "-p8000"], "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["flask", "run", "--port", "5000", "--extra-files", "--port=9000"],
+         "ExposedPorts": {"5000/tcp": {}}},
+        {"Entrypoint": ["flask", "run", "--extra-files", "--port=9000", "--port", "5000"],
+         "ExposedPorts": {"5000/tcp": {}}},
         {"Entrypoint": ["uvicorn", "main:app", "--por=9000"], "ExposedPorts": {"8000/tcp": {}}},
         {"Entrypoint": ["python", "manage.py", "runserver"], "ExposedPorts": {"8000/tcp": {}}},
         {"Entrypoint": ["python", "manage.py", "runserver", "--custom", "2", "0.0.0.0:8000"],
+         "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["python", "manage.py", "runserver", "8000", "--custom", "9000"],
+         "ExposedPorts": {"8000/tcp": {}}},
+        {"Entrypoint": ["python", "manage.py", "runserver", "8000", "9000"],
          "ExposedPorts": {"8000/tcp": {}}},
         {"Entrypoint": ["streamlit", "run", "app.py"], "Env": ["STREAMLIT_SERVER_PORT=9000"],
          "ExposedPorts": {"8501/tcp": {}}},
@@ -1407,7 +1421,8 @@ def test_unrecognized_command_without_ports_is_not_reported(tmp_path, monkeypatc
     [
         ["0/tcp"], ["65536/tcp"], ["-1/tcp"], [" 80/tcp"], ["80/"], ["80/icmp"], ["80/tcp/x"],
         ["8000-8010/tcp"], ["\u0668\u0660/tcp"], ["http/tcp"], ["8000", "8000/tcp"], ["53/udp", "53/UDP"],
-        ["9" * 5000 + "/tcp"], ["080/tcp", "80/tcp"],
+        ["9" * 5000 + "/tcp"], ["080/tcp", "80/tcp"], ["000080/tcp", "80/tcp"],
+        ["0" * 5000 + "80/tcp", "080/tcp"], ["000000/tcp"], ["00065536/tcp"],
     ],
 )
 def test_invalid_or_duplicate_exposed_port_keys_are_errors(tmp_path, monkeypatch, capsys, keys):
@@ -1423,6 +1438,14 @@ def test_exposed_port_messages_escape_untrusted_keys(tmp_path, monkeypatch, caps
     _, findings = _port_findings(tmp_path, monkeypatch, capsys, config, "--ignore", "PCB010")
     message = findings["PCB008"]["message"]
     assert "\x1b" not in message and "\\u001b" in message and "x" * 40 not in message
+
+
+@pytest.mark.parametrize("zeros", [5, 5000])
+def test_zero_padded_exposed_ports_are_normalized_duplicates(tmp_path, monkeypatch, capsys, zeros):
+    config = {"ExposedPorts": {"0" * zeros + "80/tcp": {}, "80/tcp": {}}}
+    _, findings = _port_findings(tmp_path, monkeypatch, capsys, config)
+    message = findings["PCB008"]["message"]
+    assert "duplicate:" in message and "invalid:" not in message
 
 
 PORT_REDACTION_VALUES = [
@@ -1550,6 +1573,23 @@ def test_build_socket_only_listener_does_not_block_push(tmp_path, monkeypatch, c
     config, pushes = _port_build(
         tmp_path, monkeypatch, {"8000/tcp": {}},
         f'entrypoint = ["gunicorn", "--bind", "{bind}", "app:app"]\n',
+    )
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 0
+    output = capsys.readouterr().out
+    assert "info: PCB010:" in output and "PCB009" not in output
+    assert len(pushes) == 1
+
+
+@pytest.mark.parametrize(
+    ("argv", "port"),
+    [
+        (["flask", "run", "--port", "5000", "--extra-files", "--port=9000"], 5000),
+        (["python", "manage.py", "runserver", "8000", "--custom", "9000"], 8000),
+    ],
+)
+def test_build_ambiguous_option_values_do_not_block_push(tmp_path, monkeypatch, capsys, argv, port):
+    config, pushes = _port_build(
+        tmp_path, monkeypatch, {f"{port}/tcp": {}}, f"entrypoint = {json.dumps(argv)}\n",
     )
     assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 0
     output = capsys.readouterr().out

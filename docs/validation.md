@@ -93,6 +93,9 @@ written to stderr with exit 2 and no JSON report on stdout.
 Configured `exposed-ports` must be distinct integers from 1 to 65535.
 `build` and `validate config` reject duplicates and out-of-range values with
 exit 2 before the base image is pulled or any layout blob is written.
+Image port keys and explicit listener ports accept ASCII decimal leading
+zeros; normalization and range checks apply before comparison. Integer
+conversion is bounded to five significant digits, even for long inputs.
 
 The listener check reads only the image's `Entrypoint` and `Cmd` argv. It
 recognizes `uvicorn` (`--port`), `gunicorn` (every `-b`/`--bind`; `unix:`
@@ -102,9 +105,13 @@ descriptors make the TCP listener unknown), `flask run` (`--port`/`-p`), Django 
 and `server` (`--port`, `--ServerApp.port`, `--NotebookApp.port`), directly
 or through `python -m` (including `python -m django`). Gradio apps launched as `python app.py`, Celery
 workers and other commands produce PCB010 when ports are exposed. Django
-options other than the standard `runserver` options also make the listener
+options other than the standard `runserver` options, before or after the
+address, also make the listener
 unknown, as do attached or clustered short options (`-p8000`, `-Rb :8000`)
 and abbreviated long options (`--bin`), whose effect is parser-specific.
+An unmodeled option followed by an option-looking value is also ambiguous:
+for example, Flask can consume `--port=9000` as the value of `--extra-files`.
+These cases produce non-failing PCB010 rather than a guessed port mismatch.
 
 This check does not guess. Ports set through environment variables
 (`UVICORN_PORT`, `FLASK_RUN_PORT`, `STREAMLIT_SERVER_PORT`,
