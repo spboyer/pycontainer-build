@@ -158,6 +158,36 @@ def test_hash_pinned_requirements_hit_reuses_identical_layer_without_pip(
     assert Path(second.layers[0].tar_path).read_bytes() == Path(first.layers[0].tar_path).read_bytes()
 
 
+@pytest.mark.parametrize("initial_strip", [False, True])
+def test_cache_separates_type_stub_stripping(tmp_path, monkeypatch, capsys, initial_strip):
+    context = _project(tmp_path)
+    stub = _named_wheel(context / "wheelhouse", "types-fixture", stub_only=True)
+    requirements = context / "requirements.txt"
+    requirements.write_text(
+        requirements.read_text() + f"types-fixture==1.0 --hash=sha256:{_sha(stub)}\n"
+    )
+    initial = _builder(
+        tmp_path, monkeypatch, context, "initial", strip_type_stubs=initial_strip
+    )
+    initial.build()
+    capsys.readouterr()
+
+    changed = _builder(
+        tmp_path, monkeypatch, context, "changed", strip_type_stubs=not initial_strip
+    )
+    changed.build()
+    assert "Dependency layer cache miss: no verified entry" in capsys.readouterr().out
+    assert initial.layers[0].digest != changed.layers[0].digest
+    assert (("types-fixture", "1.0") in _image(initial)[3]) == (not initial_strip)
+    assert (("types-fixture", "1.0") in _image(changed)[3]) == initial_strip
+
+    _forbid_install(monkeypatch)
+    hit = _builder(tmp_path, monkeypatch, context, "hit", strip_type_stubs=initial_strip)
+    hit.build()
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert _image(hit) == _image(initial)
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_requirements_changed_during_install_cannot_poison_cache(tmp_path, monkeypatch, nested):
     context = _project(tmp_path)
@@ -792,6 +822,7 @@ def test_locked_cache_rejects_manifest_symlink_outside_context(
 ):  # noqa: F811
     context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
     _builder(tmp_path, monkeypatch, context, "initial").build()
+    symlinked = _builder(tmp_path, monkeypatch, context, "symlinked")
 
     manifest = context / "Pipfile"
     external = tmp_path / "external-Pipfile"
@@ -804,7 +835,7 @@ def test_locked_cache_rejects_manifest_symlink_outside_context(
 
     _forbid_install(monkeypatch)
     with pytest.raises(LockfileError, match="(?i)(manifest|pipfile|context)"):
-        _builder(tmp_path, monkeypatch, context, "symlinked").build()
+        symlinked.build()
 
 
 def test_locked_cache_rechecks_manifest_containment_after_lookup(tmp_path, monkeypatch, indexes):

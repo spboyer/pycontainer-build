@@ -4,6 +4,7 @@ import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
@@ -17,6 +18,31 @@ MULTI_PLATFORM_SCAN_ERROR = (
 _REGISTRY_HOST = re.compile(
     r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?"
 )
+
+
+DOCKER_HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
+
+
+def _normalize_registry_host(entry, kind: str) -> str:
+    """Validate a ``host[:port]`` registry name and return it lowercased."""
+    if not isinstance(entry, str) or not _REGISTRY_HOST.fullmatch(entry):
+        raise ValueError(
+            f"Invalid {kind} {entry!r}: expected host[:port] without "
+            "a scheme, path, or credentials."
+        )
+    try:
+        port = urllib.parse.urlsplit(f"//{entry}").port
+    except ValueError:
+        port = 0
+    if port == 0:
+        raise ValueError(f"Invalid {kind} port in {entry!r}.")
+    return entry.lower()
+
+
+def canonical_registry(host: str) -> str:
+    """Return the lookup key for a registry host, folding Docker Hub aliases."""
+    host = host.lower()
+    return "docker.io" if host in DOCKER_HUB_HOSTS else host
 
 
 def normalize_platforms(value: str) -> List[str]:
@@ -44,19 +70,38 @@ def validate_insecure_registries(registries: List[str]) -> List[str]:
         raise ValueError("insecure_registries must be a list of host[:port] strings.")
     normalized = []
     for entry in registries:
-        if not isinstance(entry, str) or not _REGISTRY_HOST.fullmatch(entry):
+        host = _normalize_registry_host(entry, "insecure registry")
+        if host not in normalized:
+            normalized.append(host)
+    return normalized
+
+
+def validate_registry_mirrors(mirrors: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Normalize ``{upstream: [mirror, ...]}`` pull-through mirror settings."""
+    if not isinstance(mirrors, dict):
+        raise ValueError(
+            "registry_mirrors must map an upstream host[:port] to a list of mirror hosts."
+        )
+    normalized: Dict[str, List[str]] = {}
+    for upstream, hosts in mirrors.items():
+        key = canonical_registry(_normalize_registry_host(upstream, "mirrored registry"))
+        if key in normalized:
+            raise ValueError(f"Registry {upstream!r} has more than one mirror list.")
+        if not isinstance(hosts, list) or not hosts:
             raise ValueError(
-                f"Invalid insecure registry {entry!r}: expected host[:port] without "
-                "a scheme, path, or credentials."
+                f"Registry mirrors for {upstream!r} must be a non-empty list of "
+                "host[:port] strings."
             )
-        try:
-            port = urllib.parse.urlsplit(f"//{entry}").port
-        except ValueError:
-            port = 0
-        if port == 0:
-            raise ValueError(f"Invalid insecure registry port in {entry!r}.")
-        if entry.lower() not in normalized:
-            normalized.append(entry.lower())
+        ordered: List[str] = []
+        for entry in hosts:
+            host = _normalize_registry_host(entry, "registry mirror")
+            if canonical_registry(host) == key:
+                raise ValueError(
+                    f"Registry mirror {entry!r} is the upstream registry {upstream!r}."
+                )
+            if host not in ordered:
+                ordered.append(host)
+        normalized[key] = ordered
     return normalized
 
 # Linux signal names in the OCI "SIGNAME" format, matching Docker's Linux table.
@@ -126,6 +171,7 @@ class BuildConfig:
     requirements_file: Optional[str] = None
     lockfile: Optional[str] = None
     use_lockfile: bool = True
+    strip_type_stubs: bool = False
     verbose: bool = False
     dry_run: bool = False
     platform: str = "linux/amd64"
@@ -151,13 +197,26 @@ class BuildConfig:
     history_dir: Optional[str] = None
     insecure_registries: List[str] = field(default_factory=list)
     registry_ca_file: Optional[str] = None
+    registry_mirrors: Dict[str, List[str]] = field(default_factory=dict)
     security: Optional[dict] = None
     stop_signal: Optional[str] = None
     volumes: List[str] = field(default_factory=list)
     release_notes_file: Optional[str] = None
     release_notes_label: str = DEFAULT_RELEASE_NOTES_LABEL
+    build_args: Optional[Dict[str, BuildArgument]] = field(default=None, repr=False)
+    _resolved_build_args: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
+        if self.build_args is not None:
+            self._resolved_build_args = resolve_arguments(self.build_args)
+            for name in EXPANDABLE_FIELDS:
+                setattr(self, name, expand_field(getattr(self, name), self._resolved_build_args, name))
+        try:
+            self._validate()
+        except ValueError as exc:
+            raise ValueError(self.redact(str(exc))) from None
+
+    def _validate(self):
         from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
@@ -177,6 +236,7 @@ class BuildConfig:
         self.insecure_registries = validate_insecure_registries(
             self.insecure_registries
         )
+        self.registry_mirrors = validate_registry_mirrors(self.registry_mirrors)
         if self.registry_ca_file is not None:
             from .registry_client import create_registry_ssl_context
 
@@ -229,6 +289,23 @@ class BuildConfig:
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""
         return normalize_platforms(self.platform)
+
+    def redact(self, message: str) -> str:
+        """Keep build input values out of diagnostic output."""
+        return redact_values(message, self._resolved_build_args.values())
+
+    def cache_identity(self, backend: str = "pycontainer-oci-v1") -> str:
+        import hashlib
+        import json
+
+        storage_fields = {"context_dir", "output_dir", "cache_dir"}
+        identity = {
+            name: getattr(self, name)
+            for name in EXPANDABLE_FIELDS if name not in storage_fields
+        }
+        identity["backend"] = backend
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def validate_metadata(self) -> None:
         from .metadata import validate_metadata

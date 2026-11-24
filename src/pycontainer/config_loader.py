@@ -3,8 +3,9 @@ import types
 import tomllib
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union, get_args, get_origin, get_type_hints
-from .config import BuildConfig
+from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
+from .config import BuildConfig, canonical_registry
+from .build_args import resolve_arguments
 from .metadata import validate_metadata
 
 
@@ -105,7 +106,7 @@ def _format_type(expected_type: Any) -> str:
 
 
 def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
-    valid_fields = {field.name for field in fields(BuildConfig)}
+    valid_fields = {field.name for field in fields(BuildConfig) if field.init}
     unknown_fields = sorted(set(config) - valid_fields)
     if unknown_fields:
         supported = ", ".join(sorted(valid_fields))
@@ -148,15 +149,35 @@ def merge_configs(file_config: Dict[str, Any], cli_args: Dict[str, Any]) -> Dict
                 and isinstance(merged.get(key), dict)
             ):
                 merged[key] = {**merged[key], **value}
+            elif (
+                key == 'registry_mirrors'
+                and isinstance(value, dict)
+                and isinstance(merged.get(key), dict)
+            ):
+                # A CLI upstream replaces that upstream's file list; others are kept.
+                cli_keys = {canonical_registry(k) for k in value}
+                merged[key] = {
+                    **{
+                        k: v
+                        for k, v in merged[key].items()
+                        if canonical_registry(k) not in cli_keys
+                    },
+                    **value,
+                }
             else:
                 merged[key] = value
 
     return merged
 
 
-def config_from_file(path: Path, cli_overrides: Optional[Dict]=None) -> BuildConfig:
+def config_from_file(
+    path: Path,
+    cli_overrides: Optional[Dict] = None,
+    build_arg_overrides: Optional[List[str]] = None,
+) -> BuildConfig:
     """Create a validated BuildConfig from file values and explicit CLI overrides."""
     table, file_config = _load_config_table(path)
     config = merge_configs(file_config, cli_overrides or {})
     _validate_config(config, table)
+    config["build_args"] = resolve_arguments(config.get("build_args", {}), build_arg_overrides)
     return BuildConfig(**config)

@@ -2,9 +2,10 @@ import argparse, json, os, logging, sys
 from pathlib import Path
 from .config import BuildConfig, SBOM_FORMATS, SCAN_SEVERITIES
 from .builder import ImageBuilder
-from .config_loader import config_from_file
+from .config_loader import config_from_file, load_config_file, merge_configs
 from .history import BuildHistory, HistoryStorageError
 from .project import detect_python_version
+from .build_args import redact_values, resolve_arguments
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -15,6 +16,16 @@ from .devloop import (
     tilt_expected_reference,
     write_reference,
 )
+
+class _BuildArgumentLogFilter(logging.Filter):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def filter(self, record):
+        record.msg = self.config.redact(record.getMessage())
+        record.args = ()
+        return True
 
 def _metadata_argument(value: str) -> tuple[str, str]:
     key, separator, item = value.partition("=")
@@ -31,8 +42,29 @@ def _tolerate_unencodable_output():
         try: "\u2713".encode(encoding)
         except (UnicodeEncodeError, LookupError): reconfigure(errors="replace")
 
+def _run_registry(parser, args):
+    from .blob_store import BlobIntegrityError
+    from .registry_cleanup import RegistryConfirmationError, run_delete, run_prune
+    from .registry_client import RegistryRequestError
+    if args.username and not (args.password or os.getenv('REGISTRY_PASSWORD')):
+        parser.error("--username requires --password or REGISTRY_PASSWORD.")
+    if args.username and not args.password:
+        args.password=os.getenv('REGISTRY_PASSWORD')
+    if args.registry_cmd=="prune" and args.keep<1:
+        parser.error("--keep must be at least 1.")
+    if args.registry_cmd=="prune" and args.page_size is not None and args.page_size<1:
+        parser.error("--page-size must be at least 1.")
+    try:
+        return run_delete(args) if args.registry_cmd=="delete" else run_prune(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    except (RegistryRequestError, RegistryConfirmationError, BlobIntegrityError) as exc:
+        print(f"Error: {exc}",file=sys.stderr)
+        return 1
+
 def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
+    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
     if tagging:
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
         b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")
@@ -47,6 +79,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
         b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--insecure-registry",dest="insecure_registries",action="append",metavar="HOST[:PORT]",help="Use plain HTTP for this exact registry host[:port] (repeatable; unsafe outside trusted networks)")
     b.add_argument("--registry-ca-file",metavar="PATH",help="Trust an additional PEM CA bundle for registry HTTPS (verification stays enabled)")
+    b.add_argument("--registry-mirror",dest="registry_mirrors",action="append",metavar="UPSTREAM=MIRROR",help="Pull base images from UPSTREAM through MIRROR host[:port] first (repeatable, tried in order; pushes never use mirrors)")
     b.add_argument("--include",dest="include_paths",action="append",help="Include a context-root-relative file or directory (repeatable)")
     b.add_argument("--exclude",dest="exclude_paths",action="append",help="Exclude a context-root-relative path or glob (repeatable)")
     b.add_argument("--no-default-excludes",dest="exclude_defaults",action="store_false",default=None,help="Include normally excluded generated, test, virtualenv, and VCS paths")
@@ -66,6 +99,7 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True):
     b.add_argument("--requirements",dest="requirements_file",help="Requirements file for dependency layer (takes precedence over auto-detected lockfiles and venvs)")
     b.add_argument("--lockfile",help="poetry.lock, Pipfile.lock, pdm.lock or uv.lock to stage dependencies from")
     b.add_argument("--no-lockfile",dest="use_lockfile",action="store_false",default=None,help="Ignore auto-detected lockfiles")
+    b.add_argument("--strip-type-stubs",action="store_true",default=None,help="Remove .pyi files and stub-only distributions (types-*, *-stubs) from the dependency layer")
     b.add_argument("--verbose","-v",action="store_true",default=None,help="Verbose output with detailed logging")
     if push:
         b.add_argument("--dry-run",action="store_true",default=None,help="Show build plan without building")
@@ -120,6 +154,24 @@ def main():
     imp.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Value for a Dockerfile ARG (repeatable)")
     imp.add_argument("--shell",metavar="JSON",help='Shell for shell-form CMD/ENTRYPOINT conversion as a JSON array, e.g. \'["/bin/bash", "-c"]\' (default: ["/bin/sh", "-c"]); a later Dockerfile SHELL still applies')
     # --- end import subcommand ---
+    reg=sub.add_parser("registry",help="Delete or prune images in a registry")
+    reg_sub=reg.add_subparsers(dest="registry_cmd",required=True)
+    rd=reg_sub.add_parser("delete",help="Delete one manifest digest (removes every tag pointing to it)")
+    rd.add_argument("reference",help="Image reference with an explicit tag or @sha256 digest")
+    rp=reg_sub.add_parser("prune",help="Delete older semantic-version tags; dry run unless --execute")
+    rp.add_argument("repository",help="Repository without a tag, e.g. ghcr.io/user/app")
+    rp.add_argument("--keep",type=int,required=True,help="Number of highest semantic versions to keep (>= 1)")
+    rp.add_argument("--match",default="*",help="Glob selecting tags to consider (default: *)")
+    rp.add_argument("--protect",action="append",help="Glob of tags never pruned (repeatable)")
+    rp.add_argument("--page-size",type=int,help="Tags requested per page (registry may cap it)")
+    mode=rp.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run",action="store_true",help="Only print the plan (default)")
+    mode.add_argument("--execute",action="store_true",help="Delete the planned digests after confirmation")
+    for command in (rd, rp):
+        command.add_argument("--yes",action="store_true",help="Confirm deletion without prompting")
+        command.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
+        command.add_argument("--password",help="Registry password/token (or use env vars)")
+    rd.add_argument("--dry-run",action="store_true",help="Resolve and print the digest without deleting")
     history=sub.add_parser("history",help="Inspect or delete local build history")
     history_actions=history.add_subparsers(dest="history_action",required=True)
     for action in ("list", "clear"):
@@ -138,6 +190,8 @@ def main():
     compose.add_argument("--host-port",type=int,help="Compose loopback host port (default: container port)")
     args=parser.parse_args()
 
+    if args.cmd=="registry":
+        raise SystemExit(_run_registry(parser,args))
     if args.cmd=="history":
         try:
             store=BuildHistory(args.history_dir)
@@ -184,6 +238,15 @@ def main():
     if push and username and not (password or os.getenv('REGISTRY_PASSWORD')):
         parser.error("--username requires --password or REGISTRY_PASSWORD.")
 
+    registry_mirrors=None
+    if args.registry_mirrors:
+        registry_mirrors={}
+        for entry in args.registry_mirrors:
+            upstream,separator,mirror=entry.partition("=")
+            if not separator or not upstream or not mirror or "=" in mirror:
+                parser.error(f"Invalid --registry-mirror {entry!r}: expected UPSTREAM=MIRROR, e.g. docker.io=mirror.example.com.")
+            registry_mirrors.setdefault(upstream,[]).append(mirror)
+
     tag_args=getattr(args,"tag",None)
     cli_overrides={
         'tag': tag_args[0] if tag_args else None,
@@ -203,6 +266,7 @@ def main():
         'requirements_file': args.requirements_file,
         'lockfile': args.lockfile,
         'use_lockfile': args.use_lockfile,
+        'strip_type_stubs': args.strip_type_stubs,
         'verbose': args.verbose,
         'dry_run': getattr(args,"dry_run",None),
         'platform': getattr(args,"platform",None),
@@ -228,6 +292,7 @@ def main():
         'volumes': args.volumes,
         'insecure_registries': args.insecure_registries,
         'registry_ca_file': args.registry_ca_file,
+        'registry_mirrors': registry_mirrors,
     }
     cli_overrides={k:v for k,v in cli_overrides.items() if v is not None}
 
@@ -242,29 +307,39 @@ def main():
             push_target=tilt_expected_reference(os.environ,args.image)
             if push_target is None and not args.output_ref:
                 raise DevLoopError("--image requires --output-ref so Tilt can read the pushed reference.")
-            platform=single_platform(args.platform,"--platform")
-            if platform: cli_overrides['platform']=platform
             cli_overrides['tag']=push_target or f"{args.image}:{TILT_PLACEHOLDER_TAG}"
     except DevLoopError as exc:
-        parser.error(str(exc))
+        try:
+            file_config=load_config_file(Path(args.config)) if args.config else {}
+            declarations=merge_configs(file_config, {}).get("build_args", {})
+            resolved_args=resolve_arguments(declarations, args.build_arg)
+        except (OSError, ValueError) as config_error:
+            parser.error(str(config_error))
+        parser.error(redact_values(str(exc), resolved_args.values()))
     if devloop:
         # The tool owns the pushed reference; extra tags and dry runs would break its contract.
         cli_overrides.update(tags=[],semver_tags=False,latest_tag=False,dry_run=False)
 
     try:
         if args.config:
-            cfg=config_from_file(Path(args.config), cli_overrides)
+            cfg=config_from_file(Path(args.config), cli_overrides, args.build_arg)
         else:
-            cfg=BuildConfig(**cli_overrides)
+            resolve_arguments({}, args.build_arg)
+            cfg=BuildConfig(**cli_overrides, build_args={})
             if 'base_image' not in cli_overrides:
                 py_ver=detect_python_version(cfg.context_dir)
                 cfg.base_image=f"python:{py_ver}-slim"
-        if devloop:
-            platform=single_platform(cfg.platform,"platform")
-            if not platform: raise DevLoopError("platform must specify a single target platform.")
-            cfg.platform=platform
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
+
+    if devloop:
+        try:
+            source="--platform" if args.cmd=="tilt-build" and args.platform is not None else "platform"
+            platform=single_platform(cfg.platform,source)
+            if not platform: raise DevLoopError("platform must specify a single target platform.")
+            cfg.platform=platform
+        except DevLoopError as exc:
+            parser.error(cfg.redact(str(exc)))
 
     if cfg.verbose:
         logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
@@ -272,34 +347,43 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     from .scanning import ScanError
+    log_filter = _BuildArgumentLogFilter(cfg)
+    handlers = list(logging.getLogger().handlers) if cfg.build_args else []
+    for handler in handlers:
+        handler.addFilter(log_filter)
     try:
-        builder=ImageBuilder(cfg)
-        out=builder.build()
-    except ReleaseNotesError as exc:
-        parser.error(str(exc))
-    except HistoryStorageError as exc:
-        parser.exit(1,f"Build history error: {exc}\n")
-    except ScanError as exc:
-        parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
-    print("Built:", out)
-    
-    if push:
-        if username and not password:
-            password=os.getenv('REGISTRY_PASSWORD')
-        if args.cmd=="tilt-build" and push_target is None:
-            push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
         try:
+            builder=ImageBuilder(cfg)
+            out=builder.build()
+        except ReleaseNotesError as exc:
+            parser.error(cfg.redact(str(exc)))
+        except HistoryStorageError as exc:
+            parser.exit(1,f"Build history error: {cfg.redact(str(exc))}\n")
+        print("Built:", cfg.redact(str(out)))
+
+        if push:
+            if username and not password:
+                password=os.getenv('REGISTRY_PASSWORD')
+            if args.cmd=="tilt-build" and push_target is None:
+                push_target=f"{args.image}:{tilt_content_tag(builder.manifest_digest)}"
             pushed=builder.push(
                 registry_url=push_target,
                 username=username,
                 password=password,
                 show_progress=not args.no_progress,
             )
-        except ScanError as exc:
-            parser.exit(3 if exc.category == "findings" else 4, f"{exc}\n")
-        if getattr(args,"output_ref",None):
-            write_reference(Path(args.output_ref),pushed)
-            print("Wrote image reference to", args.output_ref)
+            if getattr(args,"output_ref",None):
+                write_reference(Path(args.output_ref),pushed)
+                print("Wrote image reference to", cfg.redact(str(args.output_ref)))
+    except ScanError as exc:
+        parser.exit(3 if exc.category == "findings" else 4, f"{cfg.redact(str(exc))}\n")
+    except (OSError, ValueError, RuntimeError) as exc:
+        if not cfg.build_args:
+            raise
+        parser.error(cfg.redact(str(exc)))
+    finally:
+        for handler in handlers:
+            handler.removeFilter(log_filter)
 
 if __name__=="__main__":
     main()

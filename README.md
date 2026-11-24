@@ -76,6 +76,9 @@ pycontainer build --tag myapp:latest --platform linux/amd64
 
 # Dry-run to preview (verbose mode)
 pycontainer build --tag test:latest --dry-run --verbose
+
+# Preview pruning old versions (dry run by default; --execute to delete)
+pycontainer registry prune ghcr.io/user/myapp --keep 5
 ```
 
 ### Output
@@ -189,6 +192,9 @@ offline preparation, error behavior and the opt-in acceptance test.
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
+- ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
+  dry-run-by-default semver `registry prune` that never deletes digests shared
+  with retained tags ([guide](docs/REGISTRY_CLEANUP.md))
 - ✅ **Multi-provider authentication** — GitHub tokens, Docker config, Azure CLI, env vars
 - ✅ **OAuth2 token exchange** — Automatic bearer token flow with Www-Authenticate
 - ✅ **Credential auto-discovery** — Tries multiple auth sources automatically
@@ -498,13 +504,18 @@ pycontainer build \
   `Metadata-Version`. Direct URLs, egg distributions, unknown markers, and
   patch-dependent `Requires-Python` without a full `PYTHON_VERSION` fail.
   Virtualenvs do not record selected extras or groups. An extra or group
-  counts as not requested only when it is missing a requirement that any
-  Windows, Linux or macOS CPython host of the venv's Python version would have
-  installed; a `lib/pythonX.Y/site-packages` layout whose `pyvenv.cfg` `home`
-  is a POSIX path limits the hosts to Linux and macOS (MSYS2 CPython is
-  Windows with that layout), and `Lib/site-packages` to Windows. Otherwise, if
-  its target requirements are not satisfied, verification fails rather than
-  guessing.
+  counts as not requested only when it is missing a requirement that the
+  venv's creator host provably would have installed. Only facts the venv
+  establishes are used: CPython, the venv's Python minor version when known,
+  and the OS family from the layout (`lib/pythonX.Y/site-packages` with a
+  POSIX `pyvenv.cfg` `home` is non-Windows; MSYS2 CPython is Windows with that
+  layout; `Lib/site-packages` is Windows). Markers on any other host value,
+  such as `platform_machine` or a specific non-Windows `sys_platform`, are
+  unknown rather than assumed, so a requirement like
+  `fast; extra == "speed" and platform_machine != "armv7l"` cannot rule the
+  extra out. Otherwise, if its target requirements are not satisfied,
+  verification fails rather than guessing; install the extra into the venv or
+  use a requirements file instead.
   Direct URL installation metadata is rejected because it can contain
   credentials. Host-only packages remain in the image, and loose modules
   without package metadata are copied unverified. `setup.py`, `setup.cfg`,
@@ -529,6 +540,25 @@ pycontainer build \
 - `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
   `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
   (`use-lockfile = false`) ignores auto-detected lockfiles.
+- `--strip-type-stubs` — Opt in (`[build] strip-type-stubs = true`) to drop
+  typing-only files from the dependency layer. Off by default; the default
+  layer is unchanged. It deletes every staged `*.pyi` file and removes
+  stub-only distributions (canonical names `types-*` or `*-stubs`) with their
+  `.dist-info`, rewrites each affected `RECORD`, and leaves them out of the
+  SBOM. A stub-named distribution is removed only if its `RECORD` lists
+  nothing but `.pyi`, `py.typed`, `*-stubs/METADATA.toml` and its own
+  metadata; one that also ships runtime code (for example `django-stubs`
+  with its mypy plugin) is kept, minus its `.pyi` files. Files also listed by
+  a retained distribution are preserved. A malformed `RECORD`, a stub
+  distribution without a `RECORD`, or any `RECORD` path outside
+  site-packages fails the build before anything is changed. The only outside
+  entries accepted are virtualenv launchers in retained distributions,
+  including stub-named packages with runtime files
+  (`../../Scripts/<name>` or `../../../bin/<name>`, not `.pyi`); they are never
+  deleted and stay byte-identical in the rewritten `RECORD`.
+  Identical inputs still give
+  identical layer digests. Leave it off if a dependency reads `.pyi` files
+  at runtime; there are no per-package exceptions.
 - **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
   `conda-lock.yml`, and `conda-meta/` directories in the context. With
   `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a
@@ -608,10 +638,15 @@ come from uv `source.registry`, Poetry `source` (none means PyPI, which must
 then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
 first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
 only with a single effective index (PyPI or one source named `pypi`), and
-`pdm.toml` `[pypi]` settings are rejected. To build through a PyPI mirror,
+`pdm.toml` `[pypi]` settings are rejected. User or global PDM index settings
+(`pdm config pypi.url`, `PDM_PYPI_URL`) are not recorded in the lock and
+cannot be detected; such a lock is installed from PyPI, where its hashes must
+still match. To build through a PyPI mirror,
 relock against the mirror so the lock records it. The recorded index is
 trusted for the files its pages link to (PyPI serves them from
-files.pythonhosted.org), and hashes verify the bytes. Index credentials must
+files.pythonhosted.org), and hashes verify the bytes. Recorded indexes must
+use HTTPS; plain HTTP is accepted only for loopback hosts, because pip may
+send netrc credentials. Index credentials must
 be `${VARIABLE}` placeholders in the URL's credentials or query values (never
 its host or path, which fix the source) over HTTPS, or netrc, never literal
 secrets; proxy and CA bundle variables such as
@@ -686,6 +721,19 @@ exclude-paths = ["src/generated", "fixtures/**"]
 exclude-defaults = true
 ```
 
+Context traversal never follows directory symlinks or Windows junctions. A
+linked include root (including auto-detected `src`, `app` or a virtualenv)
+fails the build; nested directory links are skipped. A selected file symlink
+must use a relative target that resolves to an existing file inside the
+context and that is itself selected (exclusions win); it is stored as a link
+with `/` separators. A target may climb with leading `..` components, but not
+above the context root, and may not use `..` after descending into a directory.
+Absolute, dangling, cyclic, out-of-context and unselected-target file links
+fail the build. A context directory that is itself a symlink is still
+supported. These checks are not a defense against the context changing during
+a build, and they do not cover explicitly named inputs such as requirements or
+manifest files.
+
 **Caching Options**:
 - `--no-cache` — Disable layer caching, force full rebuild
 - `--cache-dir PATH` — Custom cache directory (default: `~/.pycontainer/cache`)
@@ -742,6 +790,11 @@ See [metadata configuration and integration details](docs/metadata.md).
 - `--registry-ca-file PATH` — Trust an additional PEM CA bundle for registry
   HTTPS (`[build] registry-ca-file`). Certificate verification always stays on;
   there is no option to skip it.
+- `--registry-mirror UPSTREAM=MIRROR` — Pull base images through `MIRROR`
+  before `UPSTREAM` (repeatable, tried in order; `[build.registry_mirrors]`).
+  Pushes never use mirrors, and mirrors never receive upstream credentials.
+  See [base-image registry mirrors](docs/REGISTRY_PUSH.md#base-image-registry-mirrors).
+
 Registry connections are direct: environment/system proxy settings are ignored.
 URLs containing embedded credentials are rejected; use the credential providers
 or authentication flags instead.
@@ -770,7 +823,7 @@ The key covers requirement/constraint/find-links content, target platform,
 pip target/ABI/libc tags, the installer's target marker environment, locked
 manifest roots and extras from the same snapshot used for package selection,
 the backend used for closure verification, Python version and implementation,
-workdir, pip version, the installer backend and sanitized index and find-links
+workdir, type-stub stripping, pip version, the installer backend and sanitized index and find-links
 identities, including their exact paths. Plain
 requirements also key allowlisted ambient pip settings, read locally through
 pip's configuration parser even on a hit; locked installs are `--isolated`.
@@ -938,6 +991,68 @@ how to apply them.
 Concurrent builds targeting the same output directory are rejected; use a
 separate output directory or retry after the current build finishes.
 
+### Build arguments
+
+Declare inputs in either configuration table, then pass repeatable overrides:
+
+```toml
+[build]
+tag = "myapp:${VERSION}"
+workdir = "/app"
+entrypoint = ["python", "-m", "app"]
+
+[build.build-args]
+VERSION = "1.0.0"                 # string default
+ENVIRONMENT = {}                   # required, including an explicitly empty value
+OPTION = { default = "" }          # optional default table
+
+[build.labels]
+version = "${VERSION}"
+literal = "$${VERSION}"            # persists the literal ${VERSION}
+
+[build.env]
+APP_ENV = "${ENVIRONMENT}"         # explicit runtime persistence
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg ENVIRONMENT=production --build-arg VERSION=1.2.3
+```
+
+For `pyproject.toml`, use `[tool.pycontainer.build-args]` instead.
+The `skaffold-build` and `tilt-build` commands accept the same overrides
+when using a configuration file.
+Names match `[A-Za-z_][A-Za-z0-9_]*`; values are strings. Overrides split on
+the first `=` (so `OPTION=a=b` is valid), and the last occurrence wins.
+Ordinary explicit CLI settings override file settings before interpolation.
+Malformed or undeclared arguments, missing required values, invalid/unclosed
+references, and C0/C1/DEL control characters fail before building, including
+in dry-run mode. Defaults are checked even when overridden.
+
+`${NAME}` expands **once**, only in `tag`, `tags`, `base_image`, `context_dir`,
+`workdir`, `entrypoint`, `cmd`, `user`, `include_paths`, `exclude_paths`,
+`output_dir`, `cache_dir`, `requirements_file`, `platform`, `stop_signal`,
+`volumes`, and the **values**
+of `env` and `labels`. Hyphenated setting aliases work too. Dictionary keys,
+SBOM formats, system-package declarations and other settings do not expand.
+`$$` escapes one literal dollar; bare `$NAME` stays literal. Inserted values
+are not rescanned, defaults do not reference other arguments, and no host
+environment lookup, expression evaluation or shell execution occurs.
+Direct `BuildConfig` callers opt into interpolation by supplying `build_args`;
+without it, existing literal dollar expressions are preserved.
+
+Arguments are **not secrets** and are not automatically runtime environment
+variables. Only explicit interpolation into persisted image fields (including
+labels, environment, command or workdir) stores a value in image metadata.
+Configuration/source files selected for the app layer are still copied normally;
+exclude files containing defaults if they should not be shipped.
+Diagnostic output redacts nonempty argument values. Cache metadata contains
+hashed resolved configuration/target/backend identity, not argument values;
+argument builds omit source-path metadata. Unused argument changes do not
+invalidate the app-layer cache. The cache stores actual layer contents, not
+encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
+scoped interface; imported values escape dollars to preserve their runtime
+meaning when loaded. Build arguments do not introduce stages or conditions.
+
 ---
 
 ## 🗺️ Roadmap
@@ -1049,8 +1164,7 @@ index descriptor. Its dependencies install only as `armv7l` wheels
 (`manylinux2014_armv7l` or `musllinux_1_2_armv7l`, the same libc floor as the
 other targets). Many packages do not publish `armv7l` wheels; such builds fail
 explicitly, and source builds or host binaries are never used as a fallback. Each
-platform is built in isolation: it selects its own base manifest (registry
-builds re-select from the first resolved base-index digest), stages its own
+platform is built in isolation: it selects its own base manifest, stages its own
 wheel-only dependency layer, and shares the byte-identical application layer
 (its cache key needs no platform input; dependency layers are never cached).
 Virtualenv closure is verified separately against each target base. Explicit
@@ -1060,7 +1174,17 @@ The output `index.json` and tag refs point at the image index only after
 every platform manifest, config, platform field and DiffID has been verified;
 a failed platform leaves earlier tags untouched. A local `oci:` base must
 keep the same layout `index.json` for every platform and until publication;
-a change fails the build instead of mixing base versions. Push uploads blobs, then
+a change fails the build instead of mixing base versions. A registry base tag
+is read once: every platform selects from that first verified base index or
+manifest snapshot and fetches its platform manifest by descriptor digest, so a
+tag that moves mid-build cannot mix snapshots. The snapshot must match a
+`sha256:` or `sha512:` `Docker-Content-Digest` header; a mismatch fails. An
+unrecognized header algorithm cannot be verified: it is kept as an opaque
+value, the first snapshot is still reused for every platform, and the tag is
+not treated as verified provenance for libc or Python version inference. If a pinned
+platform manifest can no longer be fetched, the build fails before the layout
+`index.json` or refs are written (a reused output directory may still contain
+an earlier build's index). Push uploads blobs, then
 platform manifests and the index by digest, and moves tags last. Registry v2
 has no atomic multi-tag update: tags are pushed one at a time, so if a later
 tag fails, earlier tags in the same push may already point at the new index.
@@ -1139,6 +1263,7 @@ This style is intentional for the experimental phase.
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
+- **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
 
 ### External References
 

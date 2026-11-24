@@ -15,7 +15,7 @@ from pycontainer import builder as builder_module
 from pycontainer.auth import RegistryAuth
 from pycontainer.builder import ImageBuilder, LayerIntegrityError, UnsupportedPlatformError
 from pycontainer.config import BuildConfig, normalize_platforms
-from pycontainer.registry_client import RegistryRequestError
+from pycontainer.registry_client import BlobIntegrityError, RegistryClient, RegistryRequestError
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
@@ -211,7 +211,7 @@ def test_tag_provenance_survives_digest_pinning_only_for_tag_pulls(
     builder.build()
 
     top_level = [ref for ref, _ in registry.manifest_calls if ref in ("3.11-slim", registry.index_digest)]
-    assert top_level[1:] == [registry.index_digest] * 2
+    assert len(top_level) == 1
     assert seen == [("amd64", verified), ("arm64", verified), ("arm", verified)]
 
 
@@ -673,12 +673,10 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
         app_layers.add(manifest["layers"][-1]["digest"])
     assert len(app_layers) == 1
 
-    # The second platform re-selects from the exact base index the first one resolved.
+    # The second platform re-selects from the exact base index snapshot the first
+    # one resolved, without another top-level manifest request.
     top_level = [call for call in registry.manifest_calls if call[0] in ("3.11-slim", registry.index_digest)]
-    assert top_level == [
-        ("3.11-slim", {"expected_digest": None}),
-        (registry.index_digest, {"expected_digest": registry.index_digest}),
-    ]
+    assert top_level == [("3.11-slim", {"expected_digest": None})]
 
 
 def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
@@ -1146,6 +1144,157 @@ def test_compressed_base_diff_id_mismatch_fails_before_publication(tmp_path, mon
     assert not hasattr(builder, "index_digest")
 
 
+THREE = "linux/amd64,linux/arm64,linux/arm/v7"
+SNAPSHOT_ENV = ["PYTHON_IMPLEMENTATION=CPython", "PYTHON_VERSION=3.11.9", "PYTHON_LIBC=glibc-2.17"]
+
+
+def _sha512_header(body):
+    return "sha512:" + hashlib.sha512(body).hexdigest()
+
+
+def _moving_tag_registry(monkeypatch, tag_header=_sha512_header, missing=()):
+    """Serve the real RegistryClient a tag that moves from snapshot A to B after one read."""
+    first, second = (
+        FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_env=SNAPSHOT_ENV + [f"SNAPSHOT={name}"])
+        for name in ("A", "B")
+    )
+    requests = []
+
+    def make_request(client, method, url, *args, **kwargs):
+        assert method == "GET" and "/manifests/" in url
+        reference = url.rsplit("/", 1)[1]
+        requests.append(reference)
+        if reference == "3.11-slim":
+            body = (first if requests.count(reference) == 1 else second).manifests[reference]
+            return 200, body, {"Docker-Content-Digest": tag_header(body)}
+        body = first.manifests.get(reference) or second.manifests.get(reference)
+        if body is None or reference in missing:
+            return 404, b"", {}
+        return 200, body, {"Docker-Content-Digest": _digest(body)}
+
+    def open_blob(client, url, retry_auth=True):
+        data = {**first.blobs, **second.blobs}[url.rsplit("/", 1)[1]]
+        response = io.BytesIO(data)
+        response.status = 200
+        response.headers = {"Content-Length": str(len(data))}
+        return response
+
+    monkeypatch.setattr(RegistryClient, "_make_request", make_request)
+    monkeypatch.setattr(RegistryClient, "_open_blob_response", open_blob)
+    monkeypatch.setattr(builder_module, "get_registry_auth", lambda *a, **k: RegistryAuth())
+    return first, requests
+
+
+def _real_client_builder(tmp_path):
+    return ImageBuilder(BuildConfig(
+        tag="registry.example/team/app:v1",
+        base_image="registry.example/library/python:3.11-slim",
+        context_dir=str(_context(tmp_path)), output_dir=str(tmp_path / "out"),
+        platform=THREE, include_deps=False, use_cache=False, reproducible=True,
+    ))
+
+
+@pytest.mark.parametrize(("tag_header", "verified"), [
+    (_sha512_header, True),
+    (lambda body: "blake3:" + "0" * 64, False),
+])
+def test_moving_tag_with_non_sha256_digest_binds_every_platform_to_first_snapshot(
+    tmp_path, monkeypatch, tag_header, verified
+):
+    first, requests = _moving_tag_registry(monkeypatch, tag_header)
+    builder = _real_client_builder(tmp_path)
+    builder.build()
+
+    assert requests.count("3.11-slim") == 1
+    index = json.loads(_blob(tmp_path / "out", builder.index_digest))
+    base_manifests = json.loads(first.manifests["3.11-slim"])["manifests"]
+    assert [d["platform"] for d in index["manifests"]] == [d["platform"] for d in base_manifests]
+    for descriptor, base in zip(index["manifests"], base_manifests):
+        manifest = json.loads(_blob(tmp_path / "out", descriptor["digest"]))
+        config = json.loads(_blob(tmp_path / "out", manifest["config"]["digest"]))
+        assert "SNAPSHOT=A" in config["config"]["Env"]
+        assert manifest["layers"][:-1] == json.loads(first.manifests[base["digest"]])["layers"]
+    assert builder._resolved_base_from_tag is verified
+    assert builder._base_image_tag_verified is verified
+
+
+def test_locked_build_keeps_recorded_index_and_target_markers_with_moving_sha512_tag(
+    tmp_path, monkeypatch, request
+):
+    from test_lockfiles import _SimpleIndex, _ambient_pip, _write_target_marker_uv_project
+
+    index = _SimpleIndex()
+    rogue = _SimpleIndex()
+    request.addfinalizer(index.close)
+    request.addfinalizer(rogue.close)
+    ctx = tmp_path / "ctx"
+    _write_target_marker_uv_project(ctx, registry=index.url)
+    for wheel in (ctx / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
+        rogue.add(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, ctx / "wheelhouse")
+    _, requests = _moving_tag_registry(monkeypatch)
+    installs = []
+    real_install = builder_module.install_locked_requirements
+
+    def install(*args, **kwargs):
+        installs.append((args[4], args[0][0][0], kwargs["base_image_tag_verified"]))
+        return real_install(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    builder = ImageBuilder(BuildConfig(
+        tag="registry.example/team/app:v1",
+        base_image="registry.example/library/python:3.11-slim",
+        context_dir=str(ctx), output_dir=str(tmp_path / "out"),
+        platform=THREE, include_deps=True, use_cache=False, reproducible=True,
+    ))
+    builder.build()
+
+    assert requests.count("3.11-slim") == 1
+    assert installs == [(arch, index.url, True) for arch in ("amd64", "arm64", "arm")]
+    assert index.requests
+    assert rogue.requests == []
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        suffix = {"amd64": "amd", "arm64": "arm", "arm": "armv7"}[arch]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert "SNAPSHOT=A" in config["config"]["Env"]
+        with tarfile.open(image.layers[-2].tar_path) as archive:
+            names = archive.getnames()
+        for prefix in ("marker_root", "marker_trans"):
+            assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
+            for other in {"amd", "arm", "armv7"} - {suffix}:
+                assert not any(f"{prefix}_{other}/" in name for name in names)
+
+
+def test_forged_sha512_tag_digest_fails_before_publication(tmp_path, monkeypatch):
+    _, requests = _moving_tag_registry(
+        monkeypatch, lambda body: _sha512_header(body + b" ")
+    )
+    builder = _real_client_builder(tmp_path)
+
+    with pytest.raises(BlobIntegrityError, match="digest does not match"):
+        builder.build()
+    out = tmp_path / "out"
+    assert requests == ["3.11-slim"]
+    assert not (out / "index.json").exists() and not (out / "oci-layout").exists()
+    assert not any(path.is_file() for path in (out / "refs").rglob("*"))
+
+
+def test_unavailable_pinned_platform_manifest_fails_without_rereading_tag(tmp_path, monkeypatch):
+    first = FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7"), base_env=SNAPSHOT_ENV + ["SNAPSHOT=A"])
+    arm64 = json.loads(first.manifests["3.11-slim"])["manifests"][1]["digest"]
+    _, requests = _moving_tag_registry(monkeypatch, missing=(arm64,))
+    builder = _real_client_builder(tmp_path)
+
+    with pytest.raises(RegistryRequestError, match="404"):
+        builder.build()
+    out = tmp_path / "out"
+    assert requests.count("3.11-slim") == 1 and requests[-1] == arm64
+    assert not (out / "index.json").exists() and not (out / "oci-layout").exists()
+    assert not any(path.is_file() for path in (out / "refs").rglob("*"))
+
+
 def _select_layout_reference(layout, reference):
     """Resolve a reference the way OCI image-layout tools do: exact ref.name match."""
     matches = [
@@ -1235,6 +1384,38 @@ def test_push_order_is_blobs_manifests_index_then_tags(tmp_path, monkeypatch):
     assert [call[1] for call in client.calls if call[0] == "index"] == [builder.index_digest, "v1", "latest"]
     assert all(call[2] == builder.index_digest for call in client.calls if call[0] == "index")
     assert builder.pushed_refs == ["registry.example/team/app:v1", "registry.example/team/app:latest"]
+
+
+def test_build_arguments_select_platforms_label_each_image_and_redact_index_output(
+    tmp_path, monkeypatch, capsys,
+):
+    value = "private-team"
+    platforms = "linux/amd64,linux/arm64,linux/arm/v7"
+    builder = _builder(
+        tmp_path, monkeypatch, FakeBaseRegistry(platforms=("amd64", "arm64", "arm/v7")),
+        tag="registry.example/${TEAM}/app:v1", platform="${PLATFORMS}",
+        labels={"team": "${TEAM}"}, build_args={"TEAM": value, "PLATFORMS": platforms},
+    )
+    builder.build()
+    out = tmp_path / "out"
+    index = json.loads(_blob(out, builder.index_digest))
+    assert index["manifests"][2]["platform"] == {
+        "architecture": "arm", "os": "linux", "variant": "v7",
+    }
+    _verify_index = builder_module._verify_image_index
+    _verify_index(
+        out / "blobs" / "sha256", builder.index_digest, builder.index_size,
+        builder.platform_images, check_diff_ids=True,
+    )
+    for descriptor in index["manifests"]:
+        manifest = json.loads(_blob(out, descriptor["digest"]))
+        config = json.loads(_blob(out, manifest["config"]["digest"]))
+        assert config["config"]["Labels"]["team"] == value
+    monkeypatch.setattr(builder_module, "RegistryClient", FakePushClient())
+    builder.push(show_progress=True)
+    output = capsys.readouterr()
+    assert "Pushing image index" in output.out
+    assert value not in output.out + output.err
 
 
 def test_failed_index_push_publishes_no_tags(tmp_path, monkeypatch):
@@ -1362,7 +1543,7 @@ def test_arm_v7_index_selects_exact_variant_and_round_trips_it(tmp_path, monkeyp
         json.loads(_blob(out, d["digest"])) for d in index["manifests"]
     )} == {builder.platform_images[0].layers[-1].digest}
     top_level = [call[0] for call in registry.manifest_calls if call[0] in ("3.11-slim", registry.index_digest)]
-    assert top_level == ["3.11-slim", registry.index_digest, registry.index_digest]
+    assert top_level == ["3.11-slim"]
 
 
 def test_arm_v7_base_config_variant_conflict_fails_before_publication(tmp_path, monkeypatch):

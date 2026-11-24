@@ -18,6 +18,10 @@ daemon without discussing the trade-off first.
 - `cache.py`: optional local application- and dependency-layer cache.
 - `dependency_cache.py`: dependency-layer cache key, eligibility and inventory.
 - `auth.py`, `registry_client.py`: credential providers and Registry v2 I/O.
+- `registry_cleanup.py`: `registry delete`/`prune` planning and confirmation.
+  Deletion is by manifest digest and removes every aliased tag; never select a
+  digest shared with a retained tag, and never retry `DELETE`. Tests use the
+  in-process fake registry in `tests/test_registry_cleanup.py`, never a real one.
 - `sbom.py`: Python package inventory and SPDX/CycloneDX generation.
 - `scanning.py`: opt-in, fail-closed Grype gate and JSON/SARIF reports.
   Multi-platform index scanning is rejected; build and scan each target separately.
@@ -46,7 +50,8 @@ Caching is enabled by default under `~/.pycontainer/cache`; `--cache-dir`
 selects another location and `--no-cache` disables it. Cache keys include file
 content, normalized relative paths, workdir, and reproducibility settings, plus
 the context-relative hardlink targets `tarfile` emits (never inode numbers or
-absolute paths); key version 3 invalidated earlier keys that lacked them.
+absolute paths); key version 3 invalidated earlier keys that lacked them, and
+version 4 invalidated Windows entries whose symlink text kept backslashes.
 Index updates are locked and atomically replaced; cache blobs are verified
 before reuse. A malformed index raises an explicit `CacheIndexError` with a
 remediation message; missing or corrupt blobs are discarded and rebuilt. A
@@ -63,7 +68,7 @@ reason. Keys hold target tags, Python, workdir, pip version, sanitized index
 identity (URLs with userinfo, credential-bearing paths or query values miss),
 the installer's exact target marker environment, locked manifest roots/extras
 and verifier backend, allowlisted ambient pip settings for plain requirements,
-and `INSTALLER_BACKEND`. Nonempty Python startup overrides (such as
+type-stub stripping, and `INSTALLER_BACKEND`. Nonempty Python startup overrides (such as
 `PYTHONPATH`) are explicit misses even for locked installs; pip and the config
 probe ignore `PYTHONPATH`, but the builder process may not. A relative
 `PIP_CONFIG_FILE` is a miss for plain requirements. Plain requirements read
@@ -213,8 +218,10 @@ There is no configured root formatter, linter, type checker, or timing gate.
 The PR workflow runs the test matrix and records benchmark
 trends on main; the release workflow runs hermetic tests on Linux/Python 3.11
 and 3.15 plus the runtime gate. The benchmark includes synthetic loopback registry transfers at
-multiple blob sizes with per-sample peak RSS and Python allocation metrics; it
-does not measure external registry throughput. Do not describe suggested tools
+multiple blob sizes with per-sample peak RSS and Python allocation metrics, and
+`registry-network-*` cases that time the real sequential pull/build/push against
+a loopback registry with injected latency and bandwidth (see `docs/TESTING.md`);
+it does not measure external registry throughput. Do not describe suggested tools
 as existing required checks.
 
 ## Change discipline
@@ -243,7 +250,10 @@ size before publication; only safe reads use bounded retries and explicit
 request timeouts. Registry HTTP(S) requests go through the client's openers:
 keep HTTPS verification on (custom CAs only add trust), plain HTTP only for
 explicit `insecure_registries` hosts, no HTTPS-to-HTTP redirects, and no
-credentials over HTTP to non-loopback hosts.
+credentials over HTTP to non-loopback hosts. Base-image mirrors
+(`registry_mirrors.py`) apply only to pulls; each mirror uses only its own
+host-scoped credentials, integrity and rate-limit failures never fall back,
+and pushes bypass mirrors.
 
 Report benchmark fixtures, environment, repetitions and cache state. Include
 builder construction, traversal, copies and relevant I/O in lifecycle costs.
@@ -317,17 +327,20 @@ Virtualenv staging copies the host's resolution, then `_venv_closure.py` (run
 with `python -P -c`, reading stdlib-parsed `METADATA` as JSON on stdin) verifies
 target-active roots, transitive `Requires-Dist`, versions, extras, constraint
 files, and `Requires-Python` using pip's vendored `packaging`; `venv_markers.py`
-collects project roots, plausible venv hosts and checks unparsed sources. The
+collects project roots, established venv host facts and checks unparsed sources. The
 verifier never imports staged packages and fails closed on unknown markers, egg
 distributions, missing or unsupported `Metadata-Version`, invalid metadata,
 direct URLs, and patch-dependent `Requires-Python` without a full
 `PYTHON_VERSION`. Direct URL installation metadata is also rejected because it
 can contain credentials. An unrecorded extra or optional group is ruled out
-only if every plausible Windows/Linux/macOS CPython host (narrowed to posix by a
-`lib/pythonX.Y` layout with a POSIX `pyvenv.cfg` `home`, or to Windows by a
-`Lib` layout; `python_version` shared only when
-the venv minor is established) would have installed one of its missing
-requirements; otherwise unsatisfied target-active requirements fail closed.
+only if one of its missing requirements is provably active on the creator host
+using three-valued (Kleene) marker evaluation over established facts only:
+CPython, `os_name` from the layout (`posix` for `lib/pythonX.Y` with a POSIX
+`pyvenv.cfg` `home`, `nt` for `Lib`, which also implies the Windows
+`sys_platform`/`platform_system` values), and `python_version` when the venv
+minor is established. Every other host marker (for example `platform_machine`,
+or a non-Windows `sys_platform`) is unknown, never sampled from a finite host
+list (#142); otherwise unsatisfied target-active requirements fail closed.
 Extra markers compare canonical names on any vendored `packaging` version;
 `in`/`not in` keep PEP 508 substring semantics (not list membership), never
 name candidate extras or rule one out, and fail closed without

@@ -184,6 +184,24 @@ def test_base_pull_does_not_send_generic_destination_credentials(
     _assert_no_destination_secret(fake.headers_for(host, realm_host))
 
 
+@pytest.mark.parametrize("kind", ["basic", "bearer"])
+def test_base_pull_with_build_args_does_not_send_destination_credentials(
+    tmp_path, monkeypatch, registries, kind
+):
+    fake, _ = registries
+    _set_destination_credentials(monkeypatch, kind)
+    builder = ImageBuilder(BuildConfig(
+        base_image="${HOST}/team/image:latest",
+        build_args={"HOST": "base.example"},
+        context_dir=str(tmp_path),
+    ))
+
+    builder._pull_base_image(tmp_path / "blobs", "linux", "amd64")
+
+    assert fake.headers_for("auth.base.example") == [None]
+    _assert_no_destination_secret(fake.headers_for("base.example", "auth.base.example"))
+
+
 def test_base_pull_uses_registry_scoped_docker_config(
     tmp_path, monkeypatch, registries
 ):
@@ -287,7 +305,8 @@ def test_multi_platform_build_scopes_auth_for_each_base_pull(
         "amd64", "arm64",
     ]
     assert all(path in fake.paths for path in config_paths)
-    assert f"/v2/team/image/manifests/{index_digest}" in fake.paths
+    assert f"/v2/team/image/manifests/{index_digest}" not in fake.paths
+    assert fake.paths.count("/v2/team/image/manifests/latest") == 2  # one 401 challenge and retry
     expected = _basic("base-user", "base-password") if scoped else None
     assert fake.headers_for("auth.base.example") == [expected, expected]
     _assert_no_destination_secret(

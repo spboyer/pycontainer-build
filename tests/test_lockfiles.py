@@ -798,6 +798,18 @@ def test_pdm_toml_index_settings_are_rejected(tmp_path):
         load_lockfile(context, Path("pdm.lock"), PY311)
 
 
+@pytest.mark.parametrize("target_kind", ["outside", "dangling"])
+def test_pdm_toml_link_cannot_leave_context(tmp_path, target_kind):
+    context = _copy(tmp_path, "pdm")
+    target = tmp_path / "outside.toml"
+    if target_kind == "outside":
+        target.write_text("[other]\n")
+    _symlink_or_skip(context / "pdm.toml", target)
+
+    with pytest.raises(LockfileError, match="inside the build context|requires .* next to it"):
+        load_lockfile(context, Path("pdm.lock"), PY311)
+
+
 def test_uv_records_each_packages_registry(tmp_path):
     context = _write_uv_project(tmp_path / "uv", registry=PRIVATE)
 
@@ -955,6 +967,16 @@ def test_index_credentials_require_https(tmp_path, registry):
     context = _write_uv_project(tmp_path / "context", registry=registry)
     with pytest.raises(LockfileError, match="HTTPS"):
         load_lockfile(context, Path("uv.lock"), PY311)
+
+
+def test_plain_http_index_is_loopback_only(tmp_path):
+    remote = _write_uv_project(tmp_path / "remote", registry="http://example.com/simple")
+    with pytest.raises(LockfileError, match="only for loopback hosts"):
+        load_lockfile(remote, Path("uv.lock"), PY311)
+
+    loopback = _write_uv_project(tmp_path / "loopback", registry="http://127.0.0.1:8080/simple")
+    text = load_lockfile(loopback, Path("uv.lock"), PY311).requirement_sets()[0][1]
+    assert "--trusted-host 127.0.0.1" in text
 
 
 @pytest.mark.parametrize(
@@ -1172,15 +1194,16 @@ def indexes():
         server.close()
 
 
-def _named_wheel(directory, name, requires=(), extras=()):
+def _named_wheel(directory, name, requires=(), extras=(), *, stub_only=False):
     module = name.replace("-", "_")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{module}-1.0-py3-none-any.whl"
     metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
     metadata += "".join(f"Provides-Extra: {extra}\n" for extra in extras)
     metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requires)
+    module_file = "__init__.pyi" if stub_only else "__init__.py"
     files = {
-        f"{module}/__init__.py": b"",
+        f"{module}/{module_file}": b"",
         f"{module}-1.0.dist-info/METADATA": (metadata + "\n").encode(),
         f"{module}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
@@ -1219,6 +1242,42 @@ def test_uv_dynamic_dependencies_fail_before_installation(tmp_path):
 def _layer_names(layer):
     with tarfile.open(layer.tar_path) as archive:
         return archive.getnames()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_build_arguments_preserve_locked_staging_and_redact_paths(
+    tmp_path, monkeypatch, capsys, indexes, dry_run
+):
+    value = "private-lock-context"
+    context = tmp_path / "context"
+    project = context / value
+    wheel = _write_wheel(project / "wheelhouse")
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, project / "wheelhouse")
+    _write_uv_project(project, wheel, registry=recorded.url)
+    builder = _builder(
+        tmp_path, monkeypatch, context=context, include_deps=True,
+        build_args={"DIRECTORY": value}, workdir="/${DIRECTORY}", dry_run=dry_run,
+        lockfile=f"{value}/uv.lock",
+    )
+
+    builder.build()
+
+    output = capsys.readouterr().out
+    assert value not in output
+    assert "<redacted>" in output
+    if dry_run:
+        assert "Dependency Source: lock" in output
+        assert not recorded.requests
+    else:
+        assert "Staging 1 locked packages" in output
+        assert "fixture-dep" in {name for name, _ in builder._staged_packages}
+        assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+        assert any(
+            f"{value}/.python/site-packages/fixture_dep/__init__.py" in _layer_names(layer)
+            for layer in builder.layers
+        )
+    assert not rogue.requests
 
 
 def _write_pipenv_project(context, *, requires=(), extras=(), registry="https://pypi.org/simple"):
@@ -2255,15 +2314,18 @@ def test_each_locked_index_install_evaluates_markers_for_the_target(tmp_path, mo
 
 
 @pytest.mark.parametrize(
-    ("arch", "selected_arch", "excluded_arch"),
+    ("arch", "selected_arch", "excluded_arch", "missing_transitive", "strip_type_stubs"),
     [
-        ("amd64", "amd-dep", "arm-dep"),
-        ("arm64", "arm-dep", "amd-dep"),
+        pytest.param("amd64", "amd-dep", "arm-dep", False, False, id="amd64"),
+        pytest.param("amd64", "amd-dep", "arm-dep", True, False, id="amd64-missing"),
+        pytest.param("arm64", "arm-dep", "amd-dep", False, False, id="arm64"),
+        pytest.param("arm64", "arm-dep", "amd-dep", True, False, id="arm64-missing"),
+        pytest.param("arm64", "arm-dep", "amd-dep", False, True, id="arm64-strip-stubs"),
     ],
 )
-@pytest.mark.parametrize("missing_transitive", [False, True])
 def test_locked_build_selects_target_transitive_markers_across_indexes(
-    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch, missing_transitive
+    tmp_path, monkeypatch, indexes, arch, selected_arch, excluded_arch,
+    missing_transitive, strip_type_stubs,
 ):
     wheelhouse = tmp_path / "wheels"
     wheels = {
@@ -2277,6 +2339,7 @@ def test_locked_build_selects_target_transitive_markers_across_indexes(
                 "arm-dep==1.0; platform_machine == 'aarch64'",
                 "win-dep==1.0; sys_platform == 'win32'",
                 "feature-dep==1.0; extra == 'feature' and sys_platform == 'linux'",
+                *(["types-root==1.0; platform_machine == 'aarch64'"] if strip_type_stubs else []),
             ],
             extras=["feature"],
         ),
@@ -2284,6 +2347,8 @@ def test_locked_build_selects_target_transitive_markers_across_indexes(
     for name in ("common-dep", "newpy-dep", "amd-dep", "arm-dep", "win-dep", "feature-dep"):
         requires = ["missing-dep>=1.0; sys_platform == 'linux'"] if missing_transitive and name == "feature-dep" else ()
         wheels[name] = _named_wheel(wheelhouse, name, requires=requires)
+    if strip_type_stubs:
+        wheels["types-root"] = _named_wheel(wheelhouse, "types-root", stub_only=True)
     index_a, index_b, rogue = (indexes(*wheels.values()) for _ in range(3))
     _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
 
@@ -2326,7 +2391,10 @@ dependencies = [
     { name = "amd-dep", marker = "platform_machine == 'x86_64'" },
     { name = "arm-dep", marker = "platform_machine == 'aarch64'" },
     { name = "win-dep", marker = "sys_platform == 'win32'" },
-]
+"""
+            if strip_type_stubs:
+                lock += """    { name = "types-root", marker = "platform_machine == 'aarch64'" },\n"""
+            lock += """]
 
 [package.optional-dependencies]
 feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
@@ -2334,12 +2402,21 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
     (context / "uv.lock").write_text(lock)
     builder = _builder(
         tmp_path, monkeypatch, context=context, include_deps=True,
-        generate_sbom=True, platform=f"linux/{arch}",
+        generate_sbom=True, platform=f"linux/{arch}", strip_type_stubs=strip_type_stubs,
     )
     monkeypatch.setattr(
         ImageBuilder, "_pull_base_image",
         lambda self, layers_dir, os_name, target_arch: ([], {**BASE_CONFIG, "architecture": target_arch}),
     )
+    commands = []
+    if strip_type_stubs:
+        popen = subprocess.Popen
+
+        def record_pip(command, *args, **kwargs):
+            commands.append(command)
+            return popen(command, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", record_pip)
 
     if missing_transitive:
         with pytest.raises(LockfileError, match="feature-dep.*missing-dep"):
@@ -2361,10 +2438,19 @@ feature = [{ name = "feature-dep", marker = "sys_platform == 'linux'" }]
     assert {(package["name"], package["versionInfo"]) for package in sbom["packages"]} == {
         (name, "1.0") for name in expected
     }
+    if strip_type_stubs:
+        assert not any(name.endswith(".pyi") or "types_root" in name for name in names)
+        bootstrap = _PIP_TARGET_SCRIPT.read_text(encoding="utf-8")
+        assert len(commands) == 2
+        assert all(command[1:5] == ["-E", "-P", "-c", bootstrap] for command in commands)
+        assert all(
+            json.loads(command[5])["environment"]["platform_machine"] == "aarch64"
+            for command in commands
+        )
     requested_a = {path.split("/")[2] for path in index_a.requests if path.startswith("/simple/")}
     requested_b = {path.split("/")[2] for path in index_b.requests if path.startswith("/simple/")}
     assert requested_a == {"root-dep", "common-dep"}
-    assert requested_b == {"feature-dep", selected_arch}
+    assert requested_b == {"feature-dep", selected_arch} | ({"types-root"} if strip_type_stubs else set())
     assert excluded_arch not in requested_a | requested_b
     assert "win-dep" not in requested_a | requested_b
     assert rogue.requests == []

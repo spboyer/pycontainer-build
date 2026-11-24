@@ -36,7 +36,7 @@ from .dependencies import (
 # Bump when the staged dependency layer layout or tar encoding changes.
 KEY_VERSION = 1
 # Bump when installer or closure-verification behavior changes.
-INSTALLER_BACKEND = "pip-target-v9"
+INSTALLER_BACKEND = "pip-target-v10"
 INVENTORY_VERSION = 1
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 PIP_CONFIG_TIMEOUT_SECONDS = 60
@@ -169,6 +169,7 @@ def dependency_cache_key(
     base_config: Optional[dict],
     workdir: str,
     reproducible: bool,
+    strip_type_stubs: bool = False,
     base_image_tag_verified: bool = False,
     variant: Optional[str] = None,
     requirements: Optional[Path] = None,
@@ -270,7 +271,11 @@ def dependency_cache_key(
             "python": f"{platform.python_implementation()} {platform.python_version()}",
             "platform": sys.platform,
         },
-        "layer": {"workdir": workdir, "reproducible": True},
+        "layer": {
+            "workdir": workdir,
+            "reproducible": True,
+            "strip_type_stubs": strip_type_stubs,
+        },
         "inputs": inputs,
         "ambient": ambient,
     }
