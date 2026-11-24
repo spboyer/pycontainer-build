@@ -865,7 +865,10 @@ def test_locked_cache_rejects_manifest_symlink_outside_context(
 ):  # noqa: F811
     context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
     _builder(tmp_path, monkeypatch, context, "initial").build()
-    symlinked = _builder(tmp_path, monkeypatch, context, "symlinked")
+    # Keep the manifest out of app selection to exercise the lockfile check.
+    symlinked = _builder(
+        tmp_path, monkeypatch, context, "symlinked", include_paths=["Pipfile.lock"]
+    )
 
     manifest = context / "Pipfile"
     external = tmp_path / "external-Pipfile"
