@@ -486,6 +486,47 @@ def test_builder_redacts_stub_error_fields_hidden_from_formatted_tracebacks(
         assert error.filename == "<redacted>"
 
 
+@pytest.mark.parametrize("field", ["filename", "bytes_filename", "nested_detail"])
+def test_builder_redacts_raw_stub_error_values_with_mixed_quotes(
+    tmp_path, monkeypatch, field
+):
+    context = tmp_path / "context"
+    _site_packages(context / ".venv" / "Lib" / "site-packages")
+    (context / "app.py").write_text("print('app')\n")
+    value = "synthetic'secret"
+    filename = '/tmp/prefix"synthetic\'secret-suffix'
+    builder = _stub_builder(tmp_path, monkeypatch, context, value, False)
+    original = PermissionError(13, "permission denied", filename)
+    if field == "bytes_filename":
+        original.filename = filename.encode("utf-8") + b"\xff"
+    if field == "nested_detail":
+        original.filename = None
+        original.detail = {"paths": [filename]}
+    real_rmtree = shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if not str(path).endswith(".dist-info"):
+            return real_rmtree(path, *args, **kwargs)
+        raise original
+
+    monkeypatch.setattr("pycontainer.dependencies.shutil.rmtree", fail)
+    with pytest.raises(PermissionError) as caught:
+        builder.build()
+
+    error = caught.value
+    assert error is not original
+    assert error.errno == 13
+    assert error.strerror == "permission denied"
+    assert value not in repr(vars(error))
+    assert value not in "".join(traceback.format_exception(error))
+    assert "synthetic\\'secret" not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None and error.__context__ is None
+    if field == "filename":
+        assert error.filename == '/tmp/prefix"<redacted>-suffix'
+    if field == "bytes_filename":
+        assert error.filename == '/tmp/prefix"<redacted>-suffix\udcff'
+
+
 def test_cli_and_config_enable_strip_type_stubs(tmp_path, monkeypatch):
     configs = []
 

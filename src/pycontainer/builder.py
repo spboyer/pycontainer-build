@@ -104,10 +104,41 @@ def parse_platform_variant(platform: str) -> Optional[str]:
     return parts[2] if len(parts) == 3 else None
 
 
+def _diagnostic_needs_redaction(value, redact) -> bool:
+    pending = [value]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (tuple, list, set, frozenset)):
+            pending.extend(current)
+        elif isinstance(current, os.PathLike):
+            pending.append(os.fspath(current))
+        else:
+            text = (
+                current.decode("utf-8", errors="surrogateescape")
+                if isinstance(current, bytes)
+                else current if isinstance(current, str) else repr(current)
+            )
+            if redact(text) != text:
+                return True
+    return False
+
+
 def _redacted_os_error(error: OSError, redact) -> OSError:
     """Rebuild an OSError with redacted text while keeping errno and filenames."""
     def text(value):
-        return None if value is None else redact(os.fsdecode(value))
+        if value is None:
+            return None
+        value = os.fspath(value)
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="surrogateescape")
+        return redact(value)
 
     filename, filename2 = text(error.filename), text(error.filename2)
     if isinstance(error.errno, int) and error.strerror is not None:
@@ -535,9 +566,9 @@ class ImageBuilder:
                     for name, descriptor in vars(base).items()
                     if isinstance(descriptor, MemberDescriptorType)
                 )
-                diagnostics.append(repr((current.args, vars(current), fields, slots)))
+                diagnostics.append((current.args, vars(current), fields, slots))
                 pending.extend((current.__cause__, current.__context__))
-            if all(redact(value) == value for value in diagnostics):
+            if not _diagnostic_needs_redaction(diagnostics, redact):
                 raise
             if isinstance(error, OSError):
                 replacement = _redacted_os_error(error, redact)
