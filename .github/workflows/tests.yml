@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked test dependencies
@@ -44,7 +44,77 @@ jobs:
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration"
+        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
+
+  # Evidence for #148, not a gate: populate a --cache-dir on each OS, then
+  # restore every OS's cache into another absolute path and checkout location.
+  cache-portability-populate:
+    name: Cache portability populate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Populate a cache from the example app
+        shell: bash
+        run: >
+          python scripts/check_cache_portability.py populate
+          --context examples/fastapi-app
+          --cache-dir "$RUNNER_TEMP/portability/cache"
+          --output-dir "$RUNNER_TEMP/source-output"
+          --report "$RUNNER_TEMP/portability/report.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cache-portability-${{ runner.os }}
+          path: ${{ runner.temp }}/portability
+          retention-days: 7
+
+  cache-portability-verify:
+    name: Cache portability restore (${{ matrix.os }})
+    needs: cache-portability-populate
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cache-portability-*
+          path: ${{ runner.temp }}/restored
+      - name: Restore each OS cache into a relocated checkout
+        shell: bash
+        run: |
+          status=0
+          for source in Linux Windows; do
+            checkout="$RUNNER_TEMP/relocated-$source/checkout/app"
+            mkdir -p "$(dirname "$checkout")"
+            cp -Rp examples/fastapi-app "$checkout"
+            python scripts/check_cache_portability.py verify \
+              --context "$checkout" \
+              --cache-dir "$RUNNER_TEMP/restored/cache-portability-$source/cache" \
+              --output-dir "$RUNNER_TEMP/relocated-$source/output" \
+              --source-report "$RUNNER_TEMP/restored/cache-portability-$source/report.json" \
+              --report "$RUNNER_TEMP/relocated-$source/report.json" || status=1
+          done
+          exit $status
 
       - name: Install optional pre-commit test tooling
         run: uv pip install -r tests/pre-commit-requirements.txt
@@ -61,7 +131,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked build dependencies
@@ -78,7 +148,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked Poetry plugin dependencies
@@ -97,7 +167,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked Hatch plugin dependencies
@@ -121,7 +191,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: plugins/vscode-pycontainer/package-lock.json
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Install the core for the extension smoke test
@@ -157,6 +227,16 @@ jobs:
       contents: read
       packages: write
 
+  runtime-check:
+    name: Real OCI runtime check
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: tests
+    uses: ./.github/workflows/runtime-check.yml
+    with:
+      check-index: true
+    permissions:
+      contents: read
+
   registry-integration:
     name: Opt-in registry integration tests
     if: github.event_name == 'workflow_dispatch' && inputs['run-registry-integration']
@@ -167,7 +247,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.13.6"
       - name: Sync locked test dependencies

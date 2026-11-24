@@ -25,6 +25,22 @@ pycontainer validate config -c PATH [OVERRIDES]
   (`--push`, `--registry`, `--username`, `--password`, `--no-progress`,
   `--verbose`, `--dry-run`) are rejected.
 
+The shared build options also include `--build-arg`, dependency lockfile and
+type-stub options, registry transport settings, metadata and release-note
+options, scanner configuration, `--stop-signal` and `--volume`. These settings
+are resolved offline; scanners are not executed, release-note contents are not
+embedded, and no dependency or base-image content is loaded. History recording
+flags are operational and are rejected.
+
+Declared build arguments resolve before configuration construction, including
+platform-dependent security checks. Repeatable overrides use the last value.
+Undeclared inputs and missing required values fail with exit 2. Diagnostics
+redact nonempty argument values, including values within success/error source
+path labels. Only matching value substrings are replaced.
+This does not change the direct Python API:
+omitted `BuildConfig.build_args` preserves literal dollars; an explicitly
+provided table, including an empty one, enables interpolation.
+
 `pycontainer validate` is a namespace: a bare `validate` is a usage error.
 `validate image` is reserved for image linting and is not yet available.
 
