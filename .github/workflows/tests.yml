@@ -45,6 +45,10 @@ jobs:
         env:
           PYTHONPATH: src
         run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
+      - name: Install optional pre-commit test tooling
+        run: uv pip install -r tests/pre-commit-requirements.txt
+      - name: Run hermetic pre-commit hook tests
+        run: uv run --locked --group test python -m pytest tests/test_pre_commit_hook.py -q
 
   # Evidence for #148, not a gate: populate a --cache-dir on each OS, then
   # restore every OS's cache into another absolute path and checkout location.
