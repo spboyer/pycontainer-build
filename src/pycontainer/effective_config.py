@@ -10,7 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from .builder import parse_platform
 from .build_args import EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 from .config import BuildConfig, validate_exposed_ports
-from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
+from .config_loader import (
+    BUILD_TABLE,
+    ConfigValidationError,
+    _validate_config,
+    load_explicit_file_config,
+    merge_configs,
+)
 from .dependencies import validate_target_platform
 from .fs_utils import relative_context_path
 from .project import detect_python_version
@@ -48,18 +54,6 @@ NOT_PERFORMED = (
     "runtime: OCI import and container startup",
     "build context: file selection, framework defaults and entrypoint detection",
 )
-
-
-class ConfigValidationError(ValueError):
-    """One or more source-qualified configuration diagnostics."""
-
-    def __init__(self, diagnostics: List[str], redaction_values=()):
-        self.diagnostics = list(diagnostics)
-        self._redaction_values = tuple(redaction_values)
-        super().__init__("\n".join(self.diagnostics))
-
-    def redact(self, message: str) -> str:
-        return redact_values(message, self._redaction_values)
 
 
 def _origin(field: str, overrides: Dict[str, Any], table: Optional[str], file_keys) -> str:
@@ -146,13 +140,43 @@ def resolve_build_config(
     table, file_config = None, {}
     if config_path is not None:
         table, file_config = load_explicit_file_config(config_path)
+    cfg = resolve_settings(
+        file_config, overrides, table, build_arg_overrides=build_arg_overrides,
+        detect_base_image=config_path is None,
+    )
+    return cfg, table
+
+
+def resolve_settings(
+    file_config: Dict[str, Any],
+    overrides: Dict[str, Any],
+    table: Optional[str],
+    *,
+    build_arg_overrides: Optional[List[str]] = None,
+    detect_base_image: bool = False,
+) -> BuildConfig:
+    """Validate already-loaded settings exactly as resolve_build_config does after loading."""
     merged = merge_configs(file_config, overrides)
     origin = lambda field: _origin(field, overrides, table, file_config)
+    declarations = merged.get("build_args") or {}
     try:
-        arguments = resolve_arguments(merged.get("build_args") or {}, build_arg_overrides)
+        arguments = resolve_arguments(declarations, build_arg_overrides)
     except ValueError as exc:
+        # Resolution can fail before returning otherwise valid defaults/overrides.
+        known_values = []
+        if isinstance(declarations, dict):
+            for declaration in declarations.values():
+                value = declaration.get("default") if isinstance(declaration, dict) else declaration
+                if isinstance(value, str):
+                    known_values.append(value)
+            for item in build_arg_overrides or []:
+                name, separator, value = item.partition("=")
+                if separator and name in declarations:
+                    known_values.append(value)
         field_origin = "CLI option --build-arg" if "--build-arg" in str(exc) or str(exc).startswith("Undeclared build argument ") else origin("build_args")
-        raise ConfigValidationError([f"{field_origin}: {exc}"]) from None
+        raise ConfigValidationError(
+            [redact_values(f"{field_origin}: {exc}", known_values)], known_values
+        ) from None
     try:
         _validate_config(merged, table or BUILD_TABLE)
     except ValueError as exc:
@@ -183,7 +207,7 @@ def resolve_build_config(
         raise ConfigValidationError(
             [redact_values(error, arguments.values()) for error in errors], arguments.values()
         ) from None
-    if config_path is None and "base_image" not in overrides:
+    if detect_base_image and "base_image" not in overrides:
         try:
             version = detect_python_version(cfg.context_dir)
         except (AttributeError, OSError, TypeError, ValueError) as exc:
@@ -197,4 +221,4 @@ def resolve_build_config(
     errors = semantic_errors(cfg, origin)
     if errors:
         raise ConfigValidationError([cfg.redact(error) for error in errors], arguments.values())
-    return cfg, table
+    return cfg

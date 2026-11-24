@@ -256,6 +256,77 @@ def test_invalid_validation_configuration_is_an_error(tmp_path, monkeypatch, cap
     assert "validat" in capsys.readouterr().err.lower()
 
 
+SECRET_ARGUMENT = "REDACTION_FIXTURE_2459"
+
+
+def _assert_redacted(capsys):
+    captured = capsys.readouterr()
+    assert SECRET_ARGUMENT not in captured.out + captured.err
+    assert "<redacted>" in captured.err
+
+
+@pytest.mark.parametrize(
+    "validate_table",
+    [
+        f'ignore = ["{SECRET_ARGUMENT}"]\n',
+        f'{SECRET_ARGUMENT} = ["PCB001"]\n',
+    ],
+)
+def test_invalid_validation_configuration_redacts_build_arguments(tmp_path, monkeypatch, capsys, validate_table):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n[build.validate]\n{validate_table}'
+    )
+
+    assert _validate(monkeypatch, tmp_path, "--config", str(config)) == 2
+    _assert_redacted(capsys)
+
+
+@pytest.mark.parametrize("command", ["config", "image"])
+def test_config_key_collisions_redact_declared_build_arguments(tmp_path, monkeypatch, capsys, command):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    secret = "redaction-fixture-2159"
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build]\n{secret} = true\n{secret.replace("-", "_")} = true\n'
+        f'[build.build-args]\nTOKEN = "{secret}"\n'
+    )
+
+    if command == "image":
+        code = _validate(monkeypatch, tmp_path, "--config", str(config))
+    else:
+        code = _run(monkeypatch, ["validate", "config", str(config)])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert secret not in captured.out + captured.err
+    assert "normalize to the same setting 'redaction_fixture_2159'" in captured.err
+    assert "<redacted>" in captured.err
+
+
+def test_unknown_cli_ignore_redacts_configured_build_arguments(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path)
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = {{ default = "{SECRET_ARGUMENT}" }}\n')
+
+    assert _validate(monkeypatch, tmp_path, "--config", str(config), "--ignore", SECRET_ARGUMENT) == 2
+    _assert_redacted(capsys)
+
+
+def test_layout_errors_redact_configured_build_arguments(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n')
+
+    assert _validate(
+        monkeypatch, tmp_path, "--config", str(config), "--output", str(tmp_path / f"output-{SECRET_ARGUMENT}")
+    ) == 2
+    _assert_redacted(capsys)
+
+
 def test_unknown_cli_ignore_is_an_error(tmp_path, monkeypatch, capsys):
     descriptor, _, _ = _image(tmp_path)
     _layout(tmp_path, [descriptor])
@@ -933,6 +1004,49 @@ def _build_fixture(tmp_path, monkeypatch, *, user="1000", env=None):
     return config, pushes
 
 
+def _squash_fixture(tmp_path, monkeypatch):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    (tmp_path / "context" / "deps.py").write_text("VALUE = 1\n")
+    config.write_text(config.read_text().replace('include-paths = ["app.py"]', 'include-paths = ["app.py", "deps.py"]'))
+
+    def base(self, layers_dir, os_name, arch):
+        image = {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python", "app.py"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+        return [], image
+
+    def deps_layer(self, layers_dir, **kwargs):
+        return self._create_app_layer(layers_dir, ["deps.py"])
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    monkeypatch.setattr(builder, "target_libc_config", lambda *args, **kwargs: args[3])
+    monkeypatch.setattr(builder.ImageBuilder, "_create_deps_layer", deps_layer)
+    return config, pushes
+
+
+@pytest.mark.parametrize("platforms", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_build_validation_accepts_squashed_layouts(tmp_path, monkeypatch, capsys, platforms):
+    config, pushes = _squash_fixture(tmp_path, monkeypatch)
+    assert _run(monkeypatch, [
+        "build", "--config", str(config), "--platform", platforms,
+        "--include-deps", "--squash", "--analyze-layers", "--validate", "--push",
+    ]) == 0
+    assert len(pushes) == 1
+    output = capsys.readouterr().out
+    assert output.count("Squashed 2 builder layers") == len(platforms.split(","))
+    assert output.count("No image validation findings.") == len(platforms.split(","))
+    for platform in platforms.split(","):
+        assert _validate(monkeypatch, tmp_path / "output", "--platform", platform, "--format", "json") == 0
+        report = _report(capsys)
+        assert report["image"]["platform"] == platform
+        assert report["findings"] == []
+
+
 @pytest.mark.parametrize(
     ("user", "env", "expected"),
     [("1000", [], 0), ("root", [], 1), ("1000", ["TOKEN=value"], 1)],
@@ -978,6 +1092,16 @@ def test_build_checks_unknown_ignore_before_building(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cli, "ImageBuilder", lambda *_: pytest.fail("must reject before building"))
     assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--ignore", "PCB999"]) == 2
     assert "PCB999" in capsys.readouterr().err
+
+
+def test_build_unknown_ignore_redacts_build_arguments(tmp_path, monkeypatch, capsys):
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    config.write_text(config.read_text() + f'\n[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n')
+    monkeypatch.setattr(cli, "ImageBuilder", lambda *_: pytest.fail("must reject before building"))
+    assert _run(
+        monkeypatch, ["build", "--config", str(config), "--validate", "--ignore", SECRET_ARGUMENT]
+    ) == 2
+    _assert_redacted(capsys)
 
 
 def test_build_rejects_unknown_config_ignore_before_building(tmp_path, monkeypatch, capsys):

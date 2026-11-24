@@ -46,6 +46,9 @@ uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a
 
 ### Build Your First Image
 
+For offline configuration checks before committing, use the optional
+[pre-commit configuration-validation hook](docs/pre-commit.md).
+
 ```bash
 # Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
@@ -214,6 +217,7 @@ offline preparation, error behavior and the opt-in acceptance test.
 **Production Features** (Phase 4):
 - ✅ **Framework auto-detection** — FastAPI, Flask, Django automatically configured
 - ✅ **Configuration files** — Load settings from `pycontainer.toml`
+- ✅ **Configuration templates and wizard** — `pycontainer init` for FastAPI, Flask and generic apps
 - ✅ **SBOM generation** — Create SPDX 2.3 or CycloneDX 1.4 security manifests
 - ✅ **Runtime security fragments** — Opt-in Kubernetes `securityContext` and
   OCI runtime-spec fragments for capabilities, seccomp, AppArmor, SELinux and
@@ -630,13 +634,28 @@ normalization and include the target; unverifiable marker equivalence and
 unknown target marker values fail explicitly. Normalization supports
 `python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
 unrecognized equivalences are rejected even if they are logically equal.
-Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
-PyPI itself is left to your pip configuration so mirrors keep working, and
-pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
-The same pip bootstrap used for ordinary requirements ignores inherited settings
-that can override the wheel target or add requirements.
-Hashes verify the bytes, not which server supplied them. Index credentials
-must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
+Each package is installed only from the index its lock records, one pip run
+per index with `--isolated` and every `PIP_*` variable and pip config file
+ignored, so `PIP_INDEX_URL`, `pip.conf`, `--find-links` wheelhouses or another
+index serving the same hash cannot substitute an artifact. Per-package sources
+come from uv `source.registry`, Poetry `source` (none means PyPI, which must
+then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
+first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
+only with a single effective index (PyPI or one source named `pypi`), and
+`pdm.toml` `[pypi]` settings are rejected. User or global PDM index settings
+(`pdm config pypi.url`, `PDM_PYPI_URL`) are not recorded in the lock and
+cannot be detected; such a lock is installed from PyPI, where its hashes must
+still match. To build through a PyPI mirror,
+relock against the mirror so the lock records it. The recorded index is
+trusted for the files its pages link to (PyPI serves them from
+files.pythonhosted.org), and hashes verify the bytes. Recorded indexes must
+use HTTPS; plain HTTP is accepted only for loopback hosts, because pip may
+send netrc credentials. Index credentials must
+be `${VARIABLE}` placeholders in the URL's credentials or query values (never
+its host or path, which fix the source) over HTTPS, or netrc, never literal
+secrets; proxy and CA bundle variables such as
+`HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
+normal pip behavior, including your pip configuration.
 
 ### Local base images
 
@@ -757,6 +776,17 @@ error handling, and custom-directory inspection.
 - `--verbose` / `-v` — Detailed build progress
 - `--dry-run` — Preview build without creating artifacts
 - `--no-reproducible` — Disable deterministic builds
+- `--analyze-layers` — Write `layer-analysis.json` with per-layer sizes,
+  repeated content and predicted squash savings
+- `--squash` — Opt in to merging the layers pycontainer creates (dependencies
+  and application) into one layer; base-image layers are never squashed
+
+The default layout is unchanged unless `--squash` is given. Squashing
+preserves overlay semantics (whiteouts, opaque directories, links, metadata)
+or fails explicitly, but it usually saves little space for pycontainer's own
+layers and gives up layer-level cache reuse between the dependency and
+application layers. See [Layer analysis and squashing](docs/layer-squashing.md)
+before enabling it.
 
 Labels inherit from the base image; their precedence is CLI, configuration
 file, detected framework, then base image. Manifest and index annotations are
@@ -858,6 +888,8 @@ workdir = "/app"
 include_deps = true
 reproducible = true
 generate-sbom = "cyclonedx" # false disables; true or "spdx" selects SPDX
+analyze-layers = false      # true writes layer-analysis.json
+squash = false              # true merges builder-created layers only
 release-notes-file = "CHANGELOG-1.0.0.md" # optional; relative to the context
 
 [build.labels]
@@ -966,6 +998,28 @@ Validation exits 0 below the requested severity threshold, 1 for findings at or
 above it, and 2 for usage, layout or integrity errors. Base-image provenance
 is reported as unknown, not inferred from labels. See the
 [image validation rules, suppression and limits](docs/validation.md).
+
+### Generating a configuration file
+
+`pycontainer init` writes a `[build]` file offline from a template, or from an
+explicitly invoked terminal wizard. It never prompts for credentials, never
+contacts a registry or daemon, and never edits `pyproject.toml`:
+
+```bash
+pycontainer init --list-templates                       # fastapi, flask, generic
+pycontainer init --template fastapi                     # writes pycontainer.toml
+pycontainer init -t flask --app web:app --port 8080 -o deploy/flask.toml
+pycontainer init --interactive                          # TTY only; never overwrites
+pycontainer build --config pycontainer.toml
+```
+
+The result is validated with the same loader and resolver `build --config`
+uses before it is published. An existing regular file is refused unless
+`--force` is passed (templates only); links, directories and special files are
+rejected. Cancellation never exposes a partial output file.
+Creating without `--force` requires hard-link support for atomic no-clobber publication.
+Templates write configuration only; they do not add application code or new
+framework detection. See [configuration templates and wizard](docs/init-config.md).
 
 ### Build arguments
 
@@ -1237,6 +1291,7 @@ This style is intentional for the experimental phase.
 - **[Build History](docs/build-history.md)** — Opt-in timing, privacy, retention, and deletion
 - **[Azure Developer CLI Integration](docs/azd-integration.md)** — Deploy to Azure with azd
 - **[GitHub Actions Guide](docs/github-actions.md)** — Automate builds in CI/CD
+- **[Layer Analysis and Squashing](docs/layer-squashing.md)** — Opt-in layer report and builder-layer squashing trade-offs
 - **[Skaffold and Tilt](docs/skaffold-tilt.md)** — Custom-builder contracts for the Kubernetes inner loop
 - **[Registry Push Guide](docs/REGISTRY_PUSH.md)** — Pushing images, including [troubleshooting registry errors, rate limits and quotas](docs/REGISTRY_PUSH.md#registry-errors-rate-limits-and-quotas)
 - **[Registry Cleanup Guide](docs/REGISTRY_CLEANUP.md)** — Deleting images and pruning old versions, shared-digest hazards and registry garbage collection
