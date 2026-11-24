@@ -332,7 +332,6 @@ def test_invalid_paths_are_aggregated_with_source_and_field(offline, monkeypatch
     "argv",
     [
         ["validate"],
-        ["validate", "image"],
         ["validate", "config", "a.toml", "-c", "b.toml"],
         ["validate", "config", "-c", "a.toml", "-c", "b.toml"],
         ["validate", "config", "--push"],

@@ -12,7 +12,13 @@ from .build_args import (
     EXPANDABLE_FIELDS, expand_field, known_argument_values, redact_values, resolve_arguments,
 )
 from .config import BuildConfig
-from .config_loader import BUILD_TABLE, _validate_config, load_explicit_file_config, merge_configs
+from .config_loader import (
+    BUILD_TABLE,
+    ConfigValidationError,
+    _validate_config,
+    load_explicit_file_config,
+    merge_configs,
+)
 from .dependencies import validate_target_platform
 from .fs_utils import relative_context_path
 from .project import detect_python_version
@@ -50,18 +56,6 @@ NOT_PERFORMED = (
     "runtime: OCI import and container startup",
     "build context: file selection, framework defaults and entrypoint detection",
 )
-
-
-class ConfigValidationError(ValueError):
-    """One or more source-qualified configuration diagnostics."""
-
-    def __init__(self, diagnostics: List[str], redaction_values=()):
-        self.diagnostics = list(diagnostics)
-        self._redaction_values = tuple(redaction_values)
-        super().__init__("\n".join(self.diagnostics))
-
-    def redact(self, message: str) -> str:
-        return redact_values(message, self._redaction_values)
 
 
 def _origin(field: str, overrides: Dict[str, Any], table: Optional[str], file_keys) -> str:

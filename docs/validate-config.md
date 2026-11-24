@@ -44,7 +44,8 @@ provided table, including an empty one, enables interpolation. See
 behavior.
 
 `pycontainer validate` is a namespace: a bare `validate` is a usage error.
-`validate image` is reserved for image linting and is not yet available.
+`validate image` checks an existing OCI layout separately; see
+[offline image validation](validation.md).
 
 ## Checks
 
