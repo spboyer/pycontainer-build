@@ -436,6 +436,37 @@ def test_url_path_token_never_reaches_image_sbom_or_logs(
     )
 
 
+def test_scanned_requirement_files_reach_app_layer_credential_check(
+    tmp_path, monkeypatch, home, index
+):
+    import pycontainer.builder as builder_module
+
+    monkeypatch.setenv("PRIVATE_INDEX_USER", USER)
+    monkeypatch.setenv("PRIVATE_INDEX_PASSWORD", SECRET)
+    context = _context(tmp_path, "-r deps/base.in\n")
+    (context / "deps").mkdir()
+    nested = context / "deps" / "base.in"
+    nested.write_text(
+        f"--index-url {index.url_with('${PRIVATE_INDEX_USER}:${PRIVATE_INDEX_PASSWORD}')}\n"
+        "fixture-dep==1.0\n"
+    )
+    checked = []
+    original = builder_module.reject_shipped_credentials
+
+    def capture(files, context_dir, requirement_paths=()):
+        requirement_paths = list(requirement_paths)
+        checked.append({Path(path).resolve() for path in requirement_paths})
+        return original(files, context_dir, requirement_paths)
+
+    monkeypatch.setattr(builder_module, "reject_shipped_credentials", capture)
+    builder = _builder(tmp_path, monkeypatch, context=context, include_deps=True)
+
+    builder.build()
+
+    assert index.authorized >= 2
+    assert checked and nested.resolve() in checked[-1]
+
+
 @pytest.mark.parametrize("source", ["environment", "placeholder"])
 def test_wrong_url_path_token_error_is_redacted(
     tmp_path, monkeypatch, capfd, home, path_index, source

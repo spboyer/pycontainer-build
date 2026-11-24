@@ -636,13 +636,28 @@ normalization and include the target; unverifiable marker equivalence and
 unknown target marker values fail explicitly. Normalization supports
 `python_version >= 'X.Y'` and `python_version < 'X.Y'` bounds; other
 unrecognized equivalences are rejected even if they are logically equal.
-Non-PyPI indexes in the lock are passed to pip as `--extra-index-url`;
-PyPI itself is left to your pip configuration so mirrors keep working, and
-pip can also use an offline wheelhouse (`PIP_NO_INDEX` and `PIP_FIND_LINKS`).
-The same pip bootstrap used for ordinary requirements ignores inherited settings
-that can override the wheel target or add requirements.
-Hashes verify the bytes, not which server supplied them. Index credentials
-must use `${VARIABLE}` placeholders and HTTPS, never literal secrets.
+Each package is installed only from the index its lock records, one pip run
+per index with `--isolated` and every `PIP_*` variable and pip config file
+ignored, so `PIP_INDEX_URL`, `pip.conf`, `--find-links` wheelhouses or another
+index serving the same hash cannot substitute an artifact. Per-package sources
+come from uv `source.registry`, Poetry `source` (none means PyPI, which must
+then be an enabled Poetry source) and Pipenv `index` (unset means Pipenv's
+first source; `install_search_all_sources` fails closed). PDM records no per-package index, so a PDM lock is accepted
+only with a single effective index (PyPI or one source named `pypi`), and
+`pdm.toml` `[pypi]` settings are rejected. User or global PDM index settings
+(`pdm config pypi.url`, `PDM_PYPI_URL`) are not recorded in the lock and
+cannot be detected; such a lock is installed from PyPI, where its hashes must
+still match. To build through a PyPI mirror,
+relock against the mirror so the lock records it. The recorded index is
+trusted for the files its pages link to (PyPI serves them from
+files.pythonhosted.org), and hashes verify the bytes. Recorded indexes must
+use HTTPS; plain HTTP is accepted only for loopback hosts, because pip may
+send netrc credentials. Index credentials must
+be `${VARIABLE}` placeholders in the URL's credentials or query values (never
+its host or path, which fix the source) over HTTPS, or netrc, never literal
+secrets; proxy and CA bundle variables such as
+`HTTPS_PROXY` and `SSL_CERT_FILE` still apply. Plain requirements files keep
+normal pip behavior, including your pip configuration.
 
 ### Local base images
 
