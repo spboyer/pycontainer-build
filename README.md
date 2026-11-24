@@ -547,6 +547,25 @@ pycontainer build \
 - `--lockfile FILE` — Stage dependencies from `poetry.lock`, `Pipfile.lock`,
   `pdm.lock`, or `uv.lock` (`[build] lockfile`). `--no-lockfile`
   (`use-lockfile = false`) ignores auto-detected lockfiles.
+- `--strip-type-stubs` — Opt in (`[build] strip-type-stubs = true`) to drop
+  typing-only files from the dependency layer. Off by default; the default
+  layer is unchanged. It deletes every staged `*.pyi` file and removes
+  stub-only distributions (canonical names `types-*` or `*-stubs`) with their
+  `.dist-info`, rewrites each affected `RECORD`, and leaves them out of the
+  SBOM. A stub-named distribution is removed only if its `RECORD` lists
+  nothing but `.pyi`, `py.typed`, `*-stubs/METADATA.toml` and its own
+  metadata; one that also ships runtime code (for example `django-stubs`
+  with its mypy plugin) is kept, minus its `.pyi` files. Files also listed by
+  a retained distribution are preserved. A malformed `RECORD`, a stub
+  distribution without a `RECORD`, or any `RECORD` path outside
+  site-packages fails the build before anything is changed. The only outside
+  entries accepted are virtualenv launchers in retained distributions,
+  including stub-named packages with runtime files
+  (`../../Scripts/<name>` or `../../../bin/<name>`, not `.pyi`); they are never
+  deleted and stay byte-identical in the rewritten `RECORD`.
+  Identical inputs still give
+  identical layer digests. Leave it off if a dependency reads `.pyi` files
+  at runtime; there are no per-package exceptions.
 - **Conda**: name-only detection recognizes `environment.yml`, `environment.yaml`,
   `conda-lock.yml`, and `conda-meta/` directories in the context. With
   `--include-deps`, Conda-only inputs fail explicitly (also in dry-run); a

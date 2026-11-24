@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -75,6 +76,9 @@ _DEBIAN_GLIBC_MINOR = {
 }
 _ALPINE_MUSL_MINOR = {f"alpine3.{n}": 1 if n <= 12 else 2 for n in range(25)}
 _NATIVE_SUFFIXES = {".so", ".pyd", ".dll", ".dylib"}
+_LAUNCHER_RECORD_PATH = re.compile(
+    r"(?:\.\./\.\./Scripts|\.\./\.\./\.\./bin)/([^/:]+)", re.IGNORECASE
+)
 _PIP_OVERRIDE_OPTIONS = {
     "--abi",
     "--build",
@@ -1239,6 +1243,184 @@ def staged_packages(
                 f"Staged package metadata is missing Name or Version: {metadata}"
             )
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
+
+
+def strip_type_stubs(site_packages: Path) -> List[str]:
+    """Remove stub-only distributions and ``.pyi`` files; return removed names.
+
+    Every RECORD is validated and every deletion is resolved before anything
+    is changed, so invalid input raises without a partial rewrite.
+    """
+    if not site_packages.is_dir():
+        return []
+    root = site_packages.resolve()
+    records = {}
+    record_paths = {}
+    for info_dir in sorted(site_packages.glob("*.dist-info")):
+        if not info_dir.is_dir():
+            continue
+        record = info_dir / "RECORD"
+        rows = _read_record(record) if record.is_file() else None
+        records[info_dir] = rows
+        record_paths[info_dir] = [path for _, path in rows or () if path]
+
+    stub_dirs = []
+    for info_dir, rows in records.items():
+        name = _distribution_name(info_dir)
+        if not (name.startswith("types-") or name.endswith("-stubs")):
+            continue
+        if rows is None:
+            raise ValueError(
+                f"Cannot strip type stub distribution without a RECORD: {info_dir.name}"
+            )
+        paths = record_paths[info_dir]
+        escaping = [
+            path for path in paths
+            if _is_escaping_record_path(path) and not _is_launcher_record_path(path)
+        ]
+        if escaping:
+            raise ValueError(
+                f"RECORD path escapes site-packages in {info_dir.name}: {escaping[0]}"
+            )
+        if all(_is_stub_record_path(path, info_dir.name) for path in paths):
+            stub_dirs.append(info_dir)
+        else:
+            logger.warning(
+                "Keeping %s: it ships runtime files; only its .pyi files are removed.",
+                info_dir.name,
+            )
+
+    retained_keys = set()
+    for info_dir, paths in record_paths.items():
+        if info_dir in stub_dirs:
+            continue
+        for path in paths:
+            if _is_escaping_record_path(path):
+                if not _is_launcher_record_path(path):
+                    raise ValueError(
+                        f"RECORD path escapes site-packages in {info_dir.name}: {path}"
+                    )
+                continue
+            retained_keys.add(_record_key(path))
+
+    removals = {}
+    for path in site_packages.rglob("*.pyi"):
+        if path.is_file() or path.is_symlink():
+            relative = path.relative_to(site_packages).as_posix()
+            removals[_record_key(relative)] = relative
+    for info_dir in stub_dirs:
+        for path in record_paths[info_dir]:
+            normalized = _normalize_record_path(path)
+            key = _record_key(normalized)
+            in_metadata = os.path.normcase(normalized.split("/", 1)[0]) == os.path.normcase(
+                info_dir.name
+            )
+            if in_metadata or key in retained_keys:
+                continue
+            removals.setdefault(key, normalized)
+    files = []
+    for relative in sorted(removals.values()):
+        target = site_packages / relative
+        if not (target.is_file() or target.is_symlink()):
+            continue
+        if not target.parent.resolve().is_relative_to(root):
+            raise ValueError(f"Type stub path resolves outside site-packages: {relative}")
+        files.append(target)
+    for info_dir in stub_dirs:
+        if info_dir.is_symlink() or not info_dir.resolve().is_relative_to(root):
+            raise ValueError(
+                f"Type stub metadata resolves outside site-packages: {info_dir.name}"
+            )
+    rewrites = []
+    for info_dir, rows in records.items():
+        if info_dir in stub_dirs or rows is None:
+            continue
+        kept = [
+            line for line, path in rows
+            if path is None
+            or _is_escaping_record_path(path)
+            or _record_key(path) not in removals
+        ]
+        if len(kept) != len(rows):
+            rewrites.append((info_dir / "RECORD", b"".join(kept)))
+
+    for target in files:
+        target.unlink()
+    for info_dir in stub_dirs:
+        shutil.rmtree(info_dir)
+    for record, content in rewrites:
+        record.write_bytes(content)
+    parents = sorted(
+        {parent for target in files for parent in target.parents
+         if parent != site_packages and site_packages in parent.parents},
+        key=lambda directory: len(directory.parts),
+        reverse=True,
+    )
+    for directory in parents:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    return sorted(_distribution_name(info_dir) for info_dir in stub_dirs)
+
+
+def _read_record(record: Path) -> List[Tuple[bytes, Optional[str]]]:
+    """Return raw lines with their path; blank lines have no path."""
+    rows = []
+    for number, line in enumerate(record.read_bytes().splitlines(keepends=True), 1):
+        try:
+            text = line.decode("utf-8")
+            fields = next(csv.reader([text], strict=True)) if text.strip() else None
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise ValueError(f"Malformed RECORD {record} line {number}: {error}") from error
+        if fields is None:
+            rows.append((line, None))
+            continue
+        if len(fields) != 3 or not fields[0] or "\0" in fields[0]:
+            raise ValueError(f"Malformed RECORD {record} line {number}")
+        rows.append((line, fields[0]))
+    return rows
+
+
+def _distribution_name(info_dir: Path) -> str:
+    metadata = info_dir / "METADATA"
+    name = None
+    if metadata.is_file():
+        with metadata.open(encoding="utf-8", errors="replace") as stream:
+            name = Parser().parse(stream, headersonly=True).get("Name")
+    if not name:
+        name = info_dir.name[: -len(".dist-info")].split("-", 1)[0]
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _is_escaping_record_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return (
+        normalized.startswith("/")
+        or PureWindowsPath(path).drive != ""
+        or ".." in normalized.split("/")
+    )
+
+
+def _is_launcher_record_path(path: str) -> bool:
+    # Venv launchers: Lib/site-packages -> ../../Scripts, lib/pythonX.Y/site-packages -> ../../../bin.
+    match = _LAUNCHER_RECORD_PATH.fullmatch(path.replace("\\", "/"))
+    return bool(match) and match.group(1) not in {".", ".."} and not path.lower().endswith(".pyi")
+
+
+def _is_stub_record_path(path: str, info_name: str) -> bool:
+    parts = _normalize_record_path(path).split("/")
+    if os.path.normcase(parts[0]) == os.path.normcase(info_name):
+        return True
+    if parts[-1].endswith(".pyi") or parts[-1] == "py.typed":
+        return True
+    return len(parts) > 1 and parts[0].endswith("-stubs") and parts[-1] == "METADATA.toml"
+
+
+def _normalize_record_path(path: str) -> str:
+    return posixpath.normpath(path.replace("\\", "/"))
+
+
+def _record_key(path: str) -> str:
+    return os.path.normcase(_normalize_record_path(path))
 
 
 def create_console_entrypoints(site_packages: Path, scripts_dir: Path) -> None:
