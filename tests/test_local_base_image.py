@@ -22,7 +22,7 @@ from pycontainer.local_image import (
     parse_local_image_reference,
 )
 from test_dependency_staging import _write_wheel
-from test_lockfiles import _write_uv_project
+from test_lockfiles import _write_uv_project, indexes
 
 
 def sha(data: bytes) -> str:
@@ -1244,7 +1244,7 @@ def test_local_source_name_does_not_establish_python_abi(
 
 
 @pytest.mark.parametrize("transport", ["oci", "docker"])
-def test_local_source_lockfile_keeps_unverified_provenance(tmp_path, monkeypatch, offline, transport):
+def test_local_source_lockfile_keeps_unverified_provenance(tmp_path, monkeypatch, offline, indexes, transport):
     name = "docker.io/library/python:3.11-slim"
     base_image = local_source_with_env(
         tmp_path, transport, name,
@@ -1252,7 +1252,8 @@ def test_local_source_lockfile_keeps_unverified_provenance(tmp_path, monkeypatch
     )
     context = tmp_path / "context"
     wheel = _write_wheel(context / "wheelhouse", tag="cp311-cp311-musllinux_1_2_x86_64")
-    _write_uv_project(context, wheel)
+    index = indexes(wheel)
+    _write_uv_project(context, wheel, registry=index.url)
     lock = context / "uv.lock"
     lock.write_text(
         lock.read_text(encoding="utf-8").replace("fixture_dep-1.0-py3-none-any.whl", wheel.name),
@@ -1267,7 +1268,7 @@ def test_local_source_lockfile_keeps_unverified_provenance(tmp_path, monkeypatch
         )
     )
     with patch("pycontainer.builder.target_python_version", wraps=target_python_version) as version, patch(
-        "pycontainer.builder.install_requirements", wraps=install_requirements
+        "pycontainer.dependencies.install_requirements", wraps=install_requirements
     ) as install:
         builder.build()
 

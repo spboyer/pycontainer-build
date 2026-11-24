@@ -374,13 +374,15 @@ def test_platform_libc_uses_selected_layers_only_with_verified_provenance(
 
 
 @pytest.mark.parametrize("source", ["verified-tag", "unresolved-tag", "digest"])
-def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path, monkeypatch, source):
-    from test_lockfiles import _write_target_marker_uv_project
+def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path, monkeypatch, request, source):
+    from test_lockfiles import _SimpleIndex, _write_target_marker_uv_project
 
     ctx = tmp_path / "ctx"
-    _write_target_marker_uv_project(ctx)
-    monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setenv("PIP_FIND_LINKS", str(ctx / "wheelhouse"))
+    index = _SimpleIndex()
+    request.addfinalizer(index.close)
+    _write_target_marker_uv_project(ctx, registry=index.url)
+    for wheel in (ctx / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
     registry = FakeBaseRegistry(
         platforms=("amd64", "arm64", "arm/v7"),
         base_env=["PYTHON_VERSION=3.11.9"],
@@ -402,13 +404,13 @@ def test_locked_index_uses_target_markers_and_verified_base_provenance(tmp_path,
 
         registry.client = unresolved_client
     installs = []
-    real_install = builder_module.install_requirements
+    real_install = builder_module.install_locked_requirements
 
     def install(*args, **kwargs):
-        installs.append((args[4], kwargs["locked"], kwargs["base_image_tag_verified"]))
+        installs.append((args[4], args[0][0][0] == index.url, kwargs["base_image_tag_verified"]))
         return real_install(*args, **kwargs)
 
-    monkeypatch.setattr(builder_module, "install_requirements", install)
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
     base_image = "python:3.11-slim"
     if source == "digest":
         base_image += "@" + registry.index_digest
@@ -1157,6 +1159,55 @@ def test_moving_tag_with_non_sha256_digest_binds_every_platform_to_first_snapsho
         assert manifest["layers"][:-1] == json.loads(first.manifests[base["digest"]])["layers"]
     assert builder._resolved_base_from_tag is verified
     assert builder._base_image_tag_verified is verified
+
+
+def test_locked_build_keeps_recorded_index_and_target_markers_with_moving_sha512_tag(
+    tmp_path, monkeypatch, request
+):
+    from test_lockfiles import _SimpleIndex, _ambient_pip, _write_target_marker_uv_project
+
+    index = _SimpleIndex()
+    rogue = _SimpleIndex()
+    request.addfinalizer(index.close)
+    request.addfinalizer(rogue.close)
+    ctx = tmp_path / "ctx"
+    _write_target_marker_uv_project(ctx, registry=index.url)
+    for wheel in (ctx / "wheelhouse").glob("*.whl"):
+        index.add(wheel)
+        rogue.add(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, ctx / "wheelhouse")
+    _, requests = _moving_tag_registry(monkeypatch)
+    installs = []
+    real_install = builder_module.install_locked_requirements
+
+    def install(*args, **kwargs):
+        installs.append((args[4], args[0][0][0], kwargs["base_image_tag_verified"]))
+        return real_install(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "install_locked_requirements", install)
+    builder = ImageBuilder(BuildConfig(
+        tag="registry.example/team/app:v1",
+        base_image="registry.example/library/python:3.11-slim",
+        context_dir=str(ctx), output_dir=str(tmp_path / "out"),
+        platform=THREE, include_deps=True, use_cache=False, reproducible=True,
+    ))
+    builder.build()
+
+    assert requests.count("3.11-slim") == 1
+    assert installs == [(arch, index.url, True) for arch in ("amd64", "arm64", "arm")]
+    assert index.requests
+    assert rogue.requests == []
+    for image in builder.platform_images:
+        arch = image.platform["architecture"]
+        suffix = {"amd64": "amd", "arm64": "arm", "arm": "armv7"}[arch]
+        config = json.loads(_blob(tmp_path / "out", image.config_digest))
+        assert "SNAPSHOT=A" in config["config"]["Env"]
+        with tarfile.open(image.layers[-2].tar_path) as archive:
+            names = archive.getnames()
+        for prefix in ("marker_root", "marker_trans"):
+            assert f"app/.python/site-packages/{prefix}_{suffix}/__init__.py" in names
+            for other in {"amd", "arm", "armv7"} - {suffix}:
+                assert not any(f"{prefix}_{other}/" in name for name in names)
 
 
 def test_forged_sha512_tag_digest_fails_before_publication(tmp_path, monkeypatch):
