@@ -44,6 +44,7 @@ from pycontainer.remote_cache import (
     cache_tag,
     parse_cache_spec,
 )
+from test_lockfiles import indexes
 
 
 CACHE_HOST = "cache.example"
@@ -432,13 +433,18 @@ def test_cached_layer_verification_redacts_build_arguments(
     assert error.value.__context__ is None
 
 
-def test_locked_build_remote_cache_excludes_concurrent_staging(tmp_path, registry, monkeypatch):
-    from test_dependency_staging import BASE_CONFIG as LOCKED_BASE_CONFIG
-    from test_lockfiles import _offline_wheelhouse, _write_uv_project
+def test_locked_build_remote_cache_excludes_concurrent_staging(
+    tmp_path, registry, monkeypatch, indexes
+):
+    from test_dependency_staging import BASE_CONFIG as LOCKED_BASE_CONFIG, _write_wheel
+    from test_lockfiles import _ambient_pip, _write_uv_project
 
     context = tmp_path / "context"
-    wheel = _offline_wheelhouse(monkeypatch, context)
-    _write_uv_project(context, wheel)
+    wheelhouse = tmp_path / "wheelhouse"
+    wheel = _write_wheel(wheelhouse)
+    recorded, rogue = indexes(wheel), indexes(wheel)
+    _ambient_pip(monkeypatch, tmp_path, rogue.url, wheelhouse)
+    _write_uv_project(context, wheel, registry=recorded.url)
     staging = context / ".pycontainer-lockfile-concurrent" / "locked-requirements.txt"
     staging.parent.mkdir()
     staging.write_text("first\n", encoding="utf-8")
@@ -460,9 +466,11 @@ def test_locked_build_remote_cache_excludes_concurrent_staging(tmp_path, registr
     assert "app/uv.lock" in names
     assert not any(".pycontainer-lockfile-" in name for name in names)
     assert cold.digest in registry.blobs
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
 
     staging.write_text("changed\n", encoding="utf-8")
     registry.requests.clear()
+    recorded.requests.clear()
     _forbid_tar_build(monkeypatch)
     reader = _builder(tmp_path, "locked-reader", cache_from=CACHE_SPEC, **options)
     reader.build()
@@ -471,6 +479,8 @@ def test_locked_build_remote_cache_excludes_concurrent_staging(tmp_path, registr
         method == "GET" and "/manifests/" in path
         for _, method, path, _ in registry.requests
     )
+    assert any(path.startswith("/files/fixture_dep-1.0") for path in recorded.requests)
+    assert not rogue.requests
     for builder in (writer, reader):
         with tarfile.open(builder.layers[-2].tar_path) as archive:
             assert "app/.python/site-packages/fixture_dep/__init__.py" in archive.getnames()

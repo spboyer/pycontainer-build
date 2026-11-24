@@ -1,8 +1,10 @@
 """Opt-in OCI import and container startup check."""
 import argparse
 import base64
+import contextlib
 import csv
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import threading
 import tomllib
 import uuid
 from datetime import datetime, timezone
@@ -29,6 +32,7 @@ LOCK_MARKER = "pycontainer-lockfile-runtime-ok"
 LOCK_FIXTURE_PATH = "tests/fixtures/runtime-lock"
 LOCK_FIXTURE = Path(__file__).resolve().parents[1] / LOCK_FIXTURE_PATH
 STDOUT_LIMIT = 2000
+FIXTURE_REGISTRY = 'source = { registry = "https://pypi.org/simple" }'
 INDEX_PLATFORMS = ("linux/amd64", "linux/arm64")
 
 
@@ -119,6 +123,63 @@ def prepare_lock_fixture(context, platform):
         })
     (context / "expected.json").write_text(json.dumps(expected), encoding="utf-8")
     return "sha256:" + hashlib.sha256(lock_bytes).hexdigest(), expected
+
+
+@contextlib.contextmanager
+def serve_lock_wheelhouse(context):
+    """Serve the fixture wheelhouse as the staged lock's recorded loopback index.
+
+    Locked installs fetch each package only from its recorded index and ignore
+    ambient pip settings, so the staged copy records this index explicitly.
+    """
+    wheels = {wheel.name: wheel for wheel in (context / "wheelhouse").glob("*.whl")}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parts = [part for part in urlparse(self.path).path.split("/") if part]
+            body, content_type = None, "text/html"
+            if len(parts) == 2 and parts[0] == "simple":
+                links = [
+                    f'<a href="/files/{name}#sha256={hashlib.sha256(wheel.read_bytes()).hexdigest()}">'
+                    f"{name}</a>"
+                    for name, wheel in sorted(wheels.items())
+                    if name.split("-", 1)[0].replace("_", "-") == parts[1]
+                ]
+                if links:
+                    body = ("<html><body>" + "".join(links) + "</body></html>").encode()
+            elif len(parts) == 2 and parts[0] == "files" and parts[1] in wheels:
+                body, content_type = wheels[parts[1]].read_bytes(), "application/octet-stream"
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/simple"
+        lock = context / "uv.lock"
+        text = lock.read_text(encoding="utf-8")
+        if not text.count(FIXTURE_REGISTRY) or text.count("registry =") != text.count(FIXTURE_REGISTRY):
+            raise ValueError("lock fixture packages must all record the PyPI registry")
+        lock.write_text(
+            text.replace(FIXTURE_REGISTRY, f'source = {{ registry = "{url}" }}'), encoding="utf-8"
+        )
+        with (context / "pyproject.toml").open("a", encoding="utf-8") as pyproject:
+            pyproject.write(f'\n[[tool.uv.index]]\nurl = "{url}"\n')
+        yield url
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def record_image(evidence, builder):
@@ -502,17 +563,8 @@ def run_check(args, evidence):
 
         builder = ImageBuilder(config)
         if args.dependency_fixture == "lockfile":
-            saved = {name: os.environ.get(name) for name in ("PIP_NO_INDEX", "PIP_FIND_LINKS")}
-            try:
-                os.environ["PIP_NO_INDEX"] = "1"
-                os.environ["PIP_FIND_LINKS"] = str(context / "wheelhouse")
+            with serve_lock_wheelhouse(context):
                 builder.build()
-            finally:
-                for name, value in saved.items():
-                    if value is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = value
         else:
             builder.build()
         if args.multi_platform_index:
