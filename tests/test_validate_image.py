@@ -981,6 +981,49 @@ def _build_fixture(tmp_path, monkeypatch, *, user="1000", env=None):
     return config, pushes
 
 
+def _squash_fixture(tmp_path, monkeypatch):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    (tmp_path / "context" / "deps.py").write_text("VALUE = 1\n")
+    config.write_text(config.read_text().replace('include-paths = ["app.py"]', 'include-paths = ["app.py", "deps.py"]'))
+
+    def base(self, layers_dir, os_name, arch):
+        image = {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python", "app.py"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+        }
+        return [], image
+
+    def deps_layer(self, layers_dir, **kwargs):
+        return self._create_app_layer(layers_dir, ["deps.py"])
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    monkeypatch.setattr(builder, "target_libc_config", lambda *args, **kwargs: args[3])
+    monkeypatch.setattr(builder.ImageBuilder, "_create_deps_layer", deps_layer)
+    return config, pushes
+
+
+@pytest.mark.parametrize("platforms", ["linux/amd64", "linux/amd64,linux/arm64"])
+def test_build_validation_accepts_squashed_layouts(tmp_path, monkeypatch, capsys, platforms):
+    config, pushes = _squash_fixture(tmp_path, monkeypatch)
+    assert _run(monkeypatch, [
+        "build", "--config", str(config), "--platform", platforms,
+        "--include-deps", "--squash", "--analyze-layers", "--validate", "--push",
+    ]) == 0
+    assert len(pushes) == 1
+    output = capsys.readouterr().out
+    assert output.count("Squashed 2 builder layers") == len(platforms.split(","))
+    assert output.count("No image validation findings.") == len(platforms.split(","))
+    for platform in platforms.split(","):
+        assert _validate(monkeypatch, tmp_path / "output", "--platform", platform, "--format", "json") == 0
+        report = _report(capsys)
+        assert report["image"]["platform"] == platform
+        assert report["findings"] == []
+
+
 @pytest.mark.parametrize(
     ("user", "env", "expected"),
     [("1000", [], 0), ("root", [], 1), ("1000", ["TOKEN=value"], 1)],
