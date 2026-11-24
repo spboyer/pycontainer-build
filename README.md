@@ -46,6 +46,9 @@ uvx --from git+https://github.com/spboyer/pycontainer-build.git@d3ee7e0f5a1f342a
 
 ### Build Your First Image
 
+For offline configuration checks before committing, use the optional
+[pre-commit configuration-validation hook](docs/pre-commit.md).
+
 ```bash
 # Simple build (auto-detects Python version and base image)
 pycontainer build --tag myapp:latest
