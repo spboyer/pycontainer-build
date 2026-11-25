@@ -16,7 +16,7 @@ import tempfile
 import time
 from email.parser import Parser
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Iterable, List, Mapping, Optional, Tuple
 
 from .credentials import (
     PLACEHOLDER,
@@ -1392,12 +1392,15 @@ def staged_packages(
     return sorted(set(packages), key=lambda item: (item[0].lower(), item[1]))
 
 
-def strip_type_stubs(site_packages: Path) -> List[str]:
+def strip_type_stubs(
+    site_packages: Path, *, redact: Optional[Callable[[str], str]] = None
+) -> List[str]:
     """Remove stub-only distributions and ``.pyi`` files; return removed names.
 
     Every RECORD is validated and every deletion is resolved before anything
     is changed, so invalid input raises without a partial rewrite.
     """
+    redact_message = redact if redact is not None else str
     if not site_packages.is_dir():
         return []
     root = site_packages.resolve()
@@ -1432,10 +1435,10 @@ def strip_type_stubs(site_packages: Path) -> List[str]:
         if all(_is_stub_record_path(path, info_dir.name) for path in paths):
             stub_dirs.append(info_dir)
         else:
-            logger.warning(
-                "Keeping %s: it ships runtime files; only its .pyi files are removed.",
-                info_dir.name,
-            )
+            logger.warning("%s", redact_message(
+                f"Keeping {info_dir.name}: it ships runtime files; "
+                "only its .pyi files are removed."
+            ))
 
     retained_keys = set()
     for info_dir, paths in record_paths.items():

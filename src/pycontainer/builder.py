@@ -1,8 +1,9 @@
-import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
+import copy, hashlib, json, os, shutil, tarfile, tempfile, logging, traceback
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
+from types import MemberDescriptorType
 from typing import Optional, List, Dict, Tuple
 from .config import BuildConfig, MULTI_PLATFORM_SCAN_ERROR, canonical_registry, validate_exposed_ports
 from .system_packages import report_system_packages
@@ -101,6 +102,72 @@ def parse_platform_variant(platform: str) -> Optional[str]:
     parse_platform(platform)
     parts = platform.split("/")
     return parts[2] if len(parts) == 3 else None
+
+
+def _diagnostic_needs_redaction(value, redact) -> bool:
+    pending = [value]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (tuple, list, set, frozenset)):
+            pending.extend(current)
+        elif isinstance(current, os.PathLike):
+            pending.append(os.fspath(current))
+        else:
+            text = (
+                current.decode("utf-8", errors="surrogateescape")
+                if isinstance(current, bytes)
+                else current if isinstance(current, str) else repr(current)
+            )
+            if redact(text) != text:
+                return True
+    return False
+
+
+def _redacted_os_error(error: OSError, redact) -> OSError:
+    """Rebuild an OSError with redacted text while keeping errno and filenames."""
+    def text(value):
+        if value is None:
+            return None
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            return "<redacted>" if _diagnostic_needs_redaction(value, redact) else value
+        value = os.fspath(value)
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="surrogateescape")
+        return redact(value)
+
+    filename, filename2 = text(error.filename), text(error.filename2)
+    if isinstance(error.errno, int) and error.strerror is not None:
+        args = (error.errno, text(error.strerror), filename)
+        winerror = getattr(error, "winerror", None)
+        if winerror is not None:
+            args += (winerror, filename2)
+    else:
+        args = (redact(str(error)),)
+    standard_types = (
+        OSError, BlockingIOError, ChildProcessError, ConnectionError,
+        BrokenPipeError, ConnectionAbortedError, ConnectionRefusedError,
+        ConnectionResetError, FileExistsError, FileNotFoundError,
+        InterruptedError, IsADirectoryError, NotADirectoryError,
+        PermissionError, ProcessLookupError, TimeoutError,
+    )
+    # Custom constructors may regenerate the very text being redacted.
+    error_type = type(error) if type(error) in standard_types else OSError
+    replacement = error_type(*args)
+    if filename is not None and replacement.filename is None:
+        replacement.filename = filename
+    if filename2 is not None:
+        replacement.filename2 = filename2
+    characters_written = getattr(error, "characters_written", None)
+    if isinstance(characters_written, int):
+        replacement.characters_written = characters_written
+    return replacement
 
 
 def _validate_registry_descriptor(
@@ -474,6 +541,44 @@ class ImageBuilder:
 
     def _print(self, message: str):
         print(self.config.redact(message))
+
+    def _strip_type_stubs(self, site_packages: Path) -> List[str]:
+        redact = self.config.redact
+        try:
+            return strip_type_stubs(site_packages, redact=redact)
+        except (OSError, ValueError) as error:
+            diagnostics = ["".join(traceback.format_exception(error))]
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if current is None or id(current) in seen:
+                    continue
+                seen.add(id(current))
+                fields = tuple(
+                    getattr(current, name, None)
+                    for name in (
+                        "errno", "strerror", "filename", "filename2",
+                        "winerror", "characters_written",
+                    )
+                )
+                slots = tuple(
+                    getattr(current, name, None)
+                    for base in type(current).__mro__
+                    for name, descriptor in vars(base).items()
+                    if isinstance(descriptor, MemberDescriptorType)
+                )
+                diagnostics.append((current.args, vars(current), fields, slots))
+                pending.extend((current.__cause__, current.__context__))
+            if not _diagnostic_needs_redaction(diagnostics, redact):
+                raise
+            failure = error
+        # Reconstruct outside the handler so reconstruction failures cannot chain it.
+        if isinstance(failure, OSError):
+            replacement = _redacted_os_error(failure, redact)
+        else:
+            replacement = ValueError(redact(str(failure)))
+        raise replacement
 
     def _record_failed_history(self, timing, config):
         try:
@@ -1601,9 +1706,9 @@ class ImageBuilder:
                 reject_credentialed_direct_urls(site_packages)
 
             if self.config.strip_type_stubs:
-                removed = strip_type_stubs(site_packages)
+                removed = self._strip_type_stubs(site_packages)
                 if removed:
-                    print(f"Removed type stub distributions: {', '.join(removed)}")
+                    self._print(f"Removed type stub distributions: {', '.join(removed)}")
             create_console_entrypoints(site_packages, stage_root / "bin")
             self._staged_packages = staged_packages(
                 site_packages,
