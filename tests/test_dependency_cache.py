@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import tomllib
 import zipfile
@@ -158,6 +159,44 @@ def test_hash_pinned_requirements_hit_reuses_identical_layer_without_pip(
     assert _image(second) == _image(first)
     assert _image(second)[3] == [("fixture-dep", "1.0")]
     assert Path(second.layers[0].tar_path).read_bytes() == Path(first.layers[0].tar_path).read_bytes()
+
+
+def test_dependency_cache_hit_preserves_conditional_app_selection(tmp_path, monkeypatch, capsys):
+    context = _project(tmp_path)
+    debug = context / "debug"
+    debug.mkdir()
+    (debug / "inspect.py").write_text("print('debug')\n")
+    (debug / "secret.py").write_text("print('excluded')\n")
+    rules = [
+        {"when": 'MODE == "dev"', "include": "debug/**"},
+        {"when": 'MODE == "dev"', "exclude": "debug/secret.py"},
+    ]
+
+    def build(mode, name):
+        image = _builder(
+            tmp_path, monkeypatch, context, name, generate_sbom=False,
+            include_paths=["app.py"], build_args={"MODE": mode}, file_rules=rules,
+        )
+        image.build()
+        return image
+
+    dev = build("dev", "dev")
+    capsys.readouterr()
+    _forbid_install(monkeypatch)
+    production = build("production", "production")
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert production.layers[0].digest == dev.layers[0].digest
+    assert production.layers[-1].digest != dev.layers[-1].digest
+
+    for image, includes_debug in ((dev, True), (production, False)):
+        with tarfile.open(image.layers[-1].tar_path) as archive:
+            names = set(archive.getnames())
+        assert ("app/debug/inspect.py" in names) == includes_debug
+        assert "app/debug/secret.py" not in names
+
+    repeat = build("dev", "repeat")
+    assert "Dependency layer cache hit" in capsys.readouterr().out
+    assert [layer.digest for layer in repeat.layers] == [layer.digest for layer in dev.layers]
 
 
 @pytest.mark.parametrize("initial_strip", [False, True])
@@ -826,7 +865,10 @@ def test_locked_cache_rejects_manifest_symlink_outside_context(
 ):  # noqa: F811
     context, _, _, _ = _pipenv_with_optional_extra(tmp_path, indexes, requires=())
     _builder(tmp_path, monkeypatch, context, "initial").build()
-    symlinked = _builder(tmp_path, monkeypatch, context, "symlinked")
+    # Keep the manifest out of app selection to exercise the lockfile check.
+    symlinked = _builder(
+        tmp_path, monkeypatch, context, "symlinked", include_paths=["Pipfile.lock"]
+    )
 
     manifest = context / "Pipfile"
     external = tmp_path / "external-Pipfile"

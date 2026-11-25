@@ -1,4 +1,5 @@
 import copy, hashlib, json, os, shutil, tarfile, tempfile, logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -79,21 +80,6 @@ def _atomic_write_bytes(destination: Path, content: bytes) -> None:
         os.replace(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
-
-
-def parse_platform(platform: str) -> Tuple[str, str]:
-    """Parse a platform string into its OS and architecture components."""
-    parts = platform.split("/")
-    if (
-        len(parts) not in (2, 3)
-        or any(not part for part in parts)
-        or any(part.strip() != part for part in parts)
-    ):
-        raise ValueError(
-            f"Invalid platform format: {platform}. Expected 'os/arch[/variant]' "
-            "(e.g., 'linux/amd64' or 'linux/arm/v7')."
-        )
-    return parts[0], parts[1]
 
 
 def parse_platform_variant(platform: str) -> Optional[str]:
@@ -190,6 +176,7 @@ from .oci import (
     build_layout_index_json,
     build_manifest_json,
     build_oci_layout,
+    parse_platform,
 )
 from .project import (
     CONDA_FILES, detect_conda_inputs, detect_entrypoint,
@@ -425,24 +412,18 @@ class ImageBuilder:
             if config.cache_dir
             else default_cache_dir
         )
-        self.context_excludes=(
-            *context_exclude_paths(
-                context_dir,
-                output_dir=config.output_dir,
-                cache_dir=cache_dir,
-                exclude_paths=config.exclude_paths,
-                exclude_defaults=config.exclude_defaults,
-            ),
-            f"{_LOCKFILE_STAGING_PREFIX}*",
+        ordinary_excludes=context_exclude_paths(
+            context_dir,
+            output_dir=config.output_dir,
+            cache_dir=cache_dir,
+            exclude_paths=config.exclude_paths,
+            exclude_defaults=config.exclude_defaults,
         )
-        self.context_include_paths=(
-            config.include_paths
-            if config.include_paths is not None
-            else default_include_paths(
-                context_dir,
-                exclude_paths=self.context_excludes,
-                exclude_defaults=config.exclude_defaults,
-            )
+        self.ordinary_context_excludes=ordinary_excludes
+        self.context_excludes=(
+            *ordinary_excludes,
+            *config._conditional_excludes,
+            f"{_LOCKFILE_STAGING_PREFIX}*",
         )
         self.dependency_excludes=tuple(
             exclude
@@ -451,20 +432,15 @@ class ImageBuilder:
                 config.exclude_defaults
                 and exclude in VIRTUALENV_EXCLUDES
                 and exclude not in config.exclude_paths
+                and exclude not in config._conditional_excludes
             )
         )
         self.release_notes_labels=release_notes_labels(config)
-        framework_label_explicit="framework" in (config.labels or {})
-        self.config=apply_framework_defaults(
-            config,
-            context_dir,
-            self.context_include_paths,
-            self.context_excludes,
-            exclude_defaults=False,
-        )
-        if "framework" in self.release_notes_labels and not framework_label_explicit and self.config.labels:
-            # The configured release-notes key takes precedence over the framework default.
-            self.config.labels.pop("framework", None)
+        self._framework_label_explicit="framework" in (config.labels or {})
+        self.config=config
+        self._framework_before=None
+        self._framework_after=None
+        self._refresh_context_selection()
         self.verbose=getattr(config, 'verbose', False)
         self.dry_run=getattr(config, 'dry_run', False)
         if config.use_cache and not self.dry_run:
@@ -475,6 +451,69 @@ class ImageBuilder:
     def _print(self, message: str):
         print(self.config.redact(message))
 
+    def _refresh_context_selection(self):
+        config=self.config
+        fields=("entrypoint", "exposed_ports", "labels")
+        if self._framework_before is not None:
+            for name in ("entrypoint", "exposed_ports"):
+                if getattr(config, name) == self._framework_after[name]:
+                    setattr(config, name, deepcopy(self._framework_before[name]))
+            before=self._framework_before["labels"]
+            after=self._framework_after["labels"]
+            if config.labels is not None and before != after:
+                before_labels=before or {}
+                after_labels=after or {}
+                if (
+                    "framework" in after_labels
+                    and config.labels.get("framework") == after_labels["framework"]
+                ):
+                    if "framework" in before_labels:
+                        config.labels["framework"]=before_labels["framework"]
+                    else:
+                        config.labels.pop("framework", None)
+                    if not config.labels and before is None:
+                        config.labels=None
+        context_dir=Path(config.context_dir)
+        self.context_include_paths=(
+            config.include_paths
+            if config.include_paths is not None
+            else default_include_paths(
+                context_dir,
+                exclude_paths=self.ordinary_context_excludes,
+                exclude_defaults=config.exclude_defaults,
+            )
+        )
+        self.context_files=select_context_files(
+            context_dir,
+            self.context_include_paths,
+            self.context_excludes,
+            config._conditional_includes,
+        )
+        self._framework_before={name: deepcopy(getattr(config, name)) for name in fields}
+        apply_framework_defaults(
+            config,
+            context_dir,
+            files=[path for path, _ in self.context_files],
+        )
+        if (
+            "framework" in self.release_notes_labels
+            and not self._framework_label_explicit
+            and config.labels
+        ):
+            # The configured release-notes key takes precedence over the framework default.
+            config.labels.pop("framework", None)
+        self._framework_after={name: deepcopy(getattr(config, name)) for name in fields}
+
+    def _entrypoint(self):
+        # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
+        if self.config.entrypoint is not None:
+            return self.config.entrypoint
+        if self.config.cmd is not None:
+            return None
+        return detect_entrypoint(
+            self.config.context_dir,
+            files={relative for _, relative in self.context_files},
+        )
     def _record_failed_history(self, timing, config):
         try:
             self._history.validate_location(config.context_dir, config.output_dir)
@@ -490,33 +529,34 @@ class ImageBuilder:
     def build(self):
         validate_exposed_ports(self.config.exposed_ports)
         self.config.validate_metadata()
-        self._conda_warning_emitted = False
         self._dependency_source_cache = None
         if self.config.scan and len(self.config.target_platforms()) > 1:
             raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
-        if conda_prefix(self.config.context_dir, ".") is not None:
-            raise ValueError(
-                "The build context is inside a host Conda environment; use a "
-                "source-only build context to avoid copying host environment files. "
-                "Conda staging is unsupported. Export pip-compatible requirements "
-                "with `python -m pip freeze > requirements.txt` and select that "
-                "file with --requirements and --include-deps."
-            )
-        if self.config.include_deps:
-            self._check_conda_dependencies()
-        if self.dry_run:
-            logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
-            self._show_build_plan()
-            return self.config.tag
-
         timing = BuildTiming() if self._history else None
         token = self._history_timer.set(timing) if timing else None
         try:
             try:
+                self._conda_warning_emitted = False
+                if conda_prefix(self.config.context_dir, ".") is not None:
+                    raise ValueError(
+                        "The build context is inside a host Conda environment; use a "
+                        "source-only build context to avoid copying host environment files. "
+                        "Conda staging is unsupported. Export pip-compatible requirements "
+                        "with `python -m pip freeze > requirements.txt` and select that "
+                        "file with --requirements and --include-deps."
+                    )
+                if self.config.include_deps:
+                    self._check_conda_dependencies()
+                if self.dry_run:
+                    self._refresh_context_selection()
+                    logger.info("DRY RUN: Would build image %s", self.config.redact(self.config.tag))
+                    self._show_build_plan()
+                    return self.config.tag
                 if self._history:
                     self._history.validate_location(
                         self.config.context_dir, self.config.output_dir
                     )
+                self._refresh_context_selection()
                 with output_directory_lock(self.config.output_dir):
                     security_fragments=render_security_fragments(
                         self.config.security, self.config.context_dir
@@ -534,7 +574,9 @@ class ImageBuilder:
                     for fragment_path in write_security_fragments(
                         Path(self.config.output_dir), security_fragments
                     ):
-                        logger.info(self.config.redact(f"✓ Security fragment saved to {fragment_path} (not enforced by the image)"))
+                        logger.info(self.config.redact(
+                            f"✓ Security fragment saved to {fragment_path} (not enforced by the image)"
+                        ))
             except BaseException:
                 if timing:
                     self._record_failed_history(timing, self.config)
@@ -551,6 +593,7 @@ class ImageBuilder:
                 self._history_timer.reset(token)
 
     def _build_image(self):
+        self._image_entrypoint = self._entrypoint()
         self._dependency_source_cache = None
         self._lock_selection_cache = {}
         self._requirement_files = []
@@ -699,15 +742,6 @@ class ImageBuilder:
             )
         report_system_packages(self.config, base_layers, locked_names, redact=self.config.redact)
         
-        # Like Docker, a configured cmd without entrypoint runs under the base Entrypoint.
-        if self.config.entrypoint is not None:
-            entry = self.config.entrypoint
-        elif self.config.cmd is not None:
-            entry = None
-        else:
-            entry = detect_entrypoint(self.config.context_dir)
-        include = self.context_include_paths
-
         app_layers=[]
         if self.config.include_deps:
             with self._time_history_phase("dependencies"):
@@ -723,9 +757,11 @@ class ImageBuilder:
             if deps_layer: app_layers.append(deps_layer)
         
         # The application tar is byte-identical for every target, so build it once.
+        # Conditional file rules are rejected for multi-target builds, so the
+        # selected application files never differ between targets.
         if self._app_layer is None:
             with self._time_history_phase("application"):
-                self._app_layer=self._create_app_layer(layers_dir, include)
+                self._app_layer=self._create_app_layer(layers_dir)
         app_layers.append(self._app_layer)
 
         source_layers=list(app_layers)
@@ -766,7 +802,7 @@ class ImageBuilder:
             )
             image_env["PATH"] = f"{bin_path}:{current_path}"
 
-        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,entry,self.config.exposed_ports,
+        cfg = build_config_json(arch,os_name,image_env,self.config.workdir,self._image_entrypoint,self.config.exposed_ports,
                                 labels=self.config.labels,user=self.config.user,cmd=self.config.cmd,base_config=base_config,
                                 layer_diff_ids=[layer.digest for layer in app_layers],
                                 stop_signal=self.config.stop_signal,volumes=self.config.volumes,
@@ -883,7 +919,10 @@ class ImageBuilder:
         log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
 
         def upstream_client():
-            auth=get_registry_auth(registry, include_generic_environment=False, **log_options)
+            log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
+            auth=get_registry_auth(
+                registry, include_generic_environment=False, **log_options
+            )
             return self._registry_client(registry, repo, auth)
 
         mirrors=self.config.registry_mirrors.get(canonical_registry(registry), [])
@@ -1232,12 +1271,11 @@ class ImageBuilder:
             self._print(f"  Platform: {platforms[0]}")
         self._print(f"  Context: {self.config.context_dir}")
         self._print(f"  Working Dir: {self.config.workdir}")
-        if self.config.entrypoint is not None:
-            entrypoint = ' '.join(self.config.entrypoint) or '<none>'
-        elif self.config.cmd is not None:
+        entrypoint = self._entrypoint()
+        if entrypoint is None:
             entrypoint = '<inherited from base image>'
         else:
-            entrypoint = '<auto-detect>'
+            entrypoint = ' '.join(entrypoint) or '<none>'
         self._print(f"  Entrypoint: {entrypoint}")
         if self.config.cmd is not None:
             self._print(f"  Cmd: {' '.join(self.config.cmd) or '<none>'}")
@@ -1281,6 +1319,13 @@ class ImageBuilder:
         for name in render_security_fragments(self.config.security, self.config.context_dir):
             self._print(f"  Security Fragment (applied by your runtime, not the image): {SECURITY_DIR}/{name}")
         self._print(f"  Use Cache: {self.config.use_cache}")
+        if self.config.file_rules:
+            active=len(self.config._conditional_includes)+len(self.config._conditional_excludes)
+            self._print(f"  Conditional File Patterns Active: {active}")
+        self._print(f"  Application Files: {len(self.context_files)} selected")
+        if self.verbose:
+            for _, relative in self.context_files:
+                self._print(f"    {relative.as_posix()}")
 
     def _uses_lockfile(self) -> bool:
         if self.config.lockfile:
@@ -1759,9 +1804,18 @@ class ImageBuilder:
         finally:
             tmp.unlink(missing_ok=True)
 
-    def _create_app_layer(self, layers_dir, include_paths):
+    def _create_app_layer(self, layers_dir, include_paths=None):
         ctx=Path(self.config.context_dir)
-        files=select_context_files(ctx, include_paths, self.context_excludes)
+        files=(
+            list(self.context_files)
+            if include_paths is None
+            else select_context_files(
+                ctx,
+                include_paths,
+                self.context_excludes,
+                self.config._conditional_includes,
+            )
+        )
         configured_requirements = ctx / (self.config.requirements_file or DEFAULT_REQUIREMENTS_FILE)
         reject_shipped_credentials(
             files,

@@ -33,7 +33,8 @@ embedded, and no dependency or base-image content is loaded. History recording
 flags are operational and are rejected.
 
 Declared build arguments resolve before configuration construction, including
-platform-dependent security checks. Repeatable overrides use the last value.
+platform-dependent security checks and conditional file rules. Repeatable
+overrides use the last value.
 Undeclared inputs and missing required values fail with exit 2. Diagnostics
 redact nonempty argument values, including values within success/error source
 path labels. Only matching value substrings are replaced.
@@ -55,6 +56,8 @@ provided table, including an empty one, enables interpolation.
   omitting every path validates the build defaults.
 - Missing files, malformed TOML, unknown keys, wrong TOML types and keys that
   normalize to the same setting.
+- Conditional file-rule expressions, declared names and patterns, including
+  inactive rules and the single-target restriction.
 - Semantic checks shared with `build`: SBOM format, system package names, tag
   and base-image references, platform format, relative include/exclude and
   requirements paths, an existing context directory, distinct exposed ports
@@ -80,7 +83,8 @@ locks, contacts a registry or writes files, so it cannot verify:
 - base image existence, platform match, registry authentication or push;
 - dependency source selection, wheel installation or target Python ABI;
 - OCI import or container startup;
-- build-context file selection, framework defaults or entrypoint detection.
+- build-context file selection, selected symlink targets, framework defaults
+  or entrypoint detection.
 
 A successful validation is therefore not proof that a build will succeed.
 

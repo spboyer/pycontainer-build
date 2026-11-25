@@ -18,6 +18,7 @@ from .config_loader import (
     merge_configs,
 )
 from .dependencies import validate_target_platform
+from .file_rules import FileRuleError
 from .fs_utils import relative_context_path
 from .project import detect_python_version
 from .registry_client import parse_image_reference
@@ -196,7 +197,10 @@ def resolve_settings(
     try:
         cfg = BuildConfig(**merged)
     except ValueError as exc:
-        errors = _constructor_errors(expanded, origin) or [str(exc)]
+        errors = _constructor_errors(expanded, origin)
+        if not errors:
+            message = f"{origin('file_rules')}: {exc}" if isinstance(exc, FileRuleError) else str(exc)
+            errors = [message]
         for field in ("include_paths", "exclude_paths"):
             for value in expanded.get(field) or []:
                 try:

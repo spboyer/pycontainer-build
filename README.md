@@ -1136,7 +1136,67 @@ argument builds omit source-path metadata. Unused argument changes do not
 invalidate the app-layer cache. The cache stores actual layer contents, not
 encrypted data. Dockerfile `import --build-arg` remains a separate, Dockerfile-
 scoped interface; imported values escape dollars to preserve their runtime
-meaning when loaded. Build arguments do not introduce stages or conditions.
+meaning when loaded. Build arguments do not introduce stages; conditional file
+selection is limited to the file rules below.
+
+### Conditional file rules
+
+`file-rules` add or remove application files based on declared build arguments
+and the explicit target platform:
+
+```toml
+[build]
+include-paths = ["src", "pyproject.toml"]
+
+[build.build-args]
+BUILD_MODE = "production"
+
+[[build.file-rules]]
+when = 'BUILD_MODE == "dev"'
+include = ["debug_tools/**"]
+
+[[build.file-rules]]
+when = 'BUILD_MODE == "dev" and target.arch == "arm64"'
+exclude = "debug_tools/x86_only"
+```
+
+```bash
+pycontainer build --config pycontainer.toml --build-arg BUILD_MODE=dev --platform linux/arm64
+```
+
+Use `[[tool.pycontainer.file-rules]]` in `pyproject.toml`. Each rule has
+exactly `when` plus one of `include` or `exclude` (a pattern or a non-empty
+list). A condition is one or more `NAME == "value"` or `NAME != "value"`
+comparisons joined by `and`; string values use double quotes and support only
+`\"` and `\\` escapes. Names are declared build arguments, `target.os` and
+`target.arch` (from `platform`, including a `--platform` override). The host
+environment is never read and nothing is evaluated as code.
+File rules currently require a single target platform; comma-separated target
+lists are rejected until per-target selection and application layers are supported.
+Unknown names, unknown keys, malformed expressions, and absolute, drive-qualified or `..`
+patterns fail before building, even for inactive rules. Patterns are literal
+(not `${}`-expanded), relative to the context, case-sensitive, and use `/` or
+`\` interchangeably; a pattern matching a directory matches everything below it.
+`validate config` checks these rules against the same resolved arguments and
+platform as `build`, but does not select files or verify symlink targets.
+
+Active includes add to `include-paths`; **every exclusion wins** over every
+include. That covers active exclude rules, `exclude-paths`, the default
+exclusions (so a `tests/**` rule needs `--no-default-excludes`), and the output
+and cache directories, which are always excluded. Conda environment prefixes
+(directories containing `conda-meta/`) are also always pruned, including symlink
+aliases to them. Ordinary includes skip these prefixes; a conditional rule
+rooted inside one fails unless that root is already excluded. Host
+Conda environments are never copied into the image. The selection is refreshed
+once per build and shared by framework detection, `--dry-run` (which reports the count and,
+with `-v`, each path), the app layer and the cache key; active rule sets are part
+of the cache identity. Selected file symlinks must use a relative target and
+resolve to another selected file inside the context; dangling, cyclic, absolute,
+escaping or unselected targets are rejected. Directory links and Windows
+junctions are never traversed; an include root through one is rejected unless
+the root is already excluded. Automatic entrypoint discovery only reads a
+selected `pyproject.toml` and rejects an excluded local script module; use an
+explicit entrypoint if the intended module comes from elsewhere.
 
 ---
 

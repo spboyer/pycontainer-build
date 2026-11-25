@@ -87,6 +87,7 @@ def _glob_matches(path_parts, pattern_parts):
 
 
 def path_is_excluded(relative_path, excludes):
+    """Return whether a path or any parent directory matches a pattern."""
     parts = Path(relative_path).as_posix().split("/")
     for exclude in excludes:
         pattern = str(exclude).replace("\\", "/").removeprefix("./").rstrip("/")
@@ -172,10 +173,14 @@ def context_exclude_paths(
         if generated_path is None:
             continue
         absolute_path = Path(os.path.abspath(generated_path))
-        try:
-            excludes.append(absolute_path.relative_to(context).as_posix())
-        except ValueError:
-            continue
+        for root, path in (
+            (context, absolute_path),
+            (context.resolve(), absolute_path.resolve()),
+        ):
+            try:
+                excludes.append(path.relative_to(root).as_posix())
+            except ValueError:
+                continue
 
     for path in exclude_paths:
         excludes.append(relative_context_path(path).as_posix())
@@ -227,13 +232,40 @@ def _check_selected_link(base, path, relative):
         )
 
 
-def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=True):
+def _check_conda_root(base, relative):
+    """Reject an include path at or inside a Conda environment prefix."""
+    if conda_prefix(base, relative) is not None:
+        raise ValueError(
+            f"Include path {relative.as_posix()!r} is inside a Conda "
+            "environment; host Conda environments are never copied into "
+            "the image."
+        )
+
+
+def glob_root(pattern):
+    """Return the literal leading directory a context glob can match beneath."""
+    parts = []
+    for part in relative_context_path(pattern).parts:
+        if any(character in part for character in "*?["):
+            break
+        parts.append(part)
+    return Path(*parts) if parts else Path(".")
+
+
+def iter_files(
+    base,
+    relative_paths,
+    *,
+    exclude_paths=None,
+    exclude_defaults=True,
+    match_patterns=None,
+):
     """Yield unique context files, pruning excluded directories during traversal.
 
     Directory symlinks and junctions are never followed: an include path that
     names or traverses one is rejected and nested ones are pruned. Selected
     file symlinks must use a relative target resolving to a file inside the
-    context.
+    context. With ``match_patterns`` only matching files are yielded.
     """
     base = Path(base)
     excludes = list(DEFAULT_CONTEXT_EXCLUDES) if exclude_defaults else []
@@ -241,6 +273,8 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
         excludes.extend(exclude_paths)
 
     def selected(path, relative):
+        if match_patterns is not None and not path_is_excluded(relative, match_patterns):
+            return False
         if path.is_symlink():
             if _conda_prefix_in_context(base, relative) is not None:
                 return False
@@ -252,6 +286,8 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
         relative = relative_context_path(relative_path)
         if path_is_excluded(relative, excludes):
             continue
+        if match_patterns is not None:
+            _check_conda_root(base, relative)
         if conda_prefix(base, relative) is not None:
             continue
         absolute = base / relative
@@ -292,20 +328,39 @@ def iter_files(base, relative_paths, *, exclude_paths=None, exclude_defaults=Tru
                 yield absolute, child_relative
 
 
-def select_context_files(base, include_paths, excludes):
-    """Return the deterministic (absolute, relative) application file selection.
+def select_context_files(base, include_paths, excludes, conditional_includes=()):
+    """Return the single deterministic (absolute, relative) application selection.
 
-    ``excludes`` must already contain any default patterns. A selected file
-    symlink must target another selected file, so exclusions win over links.
+    Ordinary include paths keep their existing order; files added only by
+    active conditional include globs follow in POSIX path order. Every exclude
+    pattern wins over both. ``excludes`` must already contain any default
+    patterns. A selected file symlink must target another selected file, so
+    exclusions win over links.
     """
     files = list(
         iter_files(base, include_paths, exclude_paths=excludes, exclude_defaults=False)
     )
+    if conditional_includes:
+        seen = {relative.as_posix() for _, relative in files}
+        roots = sorted({glob_root(pattern).as_posix() for pattern in conditional_includes})
+        added = [
+            (path, relative)
+            for path, relative in iter_files(
+                base,
+                roots,
+                exclude_paths=excludes,
+                exclude_defaults=False,
+                match_patterns=conditional_includes,
+            )
+            if relative.as_posix() not in seen
+        ]
+        files.extend(sorted(added, key=lambda item: item[1].as_posix()))
     # Lexical membership keeps the link valid inside the image. A ``..`` after
     # a descending component could climb out of a pruned directory link that
     # the image lacks, so targets may only climb first and then descend, and
-    # never above the context root, which the image root mirrors.
-    lexical_paths = {os.path.normcase(os.path.abspath(path)) for path, _ in files}
+    # never above the context root, which the image root mirrors. The lexical
+    # check is case-exact so a link valid on Windows cannot dangle on Linux.
+    lexical_paths = {os.path.abspath(path) for path, _ in files}
     resolved_paths = {
         os.path.normcase(os.path.realpath(path))
         for path, _ in files
@@ -324,7 +379,7 @@ def select_context_files(base, include_paths, excludes):
             if (
                 ".." in parts[climbs:]
                 or climbs >= len(relative.parts)
-                or os.path.normcase(os.path.abspath(target)) not in lexical_paths
+                or os.path.abspath(target) not in lexical_paths
                 or os.path.normcase(os.path.realpath(target)) not in resolved_paths
             ):
                 raise ValueError(

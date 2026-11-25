@@ -476,13 +476,33 @@ def test_selected_linked_source_is_rejected_before_pull(
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "environment.yml").write_text("invalid YAML")
     _symlink_or_skip(context / "src", source, directory=True)
-    monkeypatch.setattr(ImageBuilder, "_pull_base_image", lambda *args: pytest.fail("base pull"))
-
-    with pytest.raises(ValueError, match="directory links are never followed"):
+    assert detect_conda_inputs(context, selected_paths=[selected]) == [
+        Path("src/nested/environment.yml")
+    ]
+    with pytest.raises(ValueError, match="symlink or junction directory"):
         _builder(
             tmp_path / "run", monkeypatch, context=context, include_deps=True,
             include_paths=[selected], dry_run=dry_run,
-        ).build()
+        )
+
+
+def test_selected_linked_source_detection_respects_excludes(tmp_path, monkeypatch, caplog):
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    source = tmp_path / "linked-source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "environment.yml").write_text("invalid YAML")
+    _symlink_or_skip(context / "src", source, directory=True)
+    assert detect_conda_inputs(
+        context, selected_paths=["src"], exclude_paths=["src/nested"]
+    ) == []
+    with pytest.raises(ValueError, match="symlink or junction directory"):
+        _builder(
+            tmp_path / "run", monkeypatch, context=context, include_deps=True,
+            include_paths=["src"], exclude_paths=["src/nested"], dry_run=True,
+        )
+    assert not [record for record in caplog.records if "Conda" in record.message]
 
 
 def test_excluded_linked_source_is_not_followed(tmp_path, monkeypatch, caplog):
@@ -623,12 +643,13 @@ def test_requirements_alias_to_conda_descriptor_is_rejected(
     descriptor = tmp_path / signal
     descriptor.write_text("numpy\n")
     _symlink_or_skip(tmp_path / "requirements.txt", Path(signal))
-    builder = _builder(
-        tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
-        exclude_paths=[signal] if exclude_target else [], dry_run=True,
-    )
-
-    with pytest.raises(ValueError, match="Conda staging is unsupported"):
+    message = "another selected file" if exclude_target else "Conda staging is unsupported"
+    with pytest.raises(ValueError, match=message):
+        builder = _builder(
+            tmp_path / "run", monkeypatch, context=tmp_path, include_deps=True,
+            include_paths=["requirements.txt", signal],
+            exclude_paths=[signal] if exclude_target else [], dry_run=True,
+        )
         builder.build()
 
 

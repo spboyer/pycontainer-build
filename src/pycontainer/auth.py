@@ -247,10 +247,10 @@ def get_registry_auth(
     if password:
         return RegistryAuth(bearer_token=password)
 
-    options = {"log_redact": log_redact} if log_redact is not None else {}
-    provider=get_default_auth_provider(
-        include_generic_environment=include_generic_environment, **options
-    )
+    provider_options={"include_generic_environment": include_generic_environment}
+    if log_redact is not None:
+        provider_options["log_redact"]=log_redact
+    provider=get_default_auth_provider(**provider_options)
 
     token=provider.get_token(registry)
     if token:

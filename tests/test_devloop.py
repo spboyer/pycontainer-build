@@ -519,6 +519,42 @@ def test_devloop_build_arguments_preserve_tool_reference(
     assert "private-v2" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_file_rules_use_cli_arguments_and_tool_target(
+    tmp_path, monkeypatch, recording, command,
+):
+    from pycontainer.builder import ImageBuilder
+
+    (tmp_path / "app.py").write_text("print('app')\n")
+    (tmp_path / "arm.py").write_text("print('arm')\n")
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(
+        '[build]\ninclude-paths = ["app.py"]\n'
+        '[build.build-args]\nMODE = "production"\n'
+        '[[build.file-rules]]\n'
+        'when = \'MODE == "dev" and target.arch == "arm64"\'\n'
+        'include = "arm.py"\n'
+    )
+    reference = "localhost:5000/a:1"
+    monkeypatch.setenv("MODE", "production")
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", reference)
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+        monkeypatch.setenv("PLATFORMS", "linux/arm64")
+        extra = []
+    else:
+        monkeypatch.setenv("EXPECTED_REF", reference)
+        extra = ["--context", str(tmp_path), "--platform", "linux/arm64"]
+
+    run_cli(monkeypatch, command, "--config", str(config), "--no-progress",
+            "--build-arg", "MODE=dev", *extra)
+    (builder,) = recording
+    selected = ImageBuilder(builder.config).context_files
+    assert [path.as_posix() for _, path in selected] == ["app.py", "arm.py"]
+    assert builder.pushes[0][0] == reference
+
+
 def test_tilt_output_reference_path_redacts_build_arguments(tmp_path, monkeypatch, recording, capsys):
     config = tmp_path / "pycontainer.toml"
     config.write_text('[build.build-args]\nVALUE = "private-ref"\n')

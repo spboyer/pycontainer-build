@@ -12,13 +12,33 @@ def detect_framework(
     exclude_paths=None,
     *,
     exclude_defaults=True,
+    files=None,
 ) -> Optional[Tuple[str, List[str], List[int]]]:
     """Detect web framework and return (name, entrypoint, exposed_ports).
-    
+
+    ``files`` supplies an already selected file set instead of rescanning.
+
     Returns:
         Tuple of (framework_name, entrypoint_cmd, ports) or None if not detected
     """
     ctx=Path(context_dir)
+    if files is not None:
+        files = [Path(path) for path in files if Path(path).suffix == ".py"]
+    else:
+        files = _scan_python_files(ctx, include_paths, exclude_paths, exclude_defaults)
+
+    fastapi=_detect_fastapi(files, ctx)
+    if fastapi: return fastapi
+
+    flask=_detect_flask(files)
+    if flask: return flask
+
+    django=_detect_django(files, ctx)
+    if django: return django
+
+    return None
+
+def _scan_python_files(ctx, include_paths, exclude_paths, exclude_defaults):
     paths = (
         default_include_paths(
             ctx,
@@ -28,7 +48,7 @@ def detect_framework(
         if include_paths is None
         else include_paths
     )
-    files = [
+    return [
         path
         for path, _ in iter_files(
             ctx,
@@ -38,17 +58,6 @@ def detect_framework(
         )
         if path.suffix == ".py"
     ]
-    
-    fastapi=_detect_fastapi(files, ctx)
-    if fastapi: return fastapi
-    
-    flask=_detect_flask(files)
-    if flask: return flask
-    
-    django=_detect_django(files, ctx)
-    if django: return django
-    
-    return None
 
 def _detect_fastapi(files: List[Path], ctx: Path) -> Optional[Tuple[str, List[str], List[int]]]:
     """Detect FastAPI applications."""
@@ -108,6 +117,7 @@ def apply_framework_defaults(
     exclude_paths=None,
     *,
     exclude_defaults=True,
+    files=None,
 ):
     """Apply framework-specific defaults to build config."""
     detection=detect_framework(
@@ -115,6 +125,7 @@ def apply_framework_defaults(
         include_paths,
         exclude_paths,
         exclude_defaults=exclude_defaults,
+        files=files,
     )
     if not detection:
         return config

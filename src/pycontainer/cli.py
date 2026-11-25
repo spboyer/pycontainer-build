@@ -137,7 +137,7 @@ def _run_registry(parser, args):
 def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,validation=False):
     if not validation:
         b.add_argument("--config","-c",help="Path to pycontainer.toml config file")
-    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret)")
+    b.add_argument("--build-arg",action="append",default=[],metavar="KEY=VALUE",help="Override a declared build argument (repeatable; last wins; not a secret; also used by file-rules conditions)")
     if tagging:
         b.add_argument("--tag",action="append",help="Image tag (repeatable; the first is the primary tag)")
         b.add_argument("--semver-tags",action="store_true",default=None,help="Also tag the minor and major versions (v1.2.3 -> v1.2, v1)")

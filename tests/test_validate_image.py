@@ -3,11 +3,13 @@ import hashlib
 import json
 import socket
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from pycontainer import builder, cache, cli, effective_config, image_validation, registry_client
+from pycontainer.config import BuildConfig
 from pycontainer.fs_utils import output_directory_lock
 
 
@@ -1045,6 +1047,53 @@ def test_build_validation_accepts_squashed_layouts(tmp_path, monkeypatch, capsys
         report = _report(capsys)
         assert report["image"]["platform"] == platform
         assert report["findings"] == []
+
+
+@pytest.mark.parametrize("mode", ["dev", "production"])
+def test_conditional_selection_with_squash_and_image_validation(tmp_path, monkeypatch, capsys, mode):
+    config, pushes = _squash_fixture(tmp_path, monkeypatch)
+    debug = tmp_path / "context" / "debug"
+    debug.mkdir()
+    (debug / "inspect.py").write_text("print('debug')\n")
+    (debug / "secret.py").write_text("print('excluded')\n")
+    with config.open("a") as stream:
+        stream.write(
+            '\n[build.build-args]\nMODE = "production"\n'
+            '[[build.file-rules]]\nwhen = \'MODE == "dev"\'\ninclude = "debug/**"\n'
+            '[[build.file-rules]]\nwhen = \'MODE == "dev"\'\nexclude = "debug/secret.py"\n'
+        )
+
+    def deps_layer(self, layers_dir, **kwargs):
+        separate = builder.ImageBuilder(BuildConfig(
+            context_dir=self.config.context_dir, output_dir=self.config.output_dir,
+            include_paths=["deps.py"], use_cache=False,
+        ))
+        return separate._create_app_layer(layers_dir)
+
+    monkeypatch.setattr(builder.ImageBuilder, "_create_deps_layer", deps_layer)
+    overrides = ["--build-arg", f"MODE={mode}"]
+    assert _run(monkeypatch, ["validate", "config", str(config), *overrides]) == 0
+    capsys.readouterr()
+    assert _run(monkeypatch, [
+        "build", "--config", str(config), *overrides,
+        "--include-deps", "--squash", "--analyze-layers", "--validate", "--push",
+    ]) == 0
+    assert len(pushes) == 1
+    assert "Squashed 2 builder layers" in capsys.readouterr().out
+
+    layout = tmp_path / "output"
+    index = json.loads((layout / "index.json").read_text())
+    manifest = json.loads(_path(layout, index["manifests"][0]).read_text())
+    image = json.loads(_path(layout, manifest["config"]).read_text())
+    assert len(manifest["layers"]) == 1
+    assert image["rootfs"]["diff_ids"] == [manifest["layers"][0]["digest"]]
+    with tarfile.open(_path(layout, manifest["layers"][0])) as archive:
+        names = set(archive.getnames())
+    assert {"app/app.py", "app/deps.py"} <= names
+    assert ("app/debug/inspect.py" in names) == (mode == "dev")
+    assert "app/debug/secret.py" not in names
+    assert _validate(monkeypatch, layout, "--format", "json") == 0
+    assert _report(capsys)["findings"] == []
 
 
 @pytest.mark.parametrize(
