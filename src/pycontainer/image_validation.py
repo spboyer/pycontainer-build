@@ -4,6 +4,9 @@ import hashlib
 import json
 import posixpath
 import re
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 
 from .blob_store import digest_filename, hash_file
@@ -31,6 +34,16 @@ CONTAINERD_NAME = "io.containerd.image.name"
 SOURCE_LABEL = "org.opencontainers.image.source"
 VERSION_LABEL = "org.opencontainers.image.version"
 
+MIB = 1024 * 1024
+SIZE_THRESHOLDS = ("max_image_size_mb", "max_layer_size_mb")
+MAX_SIZE_THRESHOLD_DIGITS = 1000
+MAX_SIZE_THRESHOLD_EXPONENT = 1000
+STORED_SIZE_NOTE = (
+    "Sizes are stored blob sizes recorded in the layout: compressed layers count compressed "
+    "bytes and uncompressed tar layers count their full size. Network transfer and "
+    "registry or cache reuse may differ."
+)
+
 RULES = {
     "PCB001": (
         "warning",
@@ -53,6 +66,16 @@ RULES = {
         "error",
         "Image contains a non-empty secret-like environment variable.",
         "Supply secrets at runtime rather than embedding them in the image.",
+    ),
+    "PCB006": (
+        "warning",
+        "Stored image size exceeds max_image_size_mb.",
+        "Reduce the base image or layer contents, or raise max_image_size_mb.",
+    ),
+    "PCB007": (
+        "warning",
+        "A stored layer exceeds max_layer_size_mb.",
+        "Slim the largest layer or choose a smaller base image, or raise max_layer_size_mb.",
     ),
     "PCB008": (
         "error",
@@ -111,6 +134,35 @@ def validate_ignores(ignores):
     if unknown:
         names = ", ".join(repr(name) for name in unknown)
         raise ValueError(f"Unknown image validation rule ID(s): {names}.")
+
+
+_DECIMAL_LITERAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def parse_size_threshold(value, name):
+    """Return a positive, finite MiB threshold as an exact Decimal."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValueError(f"{name} must be a positive number of MiB.")
+    if isinstance(value, str):
+        value = value.strip()
+        if not _DECIMAL_LITERAL.fullmatch(value):
+            raise ValueError(f"{name} must be a positive number of MiB.")
+    try:
+        number = Decimal(repr(value) if isinstance(value, float) else value)
+    except InvalidOperation:
+        raise ValueError(f"{name} has an unsupported decimal exponent.") from None
+    if not number.is_finite() or number <= 0:
+        raise ValueError(f"{name} must be a positive number of MiB.")
+    if (
+        len(number.as_tuple().digits) > MAX_SIZE_THRESHOLD_DIGITS
+        or abs(number.adjusted()) > MAX_SIZE_THRESHOLD_EXPONENT
+    ):
+        raise ValueError(
+            f"{name} must have at most {MAX_SIZE_THRESHOLD_DIGITS} coefficient digits "
+            f"and an adjusted decimal exponent between -{MAX_SIZE_THRESHOLD_EXPONENT} "
+            f"and {MAX_SIZE_THRESHOLD_EXPONENT}."
+        )
+    return number
 
 
 def _descriptor(value, description):
@@ -353,7 +405,10 @@ class _VerifiedLayout:
             runtime = _image_config(config, len(layers))
             for layer in layers:
                 self._layer(layer)
-            self.images[digest] = (config, runtime)
+            self.images[digest] = (
+                config, runtime, config_descriptor["size"],
+                [(layer["digest"], layer["size"], layer["mediaType"]) for layer in layers],
+            )
             subject = document.get("subject")
             self.heights[digest] = (
                 1 + self._walk(subject, depth + 1, ancestors | {digest})
@@ -362,7 +417,7 @@ class _VerifiedLayout:
         elif depth + self.heights[digest] > MAX_GRAPH_DEPTH:
             raise ImageValidationError("OCI layout exceeds the graph nesting limit.")
 
-        config, _ = self.images[digest]
+        config = self.images[digest][0]
         descriptor_platform = _platform(descriptor)
         if descriptor_platform:
             actual = (config["os"], config["architecture"], config.get("variant"))
@@ -403,7 +458,7 @@ class _VerifiedLayout:
         return index, entries
 
     def _resolved_platform(self, descriptor):
-        config, _ = self.images[descriptor["digest"]]
+        config = self.images[descriptor["digest"]][0]
         declared = _platform(descriptor)
         variant = (declared[2] if declared else None) or config.get("variant")
         return config["os"], config["architecture"], variant
@@ -466,7 +521,7 @@ class _VerifiedLayout:
             selected = candidates[0]
         else:
             selected = self._select_index(candidates, requested)
-        _, runtime = self.images[selected["digest"]]
+        runtime = self.images[selected["digest"]][1]
         actual = self._resolved_platform(selected)
         if requested is not None and (
             actual[:2] != requested[:2] or (requested[2] is not None and actual[2] != requested[2])
@@ -744,20 +799,130 @@ def _findings(runtime, ignores, base_exposed_ports=None, redact=str):
     return findings
 
 
-def validate_image(output, tag=None, platform=None, ignores=(), base_exposed_ports=None, redact=str):
+def _compression(media_type):
+    if media_type.endswith(("+gzip", ".tar.gzip")):
+        return "gzip"
+    if media_type.endswith("+zstd"):
+        return "zstd"
+    if media_type.endswith(".tar"):
+        return "none"
+    return "unknown"
+
+
+def _size_report(config_size, layers, base_layer_count, thresholds, redact=str):
+    if base_layer_count is not None and not 0 <= base_layer_count <= len(layers):
+        raise ImageValidationError("Base layer count does not match the selected image.")
+    entries = []
+    for position, (digest, size, media_type) in enumerate(layers):
+        if base_layer_count is None:
+            role = "unknown"
+        else:
+            role = "base" if position < base_layer_count else "application"
+        entries.append({
+            "digest": digest, "bytes": size, "media_type": redact(media_type),
+            "compression": _compression(media_type), "role": role,
+        })
+    largest = max(entries, key=lambda entry: entry["bytes"], default=None)
+    if base_layer_count is None:
+        contributions = {"status": "unknown", "base_bytes": None, "application_bytes": None}
+    else:
+        contributions = {
+            "status": "determined",
+            "base_bytes": sum(entry["bytes"] for entry in entries if entry["role"] == "base"),
+            "application_bytes": sum(
+                entry["bytes"] for entry in entries if entry["role"] == "application"
+            ),
+        }
+    return {
+        "basis": "stored",
+        "image_bytes": config_size + sum(entry["bytes"] for entry in entries),
+        "config_bytes": config_size,
+        "largest_layer": (
+            None if largest is None else
+            {key: largest[key] for key in ("digest", "bytes", "media_type")}
+        ),
+        "contributions": contributions,
+        "layers": entries,
+        "thresholds": {
+            name: None if thresholds.get(name) is None else str(thresholds[name])
+            for name in SIZE_THRESHOLDS
+        },
+        "note": STORED_SIZE_NOTE,
+    }
+
+
+def _size_findings(size, thresholds, ignores):
+    measured = {
+        "max_image_size_mb": ("PCB006", "Stored image size", size["image_bytes"]),
+        "max_layer_size_mb": (
+            "PCB007", "Largest stored layer",
+            size["largest_layer"]["bytes"] if size["largest_layer"] else 0,
+        ),
+    }
+    findings = []
+    for name in SIZE_THRESHOLDS:
+        threshold = thresholds.get(name)
+        rule_id, subject, actual = measured[name]
+        if threshold is None or rule_id in ignores or actual <= Fraction(threshold) * MIB:
+            continue
+        severity, _, remediation = RULES[rule_id]
+        findings.append({
+            "rule_id": rule_id,
+            "severity": severity,
+            "message": (
+                f"{subject} is {actual} bytes ({actual / MIB:.2f} MiB), "
+                f"above {name} = {threshold}."
+            ),
+            "remediation": remediation,
+        })
+    return findings
+
+
+def validate_image(
+    output, tag=None, platform=None, ignores=(), base_exposed_ports=None, redact=str, *,
+    thresholds=None, expected_digest=None, base_layer_count=None,
+):
     """Verify every reachable blob, then lint one unambiguously selected image.
 
-    ``base_exposed_ports`` lists the base image's ExposedPorts keys when known (``build``).
-    ``redact`` removes configured values from raw diagnostic keys before encoding.
+    ``base_layer_count`` attributes the first layers of the selected manifest to the base
+    image. It requires ``expected_digest``, the manifest digest the caller built.
+    ``base_exposed_ports`` lists known base ports; ``redact`` sanitizes diagnostic keys and
+    reported layer media types.
     """
+    if base_layer_count is not None and expected_digest is None:
+        raise ValueError("Base layer attribution requires the expected manifest digest.")
+    if base_layer_count is not None and type(base_layer_count) is not int:
+        raise ValueError("Base layer count must be an integer.")
     validate_ignores(ignores)
+    if thresholds is None:
+        thresholds = {}
+    elif not isinstance(thresholds, Mapping):
+        raise ValueError("Image size thresholds must be a mapping or None.")
+    if any(not isinstance(name, str) for name in thresholds):
+        raise ValueError("Image size threshold names must be strings.")
+    unknown = sorted(set(thresholds) - set(SIZE_THRESHOLDS))
+    if unknown:
+        raise ValueError(f"Unknown image size threshold(s): {_display_keys(unknown, redact)}.")
+    thresholds = {
+        name: parse_size_threshold(value, name)
+        for name, value in thresholds.items() if value is not None
+    }
     layout = _VerifiedLayout(output)
     index, entries = layout.verify()
     digest, selected_platform, runtime = layout.select(index, entries, tag, platform)
+    if expected_digest is not None and digest != expected_digest:
+        raise ImageValidationError("The built image no longer matches the selected layout manifest.")
+    _, _, config_size, layers = layout.images[digest]
+    size = _size_report(config_size, layers, base_layer_count, thresholds, redact)
+    ignored = set(ignores)
     return {
         "image": {"digest": digest, "platform": "/".join(part for part in selected_platform if part)},
         "provenance": {"status": "unknown"},
-        "findings": _findings(runtime, set(ignores), base_exposed_ports, redact),
+        "findings": (
+            _findings(runtime, ignored, base_exposed_ports, redact)
+            + _size_findings(size, thresholds, ignored)
+        ),
+        "size": size,
     }
 
 

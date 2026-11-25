@@ -1,13 +1,16 @@
 import copy
+import gzip
 import hashlib
 import json
 import socket
 import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
 
-from pycontainer import builder, cache, cli, effective_config, image_validation, registry_client
+from pycontainer import builder, cache, cli, config_loader, effective_config, image_validation, registry_client
+from pycontainer.config import BuildConfig
 from pycontainer.fs_utils import output_directory_lock
 
 
@@ -146,7 +149,7 @@ def test_each_rule_reports_a_stable_id_and_remediation(
     assert _validate(monkeypatch, tmp_path, "--format", "json") == 1
 
     report = _report(capsys)
-    assert set(report) == {"image", "provenance", "findings"}
+    assert set(report) == {"image", "provenance", "findings", "size"}
     finding = next(item for item in report["findings"] if item["rule_id"] == rule)
     assert set(finding) == {"rule_id", "severity", "message", "remediation"}
     assert finding["severity"] == severity
@@ -323,6 +326,20 @@ def test_layout_errors_redact_configured_build_arguments(tmp_path, monkeypatch, 
 
     assert _validate(
         monkeypatch, tmp_path, "--config", str(config), "--output", str(tmp_path / f"output-{SECRET_ARGUMENT}")
+    ) == 2
+    _assert_redacted(capsys)
+
+
+def test_size_thresholds_preserve_redaction_on_layout_errors(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f'[build.build-args]\nTOKEN = "{SECRET_ARGUMENT}"\n'
+        '[build.validate]\nmax_layer_size_mb = 1\n'
+    )
+    assert _validate(
+        monkeypatch, tmp_path, "--config", str(config),
+        "--output", str(tmp_path / f"output-{SECRET_ARGUMENT}"),
+        "--max-image-size-mb", "1",
     ) == 2
     _assert_redacted(capsys)
 
@@ -1040,6 +1057,7 @@ def test_build_validation_accepts_squashed_layouts(tmp_path, monkeypatch, capsys
     output = capsys.readouterr().out
     assert output.count("Squashed 2 builder layers") == len(platforms.split(","))
     assert output.count("No image validation findings.") == len(platforms.split(","))
+    assert output.count("Contributions: base 0 bytes") == len(platforms.split(","))
     for platform in platforms.split(","):
         assert _validate(monkeypatch, tmp_path / "output", "--platform", platform, "--format", "json") == 0
         report = _report(capsys)
@@ -1292,6 +1310,576 @@ def test_usage_errors_exit_two(monkeypatch, capsys, args):
     assert _run(monkeypatch, args) == 2
     assert "usage:" in capsys.readouterr().err.lower()
 
+# --- Image size thresholds (#121) ---
+
+MIB = 1024 * 1024
+GZIP_LAYER = "application/vnd.oci.image.layer.v1.tar+gzip"
+
+
+def _config_size(tmp_path):
+    _, config, _ = _image(tmp_path / "scratch")
+    return config["size"]
+
+
+def _sized_image(layout, layer_bytes, **kwargs):
+    descriptor, config, layer = _image(layout, layer_data=b"x" * layer_bytes, **kwargs)
+    _layout(layout, [descriptor])
+    return descriptor, config, layer
+
+
+@pytest.mark.parametrize("value", [None, "1"])
+def test_unknown_size_threshold_names_are_rejected(tmp_path, value):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
+        image_validation.validate_image(tmp_path, thresholds={"max_image_szie_mb": value})
+    assert "max_image_szie_mb" in str(error.value)
+
+
+@pytest.mark.parametrize("value", [None, "1"])
+@pytest.mark.parametrize("marker", [
+    "synthetic-threshold-secret",
+    'unicode-\u00eb-quote"-backslash\\-value',
+    "secret-" * 20,
+])
+def test_unknown_size_threshold_diagnostic_redacts_keys(marker, value):
+    from pycontainer.build_args import redact_values
+
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
+        image_validation.validate_image(
+            Path("unused-layout"), thresholds={"unknown-" + marker: value},
+            redact=lambda text: redact_values(text, [marker]),
+        )
+    assert marker not in str(error.value)
+    assert '"unknown-<redacted>"' in str(error.value)
+
+
+def test_unknown_size_threshold_diagnostic_escapes_keys():
+    key = "unknown-\x1b[2J\n"
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
+        image_validation.validate_image(Path("unused-layout"), thresholds={key: None})
+    assert str(error.value) == (
+        f"Unknown image size threshold(s): {json.dumps(key, ensure_ascii=True)}."
+    )
+
+
+@pytest.mark.parametrize("thresholds", [False, 0, [], "", True, 1, ["max_image_size_mb"]])
+def test_size_thresholds_require_mapping(tmp_path, thresholds):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Image size thresholds must be a mapping"):
+        image_validation.validate_image(tmp_path, thresholds=thresholds)
+
+
+@pytest.mark.parametrize("key", [None, 1, ("max_image_size_mb",)])
+def test_size_threshold_keys_require_strings(tmp_path, key):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Image size threshold names must be strings"):
+        image_validation.validate_image(tmp_path, thresholds={key: None, "max_layer_size_mb": None})
+
+
+@pytest.mark.parametrize("thresholds", [None, {}])
+def test_empty_size_thresholds_are_unset(tmp_path, thresholds):
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(tmp_path, thresholds=thresholds)
+    assert report["size"]["thresholds"] == {
+        "max_image_size_mb": None, "max_layer_size_mb": None,
+    }
+    assert not report["findings"]
+
+
+def test_size_thresholds_accept_read_only_mapping(tmp_path):
+    from types import MappingProxyType
+
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(
+        tmp_path, thresholds=MappingProxyType({"max_layer_size_mb": "1"}),
+    )
+    assert report["size"]["thresholds"]["max_layer_size_mb"] == "1"
+    assert not report["findings"]
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+def test_known_none_size_threshold_is_unset(tmp_path, name):
+    _sized_image(tmp_path, 1)
+    report = image_validation.validate_image(tmp_path, thresholds={name: None})
+    assert report["size"]["thresholds"] == {
+        "max_image_size_mb": None, "max_layer_size_mb": None,
+    }
+    assert not report["findings"]
+
+
+@pytest.mark.parametrize(("delta", "expected"), [(-1, 0), (0, 0), (1, 1)])
+def test_image_size_threshold_boundaries(tmp_path, monkeypatch, capsys, delta, expected):
+    layout = tmp_path / "layout"
+    _sized_image(layout, MIB - _config_size(tmp_path) + delta)
+
+    assert _validate(monkeypatch, layout, "--format", "json", "--max-image-size-mb", "1") == expected
+
+    report = _report(capsys)
+    assert report["size"]["image_bytes"] == MIB + delta
+    assert [item["rule_id"] for item in report["findings"]] == (["PCB006"] if expected else [])
+
+
+@pytest.mark.parametrize(("delta", "expected"), [(-1, 0), (0, 0), (1, 1)])
+def test_layer_size_threshold_boundaries(tmp_path, monkeypatch, capsys, delta, expected):
+    _sized_image(tmp_path, MIB + delta)
+
+    assert _validate(monkeypatch, tmp_path, "--format", "json", "--max-layer-size-mb", "1") == expected
+
+    report = _report(capsys)
+    assert report["size"]["largest_layer"]["bytes"] == MIB + delta
+    assert [item["rule_id"] for item in report["findings"]] == (["PCB007"] if expected else [])
+
+
+@pytest.mark.parametrize(("layer_bytes", "expected"), [(104857, 0), (104858, 1)])
+def test_decimal_thresholds_compare_exactly(tmp_path, monkeypatch, capsys, layer_bytes, expected):
+    # 0.1 MiB is 104857.6 bytes; a binary float conversion must not move the boundary.
+    _sized_image(tmp_path, layer_bytes)
+    assert _validate(monkeypatch, tmp_path, "--format", "json", "--max-layer-size-mb", "0.1") == expected
+    assert len(_report(capsys)["findings"]) == expected
+
+
+def _precise_threshold(actual, delta):
+    with localcontext() as context:
+        context.prec = 80
+        return Decimal(actual) / Decimal(MIB) + Decimal(delta) * Decimal("1e-50")
+
+
+@pytest.mark.parametrize(("name", "rule"), [
+    ("max_image_size_mb", "PCB006"), ("max_layer_size_mb", "PCB007"),
+])
+@pytest.mark.parametrize("source", ["cli", "build", "tool.pycontainer"])
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_threshold_precision_survives_loading_and_reporting(
+    tmp_path, monkeypatch, capsys, name, rule, source, format_, delta
+):
+    _, config, _ = _sized_image(tmp_path, 1)
+    actual = config["size"] + 1 if name == "max_image_size_mb" else 1
+    threshold = _precise_threshold(actual, delta)
+    options = ["--format", format_]
+    if source == "cli":
+        options += ["--" + name.replace("_", "-"), format(threshold, "f")]
+    else:
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[{source}.validate]\n{name} = {threshold:f}\n")
+        options += ["--config", str(settings)]
+
+    assert _validate(monkeypatch, tmp_path, *options) == (1 if delta < 0 else 0)
+    if format_ == "json":
+        report = _report(capsys)
+        assert report["size"]["thresholds"][name] == str(threshold)
+        findings = report["findings"]
+        assert [item["rule_id"] for item in findings] == ([rule] if delta < 0 else [])
+        output = " ".join(item["message"] for item in findings)
+    else:
+        output = capsys.readouterr().out
+    if delta < 0:
+        assert f"above {name} = {threshold}" in output
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("source", ["cli", "build", "tool.pycontainer"])
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize(("value", "expected"), [
+    ("1e-400", 1), ("1e5000", 2), ("1e-5000", 2), ("1e9999999999999999999999", 2),
+])
+def test_threshold_magnitudes_are_exact_or_explicit_errors(
+    tmp_path, monkeypatch, capsys, name, source, format_, value, expected
+):
+    _sized_image(tmp_path, 1)
+    options = ["--format", format_]
+    if source == "cli":
+        options += ["--" + name.replace("_", "-"), value]
+    else:
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[{source}.validate]\n{name} = {value}\n")
+        options += ["--config", str(settings)]
+    assert _validate(monkeypatch, tmp_path, *options) == expected
+    if expected == 2:
+        captured = capsys.readouterr()
+        assert not captured.out and "exponent" in captured.err
+        diagnostic_name = name.replace("_", "-") if source == "cli" else name
+        assert diagnostic_name in captured.err
+    elif format_ == "json":
+        assert _report(capsys)["size"]["thresholds"][name] == "1E-400"
+    else:
+        assert f"above {name} = 1E-400" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("source", ["cli", "build"])
+def test_excessive_threshold_precision_is_a_usage_error(tmp_path, monkeypatch, capsys, name, source):
+    value = "1." + "1" * 1000
+    options = ["--" + name.replace("_", "-"), value]
+    if source == "build":
+        settings = tmp_path / "settings.toml"
+        settings.write_text(f"[build.validate]\n{name} = {value}\n")
+        options = ["--config", str(settings)]
+    assert _validate(monkeypatch, tmp_path, *options) == 2
+    captured = capsys.readouterr()
+    assert not captured.out and "1000" in captured.err and "digits" in captured.err
+
+
+@pytest.mark.parametrize(("exponent", "valid"), [(1000, True), (-1000, True), (1001, False), (-1001, False)])
+def test_size_threshold_exponent_limits(exponent, valid):
+    value = f"1e{exponent}"
+    if valid:
+        assert image_validation.parse_size_threshold(value, "threshold") == Decimal(value)
+    else:
+        with pytest.raises(ValueError, match="exponent"):
+            image_validation.parse_size_threshold(value, "threshold")
+
+
+def test_exact_toml_thresholds_preserve_unrelated_float_types(tmp_path):
+    settings = tmp_path / "settings.toml"
+    settings.write_text(
+        "[build]\nother = { numbers = [0.1, 1e-400, 1e9999999999999999999999] }\n"
+        "[build.validate]\nmax_image_size_mb = 0.00000095367431640624999999999999999999\n"
+    )
+    config = config_loader.load_config_file(settings)
+    assert config["validate"]["max_image_size_mb"] == Decimal("0.00000095367431640624999999999999999999")
+    assert config["other"]["numbers"] == [0.1, 0.0, float("inf")]
+    assert all(type(value) is float for value in config["other"]["numbers"])
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("literal", [
+    "1e-400", "1e1000", "1e-1000",
+    "0.00000095367431640624999999999999999999",
+])
+def test_exact_threshold_build_config_json_round_trip(tmp_path, table, name, literal):
+    from dataclasses import asdict, fields, replace
+    from fractions import Fraction
+
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f"[{table}.validate]\n{name} = {literal}\n")
+    original = config_loader.config_from_file(settings)
+    snapshot = json.loads(json.dumps(asdict(original)))
+    restored = BuildConfig(**{
+        field.name: snapshot[field.name] for field in fields(BuildConfig) if field.init
+    })
+    for config in (original, replace(original), restored):
+        assert isinstance(config.validate[name], str)
+        assert image_validation.parse_size_threshold(config.validate[name], name) == Decimal(literal)
+        boundary = Decimal("0.00000095367431640624999999999999999999")
+        if Decimal(literal) == boundary:
+            assert Fraction(image_validation.parse_size_threshold(config.validate[name], name)) * MIB < 1
+    _sized_image(tmp_path / "layout", 1)
+    report = image_validation.validate_image(tmp_path / "layout", thresholds=restored.validate)
+    assert report["size"]["thresholds"][name] == str(Decimal(literal))
+    rule = "PCB006" if name == "max_image_size_mb" else "PCB007"
+    assert (rule in {item["rule_id"] for item in report["findings"]}) == (literal != "1e1000")
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+def test_snapshot_threshold_strings_are_not_accepted_in_toml(tmp_path, table, name):
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f'[{table}.validate]\n{name} = "1E-400"\n')
+    with pytest.raises(ValueError, match="expected a number"):
+        config_loader.config_from_file(settings)
+
+
+def test_size_threshold_and_socket_port_rules_share_report(tmp_path, monkeypatch, capsys):
+    _sized_image(tmp_path, 1, config={
+        "Entrypoint": ["gunicorn", "app:app", "--bind", "unix:/tmp/app.sock"],
+        "ExposedPorts": {"8000/tcp": {}},
+    })
+    assert _validate(
+        monkeypatch, tmp_path, "--format", "json", "--max-layer-size-mb", "1e-400"
+    ) == 1
+    report = _report(capsys)
+    assert {item["rule_id"] for item in report["findings"]} == {"PCB007", "PCB010"}
+    assert report["size"]["thresholds"]["max_layer_size_mb"] == "1E-400"
+
+
+@pytest.mark.parametrize("format_", ["text", "json"])
+def test_no_thresholds_report_stored_size_without_warnings(tmp_path, monkeypatch, capsys, format_):
+    _, config, layer = _sized_image(tmp_path, 10, layer_type=GZIP_LAYER)
+
+    assert _validate(monkeypatch, tmp_path, "--format", format_) == 0
+
+    if format_ == "text":
+        out = capsys.readouterr().out
+        assert "No image validation findings." in out
+        assert "stored blob sizes" in out and "Network transfer" in out
+        assert "unknown (the layout does not record layer origin)" in out
+        return
+    report = _report(capsys)
+    size = report["size"]
+    assert report["findings"] == []
+    assert size["image_bytes"] == config["size"] + layer["size"]
+    assert size["thresholds"] == {"max_image_size_mb": None, "max_layer_size_mb": None}
+    assert size["contributions"] == {"status": "unknown", "base_bytes": None, "application_bytes": None}
+    assert size["layers"] == [{
+        "digest": layer["digest"], "bytes": 10, "media_type": GZIP_LAYER,
+        "compression": "gzip", "role": "unknown",
+    }]
+    assert "Network transfer" in size["note"]
+
+
+def test_image_size_sums_every_layer_descriptor(tmp_path, monkeypatch, capsys):
+    layer = _blob(tmp_path, b"shared layer", LAYER)
+    image = {
+        "architecture": "amd64", "os": "linux",
+        "config": {"User": "1000", "Entrypoint": ["python"],
+                   "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"}},
+        "rootfs": {"type": "layers", "diff_ids": [layer["digest"], layer["digest"]]},
+    }
+    config = _blob(tmp_path, image, CONFIG)
+    manifest = _blob(
+        tmp_path, {"schemaVersion": 2, "mediaType": MANIFEST, "config": config, "layers": [layer, layer]},
+        MANIFEST,
+    )
+    _layout(tmp_path, [manifest])
+
+    assert _validate(monkeypatch, tmp_path, "--format", "json") == 0
+    assert _report(capsys)["size"]["image_bytes"] == config["size"] + 2 * layer["size"]
+
+
+@pytest.mark.parametrize("table", ["build", "tool.pycontainer"])
+@pytest.mark.parametrize(
+    ("toml_value", "cli_value", "expected"),
+    [("1", None, 1), ("100", None, 0), ("100", "1", 1), ("1", "100", 0), (None, "1", 1)],
+)
+def test_threshold_cli_overrides_toml_only_when_supplied(
+    tmp_path, monkeypatch, capsys, table, toml_value, cli_value, expected
+):
+    _sized_image(tmp_path, MIB + 1)
+    config = tmp_path / "settings.toml"
+    config.write_text(
+        f"[{table}.validate]\n" + (f"max_layer_size_mb = {toml_value}\n" if toml_value else "")
+    )
+    options = ["--config", str(config), "--format", "json"]
+    if cli_value is not None:
+        options += ["--max-layer-size-mb", cli_value]
+
+    assert _validate(monkeypatch, tmp_path, *options) == expected
+    report = _report(capsys)
+    assert [item["rule_id"] for item in report["findings"]] == (["PCB007"] if expected else [])
+    effective = cli_value or toml_value
+    assert report["size"]["thresholds"]["max_layer_size_mb"] == effective
+
+
+@pytest.mark.parametrize("name", ["max_image_size_mb", "max_layer_size_mb"])
+@pytest.mark.parametrize("value", ["0", "-1", "0.0", '"1"', "true", "nan", "inf", "[1]"])
+def test_invalid_toml_thresholds_are_configuration_errors(tmp_path, monkeypatch, capsys, name, value):
+    _sized_image(tmp_path, 1)
+    config = tmp_path / "settings.toml"
+    config.write_text(f"[build.validate]\n{name} = {value}\n")
+
+    assert _validate(monkeypatch, tmp_path, "--config", str(config)) == 2
+    captured = capsys.readouterr()
+    assert not captured.out and f"[build.validate].{name}" in captured.err
+    assert _run(monkeypatch, ["validate", "config", str(config)]) == 2
+    assert name in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("option", ["--max-image-size-mb", "--max-layer-size-mb"])
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "nan", "inf", "0x10", "", "1_0", "1,5", "١"])
+def test_invalid_cli_thresholds_are_usage_errors(tmp_path, monkeypatch, capsys, option, value):
+    _sized_image(tmp_path, 1)
+    assert _validate(monkeypatch, tmp_path, f"{option}={value}") == 2
+    captured = capsys.readouterr()
+    assert not captured.out and option in captured.err
+
+
+@pytest.mark.parametrize("kind", ["config", "layer"])
+@pytest.mark.parametrize("corruption", ["digest", "size"])
+def test_size_rules_never_mask_integrity_errors(tmp_path, monkeypatch, capsys, kind, corruption):
+    manifest, config, layer = _image(tmp_path, bad_size=kind if corruption == "size" else None)
+    _layout(tmp_path, [manifest])
+    if corruption == "digest":
+        path = _path(tmp_path, {"config": config, "layer": layer}[kind])
+        content = path.read_bytes()
+        path.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+
+    assert _validate(
+        monkeypatch, tmp_path, "--format", "json", "--max-image-size-mb", "0.000001",
+        "--max-layer-size-mb", "0.000001", "--ignore", "PCB006", "--ignore", "PCB007",
+    ) == 2
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert corruption in captured.err.lower()
+
+
+def test_size_findings_can_be_ignored(tmp_path, monkeypatch, capsys):
+    _sized_image(tmp_path, MIB + 1)
+    assert _validate(
+        monkeypatch, tmp_path, "--format", "json", "--max-layer-size-mb", "1",
+        "--max-image-size-mb", "1", "--ignore", "PCB006", "--ignore", "PCB007",
+    ) == 0
+    assert _report(capsys)["findings"] == []
+
+
+def test_attribution_requires_the_expected_manifest_digest(tmp_path):
+    _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="expected manifest digest"):
+        image_validation.validate_image(tmp_path, base_layer_count=0)
+    with pytest.raises(ValueError, match="expected manifest digest"):
+        image_validation.validate_image(tmp_path, base_layer_count=0.5)
+
+
+@pytest.mark.parametrize("count", [0.5, 1.0, True, False, "0", "1", -1, 2])
+def test_base_layer_count_must_be_a_valid_integer(tmp_path, count):
+    descriptor, _, _ = _sized_image(tmp_path, 1)
+    with pytest.raises(ValueError, match="Base layer count"):
+        image_validation.validate_image(
+            tmp_path, expected_digest=descriptor["digest"], base_layer_count=count,
+        )
+
+
+@pytest.mark.parametrize(("count", "base"), [(0, 0), (1, 1)])
+def test_valid_base_layer_counts_are_attributed(tmp_path, count, base):
+    descriptor, _, _ = _sized_image(tmp_path, 1)
+    size = image_validation.validate_image(
+        tmp_path, expected_digest=descriptor["digest"], base_layer_count=count,
+    )["size"]
+    assert size["contributions"] == {
+        "status": "determined", "base_bytes": base, "application_bytes": 1 - base,
+    }
+
+
+def _with_base_layer(monkeypatch, tmp_path, data=b"compressed base layer"):
+    original = builder.ImageBuilder._pull_base_image
+
+    def pull(self, layers_dir, os_name, arch):
+        _, base = original(self, layers_dir, os_name, arch)
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        path = layers_dir / digest.split(":", 1)[1]
+        path.write_bytes(data)
+        base["rootfs"]["diff_ids"] = ["sha256:" + "1" * 64]
+        return [builder.OCILayer(GZIP_LAYER, digest, len(data), str(path))], base
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", pull)
+    return len(data)
+
+
+def test_build_validation_attributes_base_and_application_layers(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    base_bytes = _with_base_layer(monkeypatch, tmp_path)
+
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 0
+
+    out = capsys.readouterr().out
+    assert f"Contributions: base {base_bytes} bytes" in out
+    assert "application/dependency" in out and "stored blob sizes" in out
+    assert len(pushes) == 1
+
+
+def test_build_reports_attributed_contributions_in_engine(tmp_path, monkeypatch):
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    base_bytes = _with_base_layer(monkeypatch, tmp_path)
+    cfg, _ = effective_config.resolve_build_config(config, {})
+    built = builder.ImageBuilder(cfg)
+    built.build()
+    image = built.platform_images[0]
+
+    size = image_validation.validate_image(
+        Path(cfg.output_dir), tag=cfg.tag, expected_digest=built.manifest_digest,
+        base_layer_count=len(image.layers) - image.app_layer_count,
+    )["size"]
+
+    roles = [layer["role"] for layer in size["layers"]]
+    assert roles == ["base", "application"]
+    assert size["layers"][0]["compression"] == "gzip" and size["layers"][1]["compression"] == "none"
+    assert size["contributions"] == {
+        "status": "determined", "base_bytes": base_bytes,
+        "application_bytes": size["layers"][1]["bytes"],
+    }
+    assert size["image_bytes"] == size["config_bytes"] + base_bytes + size["layers"][1]["bytes"]
+
+
+def test_multi_platform_size_validation_uses_each_platforms_base_layers(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    base_sizes = {}
+
+    def base(self, layers_dir, os_name, arch):
+        contents = [b"a" * 50] if arch == "amd64" else [b"b" * 50, b"c" * 20000]
+        layers, diff_ids = [], []
+        for content in contents:
+            data = gzip.compress(content, compresslevel=0, mtime=0)
+            digest = "sha256:" + hashlib.sha256(data).hexdigest()
+            path = layers_dir / digest.split(":", 1)[1]
+            path.write_bytes(data)
+            layers.append(builder.OCILayer(GZIP_LAYER, digest, len(data), str(path)))
+            diff_ids.append("sha256:" + hashlib.sha256(content).hexdigest())
+        base_sizes[arch] = sum(layer.size for layer in layers)
+        return layers, {
+            "architecture": arch, "os": os_name,
+            "config": {
+                "User": "1000", "Entrypoint": ["python"],
+                "Labels": {SOURCE: "https://example.test/repo", VERSION: "1"},
+            },
+            "rootfs": {"type": "layers", "diff_ids": diff_ids},
+        }
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", base)
+    args = [
+        "build", "--config", str(config), "--platform", "linux/amd64,linux/arm64",
+        "--validate", "--push",
+    ]
+    assert _run(monkeypatch, args) == 0
+    out = capsys.readouterr().out
+    assert f"Contributions: base {base_sizes['amd64']} bytes" in out
+    assert f"Contributions: base {base_sizes['arm64']} bytes" in out
+    assert len(pushes) == 1
+
+    pushes.clear()
+    assert _run(monkeypatch, [*args, "--max-layer-size-mb", "0.015"]) == 1
+    out = capsys.readouterr().out
+    assert f"Contributions: base {base_sizes['amd64']} bytes" in out
+    assert f"Contributions: base {base_sizes['arm64']} bytes" in out
+    assert "PCB007" in out
+    assert not pushes
+
+
+def test_build_toml_threshold_blocks_push(tmp_path, monkeypatch, capsys):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    with config.open("a") as stream:
+        stream.write("\n[build.validate]\nmax_image_size_mb = 0.000001\n")
+    assert _run(monkeypatch, ["build", "--config", str(config), "--validate", "--push"]) == 1
+    assert not pushes
+    assert "PCB006" in capsys.readouterr().out
+    assert _run(monkeypatch, [
+        "build", "--config", str(config), "--validate", "--push", "--max-image-size-mb", "100",
+    ]) == 0
+    assert len(pushes) == 1
+
+
+@pytest.mark.parametrize(("name", "rule"), [
+    ("max_image_size_mb", "PCB006"), ("max_layer_size_mb", "PCB007"),
+])
+def test_build_preserves_exact_toml_thresholds(tmp_path, monkeypatch, capsys, name, rule):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    args = ["build", "--config", str(config), "--validate", "--push"]
+    assert _run(monkeypatch, args) == 0
+    size = image_validation.validate_image(tmp_path / "output")["size"]
+    actual = size["image_bytes"] if name == "max_image_size_mb" else size["largest_layer"]["bytes"]
+    threshold = _precise_threshold(actual, -1)
+    with config.open("a") as stream:
+        stream.write(f"\n[build.validate]\n{name} = {threshold:f}\n")
+    pushes.clear()
+    capsys.readouterr()
+    assert _run(monkeypatch, ["validate", "config", str(config)]) == 0
+    assert _run(monkeypatch, args) == 1
+    assert not pushes and rule in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--max-image-size-mb", "1"],
+        ["--max-layer-size-mb", "1"],
+        ["--validate", "--max-layer-size-mb", "0"],
+    ],
+)
+def test_build_threshold_usage_errors_precede_building(tmp_path, monkeypatch, capsys, args):
+    config, _ = _build_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "ImageBuilder", lambda *_: pytest.fail("must reject before building"))
+    assert _run(monkeypatch, ["build", "--config", str(config), *args]) == 2
+    assert "usage:" in capsys.readouterr().err.lower()
 
 def _port_findings(tmp_path, monkeypatch, capsys, config, *options):
     descriptor, _, _ = _image(tmp_path, config=config)
@@ -1483,13 +2071,121 @@ def test_port_findings_redact_configured_values_before_encoding(
     assert not captured.err
     if format_ == "json":
         report = json.loads(captured.out)
-        assert set(report) == {"image", "provenance", "findings"}
+        assert set(report) == {"image", "provenance", "findings", "size"}
         finding = next(item for item in report["findings"] if item["rule_id"] == rule_id)
         assert set(finding) == {"rule_id", "severity", "message", "remediation"}
         message = finding["message"]
     else:
         message = next(line for line in captured.out.splitlines() if f": {rule_id}:" in line)
     assert json.dumps("bad-<redacted>-port") in message
+
+
+def _marker_media_type(secret):
+    return f"application/example.{secret}.tar+gzip"
+
+
+@pytest.mark.parametrize("format_", ["text", "json"])
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_size_report_redacts_configured_values_in_media_types(
+    tmp_path, monkeypatch, capsys, format_, secret
+):
+    descriptor, _, _ = _image(tmp_path, layer_type=_marker_media_type(secret))
+    _layout(tmp_path, [descriptor])
+    config = tmp_path / "settings.toml"
+    config.write_text(f'[build.build-args]\nTOKEN = {json.dumps(secret)}\n')
+    assert _validate(monkeypatch, tmp_path, "--config", str(config), "--format", format_) == 0
+    captured = capsys.readouterr()
+    assert not captured.err
+    for representation in (secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]):
+        assert representation not in captured.out
+    redacted = "application/example.<redacted>.tar+gzip"
+    if format_ == "json":
+        size = json.loads(captured.out)["size"]
+        assert size["layers"][0]["media_type"] == redacted
+        assert size["layers"][0]["compression"] == "gzip"
+        assert size["largest_layer"]["media_type"] == redacted
+    else:
+        assert f", {redacted})" in captured.out
+
+
+def test_size_report_api_redacts_media_types_and_keeps_raw_without_redactor(tmp_path):
+    media_type = _marker_media_type("synthetic-media-redaction-marker")
+    descriptor, _, _ = _image(tmp_path, layer_type=media_type)
+    _layout(tmp_path, [descriptor])
+    redacted = image_validation.validate_image(
+        tmp_path, redact=lambda text: text.replace("synthetic-media-redaction-marker", "<redacted>"),
+    )["size"]
+    assert redacted["layers"][0]["media_type"] == "application/example.<redacted>.tar+gzip"
+    assert redacted["largest_layer"]["media_type"] == "application/example.<redacted>.tar+gzip"
+    assert redacted["layers"][0]["compression"] == "gzip"
+    raw = image_validation.validate_image(tmp_path)["size"]
+    assert raw["layers"][0]["media_type"] == media_type
+    assert raw["largest_layer"]["media_type"] == media_type
+
+
+@pytest.mark.parametrize("control", ["\x1b[2J", "\x07", "\x9b", "\u202e", "\n"])
+def test_size_text_escapes_terminal_control_characters(tmp_path, monkeypatch, capsys, control):
+    media_type = f"application/example{control}.tar+gzip"
+    descriptor, _, _ = _image(tmp_path, layer_type=media_type)
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path) == 0
+    out = capsys.readouterr().out
+    assert media_type not in out and control not in out.replace("\n", "")
+    assert json.dumps(media_type)[1:-1] in out
+    assert _validate(monkeypatch, tmp_path, "--format", "json") == 0
+    size = _report(capsys)["size"]
+    assert size["layers"][0]["media_type"] == media_type
+    assert size["layers"][0]["compression"] == "gzip"
+
+
+def test_size_text_keeps_standard_media_types_unescaped(tmp_path, monkeypatch, capsys):
+    descriptor, _, _ = _image(tmp_path, layer_type=GZIP_LAYER)
+    _layout(tmp_path, [descriptor])
+    assert _validate(monkeypatch, tmp_path) == 0
+    assert f", {GZIP_LAYER})." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("secret", PORT_REDACTION_VALUES)
+def test_build_size_report_redacts_live_argument_values(tmp_path, monkeypatch, capsys, secret):
+    config, pushes = _build_fixture(tmp_path, monkeypatch)
+    media_type = _marker_media_type(secret)
+    data = b"b" * (256 * 1024)
+    original = builder.ImageBuilder._pull_base_image
+
+    def pull(self, layers_dir, os_name, arch):
+        _, base = original(self, layers_dir, os_name, arch)
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        path = layers_dir / digest.split(":", 1)[1]
+        path.write_bytes(data)
+        base["rootfs"]["diff_ids"] = ["sha256:" + "1" * 64]
+        return [builder.OCILayer(media_type, digest, len(data), str(path))], base
+
+    monkeypatch.setattr(builder.ImageBuilder, "_pull_base_image", pull)
+    with config.open("a") as stream:
+        stream.write('\n[build.build-args]\nTOKEN = "declared-default"\n')
+    assert _run(
+        monkeypatch,
+        ["build", "--config", str(config), "--build-arg", f"TOKEN={secret}", "--validate", "--push"],
+    ) == 0
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert secret not in captured.out and json.dumps(secret)[1:-1] not in captured.out
+    assert f"{len(data)} bytes" in captured.out
+    assert "application/example.<redacted>.tar+gzip" in captured.out
+    assert len(pushes) == 1
+
+
+def test_validate_image_keeps_prior_positional_parameters(tmp_path):
+    key = "bad-secret-port"
+    descriptor, _, _ = _image(tmp_path, config={"ExposedPorts": {}})
+    _layout(tmp_path, [descriptor])
+    report = image_validation.validate_image(
+        tmp_path, None, None, (), [key], lambda text: text.replace("secret", "<redacted>")
+    )
+    findings = {item["rule_id"]: item["message"] for item in report["findings"]}
+    assert "PCB013" in findings
+    assert "bad-<redacted>-port" in findings["PCB013"]
+    assert report["size"]["thresholds"] == {"max_image_size_mb": None, "max_layer_size_mb": None}
 
 
 def test_non_object_exposed_ports_is_a_config_error(tmp_path, monkeypatch, capsys):

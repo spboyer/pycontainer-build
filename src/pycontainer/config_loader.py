@@ -2,6 +2,7 @@
 import types
 import tomllib
 from dataclasses import fields
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin, get_type_hints
 from .config import BuildConfig, canonical_registry
@@ -41,13 +42,27 @@ def _declared_default_values(config: Dict[str, Any]) -> List[str]:
     return values
 
 
+class _TomlFloatLiteral(str):
+    """Keep numeric TOML tokens distinct from strings until their field is known."""
+
+
+def _restore_toml_floats(value):
+    if isinstance(value, _TomlFloatLiteral):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _restore_toml_floats(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_toml_floats(item) for item in value]
+    return value
+
+
 def _load_config_table(path: Path, required: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Return the label and contents of the single configuration table in path."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
     with open(path, 'rb') as f:
-        data=tomllib.load(f)
+        data=tomllib.load(f, parse_float=_TomlFloatLiteral)
 
     found = []
     if 'build' in data:
@@ -73,7 +88,20 @@ def _load_config_table(path: Path, required: bool = False) -> Tuple[str, Dict[st
             f"Config file {path} defines neither [build] nor [tool.pycontainer]; "
             "add one of these tables (check the table name for typos)."
         )
-    return found[0] if found else (BUILD_TABLE, {})
+    table, raw = found[0] if found else (BUILD_TABLE, {})
+    config = _restore_toml_floats(raw)
+    from .image_validation import SIZE_THRESHOLDS
+    for key, value in raw.items():
+        if key.replace('-', '_') == "validate" and isinstance(value, dict):
+            for name in SIZE_THRESHOLDS:
+                if isinstance(value.get(name), _TomlFloatLiteral):
+                    try:
+                        config[key][name] = Decimal(value[name])
+                    except InvalidOperation:
+                        raise ValueError(
+                            f"{table[:-1]}.validate].{name} has an unsupported decimal exponent."
+                        ) from None
+    return table, config
 
 
 def load_config_file(path: Path) -> Dict[str, Any]:
@@ -154,17 +182,22 @@ def _validate_config(config: Dict[str, Any], table: str = BUILD_TABLE) -> None:
             nested_table = f"{table[:-1]}.validate]"
             if not isinstance(value, dict):
                 raise ValueError(f"Invalid value for {nested_table}: expected a table.")
-            unknown = sorted(set(value) - {"ignore"})
+            from .image_validation import SIZE_THRESHOLDS, parse_size_threshold, validate_ignores
+            unknown = sorted(set(value) - {"ignore", *SIZE_THRESHOLDS})
             if unknown:
                 raise ValueError(f"Unknown {nested_table} setting(s): {', '.join(unknown)}.")
             ignores = value.get("ignore", [])
             if not isinstance(ignores, list) or any(not isinstance(item, str) for item in ignores):
                 raise ValueError(f"Invalid value for {nested_table}.ignore: expected list[str].")
-            from .image_validation import validate_ignores
             try:
                 validate_ignores(ignores)
             except ValueError as exc:
                 raise ValueError(f"{nested_table}.ignore: {exc}") from None
+            for name in SIZE_THRESHOLDS:
+                if name in value and isinstance(value[name], str):
+                    raise ValueError(f"Invalid value for {nested_table}.{name}: expected a number.")
+                if name in value:
+                    parse_size_threshold(value[name], f"{nested_table}.{name}")
             continue
         expected_type = type_hints[key]
         if not _matches_type(value, expected_type):

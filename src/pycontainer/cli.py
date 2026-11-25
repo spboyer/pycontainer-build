@@ -9,7 +9,9 @@ from .history import BuildHistory, HistoryStorageError
 from .build_args import redact_values, resolve_arguments
 from .effective_config import ConfigValidationError, NOT_PERFORMED, resolve_build_config
 from .fs_utils import output_directory_lock
-from .image_validation import finding_exit_code, validate_ignores, validate_image
+from .image_validation import (
+    MIB, SIZE_THRESHOLDS, finding_exit_code, parse_size_threshold, validate_ignores, validate_image,
+)
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL, ReleaseNotesError
 from .devloop import (
     DevLoopError,
@@ -37,16 +39,61 @@ def _metadata_argument(value: str) -> tuple[str, str]:
         raise argparse.ArgumentTypeError("expected KEY=VALUE with a non-empty key")
     return key, item
 
-def _image_validation(output, tag, platform, ignores, format_, fail_on, expected_digest=None,
-                      redact=str, base_exposed_ports=None):
+def _add_size_threshold_arguments(parser, suffix=""):
+    for name in SIZE_THRESHOLDS:
+        subject = "total stored image" if name == "max_image_size_mb" else "largest stored layer"
+        parser.add_argument(
+            "--" + name.replace("_", "-"), metavar="MIB",
+            help=f"Warn when the {subject} size exceeds MIB mebibytes{suffix}",
+        )
+
+def _size_thresholds(parser, args, file_validate):
+    """Merge TOML thresholds with CLI values; a CLI value wins only when supplied."""
+    thresholds = {name: file_validate.get(name) for name in SIZE_THRESHOLDS}
+    for name in SIZE_THRESHOLDS:
+        value = getattr(args, name, None)
+        if value is not None:
+            try:
+                thresholds[name] = parse_size_threshold(value, "--" + name.replace("_", "-"))
+            except ValueError as exc:
+                parser.error(str(exc))
+    return thresholds
+
+def _mib(size):
+    return f"{size} bytes ({size / MIB:.2f} MiB)"
+
+def _terminal_text(value):
+    """Escape untrusted text containing control or other non-printable characters."""
+    return value if value.isprintable() else json.dumps(value, ensure_ascii=True)[1:-1]
+
+def _print_size(size):
+    largest = size["largest_layer"]
+    layers = "no layers" if largest is None else (
+        f"largest layer {_mib(largest['bytes'])}, {_terminal_text(largest['media_type'])}"
+    )
+    print(f"Stored image size: {_mib(size['image_bytes'])} "
+          f"(config and {len(size['layers'])} layer descriptor(s); {layers}).")
+    contributions = size["contributions"]
+    if contributions["status"] == "determined":
+        print(f"Contributions: base {_mib(contributions['base_bytes'])}; application/dependency "
+              f"{_mib(contributions['application_bytes'])}; config {_mib(size['config_bytes'])}.")
+    else:
+        print("Contributions: base versus application/dependency unknown (the layout does not "
+              f"record layer origin); config {_mib(size['config_bytes'])}.")
+    print(f"Note: {size['note']}")
+
+def _image_validation(
+    output, tag, platform, ignores, format_, fail_on, expected_digest=None,
+    thresholds=None, base_layer_count=None, redact=str, base_exposed_ports=None,
+):
     try:
-        report=validate_image(output, tag=tag, platform=platform, ignores=ignores,
-                              base_exposed_ports=base_exposed_ports, redact=redact)
+        report=validate_image(
+            output, tag=tag, platform=platform, ignores=ignores, thresholds=thresholds,
+            expected_digest=expected_digest, base_layer_count=base_layer_count,
+            base_exposed_ports=base_exposed_ports, redact=redact,
+        )
     except (OSError, ValueError) as exc:
         print(f"error: {redact(str(exc))}", file=sys.stderr)
-        return 2
-    if expected_digest is not None and report["image"]["digest"] != expected_digest:
-        print("error: the built image no longer matches the selected layout manifest.", file=sys.stderr)
         return 2
     if format_ == "json":
         print(json.dumps(report, sort_keys=True))
@@ -56,6 +103,7 @@ def _image_validation(output, tag, platform, ignores, format_, fail_on, expected
             print(f"  remediation: {finding['remediation']}")
         if not report["findings"]:
             print("No image validation findings.")
+        _print_size(report["size"])
         print("Base image provenance: unknown (PCB002 is deferred).")
     return finding_exit_code(report, fail_on)
 
@@ -69,13 +117,15 @@ def _validate_image_command(parser, args):
         if getattr(args, option) == "":
             parser.error(f"--{option} must not be empty.")
     ignores=list(args.ignore or [])
+    file_validate={}
     redact=str
     if args.config is not None:
         try:
             table, config=load_explicit_file_config(Path(args.config))
             redact=_declared_argument_redactor(config.get("build_args"))
             _validate_config(config, table)
-            ignores=[*config.get("validate", {}).get("ignore", []), *ignores]
+            file_validate=config.get("validate", {})
+            ignores=[*file_validate.get("ignore", []), *ignores]
         except (OSError, ValueError) as exc:
             print(f"error: {redact(str(exc))}", file=sys.stderr)
             raise SystemExit(2)
@@ -83,7 +133,11 @@ def _validate_image_command(parser, args):
         validate_ignores(ignores)
     except ValueError as exc:
         parser.error(redact(str(exc)))
-    code=_image_validation(Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on, redact=redact)
+    thresholds=_size_thresholds(parser, args, file_validate)
+    code=_image_validation(
+        Path(args.output), args.tag, args.platform, ignores, args.format, args.fail_on,
+        thresholds=thresholds, redact=redact,
+    )
     if code:
         raise SystemExit(code)
 
@@ -220,6 +274,7 @@ def main():
     _add_build_options(b)
     b.add_argument("--validate",action="store_true",help="Validate the image after building and before pushing")
     b.add_argument("--ignore",action="append",metavar="RULE",help="Ignore an image validation rule (requires --validate; repeatable)")
+    _add_size_threshold_arguments(b, " (requires --validate)")
     # --- validate subcommand ---
     val=sub.add_parser("validate",help="Validate configuration or an OCI image offline")
     val_sub=val.add_subparsers(dest="validate_cmd",metavar="{config,image}",required=True)
@@ -246,6 +301,7 @@ def main():
     vi.add_argument("--fail-on",choices=("warning","error"),default="warning",help="Minimum failing severity (default: warning)")
     vi.add_argument("--config","-c",help="Read validation ignores from a configuration file")
     vi.add_argument("--ignore",action="append",metavar="RULE",help="Ignore a rule ID (repeatable; extends config ignores)")
+    _add_size_threshold_arguments(vi, " (overrides the config value)")
     # --- end validate subcommand ---
     sk=sub.add_parser("skaffold-build",help="Build and push for a Skaffold custom buildCommand (reads IMAGE, BUILD_CONTEXT, PUSH_IMAGE, PLATFORMS)")
     _add_build_options(sk,tagging=False,context=False,push=False,platform=False)
@@ -353,6 +409,10 @@ def main():
 
     if args.cmd=="build" and args.ignore and not args.validate:
         b.error("--ignore requires --validate.")
+    if args.cmd=="build":
+        for name in SIZE_THRESHOLDS:
+            if getattr(args, name) is not None and not args.validate:
+                b.error(f"--{name.replace('_', '-')} requires --validate.")
     if args.cmd=="generate":
         from .deployment import generate_compose, generate_kubernetes
         try:
@@ -498,6 +558,7 @@ def main():
         validate_ignores(ignores)
     except ValueError as exc:
         b.error(cfg.redact(str(exc)))
+    thresholds=_size_thresholds(b, args, cfg.validate)
     if devloop:
         try:
             source="--platform" if args.cmd=="tilt-build" and args.platform is not None else "platform"
@@ -544,6 +605,8 @@ def main():
                         Path(builder.config.output_dir),
                         "@" + builder.manifest_digest if multi else builder.config.tag,
                         platform, ignores, "text", "warning", expected_digest=image.manifest_digest,
+                        thresholds=thresholds,
+                        base_layer_count=len(image.layers) - image.app_layer_count,
                         redact=cfg.redact, base_exposed_ports=image.base_exposed_ports,
                     )
                     if code:

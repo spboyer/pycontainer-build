@@ -9,6 +9,7 @@ pycontainer validate image
 pycontainer validate image --output dist/image --tag myapp:latest --format json
 pycontainer validate image --tag myapp:latest --platform linux/arm64 --fail-on error
 pycontainer validate image --config pycontainer.toml --ignore PCB004
+pycontainer validate image --max-image-size-mb 500 --max-layer-size-mb 200
 pycontainer build --config pycontainer.toml --validate --push
 ```
 
@@ -31,6 +32,8 @@ their reachable contents are still verified.
 | PCB003 | error | Neither `Entrypoint` nor `Cmd` is set, leaving no default process. Set at least one. |
 | PCB004 | warning | Missing or empty `org.opencontainers.image.source` or `org.opencontainers.image.version` labels hinder traceability. Set both labels. |
 | PCB005 | error | A non-empty environment variable whose name contains `PASSWORD`, `TOKEN`, or `SECRET` (case-insensitive) persists a likely secret in the image. Supply secrets at runtime instead. |
+| PCB006 | warning | The stored image size exceeds `max_image_size_mb`. Reduce the base image or layer contents, or raise the threshold. Evaluated only when the threshold is set. |
+| PCB007 | warning | The largest stored layer exceeds `max_layer_size_mb`. Slim that layer or choose a smaller base image, or raise the threshold. Evaluated only when the threshold is set. |
 | PCB008 | error | An `ExposedPorts` key is not `<1-65535>[/tcp\|udp\|sctp]`, or two keys normalize to the same port and protocol. Fix the image port metadata. |
 | PCB009 | warning | A recognized server's TCP listener ports differ from the exposed TCP ports, in either direction. Align the command and `exposed-ports`. |
 | PCB010 | info | Ports are exposed but the listener cannot be determined: the server has no explicit port, uses a socket or file descriptor, is shell-wrapped, or the command is not recognized. The listener check is skipped rather than guessed. |
@@ -38,7 +41,7 @@ their reachable contents are still verified.
 | PCB012 | info | UDP or SCTP ports are present. They are preserved unchanged and excluded from the listener check. |
 | PCB013 | info | Base-image ports were dropped because configured `exposed-ports` replace `ExposedPorts`. Reported only by `build --validate`. |
 
-PCB006 and PCB007 are reserved for image-size rules. `info` findings are
+`info` findings are
 reported but never affect the exit code, whatever `--fail-on` threshold is
 used.
 
@@ -56,6 +59,8 @@ supported:
 ```toml
 [build.validate]
 ignore = ["PCB001", "PCB004"]
+max_image_size_mb = 500     # optional; total stored image size
+max_layer_size_mb = 200     # optional; largest single stored layer
 ```
 
 Repeat `--ignore RULE` to add CLI suppressions to the TOML list. Unknown IDs,
@@ -68,6 +73,21 @@ Port findings redact raw keys before JSON escaping and truncation in both text
 and JSON output; `build --validate` uses the resolved argument values.
 Both commands also redact declared defaults from key-normalization collisions
 (for example `my-key` and `my_key`), which are reported before other checks.
+
+`--max-image-size-mb` and `--max-layer-size-mb` (on `validate image`, and on
+`build` together with `--validate`) override the matching TOML key only when
+supplied; otherwise the TOML value, if any, applies. Thresholds are positive,
+finite decimal numbers of MiB (1 MiB = 1,048,576 bytes). CLI literals and TOML
+numbers retain their decimal precision and are compared exactly without
+binary rounding, so `0.1` means 104,857.6 bytes. A size equal to the threshold
+passes; only a larger size warns. Values may have at most 1,000 coefficient
+digits (including trailing zeros) and an adjusted decimal exponent from
+-1,000 through 1,000 (the exponent of the leading significant digit).
+For example, `1e-400` is supported, while `1e5000` is rejected.
+Zero, negative, non-finite, boolean or non-numeric values (including TOML
+strings), and values outside these precision/magnitude limits, are
+configuration or usage errors with exit 2. Without a threshold, no size
+finding is produced. The TOML keys use underscores only.
 
 `--fail-on warning` is the default; `--fail-on error` still reports warnings,
 but does not fail solely because of them. `build --validate` always fails on
@@ -84,10 +104,72 @@ image index. When combined with `--scan`, both gates must pass.
 | 2 | Usage, configuration, layout or integrity error |
 
 JSON output contains `image` (selected `digest` and `platform`),
-`provenance.status`, and a `findings` array. Each finding has `rule_id`,
-`severity`, `message` and `remediation`. Usage and validation errors are
+`provenance.status`, a `findings` array and a `size` object. Each finding has
+`rule_id`, `severity`, `message` and `remediation`. Usage and validation errors are
 written to stderr with exit 2 and no JSON report on stdout.
 
+## Stored size report
+
+Every successful validation reports sizes for the selected image, whether or
+not a threshold is set. They come from descriptors whose digests and sizes
+were already verified against the blobs on disk; a descriptor that disagrees
+with its blob is an integrity error (exit 2), never a size finding, and
+ignoring PCB006 or PCB007 does not suppress it.
+
+- `image_bytes`: the config descriptor size plus the sum of every layer
+  descriptor in the manifest. A layer listed twice counts twice; the manifest
+  itself is excluded.
+- `largest_layer`: the largest layer descriptor (`digest`, `bytes`,
+  `media_type`), or `null` for an image without layers.
+- `layers`: each layer's `digest`, `bytes`, `media_type`, `compression`
+  (`gzip`, `zstd`, `none` for plain tar, or `unknown`, derived from the media
+  type) and `role`. Layer media types are not restricted, so reported
+  `media_type` values (here and in `largest_layer`) redact declared
+  build-argument values in text and JSON, as port findings do; `compression`
+  is derived from the original media type. Text output escapes media types
+  containing control or other non-printable characters as JSON string
+  escapes; JSON output relies on standard JSON escaping.
+- `contributions`: base versus application/dependency bytes, plus
+  `config_bytes` separately.
+- `thresholds`: each configured value is an **exact decimal string**, using
+  Python's `str(Decimal)` notation (for example `"1"`, `"1.0"` or `"1E-400"`),
+  or `null` when unset. JSON numeric floats are not used for thresholds:
+  consumers should parse these strings as decimals, not binary floats.
+  Text finding messages use the same exact decimal notation.
+- `note`: the stored-size accounting caveat.
+
+`BuildConfig.validate` also stores loaded decimal thresholds as exact strings,
+so `json.dumps(dataclasses.asdict(config))` needs no custom decimal encoder.
+Restore the JSON object's constructor fields into `BuildConfig` (omit fields
+whose dataclass `init` is false); threshold parsing preserves their exact value.
+This internal snapshot representation does not change the TOML contract:
+thresholds in TOML must be numbers, never quoted strings.
+
+The `validate_image(..., thresholds=...)` API accepts `None` or a mapping with
+string keys naming the supported thresholds. Empty mappings and known keys with
+`None` values leave thresholds unset. Non-mapping inputs, non-string keys and
+unknown names raise `ValueError`, including when their values are `None`.
+Its `redact` callable is applied to unknown threshold names in diagnostics
+before bounded, escaped key formatting, and to reported layer media types;
+the default leaves values unredacted. `base_layer_count` requires `expected_digest` and
+must be an `int` (not `bool`, float or string) from 0 through the number of
+layers in the selected manifest; anything else raises `ValueError`.
+
+These are **stored blob sizes**. Base layers pulled from a registry usually
+keep their compressed media types, so they count compressed bytes, while
+pycontainer writes dependency and application layers as uncompressed tar, so
+they count their full size. Network transfer, registry deduplication and
+cache reuse may differ from these numbers.
+
+An OCI layout does not record which layers came from the base image, and media
+types or labels are not proof. `validate image` therefore reports the
+contribution `status` as `unknown`, each layer's `role` as `unknown`, and the
+base and application byte counts as `null`. `build --validate` knows how many
+base layers it placed first in the manifest it just wrote; after confirming
+the layout still holds that exact manifest digest, it reports `status:
+determined`, `base` and `application` roles, and both byte totals. Text output
+prints the same summary and note. Multi-platform builds report and check sizes
+separately for each platform's manifest.
 ## Port rules
 
 Configured `exposed-ports` must be distinct integers from 1 to 65535.
