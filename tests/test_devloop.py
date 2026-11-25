@@ -41,6 +41,7 @@ from pycontainer.devloop import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = REPO_ROOT / "examples"
 SUBPROCESS_TIMEOUT_SECONDS = 120
+SERVER_POLL_INTERVAL_SECONDS = 0.01
 DIGEST = "sha256:" + "a" * 64
 
 SITECUSTOMIZE = textwrap.dedent(
@@ -114,7 +115,11 @@ class FakeRegistry:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.host = f"127.0.0.1:{self.server.server_port}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": SERVER_POLL_INTERVAL_SECONDS},
+            daemon=True,
+        )
 
     def __enter__(self):
         self.thread.start()

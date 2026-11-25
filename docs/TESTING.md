@@ -27,6 +27,9 @@ uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_i
 ```
 
 The pull-request workflow checks Linux and Windows on Python 3.11 and 3.15.
+New pull-request runs cancel older runs for the same PR; main pushes and manual
+runs remain independent. Test logs include the 20 slowest test phases to help
+identify future savings without dropping coverage.
 `uv run --locked --group build python scripts/smoke_distributions.py` builds
 wheel and sdist packages using the pinned build backend, installs each in a
 fresh virtual environment, and checks the installed CLI without installing

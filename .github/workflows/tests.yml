@@ -21,11 +21,16 @@ on:
 permissions:
   contents: read
 
+# Superseded PR runs no longer consume runners; pushes and manual runs remain
+# independent so their benchmark and explicitly requested evidence are retained.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    # Grouped dependency staging adds substantial filesystem and pip work on Windows.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 10 }}
     strategy:
       fail-fast: false
@@ -45,7 +50,7 @@ jobs:
       - name: Run hermetic tests
         env:
           PYTHONPATH: src
-        run: uv run --locked --group test python -m pytest tests -q -m "not registry_integration and not scanner_integration"
+        run: uv run --locked --group test python -m pytest tests -q --durations=20 -m "not registry_integration and not scanner_integration"
       - name: Install optional pre-commit test tooling
         run: uv pip install -r tests/pre-commit-requirements.txt
       - name: Run hermetic pre-commit hook tests

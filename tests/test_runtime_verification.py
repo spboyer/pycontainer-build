@@ -16,6 +16,12 @@ RUN_ID = "12345"
 RUN_ATTEMPT = "2"
 
 
+def test_ci_concurrency_cancels_only_superseded_pull_request_runs():
+    workflow = (WORKFLOWS / "tests.yml").read_text()
+    assert "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}" in workflow
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
+
+
 def load_script(name):
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
@@ -641,6 +647,19 @@ def test_pull_request_ci_runs_the_real_runtime_check():
 
     assert "uses: ./.github/workflows/runtime-check.yml" in job
     assert "check-index: true" in job
+
+
+def test_pull_request_ci_keeps_bounded_windows_headroom_and_matrix():
+    job = job_block("tests.yml", "tests")
+
+    assert "timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 10 }}" in job
+    assert "fail-fast: false" in job
+    assert "continue-on-error" not in job
+    assert "os: [ubuntu-latest, windows-latest]" in job
+    assert 'python-version: ["3.11", "3.15"]' in job
+    assert "pytest tests -q" in job
+    assert '-m "not registry_integration and not scanner_integration"' in job
+    assert "pytest tests/test_pre_commit_hook.py -q" in job
 
 
 def test_windows_squash_build_uses_utf8_output():

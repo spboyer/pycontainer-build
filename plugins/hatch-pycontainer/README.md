@@ -390,7 +390,7 @@ MIT License - See LICENSE file for details
 
 ## Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
+Contributions welcome! Please see [contributor guidance](../../AGENTS.md) for guidelines.
 
 ## Related Projects
 

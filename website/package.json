@@ -1,0 +1,29 @@
+{
+  "name": "pycontainer-website",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "prepare:docs": "node scripts/prepare-docs.mjs",
+    "dev": "npm run prepare:docs && astro dev",
+    "check": "npm run prepare:docs && astro check",
+    "build": "npm run prepare:docs && astro build && node scripts/check-site.mjs",
+    "preview": "astro preview",
+    "test": "node --test scripts/*.test.mjs"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.12",
+    "@astrojs/markdown-remark": "7.3.9",
+    "@astrojs/starlight": "0.43.1",
+    "astro": "7.4.12",
+    "github-slugger": "2.0.0",
+    "hast-util-from-html": "2.0.3",
+    "mdast-util-to-string": "4.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-stringify": "11.0.0",
+    "typescript": "6.0.3",
+    "unified": "11.0.5",
+    "unist-util-visit": "5.1.0"
+  }
+}
