@@ -115,6 +115,36 @@ pycontainer build \
 # 4. Combine everything into a complete image
 ```
 
+### Grouping Locked Dependencies
+
+The single dependency layer is the default. To opt in for a target-selected
+`uv.lock`, assign distribution names explicitly:
+
+```bash
+pycontainer build --tag myapp:latest --include-deps \
+  --dependency-layer-strategy explicit \
+  --stable-dependency numpy --frequent-dependency my-package
+```
+
+Alternatively, use `--dependency-layer-strategy history` with an optional
+`--dependency-history-ref REF`. The build reports the resolved commit and
+classification evidence. Explicit `--stable-dependency` and
+`--frequent-dependency` options override history; otherwise, absent or changed
+target versions are frequent. Each historical lock graph is evaluated with the
+target's markers and selected dependency extras; an unsupported or ambiguous
+target graph fails explicitly. History requires Git, a tracked clean lock, a
+complete non-shallow/non-partial repository, and at least two distinct lock
+snapshots. Ungrouped or shared transitives are frequent in explicit mode.
+
+Only `uv.lock` is supported for grouping. Requirements, virtualenvs and other
+lock formats fail explicitly; they remain available with the default single
+layer. A complete group-cache hit avoids pip and package-index requests. A
+changed lock stages and verifies the full selection again; an unchanged group
+can reuse its cached layer when the full manifest roots are unchanged.
+`--strip-type-stubs` removes typing-only files before grouping, and `--squash`
+can flatten the resulting layers. See the [README](../README.md) for TOML
+settings and ownership limitations.
+
 ### Conda Projects
 
 Conda staging is unsupported. Detection checks names only: `environment.yml`,
@@ -713,6 +743,29 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 ```
+
+---
+
+## Measuring Grouped Builds
+
+The synthetic benchmark uses local hashed wheels, a loopback package index and
+a loopback registry. Run it from the repository root:
+
+```powershell
+python benchmarks\run_build_benchmarks.py --grouped-only --repetitions 3 --files 1000 --file-bytes 1024 --output grouped-benchmark.json
+```
+
+Each cold sample starts with empty local and registry caches. Warm, app-change
+and frequent-dependency-change samples each start from a copy of the same
+baseline cache and registry blobs. The JSON includes layer digests and sizes,
+cache hits, installer and package-index requests, registry HEAD/PUT counts,
+received blob bytes, build and layer-upload times, process peak RSS and Python
+`tracemalloc` peak. The operating-system page cache is not controlled; the RSS
+measurement is taken after the build, before registry push, and excludes pip
+child processes. Upload measurements exclude config, manifest and protocol
+bytes. The base image is synthetic: no external registry transfer or container
+startup is measured. These observations are not end-to-end performance
+claims or timing gates.
 
 ---
 

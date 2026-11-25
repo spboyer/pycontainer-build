@@ -193,13 +193,14 @@ def dependency_cache_key(
     lock_roots: Optional[Sequence[str]] = None,
     lock_verifier: Optional[str] = None,
     ambient_reader: Optional[AmbientReader] = None,
+    environment_snapshot: Optional[Mapping[str, str]] = None,
 ) -> DependencyCacheKey:
     """Return the cache key for a provably reusable dependency layer or raise ``DependencyCacheMiss``."""
     if source_kind == "venv":
         raise DependencyCacheMiss("virtualenv dependencies are not provably hash-pinned")
     if not reproducible:
         raise DependencyCacheMiss("non-reproducible builds embed file timestamps")
-    environment = dict(os.environ)
+    environment = dict(os.environ if environment_snapshot is None else environment_snapshot)
     if any(
         name.upper().startswith("PYTHON")
         and name.upper() not in _PYTHON_IMAGE_METADATA
