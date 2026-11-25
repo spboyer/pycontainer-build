@@ -1,7 +1,7 @@
 import argparse, json, os, logging, sys
 from contextlib import ExitStack
 from pathlib import Path
-from .config import SBOM_FORMATS, SCAN_SEVERITIES
+from .config import SBOM_FORMATS, SCAN_SEVERITIES, SIGNING_PROVIDERS, NOTATION_SIGNATURE_FORMATS
 from .config_loader import _declared_default_values, _validate_config, load_explicit_file_config
 from .builder import ImageBuilder
 from .config_loader import load_config_file, merge_configs
@@ -148,6 +148,17 @@ def _add_build_options(b,*,tagging=True,context=True,push=True,platform=True,val
     if push:
         b.add_argument("--push",action="store_true",help="Push image to registry after build")
         b.add_argument("--registry",help="Override registry from tag (e.g., ghcr.io/user/repo:v1)")
+        b.add_argument("--sign",action=argparse.BooleanOptionalAction,default=None,help="Sign the registry-published image before moving tags (requires --push)")
+        b.add_argument("--sign-provider",choices=SIGNING_PROVIDERS,help="Signing provider: cosign or notation")
+        b.add_argument("--sign-key",help="Cosign key reference or configured Notation key name")
+        b.add_argument("--sign-plugin",help="Notation signing plugin name")
+        b.add_argument("--sign-key-id",help="Notation plugin key identifier")
+        b.add_argument("--sign-timestamp-url",help="Notation timestamp authority URL (without credentials)")
+        b.add_argument("--sign-timestamp-root-cert",help="Notation timestamp authority root certificate path")
+        b.add_argument("--sign-signature-format",choices=NOTATION_SIGNATURE_FORMATS,help="Notation signature envelope format")
+        b.add_argument("--sign-verify-key",help="Cosign public key reference used to verify a key-signed image before tagging")
+        b.add_argument("--sign-certificate-identity",help="Expected Cosign keyless certificate identity, verified before tagging")
+        b.add_argument("--sign-certificate-oidc-issuer",help="Expected Cosign keyless OIDC issuer, verified before tagging")
         b.add_argument("--username",help="Registry username (or use REGISTRY_USERNAME env var)")
         b.add_argument("--password",help="Registry password/token (or use env vars)")
     b.add_argument("--insecure-registry",dest="insecure_registries",action="append",metavar="HOST[:PORT]",help="Use plain HTTP for this exact registry host[:port] (repeatable; unsafe outside trusted networks)")
@@ -412,6 +423,17 @@ def main():
         'generate_sbom': args.generate_sbom,
         'system_packages': args.system_packages,
         'detect_system_packages': args.detect_system_packages,
+        'sign': getattr(args,"sign",None),
+        'sign_provider': getattr(args,"sign_provider",None),
+        'sign_key': getattr(args,"sign_key",None),
+        'sign_plugin': getattr(args,"sign_plugin",None),
+        'sign_key_id': getattr(args,"sign_key_id",None),
+        'sign_timestamp_url': getattr(args,"sign_timestamp_url",None),
+        'sign_timestamp_root_cert': getattr(args,"sign_timestamp_root_cert",None),
+        'sign_signature_format': getattr(args,"sign_signature_format",None),
+        'sign_verify_key': getattr(args,"sign_verify_key",None),
+        'sign_certificate_identity': getattr(args,"sign_certificate_identity",None),
+        'sign_certificate_oidc_issuer': getattr(args,"sign_certificate_oidc_issuer",None),
         'squash': args.squash,
         'analyze_layers': args.analyze_layers,
         'labels': dict(args.labels) if args.labels is not None else None,
@@ -489,6 +511,11 @@ def main():
         cfg,_=resolve_build_config(Path(args.config) if args.config else None,cli_overrides,args.build_arg)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+
+    if cfg.sign and not push:
+        parser.error("--sign requires --push; local-only image signing is not supported.")
+    if cfg.sign and cfg.dry_run:
+        parser.error("--sign cannot be used with --dry-run.")
 
     validate = args.cmd=="build" and args.validate
     if validate and cfg.dry_run:

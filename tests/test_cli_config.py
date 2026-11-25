@@ -419,3 +419,57 @@ def test_cli_status_output_survives_legacy_redirected_encoding(monkeypatch):
 
     stdout.flush()
     assert b"? Dependency layer created" in stdout.buffer.getvalue()
+
+
+def test_cli_signing_settings_use_toml_and_explicit_overrides(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        '[build]\nsign = true\nsign-provider = "notation"\nsign-key = "release"\n'
+    )
+    configs = []
+
+    class FakeImageBuilder:
+        def __init__(self, config):
+            configs.append(config)
+
+        def build(self):
+            return "layout"
+
+        def push(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    _run_cli(
+        monkeypatch,
+        [
+            "build", "--config", str(config_path), "--push",
+            "--sign-timestamp-url", "https://tsa.example",
+            "--sign-timestamp-root-cert", "root.pem",
+            "--sign-signature-format", "cose",
+            "--squash", "--analyze-layers",
+        ],
+    )
+    assert configs[-1].sign is True
+    assert configs[-1].sign_provider == "notation"
+    assert configs[-1].sign_key == "release"
+    assert configs[-1].sign_timestamp_url == "https://tsa.example"
+    assert configs[-1].sign_timestamp_root_cert == "root.pem"
+    assert configs[-1].sign_signature_format == "cose"
+    assert configs[-1].squash is True
+    assert configs[-1].analyze_layers is True
+
+    _run_cli(monkeypatch, ["build", "--config", str(config_path), "--no-sign"])
+    assert configs[-1].sign is False
+
+
+@pytest.mark.parametrize("extra", [[], ["--push", "--dry-run"]])
+def test_cli_rejects_local_only_or_dry_run_signing(monkeypatch, capsys, extra):
+    class FakeImageBuilder:
+        def __init__(self, config):
+            pytest.fail("invalid signing request must fail before building")
+
+    monkeypatch.setattr(cli, "ImageBuilder", FakeImageBuilder)
+    with pytest.raises(SystemExit) as error:
+        _run_cli(monkeypatch, ["build", "--sign", "--sign-provider", "cosign", *extra])
+    assert error.value.code == 2
+    assert "sign" in capsys.readouterr().err.lower()

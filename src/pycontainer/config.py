@@ -4,11 +4,14 @@ import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+from urllib.parse import unquote, urlsplit
 from .build_args import BuildArgument, EXPANDABLE_FIELDS, expand_field, redact_values, resolve_arguments
 
 from .release_notes import DEFAULT_RELEASE_NOTES_LABEL
 
 SBOM_FORMATS = ("spdx", "cyclonedx")
+SIGNING_PROVIDERS = ("cosign", "notation")
+NOTATION_SIGNATURE_FORMATS = ("jws", "cose")
 MIN_PORT, MAX_PORT = 1, 65535
 
 
@@ -25,8 +28,6 @@ def validate_exposed_ports(ports):
         if port in seen:
             raise ValueError(f"exposed port {port} is listed more than once.")
         seen.add(port)
-
-
 MULTI_PLATFORM_TARGETS = ("linux/amd64", "linux/arm64", "linux/arm/v7")
 SCAN_SEVERITIES = ("negligible", "low", "medium", "high", "critical")
 MULTI_PLATFORM_SCAN_ERROR = (
@@ -200,6 +201,17 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    sign: bool = False
+    sign_provider: Optional[str] = None
+    sign_key: Optional[str] = None
+    sign_plugin: Optional[str] = None
+    sign_key_id: Optional[str] = None
+    sign_timestamp_url: Optional[str] = None
+    sign_timestamp_root_cert: Optional[str] = None
+    sign_signature_format: Optional[str] = None
+    sign_verify_key: Optional[str] = None
+    sign_certificate_identity: Optional[str] = None
+    sign_certificate_oidc_issuer: Optional[str] = None
     validate: Dict[str, List[str]] = field(default_factory=dict)
     squash: bool = False
     analyze_layers: bool = False
@@ -244,6 +256,7 @@ class BuildConfig:
         self.validate_metadata()
         validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
+        self.validate_signing()
         if self.scan_threshold not in SCAN_SEVERITIES:
             raise ValueError("scan_threshold must be one of: " + ", ".join(SCAN_SEVERITIES))
         if self.scan_unknown not in ("fail", "ignore"):
@@ -306,6 +319,93 @@ class BuildConfig:
                 )
             if self.scan:
                 raise ValueError(MULTI_PLATFORM_SCAN_ERROR)
+
+    def validate_signing(self) -> None:
+        if not isinstance(self.sign, bool):
+            raise ValueError("sign must be a boolean.")
+        if self.sign_provider is not None and self.sign_provider not in SIGNING_PROVIDERS:
+            raise ValueError("sign_provider must be cosign or notation.")
+        if not self.sign:
+            return
+        if self.sign_provider is None:
+            raise ValueError("Signing requires an explicit sign_provider.")
+        for name in (
+            "sign_key", "sign_plugin", "sign_key_id",
+            "sign_timestamp_url", "sign_timestamp_root_cert", "sign_signature_format",
+            "sign_verify_key", "sign_certificate_identity", "sign_certificate_oidc_issuer",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or any(character in value for character in "\0\r\n")
+                or "PRIVATE KEY" in value.upper()
+            ):
+                raise ValueError(f"{name} must be a non-empty reference, not secret material.")
+            if value.lower().startswith("pkcs11:"):
+                decoded = unquote(value).lower()
+                if "pin-value=" in decoded or "pin-source=" in decoded:
+                    raise ValueError(
+                        f"{name} must not contain a PKCS#11 PIN; use COSIGN_PKCS11_PIN."
+                    )
+            if "://" in value:
+                parsed = urlsplit(value)
+                if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    raise ValueError(f"{name} must not contain credentials or URL parameters.")
+        if self.sign_provider == "cosign":
+            if any(
+                value is not None
+                for value in (
+                    self.sign_plugin, self.sign_key_id, self.sign_timestamp_url,
+                    self.sign_timestamp_root_cert, self.sign_signature_format,
+                )
+            ):
+                raise ValueError("Cosign does not use Notation plugin, timestamp, or format options.")
+            keyless_trust = (self.sign_certificate_identity, self.sign_certificate_oidc_issuer)
+            if self.sign_key is not None:
+                if self.sign_verify_key is None or any(keyless_trust):
+                    raise ValueError(
+                        "Cosign key signing requires sign_verify_key, the public key used to "
+                        "verify the signature, and no keyless certificate options."
+                    )
+            elif self.sign_verify_key is not None or not all(keyless_trust):
+                raise ValueError(
+                    "Cosign keyless signing requires sign_certificate_identity and "
+                    "sign_certificate_oidc_issuer for verification."
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.sign_verify_key, self.sign_certificate_identity,
+                self.sign_certificate_oidc_issuer,
+            )
+        ):
+            raise ValueError(
+                "Notation verification uses its trust policy; Cosign verification "
+                "options are not supported."
+            )
+        elif (
+            (self.sign_key is None) == (self.sign_plugin is None)
+            or (self.sign_plugin is None) != (self.sign_key_id is None)
+        ):
+            raise ValueError(
+                "Notation requires either a named sign_key or both sign_plugin "
+                "and sign_key_id."
+            )
+        if self.sign_timestamp_url is not None:
+            timestamp_url = urlsplit(self.sign_timestamp_url)
+            if timestamp_url.scheme not in {"http", "https"} or not timestamp_url.hostname:
+                raise ValueError("sign_timestamp_url must be an HTTP(S) URL.")
+        if self.sign_timestamp_root_cert is not None and self.sign_timestamp_url is None:
+            raise ValueError("sign_timestamp_root_cert requires sign_timestamp_url.")
+        if (
+            self.sign_signature_format is not None
+            and self.sign_signature_format not in NOTATION_SIGNATURE_FORMATS
+        ):
+            raise ValueError("sign_signature_format must be jws or cose.")
 
     def target_platforms(self) -> List[str]:
         """Return the normalized, de-duplicated target platforms in request order."""

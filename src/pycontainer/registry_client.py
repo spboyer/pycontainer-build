@@ -38,6 +38,12 @@ MAX_ERROR_BODY_BYTES = 4096
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MANIFEST_ACCEPT = (
+    "application/vnd.oci.image.manifest.v1+json,"
+    "application/vnd.docker.distribution.manifest.v2+json,"
+    "application/vnd.oci.image.index.v1+json,"
+    "application/vnd.docker.distribution.manifest.list.v2+json"
+)
 MAX_REPORTED_ERRORS = 5
 MAX_ERROR_TEXT_CHARS = 200
 LOW_RATE_LIMIT_REMAINING = 10
@@ -756,7 +762,7 @@ class RegistryClient:
             raise RegistryAuthenticationError(
                 f"Refusing registry token realm {_safe_url(realm)}: "
                 f"HTTPS registries require an HTTPS token realm. {error}"
-            ) from error
+            ) from None
         parsed = _validate_url(realm, self.insecure)
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
@@ -790,6 +796,10 @@ class RegistryClient:
                 ) as response:
                     body = response.read(MAX_ERROR_BODY_BYTES * 16 + 1)
                 break
+            except RegistryRequestError:
+                raise RegistryAuthenticationError(
+                    "Registry bearer-token redirect was rejected."
+                ) from None
             except urllib.error.HTTPError as error:
                 if _should_retry(error.code, error.headers, attempt):
                     time.sleep(_retry_delay(error.headers, attempt))
@@ -1087,14 +1097,7 @@ class RegistryClient:
             raise ValueError("Expected manifest size must be a non-negative integer.")
 
         url = f"{self.base_url}/{self.repository}/manifests/{reference}"
-        headers = {
-            "Accept": (
-                "application/vnd.oci.image.manifest.v1+json,"
-                "application/vnd.docker.distribution.manifest.v2+json,"
-                "application/vnd.oci.image.index.v1+json,"
-                "application/vnd.docker.distribution.manifest.list.v2+json"
-            )
-        }
+        headers = {"Accept": MANIFEST_ACCEPT}
         status, body, response_headers = self._make_request(
             "GET",
             url,
@@ -1267,6 +1270,32 @@ class RegistryClient:
                 "tag list; refusing to follow it."
             )
         return target
+
+    def verify_manifest_descriptor(
+        self, reference: str, expected_digest: str, expected_size: int, expected_media_type: str
+    ) -> None:
+        """Verify the manifest descriptor a signer resolves through HEAD."""
+        digest_filename(expected_digest)
+        if type(expected_size) is not int or expected_size < 0:
+            raise ValueError("Expected manifest size must be a non-negative integer.")
+        url = f"{self.base_url}/{self.repository}/manifests/{reference}"
+        status, _, headers = self._make_request("HEAD", url, headers={"Accept": MANIFEST_ACCEPT})
+        if status != 200:
+            raise RegistryRequestError(f"Manifest descriptor HEAD failed with HTTP {status}.")
+        normalized = {name.lower(): value for name, value in headers.items()}
+        try:
+            size = int(normalized.get("content-length", ""))
+        except (TypeError, ValueError):
+            size = None
+        media_type = (normalized.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if (
+            normalized.get("docker-content-digest") != expected_digest
+            or size != expected_size
+            or media_type != expected_media_type.lower()
+        ):
+            raise BlobIntegrityError(
+                "Registry manifest HEAD descriptor does not match the built digest, size, or media type."
+            )
 
     def _get_blob_opener(self):
         with self._blob_opener_lock:

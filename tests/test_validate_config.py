@@ -86,6 +86,21 @@ def test_no_path_validates_build_defaults_with_local_detection(offline, monkeypa
     assert cfg.base_image == "python:3.13-slim" and table is None
 
 
+def test_offline_validation_accepts_signing_config_but_build_requires_push(offline, monkeypatch, capsys):
+    path = _write(
+        offline / "pycontainer.toml",
+        '[build]\nsign = true\nsign-provider = "cosign"\n'
+        'sign-certificate-identity = "https://example.com/workflow"\n'
+        'sign-certificate-oidc-issuer = "https://example.com"\n',
+    )
+
+    assert _run(monkeypatch, ["validate", "config", path]) == 0
+    assert f"ok: {path} [build]" in capsys.readouterr().out
+
+    assert _run(monkeypatch, ["build", "--config", path]) == 2
+    assert "--sign requires --push" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "content",
     ['[project]\nname = "demo"\nrequires-python = 312\n', 'project = "invalid"\n'],

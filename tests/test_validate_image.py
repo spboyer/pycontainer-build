@@ -1059,6 +1059,47 @@ def test_build_validation_gates_push(tmp_path, monkeypatch, capsys, user, env, e
         assert ("PCB001" if user == "root" else "PCB005") in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("user", "port_mismatch", "expected"),
+    [("1000", False, 0), ("root", False, 1), ("1000", True, 1)],
+)
+def test_build_validation_gates_signed_push(tmp_path, monkeypatch, capsys, user, port_mismatch, expected):
+    real_push = builder.ImageBuilder.push
+    config, _ = _build_fixture(tmp_path, monkeypatch, user=user)
+    if port_mismatch:
+        with config.open("a") as stream:
+            stream.write('entrypoint = ["uvicorn", "main:app", "--port", "8000"]\nexposed-ports = [9000]\n')
+    monkeypatch.setattr(builder.ImageBuilder, "push", real_push)
+    monkeypatch.setattr(builder, "create_signer", lambda config: object())
+    monkeypatch.setattr(builder, "get_registry_auth", lambda *args, **kwargs: None)
+    monkeypatch.setattr(builder.ImageBuilder, "_registry_client", lambda *args: object())
+    events = []
+    validate = cli._image_validation
+
+    def record_validation(*args, **kwargs):
+        result = validate(*args, **kwargs)
+        events.append(("validate", result))
+        return result
+
+    monkeypatch.setattr(cli, "_image_validation", record_validation)
+    monkeypatch.setattr(
+        builder.ImageBuilder, "_push_signed_image",
+        lambda *args: events.append(("signed_push", None)),
+    )
+    args = [
+        "build", "--config", str(config), "--validate", "--push",
+        "--sign", "--sign-provider", "cosign", "--sign-key", "key",
+        "--sign-verify-key", "public-key",
+    ]
+
+    assert _run(monkeypatch, args) == expected
+    assert events == [("validate", expected)] + (
+        [("signed_push", None)] if expected == 0 else []
+    )
+    if port_mismatch:
+        assert "PCB009" in capsys.readouterr().out
+
+
 def test_build_integrity_error_prevents_push(tmp_path, monkeypatch, capsys):
     config, pushes = _build_fixture(tmp_path, monkeypatch)
     original = builder.ImageBuilder.build

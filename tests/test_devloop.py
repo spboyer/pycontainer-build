@@ -368,6 +368,23 @@ def test_tilt_push_failure_leaves_no_output_ref(project, tool_env):
 @pytest.mark.parametrize("tool", ["skaffold", "tilt"])
 def test_devloop_auth_failure_is_propagated_without_credentials(project, tool_env, tool):
     workspace = project(tool)
+    with FakeRegistry(workspace, fail_auth=True) as registry:
+        ref_file = workspace / "dist" / "tilt-image-ref.txt"
+        if tool == "skaffold":
+            result = run_skaffold(workspace, tool_env, image=f"{registry.host}/demo:x")
+        else:
+            argv = tilt_command(workspace) + [
+                "--image", f"{registry.host}/demo", "--output-ref", str(ref_file),
+            ]
+            result = run_tilt(workspace, tool_env, argv, output_ref=ref_file)
+        assert result.returncode != 0
+        assert "HTTP 401" in result.stderr
+        assert not ref_file.exists()
+
+
+@pytest.mark.parametrize("tool", ["skaffold", "tilt"])
+def test_devloop_auth_failure_with_explicit_http_loopback(project, tool_env, tool):
+    workspace = project(tool)
     env = dict(tool_env, REGISTRY_USERNAME="test-user", REGISTRY_PASSWORD="test-secret")
     with FakeRegistry(workspace, fail_auth=True) as registry:
         ref_file = workspace / "dist" / "tilt-image-ref.txt"
@@ -381,6 +398,7 @@ def test_devloop_auth_failure_is_propagated_without_credentials(project, tool_en
         assert result.returncode != 0
         assert "HTTP 401" in result.stderr
         assert "test-secret" not in result.stdout + result.stderr
+        assert registry.requests
         assert not ref_file.exists()
 
 
@@ -485,6 +503,27 @@ def test_skaffold_cli_ignores_config_tags_and_dry_run(tmp_path, monkeypatch, rec
     assert Path(builder.config.context_dir) == tmp_path
     assert builder.pushes[0][0] == "localhost:5000/a:1"
     assert builder.pushes[0][1]["username"] is None
+
+
+@pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])
+def test_devloop_preserves_opt_in_signing_from_config(tmp_path, monkeypatch, recording, command):
+    config = tmp_path / "pycontainer.toml"
+    config.write_text(
+        '[build]\nsign = true\nsign_provider = "cosign"\n'
+        'sign_key = "sign.key"\nsign_verify_key = "sign.pub"\n'
+    )
+    if command == "skaffold-build":
+        monkeypatch.setenv("IMAGE", "localhost:5000/a:1")
+        monkeypatch.setenv("BUILD_CONTEXT", str(tmp_path))
+        monkeypatch.setenv("PUSH_IMAGE", "true")
+    else:
+        monkeypatch.setenv("EXPECTED_REF", "localhost:5000/a:1")
+
+    run_cli(monkeypatch, command, "--config", str(config))
+    (builder,) = recording
+    assert builder.config.sign is True
+    assert builder.config.sign_verify_key == "sign.pub"
+    assert builder.pushes[0][0] == "localhost:5000/a:1"
 
 
 @pytest.mark.parametrize("command", ["skaffold-build", "tilt-build"])

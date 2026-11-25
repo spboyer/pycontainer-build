@@ -40,7 +40,7 @@ hatch-plugin = [
 testpaths = ["tests"]
 addopts = ["-m", "not registry_integration and not scanner_integration"]
 markers = [
-  "registry_integration: requires external registry access and pulls real base-image layers",
+  "registry_integration: requires real registry access and may publish test artifacts",
   "scanner_integration: opt-in real Grype and controlled vulnerability database",
 ]
 

@@ -551,7 +551,7 @@ def test_concurrent_first_use_reuses_ca_aware_openers(
     assert len(opener_constructions) == 2
 
 
-def test_push_only_client_does_not_construct_blob_opener(tmp_path, opener_constructions):
+def test_push_only_client_does_not_create_blob_opener(tmp_path, opener_constructions):
     content = b"push-only"
     digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
     source = tmp_path / "push-source"

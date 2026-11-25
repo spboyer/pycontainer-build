@@ -73,6 +73,11 @@ pycontainer build \
 # Build and push to registry
 pycontainer build --tag ghcr.io/user/myapp:v1 --push
 
+# Opt in to Cosign keyless signing with an ambient OIDC identity
+pycontainer build --tag ghcr.io/user/myapp:v1 --push --sign --sign-provider cosign \
+  --sign-certificate-identity '<expected-identity>' \
+  --sign-certificate-oidc-issuer '<expected-issuer>'
+
 # Experimental opt-in vulnerability gate (requires Grype 0.119.0)
 pycontainer build --tag ghcr.io/user/myapp:v1 --scan --push
 
@@ -195,6 +200,8 @@ offline preparation, error behavior and the opt-in acceptance test.
 - ✅ **Command-line interface** — Simple `pycontainer build` workflow
 - ✅ **Programmatic API** — Use as a library in your tools
 - ✅ **Registry push support** — Push to GHCR, ACR, Docker Hub via Registry v2 API
+- **Experimental image signing** — Opt-in Cosign or Notation signing of a
+  registry-published digest; see [signing prerequisites and status](docs/image-signing.md)
 - ✅ **Blob existence checks** — Skip uploading layers that already exist
 - ✅ **Progress reporting** — Visual feedback during push operations
 - ✅ **Registry cleanup** — `registry delete` by digest with confirmation and
@@ -575,6 +582,15 @@ pycontainer build \
   `--no-default-excludes`; a context inside a Conda prefix requires a source-only
   context instead. See the [export workaround](docs/local-development.md#conda-projects).
   Full Conda staging is deferred to [#187](https://github.com/spboyer/pycontainer-build/issues/187).
+
+**Image signing:** `--sign --sign-provider cosign|notation` requires `--push`
+and an independently configured signer. The registry must accept publication
+by digest. The image manifest, or the top-level multi-platform image index, is
+verified, signed, and its signature verified by the same provider and trust
+configuration (`--sign-verify-key`, or the keyless certificate identity and
+issuer, or a strict Notation trust policy) before tags are written. See the
+[signing guide](docs/image-signing.md) for keys, OIDC, verification, limitations
+and real-registry test prerequisites.
 
 **Lockfiles**: With `--include-deps`, the dependency source is chosen in this
 order: `--lockfile`, then `--requirements`, then a single lockfile at the

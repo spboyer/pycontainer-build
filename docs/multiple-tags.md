@@ -64,6 +64,14 @@ Names use the primary's repository spelling. For example,
 `ghcr.io/me/app:v1`. Single-platform layouts also name the primary descriptor
 at the index level.
 
+Opt-in signed pushes stage and verify the immutable manifest or image index,
+then sign and verify it before writing any requested tag. Each acknowledged
+tag write is read back; a failed write or mismatched readback stops subsequent writes and
+reports acknowledged, unknown, and unattempted references. An acknowledgement
+or successful readback is not a guarantee against a later concurrent retag.
+Signature-storage fallback tags cannot also be requested image tags. See
+[image signing](image-signing.md) for provider-specific limitations.
+
 Standard OCI tools select an image by that annotation:
 
 ```bash

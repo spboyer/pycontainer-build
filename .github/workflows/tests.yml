@@ -17,6 +17,17 @@ on:
         required: false
         type: boolean
         default: false
+      keyless-signing:
+        description: Keyless signing check on the reviewed branch (preflight proves the gate only)
+        required: false
+        type: choice
+        options: ["off", "preflight", "run"]
+        default: "off"
+      expected-sha:
+        description: Reviewed full commit SHA that must equal the dispatched head
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -261,6 +272,165 @@ jobs:
         env:
           PYTHONPATH: src
         run: uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration
+
+  keyless-signing-preflight:
+    name: Keyless signing gate
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.repository == 'spboyer/pycontainer-build'
+      && github.ref == 'refs/heads/spboyer-issue-13-image-signing'
+      && github.triggering_actor == 'spboyer'
+      && (inputs['keyless-signing'] == 'preflight' || inputs['keyless-signing'] == 'run')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require the reviewed workflow and commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs['expected-sha'] }}
+          RUN_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected-sha must be a full lowercase commit SHA."; exit 1; }
+          [ "$RUN_SHA" = "$EXPECTED_SHA" ] || { echo "The dispatched commit is not the reviewed commit."; exit 1; }
+          [ "$WORKFLOW_SHA" = "$EXPECTED_SHA" ] || { echo "The workflow file is not from the reviewed commit."; exit 1; }
+          [ "$WORKFLOW_REF" = "spboyer/pycontainer-build/.github/workflows/tests.yml@refs/heads/spboyer-issue-13-image-signing" ] || { echo "The workflow ref is not the reviewed workflow."; exit 1; }
+          echo "Gate passed: ref=$GITHUB_REF sha=$RUN_SHA workflow_sha=$WORKFLOW_SHA workflow_ref=$WORKFLOW_REF"
+
+  keyless-signing:
+    name: Keyless signing (Cosign ${{ matrix.cosign.version }})
+    needs: keyless-signing-preflight
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.repository == 'spboyer/pycontainer-build'
+      && github.ref == 'refs/heads/spboyer-issue-13-image-signing'
+      && github.triggering_actor == 'spboyer'
+      && inputs['keyless-signing'] == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        cosign:
+          - version: v2.6.1
+            sha256: 064954c5d8c7e3b28188eee5b1727b31c411550bc5fefd41aa672d3c761d103a
+          - version: v3.1.4
+            sha256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['expected-sha'] }}
+          persist-credentials: false
+      - name: Require the reviewed checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs['expected-sha'] }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ] || { echo "The checkout is not the reviewed commit."; exit 1; }
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Sync locked test dependencies
+        run: uv sync --locked --group test
+      - name: Install checksum-verified Cosign
+        shell: bash
+        env:
+          SIGNING_COSIGN_VERSION: ${{ matrix.cosign.version }}
+          SIGNING_COSIGN_SHA256: ${{ matrix.cosign.sha256 }}
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/cosign-bin"
+          mkdir -p "$bin"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --max-time 120 -o "$bin/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${SIGNING_COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${SIGNING_COSIGN_SHA256}  $bin/cosign" | sha256sum --check --strict --quiet
+          chmod 0755 "$bin/cosign"
+          reported="$(timeout 30 "$bin/cosign" version --json 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"])')"
+          [ "$reported" = "$SIGNING_COSIGN_VERSION" ] || { echo "Cosign reported an unexpected version."; exit 1; }
+          echo "$bin" >> "$GITHUB_PATH"
+      - name: Run keyless signing tests
+        shell: bash
+        env:
+          SIGNING_COSIGN_VERSION: ${{ matrix.cosign.version }}
+          SIGNING_EXPECTED_SHA: ${{ inputs['expected-sha'] }}
+          SIGNING_RUN_ID: ${{ github.run_id }}
+          SIGNING_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r name; do
+            case "$name" in
+              COSIGN_*|SIGSTORE_*|TUF_*|NOTATION_*|PYCONTAINER_*|DOCKER_*|REGISTRY_AUTH_FILE|GITHUB_TOKEN|GH_TOKEN|*_PROXY|*_proxy|SSL_CERT_*|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|XDG_*)
+                unset "$name" ;;
+            esac
+          done < <(compgen -e)
+          scratch="$RUNNER_TEMP/keyless-signing"
+          rm -rf "$scratch"
+          mkdir -p "$scratch/home" "$scratch/docker" "$scratch/tuf" "$scratch/config" "$scratch/cache"
+          export HOME="$scratch/home" DOCKER_CONFIG="$scratch/docker" TUF_ROOT="$scratch/tuf"
+          export XDG_CONFIG_HOME="$scratch/config" XDG_CACHE_HOME="$scratch/cache" PYTHONPATH=src
+          export PYCONTAINER_SIGNING_TEST_REPOSITORY="ttl.sh/pycontainer-keyless-${SIGNING_RUN_ID}-${SIGNING_RUN_ATTEMPT}-${SIGNING_COSIGN_VERSION//./-}"
+          export PYCONTAINER_COSIGN_TEST_IDENTITY="https://github.com/spboyer/pycontainer-build/.github/workflows/tests.yml@refs/heads/spboyer-issue-13-image-signing"
+          export PYCONTAINER_COSIGN_TEST_ISSUER="https://token.actions.githubusercontent.com"
+          export PYCONTAINER_COSIGN_TEST_WORKFLOW_SHA="$SIGNING_EXPECTED_SHA"
+          export PYCONTAINER_COSIGN_TEST_WORKFLOW_REPOSITORY="spboyer/pycontainer-build"
+          export PYCONTAINER_COSIGN_TEST_WORKFLOW_REF="refs/heads/spboyer-issue-13-image-signing"
+          export PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER="workflow_dispatch"
+          export PYCONTAINER_SIGNING_EVIDENCE_FILE="$scratch/evidence.txt"
+          for name in PYCONTAINER_SIGNING_TEST_REPOSITORY PYCONTAINER_COSIGN_TEST_IDENTITY \
+            PYCONTAINER_COSIGN_TEST_ISSUER PYCONTAINER_COSIGN_TEST_WORKFLOW_SHA \
+            PYCONTAINER_COSIGN_TEST_WORKFLOW_REPOSITORY PYCONTAINER_COSIGN_TEST_WORKFLOW_REF \
+            PYCONTAINER_COSIGN_TEST_WORKFLOW_TRIGGER ACTIONS_ID_TOKEN_REQUEST_URL \
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
+            [ -n "${!name:-}" ] || { echo "$name is not set."; exit 1; }
+          done
+          set +e
+          timeout 1500 .venv/bin/python -m pytest tests/test_signing_integration.py -q \
+            -o addopts= -p no:cacheprovider -m registry_integration -k cosign-keyless \
+            --tb=line --junitxml="$scratch/results.xml"
+          status=$?
+          set -e
+          python3 - "$scratch/results.xml" "$scratch/evidence.txt" <<'PY'
+          import os, re, sys
+          import xml.etree.ElementTree as ElementTree
+
+          results, evidence = sys.argv[1:]
+          root = ElementTree.parse(results).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          counts = {
+              key: sum(int(suite.get(key, 0)) for suite in suites)
+              for key in ("tests", "failures", "errors", "skipped")
+          }
+          print("Executed tests: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+          if counts != {"tests": 4, "failures": 0, "errors": 0, "skipped": 0}:
+              sys.exit("Expected exactly 4 executed keyless tests with no failures, errors or skips.")
+          pattern = re.compile(
+              r"cosign-keyless (manifest|index) sha256:[0-9a-f]{64} "
+              r"rekor-log-index=([0-9]+(,[0-9]+)*|not-reported)"
+          )
+          lines = open(evidence, encoding="utf-8").read().splitlines() if os.path.exists(evidence) else []
+          if len(lines) != 2 or not all(pattern.fullmatch(line) for line in lines):
+              sys.exit("Keyless evidence did not contain one valid manifest and index record.")
+          if sorted(pattern.fullmatch(line).group(1) for line in lines) != ["index", "manifest"]:
+              sys.exit("Keyless evidence did not cover both a manifest and an index.")
+          summary = [
+              f"Cosign {os.environ['SIGNING_COSIGN_VERSION']} at {os.environ['SIGNING_EXPECTED_SHA']}",
+              *lines,
+          ]
+          print("\n".join(summary))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(f"- `{line}`" for line in summary) + "\n")
+          PY
+          exit "$status"
 
   performance-baseline:
     name: Synthetic performance baseline

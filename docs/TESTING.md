@@ -4,7 +4,7 @@
 
 The strategy below records proposed coverage; its sample paths, tools, targets,
 and CI configuration are not all implemented. The current pytest suite is under
-`tests/`. Registry-pulling tests carry the `registry_integration` marker and are
+`tests/`. Real-registry tests carry the `registry_integration` marker and are
 excluded by default:
 
 The SBOM schema regressions require the test-only `jsonschema` package. SPDX
@@ -25,6 +25,12 @@ time:
 ```shell
 uv run --locked --group test python -m pytest tests -q -o addopts= -m registry_integration
 ```
+
+The separately opt-in signing tests publish unique tags and signatures to a
+disposable real registry and independently verify them with Cosign or
+Notation. They require explicit registry, key, OIDC identity and trust-policy
+configuration; see [image signing](image-signing.md#real-registry-tests).
+They do not run in the default suite or CI.
 
 The pull-request workflow checks Linux and Windows on Python 3.11 and 3.15.
 New pull-request runs cancel older runs for the same PR; main pushes and manual

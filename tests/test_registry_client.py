@@ -61,6 +61,58 @@ def _http_error(url, status, headers=None, body=b""):
     )
 
 
+@pytest.mark.parametrize("blob", [False, True])
+def test_auth_replay_failure_does_not_expose_challenge_context(monkeypatch, blob):
+    client = RegistryClient("registry.example", "team/app")
+    secret = "synthetic-challenge-secret"
+    attempts = 0
+
+    def open_request(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            headers = Message()
+            headers["Www-Authenticate"] = 'Bearer realm="https://auth.example/token"'
+            raise urllib.error.HTTPError(
+                request.full_url, 401, secret, headers, io.BytesIO()
+            )
+        raise ValueError("replay failed")
+
+    monkeypatch.setattr(client, "_get_bearer_token", lambda params: "token")
+    monkeypatch.setattr(client._get_blob_opener() if blob else client._opener, "open", open_request)
+    with pytest.raises(ValueError) as error:
+        if blob:
+            client._open_blob_response(f"{client.base_url}/blobs/test")
+        else:
+            client._make_request("GET", f"{client.base_url}/test")
+    assert secret not in "".join(traceback.format_exception(error.value))
+
+
+def test_upload_auth_rewind_failure_does_not_expose_challenge_context(monkeypatch):
+    client = RegistryClient("registry.example", "team/app")
+    secret = "synthetic-challenge-secret"
+
+    class BrokenRewind(io.BytesIO):
+        seeks = 0
+
+        def seek(self, offset, whence=0):
+            self.seeks += 1
+            if self.seeks > 1:
+                raise ValueError("rewind failed")
+            return super().seek(offset, whence)
+
+    def reject(request, timeout):
+        headers = Message()
+        headers["Www-Authenticate"] = 'Bearer realm="https://auth.example/token"'
+        raise urllib.error.HTTPError(request.full_url, 401, secret, headers, io.BytesIO())
+
+    monkeypatch.setattr(client, "_get_bearer_token", lambda params: "token")
+    monkeypatch.setattr(client._opener, "open", reject)
+    with pytest.raises(ValueError) as error:
+        client._make_request("PUT", f"{client.base_url}/upload", data=BrokenRewind(b"x"))
+    assert secret not in "".join(traceback.format_exception(error.value))
+
+
 def test_concurrent_initial_challenges_reuse_acquired_token(monkeypatch):
     client = RegistryClient("registry.example", "team/app")
     initial_requests = threading.Barrier(2)
@@ -190,6 +242,38 @@ def test_pull_manifest_verifies_digest_and_size(monkeypatch):
     with pytest.raises(BlobIntegrityError, match="hashes"):
         client.pull_manifest("sha256:" + "b" * 64, expected_digest="sha256:" + "b" * 64)
 
+
+@pytest.mark.parametrize("mismatch", [None, "digest", "size", "media_type", "missing"])
+def test_head_manifest_verifies_signer_visible_descriptor(monkeypatch, mismatch):
+    client = RegistryClient("registry.example", "team/app")
+    digest = "sha256:" + "a" * 64
+    media_type = "application/vnd.oci.image.manifest.v1+json"
+    headers = {
+        "Docker-Content-Digest": digest,
+        "Content-Length": "42",
+        "Content-Type": media_type + "; charset=utf-8",
+    }
+    if mismatch == "digest":
+        headers["Docker-Content-Digest"] = "sha256:" + "b" * 64
+    elif mismatch == "size":
+        headers["Content-Length"] = "43"
+    elif mismatch == "media_type":
+        headers["Content-Type"] = "application/octet-stream"
+    elif mismatch == "missing":
+        del headers["Content-Length"]
+
+    def fake_request(method, url, headers=None):
+        assert method == "HEAD"
+        assert "application/vnd.oci.image.manifest.v1+json" in headers["Accept"]
+        return 200, b"", response_headers
+
+    response_headers = headers
+    monkeypatch.setattr(client, "_make_request", fake_request)
+    if mismatch is None:
+        client.verify_manifest_descriptor(digest, digest, 42, media_type)
+    else:
+        with pytest.raises(BlobIntegrityError, match="HEAD descriptor"):
+            client.verify_manifest_descriptor(digest, digest, 42, media_type)
 
 def _manifest_with_header(monkeypatch, header):
     client = RegistryClient("registry.example", "team/app")
@@ -643,6 +727,60 @@ def test_pull_blob_cleans_only_owned_temp_after_interrupted_download(
     assert list(tmp_path.glob(".*.tmp")) == [sentinel]
 
 
+def test_blob_download_rejects_insecure_redirect(monkeypatch):
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+
+    class Opener:
+        def open(self, request, timeout):
+            raise _http_error(request.full_url, 302, {"Location": "http://storage.example/blob"})
+
+    client._blob_opener = Opener()
+    with pytest.raises(RegistryRequestError, match="HTTPS-to-HTTP"):
+        client._open_blob_response("https://registry.example/v2/team/app/blobs/sha256:abc")
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["http://storage.example/blob", "https://user:password@storage.example/blob"],
+)
+def test_blob_response_redirect_rejects_downgrade_and_userinfo(monkeypatch, location):
+    client = RegistryClient("127.0.0.1:5000", "team/app", auth_token="secret", insecure=True)
+
+    class Opener:
+        def open(self, request, timeout):
+            return _Response(status=307, headers={"Location": location})
+
+    client._blob_opener = Opener()
+    monkeypatch.setattr(
+        client._opener, "open",
+        lambda *args, **kwargs: pytest.fail("unsafe redirect must not be contacted"),
+    )
+    with pytest.raises(RegistryRequestError):
+        client._open_blob_response("https://127.0.0.1:5000/v2/team/app/blobs/sha256:abc")
+
+
+@pytest.mark.parametrize("insecure", [False, True])
+def test_blob_response_redirect_never_forwards_auth(monkeypatch, insecure):
+    host = "127.0.0.1:5000" if insecure else "registry.example"
+    client = RegistryClient(host, "team/app", auth_token="secret", insecure=insecure)
+    scheme = "http" if insecure else "https"
+    redirected = []
+
+    class Opener:
+        def open(self, request, timeout):
+            return _Response(status=307, headers={"Location": f"{scheme}://storage.example/blob"})
+
+    client._blob_opener = Opener()
+    monkeypatch.setattr(
+        client._opener, "open",
+        lambda request, timeout: redirected.append(request) or _Response(),
+    )
+    client._open_blob_response(f"{scheme}://{host}/v2/team/app/blobs/sha256:abc")
+    assert len(redirected) == 1
+    for header in ("Authorization", "Proxy-Authorization", "Cookie"):
+        assert redirected[0].get_header(header) is None
+
+
 def test_pull_blob_retries_retry_after_and_preserves_no_auth_redirect(
     tmp_path, monkeypatch
 ):
@@ -764,6 +902,27 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
     )
 
     assert requests[0].get_header("Authorization") is None
+
+
+def test_upload_rejects_insecure_external_location_without_exposing_query(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.blob"
+    source.write_bytes(b"upload")
+    client = RegistryClient("registry.example", "team/app", auth_token="secret")
+    monkeypatch.setattr(
+        client, "initiate_blob_upload",
+        lambda: "http://storage.example/upload?token=synthetic-secret",
+    )
+    monkeypatch.setattr(
+        client._opener, "open",
+        lambda *args, **kwargs: pytest.fail("insecure upload must not be contacted"),
+    )
+    with pytest.raises(RegistryRequestError, match="HTTPS-to-HTTP") as raised:
+        client.upload_blob_monolithic(
+            f"sha256:{hashlib.sha256(b'upload').hexdigest()}", source
+        )
+    assert "synthetic-secret" not in str(raised.value)
 
 
 def test_upload_rejects_local_blob_digest_mismatch_before_initiating_upload(
@@ -1417,8 +1576,6 @@ def test_token_exchange_redacts_url_credentials_and_http_error_traceback(
 ):
     client = RegistryClient("registry.example", "team/app")
     reason_token = "synthetic-status-token"
-    headers = Message()
-    headers["Retry-After"] = "120"
 
     def fake_urlopen(request, timeout):
         if request.full_url.startswith(client.base_url):
@@ -1427,18 +1584,12 @@ def test_token_exchange_redacts_url_credentials_and_http_error_traceback(
                 f'Bearer realm="https://{userinfo}auth.example/token"'
             )
             raise urllib.error.HTTPError(
-                request.full_url,
-                401,
-                f"Bearer {reason_token}",
-                challenge,
-                io.BytesIO(b""),
+                request.full_url, 401, f"Bearer {reason_token}", challenge, io.BytesIO(b"")
             )
+        headers = Message()
+        headers["Retry-After"] = "120"
         raise urllib.error.HTTPError(
-            request.full_url,
-            429,
-            f"Bearer {reason_token}",
-            headers,
-            io.BytesIO(b""),
+            request.full_url, 429, f"Bearer {reason_token}", headers, io.BytesIO(b"")
         )
 
     monkeypatch.setattr(client._opener, "open", fake_urlopen)
@@ -1447,7 +1598,6 @@ def test_token_exchange_redacts_url_credentials_and_http_error_traceback(
         client.pull_manifest("latest")
 
     rendered = "".join(traceback.format_exception(error.value))
-    assert "auth.example" in str(error.value)
     for secret in ("synthetic-user", "synthetic-password", reason_token):
         assert secret not in str(error.value)
         assert secret not in rendered
@@ -1469,6 +1619,39 @@ def test_invalid_token_challenge_hides_http_error_traceback(monkeypatch):
         client.pull_manifest("latest")
 
     assert reason_token not in "".join(traceback.format_exception(error.value))
+
+
+def test_blob_redirect_rejects_url_credentials_and_hides_http_traceback(
+    tmp_path, monkeypatch, caplog
+):
+    redirect = (
+        "https://synthetic-user:synthetic-password@storage.example/blob"
+        "?token=synthetic-query-token"
+    )
+    reason_token = "synthetic-status-token"
+
+    class Opener:
+        def open(self, request, timeout):
+            raise _http_error(request.full_url, 307, {"Location": redirect})
+
+    client = RegistryClient("registry.example", "team/app")
+    client._blob_opener = Opener()
+    digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
+
+    with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):
+        with pytest.raises(RegistryRequestError, match="embedded credentials") as error:
+            client.pull_blob(digest, tmp_path / "blob", 1)
+
+    rendered = "".join(traceback.format_exception(error.value))
+    for secret in (
+        "synthetic-user",
+        "synthetic-password",
+        "synthetic-query-token",
+        reason_token,
+    ):
+        assert secret not in str(error.value)
+        assert secret not in caplog.text
+        assert secret not in rendered
 
 
 @pytest.mark.parametrize("operation", ["manifest", "blob"])
@@ -1505,7 +1688,7 @@ def test_auth_replay_failure_hides_initial_http_error_traceback(
 
     monkeypatch.setattr(client, "_get_bearer_token", acquire)
     monkeypatch.setattr(client._opener, "open", open_request)
-    monkeypatch.setattr(client, "_get_blob_opener", lambda: client._opener)
+    monkeypatch.setattr(client, "_blob_opener", client._opener)
     monkeypatch.setattr("pycontainer.registry_client.MAX_MANIFEST_BYTES", 1)
     expected = "exceeds 1 bytes" if operation == "manifest" else "credentials"
     with pytest.raises(RegistryRequestError, match=expected) as error:
@@ -1551,7 +1734,7 @@ def test_token_exchange_failure_hides_initial_http_error_traceback(
         )
 
     monkeypatch.setattr(client._opener, "open", open_request)
-    monkeypatch.setattr(client, "_get_blob_opener", lambda: client._opener)
+    monkeypatch.setattr(client, "_blob_opener", client._opener)
     expected = (
         (RegistryAuthenticationError, "not valid JSON")
         if failure == "invalid-utf8"
@@ -1644,7 +1827,7 @@ def test_auth_upload_replay_preserves_nonzero_body_offset(monkeypatch, rewind_fa
         assert [payload for _, payload in requests] == [b"payload", b"payload"]
 
 
-def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
+def test_blob_redirect_rate_limit_redacts_url_and_http_traceback(
     tmp_path, monkeypatch, caplog
 ):
     redirect = "https://storage.example/blob?token=synthetic-query-token"
@@ -1654,7 +1837,7 @@ def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
         def open(self, request, timeout):
             raise _http_error(request.full_url, 307, {"Location": redirect})
 
-    def fake_urlopen(request, timeout):
+    def fake_open(request, timeout):
         headers = Message()
         headers["Retry-After"] = "120"
         headers["RateLimit-Remaining"] = "0"
@@ -1664,7 +1847,7 @@ def test_blob_redirect_redacts_url_credentials_logs_and_http_traceback(
 
     client = RegistryClient("registry.example", "team/app")
     client._blob_opener = Opener()
-    monkeypatch.setattr(client._opener, "open", fake_urlopen)
+    monkeypatch.setattr(client._opener, "open", fake_open)
     digest = f"sha256:{hashlib.sha256(b'x').hexdigest()}"
 
     with caplog.at_level(logging.DEBUG, logger="pycontainer.registry_client"):

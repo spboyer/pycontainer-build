@@ -99,12 +99,15 @@ def selected_image_snapshot(output, digest, platform):
             raise ScanError("identity", "missing index manifests")
         selected = [item for item in manifests if isinstance(item, dict) and item.get("digest") == digest]
         if not selected:
-            raise ScanError("identity", "selected manifest is missing or ambiguous")
-        descriptor = _descriptor(selected[0])
-        for item in selected[1:]:
-            item = _descriptor(item)
-            if any(item.get(key) != descriptor.get(key) for key in ("size", "mediaType", "platform")):
-                raise ScanError("identity", "selected manifest is missing or ambiguous")
+            raise ScanError("identity", "selected manifest is missing")
+        descriptors = [_descriptor(item) for item in selected]
+        descriptor = descriptors[0]
+        identity = {key: value for key, value in descriptor.items() if key != "annotations"}
+        if any(
+            {key: value for key, value in item.items() if key != "annotations"} != identity
+            for item in descriptors[1:]
+        ):
+            raise ScanError("identity", "selected manifest is ambiguous")
         if descriptor["mediaType"] != "application/vnd.oci.image.manifest.v1+json":
             raise ScanError("unsupported", "only OCI image manifests are supported")
         manifest = verify_snapshot(output, descriptor)
