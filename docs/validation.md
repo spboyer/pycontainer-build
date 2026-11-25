@@ -149,8 +149,9 @@ The `validate_image(..., thresholds=...)` API accepts `None` or a mapping with
 string keys naming the supported thresholds. Empty mappings and known keys with
 `None` values leave thresholds unset. Non-mapping inputs, non-string keys and
 unknown names raise `ValueError`, including when their values are `None`.
-Its `redact` callable is applied to reported layer media types; the default
-returns them unchanged. `base_layer_count` requires `expected_digest` and
+Its `redact` callable is applied to unknown threshold names in diagnostics
+before bounded, escaped key formatting, and to reported layer media types;
+the default leaves values unredacted. `base_layer_count` requires `expected_digest` and
 must be an `int` (not `bool`, float or string) from 0 through the number of
 layers in the selected manifest; anything else raises `ValueError`.
 

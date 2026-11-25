@@ -1330,8 +1330,36 @@ def _sized_image(layout, layer_bytes, **kwargs):
 @pytest.mark.parametrize("value", [None, "1"])
 def test_unknown_size_threshold_names_are_rejected(tmp_path, value):
     _sized_image(tmp_path, 1)
-    with pytest.raises(ValueError, match="Unknown image size threshold"):
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
         image_validation.validate_image(tmp_path, thresholds={"max_image_szie_mb": value})
+    assert "max_image_szie_mb" in str(error.value)
+
+
+@pytest.mark.parametrize("value", [None, "1"])
+@pytest.mark.parametrize("marker", [
+    "synthetic-threshold-secret",
+    'unicode-\u00eb-quote"-backslash\\-value',
+    "secret-" * 20,
+])
+def test_unknown_size_threshold_diagnostic_redacts_keys(marker, value):
+    from pycontainer.build_args import redact_values
+
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
+        image_validation.validate_image(
+            Path("unused-layout"), thresholds={"unknown-" + marker: value},
+            redact=lambda text: redact_values(text, [marker]),
+        )
+    assert marker not in str(error.value)
+    assert '"unknown-<redacted>"' in str(error.value)
+
+
+def test_unknown_size_threshold_diagnostic_escapes_keys():
+    key = "unknown-\x1b[2J\n"
+    with pytest.raises(ValueError, match="Unknown image size threshold") as error:
+        image_validation.validate_image(Path("unused-layout"), thresholds={key: None})
+    assert str(error.value) == (
+        f"Unknown image size threshold(s): {json.dumps(key, ensure_ascii=True)}."
+    )
 
 
 @pytest.mark.parametrize("thresholds", [False, 0, [], "", True, 1, ["max_image_size_mb"]])

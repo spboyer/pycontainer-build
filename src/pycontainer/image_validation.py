@@ -902,7 +902,7 @@ def validate_image(
         raise ValueError("Image size threshold names must be strings.")
     unknown = sorted(set(thresholds) - set(SIZE_THRESHOLDS))
     if unknown:
-        raise ValueError(f"Unknown image size threshold(s): {', '.join(unknown)}.")
+        raise ValueError(f"Unknown image size threshold(s): {_display_keys(unknown, redact)}.")
     thresholds = {
         name: parse_size_threshold(value, name)
         for name, value in thresholds.items() if value is not None
