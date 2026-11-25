@@ -2,6 +2,8 @@
 
 > **Build OCI container images from Python projects — no Docker required**
 
+[Website & searchable documentation](https://spboyer.github.io/pycontainer-build/)
+
 A native, Docker-free container image builder for Python, inspired by .NET's `PublishContainer`. Create production-ready OCI images using pure Python, without Dockerfiles or Docker daemon.
 
 ---
@@ -272,7 +274,7 @@ from pycontainer.builder import ImageBuilder
 
 config = BuildConfig(
     tag="myapp:latest",
-    context_path="/path/to/app",
+    context_dir="/path/to/app",
     env={"ENV": "production"},
     include_paths=["src/", "pyproject.toml"]
 )

@@ -1,0 +1,47 @@
+<figure class="layer-diagram">
+  <div class="diagram-heading"><span>01 / THE IMAGE</span><span>OCI STANDARD</span></div>
+  <svg viewBox="0 0 460 365" role="img" aria-labelledby="layer-title layer-description">
+    <title id="layer-title">One image, three kinds of layers</title>
+    <desc id="layer-description">Your application sits above staged Python dependencies and unchanged base-image layers, assembled into an OCI image.</desc>
+    <g fill="none" stroke="#d6c6a8" stroke-opacity=".16">
+      <path d="M20 255 230 150 440 255 230 360Z" />
+      <path d="M20 290 230 185 440 290M55 238l210 105M90 220l210 105M125 203l210 105M160 185l210 105M195 168l210 105" />
+      <path d="m55 273 210-105m-175 123 210-105m-175 123 210-105m-175 123 210-105m-175 123 210-105" />
+    </g>
+    <path d="M77 220v29l153 77 153-77v-29" fill="#242c3b" stroke="#748095" />
+    <path d="m77 220 153-77 153 77-153 77Z" fill="#30394a" stroke="#748095" />
+    <path d="M77 155v29l153 77 153-77v-29" fill="#a89980" stroke="#d6c6a8" />
+    <path d="m77 155 153-77 153 77-153 77Z" fill="#d6c6a8" stroke="#e8ddca" />
+    <path d="M77 90v29l153 77 153-77V90" fill="#b83745" stroke="#ff4f5e" />
+    <path d="m77 90 153-77 153 77-153 77Z" fill="#ff4f5e" stroke="#ff7a85" />
+    <g stroke="#1a1f2b" stroke-width="2" fill="none" stroke-linejoin="round">
+      <path d="m193 73-24 12 24 12m74-24 24 12-24 12m-28-31-18 39" />
+    </g>
+    <g stroke="#1a1f2b" stroke-width="1.5" opacity=".7">
+      <path d="m196 145 34-17 34 17-34 17Zm0 0v15l34 17 34-17v-15m-34 17v15" fill="none" />
+    </g>
+    <g stroke="#d6c6a8" stroke-dasharray="3 5" stroke-opacity=".5">
+      <path d="M77 90H25m52 65H25m52 65H25M383 90h50m-50 65h50m-50 65h50" />
+    </g>
+    <g fill="#d6c6a8">
+      <circle cx="25" cy="90" r="3" /><circle cx="25" cy="155" r="3" /><circle cx="25" cy="220" r="3" />
+    </g>
+  </svg>
+  <figcaption>
+    <span><i class="app-layer"></i>Your application</span>
+    <span><i class="dependency-layer"></i>Python dependencies</span>
+    <span><i class="base-layer"></i>Base image</span>
+  </figcaption>
+</figure>
+
+<style>
+  .layer-diagram { margin: 0; }
+  .diagram-heading { display: flex; justify-content: space-between; font: .65rem var(--mono); letter-spacing: .12em; color: var(--sand); }
+  svg { display: block; width: 100%; height: auto; margin: 1.25rem 0 .5rem; }
+  figcaption { display: flex; flex-wrap: wrap; justify-content: center; gap: .6rem 1.25rem; color: #bfc4ce; font-size: .7rem; }
+  figcaption span { display: inline-flex; align-items: center; gap: .45rem; }
+  i { width: .45rem; height: .45rem; display: inline-block; }
+  .app-layer { background: var(--coral); }
+  .dependency-layer { background: var(--sand); }
+  .base-layer { background: #748095; }
+</style>

@@ -345,6 +345,6 @@ Optimize your base image:
 
 ## Next Steps
 
-- See [example-build.yml.example](../../.github/workflows/example-build.yml.example) for complete examples
+- See [example-build.yml.example](../.github/workflows/example-build.yml.example) for complete examples
 - Read [Configuration](../README.md#configuration) for all build options
-- Explore [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) for roadmap
+- Explore the [roadmap](https://github.com/spboyer/pycontainer-build/issues/66) for planned work

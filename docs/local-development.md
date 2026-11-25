@@ -698,7 +698,7 @@ logging.basicConfig(level=logging.DEBUG)
 # Create config
 config = BuildConfig(
     tag="myapp:debug",
-    context_path=".",
+    context_dir=".",
     base_image="python:3.11-slim",
     include_deps=True,
     verbose=True
@@ -850,7 +850,7 @@ tree dist/image
 - **Deploy to Azure**: See [Azure Developer CLI Guide](azd-integration.md)
 - **Set up CI/CD**: See [GitHub Actions Guide](github-actions.md)
 - **Explore Plugins**: Check [plugins/](../plugins/)
-- **Read Architecture**: See [ARCHITECTURE.md](../ARCHITECTURE.md)
+- **Read Architecture**: See [historical architecture notes](ARCHITECTURE.md)
 
 ---
 
@@ -872,7 +872,7 @@ tree dist/image
 - **GitHub Issues**: [spboyer/pycontainer-build](https://github.com/spboyer/pycontainer-build/issues)
 - **Documentation**: See other files in [docs/](.)
 - **Examples**: Check [examples/](../examples/)
-- **Architecture**: Read [ARCHITECTURE.md](../ARCHITECTURE.md)
+- **Architecture**: Read [historical architecture notes](ARCHITECTURE.md)
 
 ---
 
