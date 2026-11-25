@@ -682,6 +682,91 @@ def test_builds_verified_index_with_pinned_base(tmp_path, monkeypatch):
     assert top_level == [("3.11-slim", {"expected_digest": None})]
 
 
+@pytest.mark.parametrize("reject_second", [False, True])
+@pytest.mark.parametrize("squash", [False, True])
+def test_required_trust_pins_verified_index_for_every_platform(
+    tmp_path, monkeypatch, reject_second, squash
+):
+    registry = FakeBaseRegistry()
+    events = []
+    root = registry.manifests[registry.index_digest]
+    children = json.loads(root)["manifests"]
+    policy = {
+        "provider": "cosign",
+        "repository": "registry.example/library/python",
+        "identity": "builder@example.com",
+        "issuer": "https://issuer.example",
+    }
+
+    class Client:
+        registry = "registry.example"
+        repository = "library/python"
+
+        def pull_manifest_bytes(self, reference, expected_digest=None, expected_size=None):
+            events.append(("manifest", reference))
+            body = registry.manifests[reference]
+            digest = _digest(body)
+            if expected_digest is not None and digest != expected_digest:
+                raise RegistryRequestError("manifest digest mismatch")
+            if expected_size is not None and len(body) != expected_size:
+                raise RegistryRequestError("manifest size mismatch")
+            return json.loads(body), digest, body
+
+        def pull_blob(self, digest, path, expected_size):
+            events.append(("blob", digest))
+            content = registry.blobs[digest]
+            assert len(content) == expected_size
+            path.write_bytes(content)
+
+    client = Client()
+    _install_fake_deps(monkeypatch)
+    ctx = _context(tmp_path, requirements=True)
+    builder = _builder(
+        tmp_path, monkeypatch, registry, base_image_trust=policy,
+        ctx=ctx, include_deps=True, squash=squash,
+    )
+
+    def create_client(*args, **kwargs):
+        assert kwargs["strict_auth"] is True
+        return client
+
+    def verify(policy, repository, digest, manifest, manifest_bytes, source):
+        assert source is client
+        assert repository == "registry.example/library/python"
+        assert digest == registry.index_digest
+        assert manifest_bytes == root
+        events.append(("verify", digest))
+        registry.manifests["3.11-slim"] = b'{"retargeted":true}'
+        if reject_second and sum(event[0] == "verify" for event in events) == 2:
+            raise RuntimeError("signature rejected")
+
+    monkeypatch.setattr(builder_module, "RegistryClient", create_client)
+    monkeypatch.setattr(builder_module, "verify_base_image", verify)
+    if reject_second:
+        with pytest.raises(RuntimeError, match="signature rejected"):
+            builder.build()
+        assert not (tmp_path / "out" / "index.json").exists()
+    else:
+        builder.build()
+        for image, child in zip(builder.platform_images, children):
+            base = json.loads(registry.manifests[child["digest"]])
+            assert image.layers[0].digest == base["layers"][0]["digest"]
+            assert image.app_layer_count == (1 if squash else 2)
+
+    assert [event for event in events if event[0] == "verify"] == [
+        ("verify", registry.index_digest), ("verify", registry.index_digest)
+    ]
+    assert [event for event in events if event[0] == "manifest"] == (
+        [("manifest", "3.11-slim"), ("manifest", children[0]["digest"])]
+        + ([] if reject_second else [("manifest", children[1]["digest"])])
+    )
+    second_verify = max(i for i, event in enumerate(events) if event[0] == "verify")
+    if reject_second:
+        assert second_verify == len(events) - 1
+    else:
+        assert events[second_verify + 1] == ("manifest", children[1]["digest"])
+
+
 def test_multi_platform_annotations_preserve_refs_digests_and_runtime(
     tmp_path, monkeypatch
 ):

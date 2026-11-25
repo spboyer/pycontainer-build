@@ -280,7 +280,7 @@ def test_basic_credentials_exchange_for_bearer_token(monkeypatch, caplog):
         def read(self, size=-1):
             return self.body if size < 0 else self.body[:size]
 
-    def fake_urlopen(request, timeout=None):
+    def fake_urlopen(request, timeout=None, strict=False):
         authorization=request.get_header("Authorization")
         assert timeout == client.timeout
         requests.append((request.full_url, authorization))
@@ -339,7 +339,7 @@ def test_bearer_exchange_failure_is_explicit_without_exposing_credentials(
         password="private-password",
     )
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, strict=False):
         if request.full_url.startswith(client.base_url):
             raise _http_error(
                 request.full_url,
@@ -376,7 +376,7 @@ def test_bearer_exchange_retries_retry_after(monkeypatch):
     token_attempts = []
     delays = []
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, strict=False):
         if request.full_url.startswith(client.base_url):
             if request.get_header("Authorization").startswith("Basic "):
                 raise _http_error(
@@ -710,7 +710,7 @@ def test_upload_streams_and_appends_digest_to_location_query(
     source.write_bytes(content)
     requests = []
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, strict=False):
         requests.append((request, timeout))
         uploaded = bytearray()
         while True:
@@ -752,7 +752,7 @@ def test_upload_does_not_forward_registry_auth_to_external_location(
     )
     requests = []
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, strict=False):
         requests.append(request)
         request.data.read()
         return _Response(status=201)
@@ -799,7 +799,7 @@ def test_safe_control_requests_retry_with_timeout_and_clear_error(
     delays = []
     client = RegistryClient("registry.example", "team/app", timeout=2.5)
 
-    def fake_urlopen(request, timeout):
+    def fake_urlopen(request, timeout, strict=False):
         requests.append((request, timeout))
         raise TimeoutError("not included in public error")
 

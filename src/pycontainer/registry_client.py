@@ -586,6 +586,8 @@ class RegistryClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        strict_auth: bool = False,
+        trusted_auth_realm: Optional[str] = None,
         insecure: bool = False,
         ca_file: Optional[str] = None,
         *,
@@ -601,6 +603,12 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
+        self.strict_auth = strict_auth
+        self.trusted_auth_realm = trusted_auth_realm
+        if strict_auth and insecure:
+            raise RegistryAuthenticationError(
+                "Required registry trust refuses plain HTTP registries."
+            )
         self._log_redact = log_redact
         self.insecure = insecure
         scheme = "http" if insecure else "https"
@@ -752,12 +760,33 @@ class RegistryClient:
 
         try:
             _check_transport(self.base_url, realm, self.insecure)
+            parsed = _validate_url(realm, self.insecure)
         except RegistryRequestError as error:
             raise RegistryAuthenticationError(
                 f"Refusing registry token realm {_safe_url(realm)}: "
                 f"HTTPS registries require an HTTPS token realm. {error}"
             ) from error
-        parsed = _validate_url(realm, self.insecure)
+        if self.strict_auth:
+            if (
+                parsed.scheme.lower() != "https"
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise RegistryAuthenticationError(
+                    "Required trust only permits HTTPS registry token realms."
+                )
+            has_credentials = bool(self.username or self.password or self.auth_token)
+            if (
+                has_credentials
+                and not self._is_registry_url(realm)
+                and realm != self.trusted_auth_realm
+            ):
+                raise RegistryAuthenticationError(
+                    "Registry requested credentials for an untrusted token realm; "
+                    "configure the exact auth_realm for required trust."
+                )
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for key in ("service", "scope"):
             value = auth_params.get(key)
@@ -909,17 +938,28 @@ class RegistryClient:
                 with self._opener.open(
                     request, timeout=self.timeout
                 ) as response:
+                    response_body = response.read(
+                        max_response_bytes + 1 if max_response_bytes is not None else -1
+                    )
+                    if (
+                        max_response_bytes is not None
+                        and len(response_body) > max_response_bytes
+                    ):
+                        raise RegistryRequestError(
+                            f"Registry response exceeds {max_response_bytes} bytes."
+                        )
                     response_headers = dict(response.headers)
                     self._observe_rate_limit(response_headers, url)
-                    if max_response_bytes is None:
-                        return response.status, response.read(), response_headers
-                    body = response.read(max_response_bytes + 1)
-                    if len(body) > max_response_bytes:
-                        raise RegistryRequestError(
-                            f"{method} response from {self._safe_request_url(url)} exceeds "
-                            f"{max_response_bytes} bytes."
-                        )
-                    return response.status, body, response_headers
+                    get_all = getattr(response.headers, "get_all", None)
+                    if get_all is not None:
+                        digests = get_all("Docker-Content-Digest", [])
+                        if len(digests) > 1:
+                            response_headers = {
+                                key: value for key, value in response_headers.items()
+                                if key.lower() != "docker-content-digest"
+                            }
+                            response_headers["Docker-Content-Digest"] = ",".join(digests)
+                    return response.status, response_body, response_headers
             except urllib.error.HTTPError as error:
                 response_headers = dict(error.headers)
                 self._observe_rate_limit(response_headers, url)
@@ -1079,6 +1119,64 @@ class RegistryClient:
         expected_size: Optional[int] = None,
     ) -> Tuple[Dict, str]:
         """Pull manifest, returning its decoded JSON and registry digest."""
+        manifest, digest, _ = self._pull_manifest(
+            reference, expected_digest, expected_size, strict_header=False
+        )
+        return manifest, digest
+
+    def pull_manifest_bytes(
+        self,
+        reference: str,
+        expected_digest: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> Tuple[Dict, str, bytes]:
+        """Pull bounded, exact manifest bytes for a required-trust decision."""
+        return self._pull_manifest(
+            reference, expected_digest, expected_size, strict_header=True
+        )
+
+    def pull_optional_manifest_bytes(
+        self, reference: str, max_bytes: int
+    ) -> Optional[Tuple[Dict, str, bytes]]:
+        """Pull bounded, exact manifest bytes, or return None when absent (404)."""
+        return self._pull_manifest(
+            reference, None, None, strict_header=True,
+            missing_ok=True, max_bytes=max_bytes,
+        )
+
+    def pull_referrers(
+        self, digest: str, artifact_type: str, max_bytes: int
+    ) -> Optional[Tuple[Dict, bytes]]:
+        """Query the OCI referrers API; None means the registry lacks it (404)."""
+        digest_filename(digest)
+        query = urllib.parse.urlencode({"artifactType": artifact_type})
+        url = f"{self.base_url}/{self.repository}/referrers/{digest}?{query}"
+        status, body, headers = self._make_request(
+            "GET", url,
+            headers={"Accept": "application/vnd.oci.image.index.v1+json"},
+            max_response_bytes=max_bytes,
+        )
+        if status == 404:
+            return None
+        if status != 200:
+            raise self._error("Referrers query", url, status, body, headers)
+        try:
+            index = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RegistryRequestError("Registry returned invalid referrers JSON.") from error
+        if not isinstance(index, dict):
+            raise RegistryRequestError("Registry returned a non-object referrers index.")
+        return index, body
+
+    def _pull_manifest(
+        self,
+        reference: str,
+        expected_digest: Optional[str],
+        expected_size: Optional[int],
+        strict_header: bool,
+        missing_ok: bool = False,
+        max_bytes: int = MAX_MANIFEST_BYTES,
+    ) -> Optional[Tuple[Dict, str, bytes]]:
         if expected_digest is not None:
             digest_filename(expected_digest)
         if expected_size is not None and (
@@ -1100,11 +1198,13 @@ class RegistryClient:
             url,
             headers=headers,
             max_response_bytes=(
-                MAX_MANIFEST_BYTES
+                min(max_bytes, MAX_MANIFEST_BYTES)
                 if expected_size is None
-                else min(expected_size, MAX_MANIFEST_BYTES)
+                else min(expected_size, max_bytes, MAX_MANIFEST_BYTES)
             ),
         )
+        if status == 404 and missing_ok:
+            return None
         if status != 200:
             raise self._error("Manifest pull", url, status, body, response_headers)
         if not body:
@@ -1137,11 +1237,25 @@ class RegistryClient:
             raise RegistryRequestError(
                 f"Registry returned a non-object manifest for {reference}."
             )
+        if strict_header:
+            digest_headers = [
+                value for key, value in response_headers.items()
+                if key.lower() == "docker-content-digest"
+            ]
+            if len(digest_headers) > 1 or (
+                digest_headers and digest_headers[0] != body_digest
+            ):
+                raise BlobIntegrityError(
+                    "Registry manifest digest header is invalid or does not "
+                    f"match the body hash {body_digest}."
+                )
+            return manifest, body_digest, body
+
         digest = response_headers.get("Docker-Content-Digest") or response_headers.get(
             "docker-content-digest"
         )
         if not digest:
-            return manifest, body_digest
+            return manifest, body_digest, body
         if digest.startswith("sha512:"):
             expected_header = f"sha512:{hashlib.sha512(body).hexdigest()}"
         elif digest.startswith("sha256:"):
@@ -1149,13 +1263,13 @@ class RegistryClient:
         else:
             # Unsupported algorithms cannot be verified; return the header opaquely so
             # callers never treat it, or a sha256 alias, as a verified digest.
-            return manifest, digest
+            return manifest, digest, body
         if digest != expected_header:
             raise BlobIntegrityError(
                 f"Registry-reported manifest digest does not match its body "
                 f"digest {body_digest}."
             )
-        return manifest, digest
+        return manifest, digest, body
 
     def delete_manifest(self, digest: str) -> None:
         """Delete a manifest by digest exactly once; the request is never retried."""

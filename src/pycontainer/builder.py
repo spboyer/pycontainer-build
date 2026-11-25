@@ -204,6 +204,12 @@ from .registry_client import (
     parse_image_reference,
 )
 from .auth import get_mirror_auth, get_registry_auth
+from .base_trust import (
+    TrustVerificationError,
+    canonical_repository,
+    validate_trust_policy,
+    verify_base_image,
+)
 from .registry_mirrors import MirroredPullClient
 from .local_image import (
     LocalImageError,
@@ -855,9 +861,15 @@ class ImageBuilder:
     def _requested_platform(self) -> str:
         return getattr(self, "_target_platform", None) or self.config.platform
 
-    def _registry_client(self, registry: str, repo: str, auth) -> RegistryClient:
+    def _registry_client(self, registry: str, repo: str, auth, policy=None) -> RegistryClient:
         """Create a registry client honoring insecure-host and CA settings."""
         insecure=registry.lower() in self.config.insecure_registries
+        trust_options = {}
+        if policy is not None:
+            trust_options = {
+                "strict_auth": True,
+                "trusted_auth_realm": policy.get("auth_realm"),
+            }
         log_options = {"log_redact": self.config.redact} if self.config.build_args else {}
         client=RegistryClient(
             registry,
@@ -867,6 +879,7 @@ class ImageBuilder:
             password=auth.password,
             insecure=insecure,
             ca_file=self.config.registry_ca_file,
+            **trust_options,
             **log_options,
         )
         warned=self.__dict__.setdefault('_warned_insecure_registries', set())
@@ -902,9 +915,30 @@ class ImageBuilder:
         self._base_image_name=self.config.base_image
         requested_variant = parse_platform_variant(self._requested_platform())
         local=parse_local_image_reference(self.config.base_image)
+        policy = self.config.base_image_trust
+        if policy is not None:
+            validate_trust_policy(policy)
+            if local is not None:
+                raise TrustVerificationError(
+                    "Required registry trust cannot verify a local base image."
+                )
         if local is None:
             registry, repo, reference=parse_image_reference(self.config.base_image)
-            client=self._base_image_client(registry, repo)
+            if policy is not None:
+                if canonical_repository(registry, repo) != policy["repository"]:
+                    raise TrustVerificationError(
+                        "Base-image repository does not match the required trust policy."
+                    )
+                if self.config.registry_mirrors.get(canonical_registry(registry), []):
+                    raise TrustVerificationError(
+                        "Required base-image trust cannot be combined with registry "
+                        "mirrors for the base registry."
+                    )
+                # Generic REGISTRY_* variables target the destination, not the base registry.
+                auth=get_registry_auth(registry, include_generic_environment=False)
+                client=self._registry_client(registry, repo, auth, policy)
+            else:
+                client=self._base_image_client(registry, repo)
             return self._read_base_image(client, reference, layers_dir, os_name, arch)
 
         target = f"{os_name}/{arch}" + (
@@ -960,21 +994,42 @@ class ImageBuilder:
         snapshot = None if local else getattr(self, "_registry_base_snapshot", None)
         if not local:
             self._print(f"Pulling base image {self.config.base_image} for {target}...")
+        policy = self.config.base_image_trust
+        manifest_bytes = None
         if snapshot is None:
-            manifest, resolved_digest = client.pull_manifest(
-                reference,
-                expected_digest=(
-                    reference
-                    if reference and reference.startswith("sha256:")
-                    else None
-                ),
+            expected_digest = (
+                reference if reference and reference.startswith("sha256:") else None
             )
+            if policy is not None:
+                if local:
+                    raise TrustVerificationError(
+                        "Required registry trust cannot verify a local base image."
+                    )
+                manifest, resolved_digest, manifest_bytes = client.pull_manifest_bytes(
+                    reference, expected_digest=expected_digest
+                )
+            else:
+                manifest, resolved_digest = client.pull_manifest(
+                    reference, expected_digest=expected_digest
+                )
         else:
             manifest, resolved_digest = copy.deepcopy(snapshot[0]), snapshot[1]
+            manifest_bytes = snapshot[2]
+        if policy is not None:
+            verify_base_image(
+                policy,
+                canonical_repository(client.registry, client.repository),
+                resolved_digest,
+                manifest,
+                manifest_bytes,
+                client,
+            )
         if local:
             self._base_image_tag_verified = False
         elif snapshot is None:
-            self._registry_base_snapshot = (copy.deepcopy(manifest), resolved_digest)
+            self._registry_base_snapshot = (
+                copy.deepcopy(manifest), resolved_digest, manifest_bytes
+            )
             # Only a registry pull by tag can vouch for the tag; a user-supplied
             # tag@digest or digest is pulled by digest and never proves its tag.
             # RegistryClient verifies sha256 and sha512 digests against the bytes.
@@ -1005,11 +1060,18 @@ class ImageBuilder:
                 raise RegistryRequestError(
                     "Selected base image descriptor does not reference an image manifest."
                 )
-            manifest, _ = client.pull_manifest(
-                manifest_digest,
-                expected_digest=manifest_digest,
-                expected_size=manifest_size,
-            )
+            if policy is not None:
+                manifest, _, _ = client.pull_manifest_bytes(
+                    manifest_digest,
+                    expected_digest=manifest_digest,
+                    expected_size=manifest_size,
+                )
+            else:
+                manifest, _ = client.pull_manifest(
+                    manifest_digest,
+                    expected_digest=manifest_digest,
+                    expected_size=manifest_size,
+                )
             if manifest.get("mediaType") != descriptor_media_type:
                 raise RegistryRequestError(
                     "Selected base image manifest media type does not match its index descriptor."

@@ -66,6 +66,53 @@ generate-sbom = true
     assert logging_levels == [logging.DEBUG]
 
 
+def test_cli_preserves_required_base_image_trust(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        '[build]\nbase_image = "registry.example/team/base:v1"\n'
+        '[build.base_image_trust]\nprovider = "cosign"\n'
+        'repository = "registry.example/team/base"\n'
+        'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
+    )
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+
+    assert config.base_image_trust == {
+        "provider": "cosign",
+        "repository": "registry.example/team/base",
+        "identity": "builder@example.com",
+        "issuer": "https://issuer.example",
+    }
+
+
+def test_cli_accepts_base_image_trust_with_other_build_options(tmp_path, monkeypatch):
+    config_path = tmp_path / "pycontainer.toml"
+    config_path.write_text(
+        '[build]\nbase_image = "registry.example/team/base:v1"\n'
+        'record_history = true\nhistory_dir = "history"\n'
+        'scan = true\nscan_threshold = "critical"\n'
+        '[build.base_image_trust]\nprovider = "cosign"\n'
+        'repository = "registry.example/team/base"\n'
+        'identity = "builder@example.com"\nissuer = "https://issuer.example"\n'
+        '[build.security.kubernetes]\nread-only-root-filesystem = true\n'
+        '[build.manifest_annotations]\nsource = "manifest"\n'
+        '[build.index_annotations]\nsource = "index"\n'
+    )
+
+    config = _capture_config(monkeypatch, ["build", "--config", str(config_path)])
+
+    assert config.base_image_trust["repository"] == "registry.example/team/base"
+    assert config.record_history is True
+    assert config.history_dir == "history"
+    assert config.scan is True
+    assert config.scan_threshold == "critical"
+    assert config.manifest_annotations == {"source": "manifest"}
+    assert config.index_annotations == {"source": "index"}
+    assert render_security_fragments(config.security, str(tmp_path)) == {
+        KUBERNETES_FRAGMENT: {"readOnlyRootFilesystem": True}
+    }
+
+
 def test_scan_config_preserved_and_cli_policy_override(tmp_path, monkeypatch):
     path = tmp_path / "scan.toml"
     path.write_text("""

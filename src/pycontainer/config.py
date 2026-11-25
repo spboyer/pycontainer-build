@@ -200,6 +200,7 @@ class BuildConfig:
     tags: Optional[List[str]] = None
     semver_tags: bool = False
     latest_tag: bool = False
+    base_image_trust: Optional[Dict[str, str]] = None
     validate: Dict[str, List[str]] = field(default_factory=dict)
     squash: bool = False
     analyze_layers: bool = False
@@ -241,6 +242,10 @@ class BuildConfig:
         from .release_notes import validate_release_notes_settings
         from .system_packages import validate_system_packages
 
+        if self.base_image_trust is not None:
+            from .base_trust import validate_trust_policy
+
+            validate_trust_policy(self.base_image_trust)
         self.validate_metadata()
         validate_release_notes_settings(self.release_notes_file, self.release_notes_label)
         self.system_packages = validate_system_packages(self.system_packages)
