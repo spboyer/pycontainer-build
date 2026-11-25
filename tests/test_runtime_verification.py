@@ -649,6 +649,19 @@ def test_pull_request_ci_runs_the_real_runtime_check():
     assert "check-index: true" in job
 
 
+def test_pull_request_ci_keeps_bounded_windows_headroom_and_matrix():
+    job = job_block("tests.yml", "tests")
+
+    assert "timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 10 }}" in job
+    assert "fail-fast: false" in job
+    assert "continue-on-error" not in job
+    assert "os: [ubuntu-latest, windows-latest]" in job
+    assert 'python-version: ["3.11", "3.15"]' in job
+    assert "pytest tests -q" in job
+    assert '-m "not registry_integration and not scanner_integration"' in job
+    assert "pytest tests/test_pre_commit_hook.py -q" in job
+
+
 def test_windows_squash_build_uses_utf8_output():
     job = job_block("runtime-check.yml", "windows-squash-build")
 
